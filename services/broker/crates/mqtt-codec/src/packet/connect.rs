@@ -155,6 +155,12 @@ impl Connect {
     /// `self.version`; the argument exists so that every packet type shares
     /// one encoding signature.
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        if version != self.version {
+            return Err(CodecError::ProtocolError(
+                "connect version does not match the encoding version",
+            ));
+        }
+
         put_string(out, "MQTT")?;
         put_u8(out, version.level());
 
@@ -239,6 +245,12 @@ impl ConnAck {
             },
         };
 
+        if session_present && reason.is_failure() {
+            return Err(CodecError::ProtocolError(
+                "session present must be false when the connect is refused",
+            ));
+        }
+
         let properties = if version == Version::V5 {
             Properties::decode(reader)?
         } else {
@@ -254,6 +266,12 @@ impl ConnAck {
 
     /// Append the body, excluding the fixed header.
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        if self.session_present && self.reason.is_failure() {
+            return Err(CodecError::ProtocolError(
+                "session present must be false when the connect is refused",
+            ));
+        }
+
         put_u8(out, u8::from(self.session_present));
         match version {
             Version::V5 => {
@@ -400,6 +418,49 @@ mod tests {
         let mut reader = Reader::new(&out);
         let err = Connect::decode_body(&mut reader, &limits).unwrap_err();
         assert!(matches!(err, CodecError::ProtocolError(_)));
+    }
+
+    #[test]
+    fn rejects_encoding_with_a_mismatched_version() {
+        let packet = Connect {
+            version: Version::V5,
+            ..minimal(Version::V5)
+        };
+        let mut out = Vec::new();
+        let err = packet.encode_body(Version::V311, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            CodecError::ProtocolError("connect version does not match the encoding version")
+        );
+    }
+
+    #[test]
+    fn rejects_encoding_a_refused_connack_with_session_present() {
+        let packet = ConnAck {
+            session_present: true,
+            reason: ReasonCode::NotAuthorized,
+            properties: Default::default(),
+        };
+        let mut out = Vec::new();
+        let err = packet.encode_body(Version::V5, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            CodecError::ProtocolError("session present must be false when the connect is refused")
+        );
+    }
+
+    #[test]
+    fn rejects_decoding_a_refused_connack_with_session_present() {
+        let mut out = Vec::new();
+        crate::writer::put_u8(&mut out, 0x01); // session present set
+        crate::writer::put_u8(&mut out, ReasonCode::NotAuthorized as u8);
+        crate::Properties::default().encode(&mut out).unwrap();
+        let mut reader = Reader::new(&out);
+        let err = ConnAck::decode_body(&mut reader, Version::V5).unwrap_err();
+        assert_eq!(
+            err,
+            CodecError::ProtocolError("session present must be false when the connect is refused")
+        );
     }
 
     #[test]
