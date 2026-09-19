@@ -759,3 +759,510 @@ mod publish {
         assert_eq!(decoded, packet);
     }
 }
+
+mod subscribe {
+    // Independence property for this vector set: the subscription options
+    // byte holds six settable bit positions -- maximum QoS (bits 1-0), no
+    // local (bit 2), retain as published (bit 3) and retain handling (bits
+    // 5-4), per MQTT-v5.0 section 3.8.3.1. A vector in which two of them
+    // are always set together is invariant under swapping exactly those
+    // two, and so cannot catch that swap; the connect vectors had that gap
+    // for will-retain and password, and it had to be closed after the fact.
+    //
+    // `encodes_a_v5_subscribe_isolating_each_option_bit` closes it here in
+    // one step: it carries six filters whose options bytes are 0x01, 0x04,
+    // 0x08, 0x10, 0x20 and 0x02, so every one of the six bit positions
+    // appears set in a byte where the other five are clear. For any pair of
+    // positions there is therefore a byte holding exactly one of the two,
+    // and swapping the pair changes that byte. That is strictly stronger
+    // than the pairwise requirement.
+    //
+    // `encodes_a_v5_subscribe_with_a_subscription_identifier` then sets no
+    // local, retain as published and retain handling 2 together (0x2D), to
+    // pin the combination and the property block's position; on its own it
+    // could not distinguish no local from retain as published, which is
+    // precisely why the isolating vector above exists.
+
+    use mqtt_codec::packet::{
+        RetainHandling, SubAck, Subscribe, SubscriptionOptions, UnsubAck, Unsubscribe,
+    };
+    use mqtt_codec::reader::Reader;
+    use mqtt_codec::{Limits, Properties, QoS, ReasonCode, Version};
+
+    /// A filter with no option set beyond its quality of service.
+    fn plain(filter: &str, qos: QoS) -> SubscriptionOptions {
+        SubscriptionOptions {
+            filter: filter.into(),
+            qos,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: RetainHandling::SendAlways,
+        }
+    }
+
+    /// An MQTT 3.1.1 SUBSCRIBE with two filters at different qualities of
+    /// service, in the specification's own non-normative example.
+    ///
+    /// MQTT-v3.1.1 section 3.8.2: the variable header is the two-byte
+    /// packet identifier, most significant byte first. Section 3.8.3: the
+    /// payload is topic filter / requested QoS pairs "packed contiguously",
+    /// each filter a UTF-8 encoded string per section 1.5.3. Figure 3.22
+    /// puts QoS in bits 1-0 of the requested QoS byte and reserves the
+    /// upper six bits, which MUST be zero [MQTT-3-8.3-4]. Table 3.5 and
+    /// figure 3.23 give exactly this payload: "a/b" at 0x01 then "c/d" at
+    /// 0x02.
+    ///
+    /// Filter order is part of the wire format, because SUBACK's reason
+    /// codes MUST match it (section 3.9.3), so this vector pins it.
+    #[test]
+    fn encodes_a_v311_subscribe_with_two_filters() {
+        let packet = Subscribe {
+            packet_id: 10,
+            filters: vec![
+                plain("a/b", QoS::AtLeastOnce),
+                plain("c/d", QoS::ExactlyOnce),
+            ],
+            properties: Properties::default(),
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V311, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x0A, // packet identifier 10
+                0x00, 0x03, 0x61, 0x2F, 0x62, // topic filter "a/b"
+                0x01, // requested QoS 1, upper six bits reserved and zero
+                0x00, 0x03, 0x63, 0x2F, 0x64, // topic filter "c/d"
+                0x02, // requested QoS 2, second in the payload
+            ]
+        );
+    }
+
+    /// An MQTT 5 SUBSCRIBE carrying a subscription identifier, with no
+    /// local, retain as published and retain handling all set on its one
+    /// filter.
+    ///
+    /// MQTT-v5.0 section 3.8.2: the variable header is the packet
+    /// identifier then the properties, so the property block sits between
+    /// the identifier and the payload. Section 3.8.2.1.2: the subscription
+    /// identifier is property identifier 11 (0x0B) followed by a Variable
+    /// Byte Integer, so the block is a length of 2 and then `0B 01`.
+    ///
+    /// Section 3.8.3.1 fixes the options byte: bits 1-0 are maximum QoS,
+    /// bit 2 is no local, bit 3 is retain as published, bits 5-4 are retain
+    /// handling and bits 7-6 are reserved. QoS 1, no local, retain as
+    /// published and retain handling 2 is therefore
+    /// `0x01 | 0x04 | 0x08 | (2 << 4)`, or 0b0010_1101 = 0x2D.
+    #[test]
+    fn encodes_a_v5_subscribe_with_a_subscription_identifier() {
+        let packet = Subscribe {
+            packet_id: 10,
+            filters: vec![SubscriptionOptions {
+                filter: "a/b".into(),
+                qos: QoS::AtLeastOnce,
+                no_local: true,
+                retain_as_published: true,
+                retain_handling: RetainHandling::DoNotSend,
+            }],
+            properties: Properties {
+                subscription_identifiers: vec![1],
+                ..Default::default()
+            },
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V5, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x0A, // packet identifier 10
+                0x02, // property block length = 2 bytes, before the payload
+                0x0B, 0x01, // subscription identifier = 1
+                0x00, 0x03, 0x61, 0x2F, 0x62, // topic filter "a/b"
+                0x2D, // options, see above
+            ]
+        );
+    }
+
+    /// One MQTT 5 SUBSCRIBE whose six filters each set a single bit of the
+    /// subscription options byte, with the other five clear.
+    ///
+    /// MQTT-v5.0 section 3.8.3.1, bit by bit: maximum QoS is bits 1-0, so
+    /// QoS 1 is 0x01 and QoS 2 is 0x02; no local is bit 2, so 0x04; retain
+    /// as published is bit 3, so 0x08; retain handling is bits 5-4, so the
+    /// value 1 ("send retained messages at subscribe only if the
+    /// subscription does not currently exist") is 0x10 and the value 2
+    /// ("do not send retained messages at the time of the subscribe") is
+    /// 0x20. Bits 7-6 are reserved and zero throughout.
+    ///
+    /// This is the vector that gives the set its independence property; see
+    /// the note at the top of this module.
+    #[test]
+    fn encodes_a_v5_subscribe_isolating_each_option_bit() {
+        let only = |filter: &str, qos, no_local, retain_as_published, retain_handling| {
+            SubscriptionOptions {
+                filter: filter.into(),
+                qos,
+                no_local,
+                retain_as_published,
+                retain_handling,
+            }
+        };
+
+        let packet = Subscribe {
+            packet_id: 1,
+            filters: vec![
+                // Maximum QoS bit 0 alone.
+                only(
+                    "q/1",
+                    QoS::AtLeastOnce,
+                    false,
+                    false,
+                    RetainHandling::SendAlways,
+                ),
+                // No local alone.
+                only(
+                    "n/l",
+                    QoS::AtMostOnce,
+                    true,
+                    false,
+                    RetainHandling::SendAlways,
+                ),
+                // Retain as published alone.
+                only(
+                    "r/p",
+                    QoS::AtMostOnce,
+                    false,
+                    true,
+                    RetainHandling::SendAlways,
+                ),
+                // Retain handling bit 0 alone.
+                only(
+                    "h/1",
+                    QoS::AtMostOnce,
+                    false,
+                    false,
+                    RetainHandling::SendIfNew,
+                ),
+                // Retain handling bit 1 alone.
+                only(
+                    "h/2",
+                    QoS::AtMostOnce,
+                    false,
+                    false,
+                    RetainHandling::DoNotSend,
+                ),
+                // Maximum QoS bit 1 alone.
+                only(
+                    "q/2",
+                    QoS::ExactlyOnce,
+                    false,
+                    false,
+                    RetainHandling::SendAlways,
+                ),
+            ],
+            properties: Properties::default(),
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V5, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x01, // packet identifier 1
+                0x00, // property block: empty
+                0x00, 0x03, 0x71, 0x2F, 0x31, 0x01, // "q/1", QoS bit 0 only
+                0x00, 0x03, 0x6E, 0x2F, 0x6C, 0x04, // "n/l", no local only
+                0x00, 0x03, 0x72, 0x2F, 0x70, 0x08, // "r/p", retain as published only
+                0x00, 0x03, 0x68, 0x2F, 0x31, 0x10, // "h/1", retain handling 1 only
+                0x00, 0x03, 0x68, 0x2F, 0x32, 0x20, // "h/2", retain handling 2 only
+                0x00, 0x03, 0x71, 0x2F, 0x32, 0x02, // "q/2", QoS bit 1 only
+            ]
+        );
+    }
+
+    /// The same fully-optioned v5 subscription encoded as MQTT 3.1.1, which
+    /// keeps only the quality of service.
+    ///
+    /// MQTT-v3.1.1 section 3.8.3 has no no-local, retain-as-published or
+    /// retain-handling option, and reserves the upper six bits of the
+    /// requested QoS byte; a server MUST treat the packet as malformed if
+    /// any reserved bit is non-zero [MQTT-3-8.3-4]. The degradation is
+    /// therefore lossy by necessity, and this vector pins it: the options
+    /// byte is the bare QoS, not 0x2D.
+    #[test]
+    fn degrading_a_v5_subscription_to_v311_drops_the_v5_only_options() {
+        let packet = Subscribe {
+            packet_id: 10,
+            filters: vec![SubscriptionOptions {
+                filter: "a/b".into(),
+                qos: QoS::AtLeastOnce,
+                no_local: true,
+                retain_as_published: true,
+                retain_handling: RetainHandling::DoNotSend,
+            }],
+            properties: Properties {
+                subscription_identifiers: vec![1],
+                ..Default::default()
+            },
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V311, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x0A, // packet identifier 10, and no property block
+                0x00, 0x03, 0x61, 0x2F, 0x62, // topic filter "a/b"
+                0x01, // requested QoS 1 alone: the v5-only options are gone
+            ]
+        );
+    }
+
+    /// An MQTT 3.1.1 SUBACK granting one subscription and failing another.
+    ///
+    /// MQTT-v3.1.1 section 3.9.2: the variable header is the packet
+    /// identifier from the SUBSCRIBE being acknowledged. Section 3.9.3: the
+    /// payload is one return code per topic filter, in the same order, and
+    /// the only permitted values are 0x00, 0x01 and 0x02 for success at
+    /// maximum QoS 0, 1 and 2, and 0x80 for failure. This version has one
+    /// failure value, so every v5 error code maps onto 0x80.
+    #[test]
+    fn encodes_a_v311_suback_with_a_grant_and_a_failure() {
+        let packet = SubAck {
+            packet_id: 10,
+            reasons: vec![ReasonCode::GrantedQos2, ReasonCode::NotAuthorized],
+            properties: Properties::default(),
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V311, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x0A, // packet identifier 10
+                0x02, // success, maximum QoS 2
+                0x80, // failure: the only failure value this version has
+            ]
+        );
+    }
+
+    /// An MQTT 5 SUBACK with a property, pinning where the property block
+    /// sits relative to the reason codes.
+    ///
+    /// MQTT-v5.0 section 3.9.2: "The Variable Header of the SUBACK Packet
+    /// contains the following fields in the order: the Packet Identifier
+    /// from the SUBSCRIBE Packet that is being acknowledged, and
+    /// Properties." Section 3.9.3 then puts the reason codes in the
+    /// payload, after the variable header, one per topic filter and in the
+    /// same order [MQTT-3.9.3-1]. So the block is in the middle, not at the
+    /// end. Section 3.9.2.1.2: the reason string is property identifier 31
+    /// (0x1F) followed by a UTF-8 string, so the block is 5 bytes.
+    ///
+    /// Table 3-8 gives 0x01 for "Granted QoS 1" and 0x80 for "Unspecified
+    /// error"; unlike 3.1.1, this version keeps the distinct error codes.
+    #[test]
+    fn encodes_a_v5_suback_with_a_property_before_the_reason_codes() {
+        let packet = SubAck {
+            packet_id: 10,
+            reasons: vec![ReasonCode::GrantedQos1, ReasonCode::UnspecifiedError],
+            properties: Properties {
+                reason_string: Some("no".into()),
+                ..Default::default()
+            },
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V5, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x0A, // packet identifier 10
+                0x05, // property block length = 5 bytes, before the payload
+                0x1F, 0x00, 0x02, 0x6E, 0x6F, // reason string "no"
+                0x01, // granted QoS 1
+                0x80, // unspecified error
+            ]
+        );
+    }
+
+    /// An MQTT 3.1.1 UNSUBSCRIBE with two filters.
+    ///
+    /// MQTT-v3.1.1 section 3.10.2: the variable header is the packet
+    /// identifier. Section 3.10.3: the payload is the list of topic
+    /// filters, UTF-8 encoded strings packed contiguously, with no options
+    /// byte between them -- that is the whole difference from SUBSCRIBE's
+    /// payload. Figure 3.30 uses "a/b" and "c/d".
+    #[test]
+    fn encodes_a_v311_unsubscribe() {
+        let packet = Unsubscribe {
+            packet_id: 10,
+            filters: vec!["a/b".into(), "c/d".into()],
+            properties: Properties::default(),
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V311, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x0A, // packet identifier 10
+                0x00, 0x03, 0x61, 0x2F, 0x62, // topic filter "a/b"
+                0x00, 0x03, 0x63, 0x2F, 0x64, // topic filter "c/d", no options byte
+            ]
+        );
+    }
+
+    /// An MQTT 5 UNSUBSCRIBE, which inserts a property block.
+    ///
+    /// MQTT-v5.0 section 3.10.2: the variable header is the packet
+    /// identifier then the properties. Section 3.10.3: the payload is the
+    /// topic filters, packed contiguously, and MUST contain at least one
+    /// [MQTT-3.10.3-2]. With no properties the block is a single zero
+    /// length byte, which is the only difference from the 3.1.1 bytes
+    /// above.
+    #[test]
+    fn encodes_a_v5_unsubscribe() {
+        let packet = Unsubscribe {
+            packet_id: 10,
+            filters: vec!["a/b".into(), "c/d".into()],
+            properties: Properties::default(),
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V5, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x0A, // packet identifier 10
+                0x00, // property block: empty
+                0x00, 0x03, 0x61, 0x2F, 0x62, // topic filter "a/b"
+                0x00, 0x03, 0x63, 0x2F, 0x64, // topic filter "c/d"
+            ]
+        );
+    }
+
+    /// An MQTT 3.1.1 UNSUBACK: the packet identifier and nothing else.
+    ///
+    /// MQTT-v3.1.1 section 3.11.2: "The variable header contains the Packet
+    /// Identifier of the UNSUBSCRIBE Packet that is being acknowledged."
+    /// Section 3.11.3: "The UNSUBACK Packet has no payload." Section 3.11.1
+    /// fixes the remaining length at 2, so the body is exactly two bytes.
+    ///
+    /// The reason codes below are therefore dropped, not encoded. Anything
+    /// longer than two bytes would be unreadable to a 3.1.1 client.
+    #[test]
+    fn encodes_a_v311_unsuback_as_exactly_the_identifier() {
+        let packet = UnsubAck {
+            packet_id: 10,
+            reasons: vec![ReasonCode::Success, ReasonCode::NoSubscriptionExisted],
+            properties: Properties::default(),
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V311, &mut out).unwrap();
+
+        assert_eq!(out, vec![0x00, 0x0A]); // packet identifier 10, and nothing else
+    }
+
+    /// An MQTT 5 UNSUBACK carrying one reason code per filter.
+    ///
+    /// MQTT-v5.0 section 3.11.2: the variable header is the packet
+    /// identifier then the properties. Section 3.11.3: "The Payload of the
+    /// UNSUBACK packet contains a list of Reason Codes", one per topic
+    /// filter and in the same order [MQTT-3.11.3-1]. Table 3-9 gives 0x00
+    /// for "Success" and 0x11 for "No subscription existed" -- the latter
+    /// has no 3.1.1 equivalent, which is why that version sends none.
+    #[test]
+    fn encodes_a_v5_unsuback_with_reason_codes() {
+        let packet = UnsubAck {
+            packet_id: 10,
+            reasons: vec![ReasonCode::Success, ReasonCode::NoSubscriptionExisted],
+            properties: Properties::default(),
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V5, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x0A, // packet identifier 10
+                0x00, // property block: empty
+                0x00, // success
+                0x11, // no subscription existed
+            ]
+        );
+    }
+
+    /// Decodes a hand-built MQTT 5 SUBSCRIBE, pinning the decoder to the
+    /// specification's layout independently of this crate's encoder.
+    ///
+    /// MQTT-v5.0 section 3.8.2: packet identifier, then the property block;
+    /// section 3.8.2.1.2 makes the subscription identifier property 11
+    /// (0x0B) followed by a Variable Byte Integer. Section 3.8.3: the
+    /// payload is filter / options pairs packed contiguously.
+    ///
+    /// The two options bytes are read with section 3.8.3.1 in hand. 0x05 is
+    /// 0b0000_0101: QoS bits 1-0 are 0b01, no local (bit 2) is set, retain
+    /// as published (bit 3) is clear, retain handling (bits 5-4) is 0. 0x2A
+    /// is 0b0010_1010: QoS bits 1-0 are 0b10, no local is clear, retain as
+    /// published is set, retain handling (bits 5-4) is 0b10, or 2.
+    ///
+    /// The independence property applies on this side too, and these bytes
+    /// were chosen for it: no local is set here only where retain as
+    /// published is clear, and vice versa, so swapping the two masks in the
+    /// decoder alone changes what this vector decodes to. An earlier draft
+    /// used 0x0D and 0x22, which set both bits together and then neither,
+    /// and so was invariant under exactly that swap.
+    #[test]
+    fn decodes_a_hand_built_v5_subscribe() {
+        let wire = [
+            0x00, 0x2A, // packet identifier 42
+            0x02, // property block length = 2 bytes
+            0x0B, 0x05, // subscription identifier = 5
+            0x00, 0x03, 0x61, 0x2F, 0x62, // topic filter "a/b"
+            0x05, // options: QoS 1, no local, retain as published clear
+            0x00, 0x03, 0x63, 0x2F, 0x64, // topic filter "c/d"
+            0x2A, // options: QoS 2, retain as published, retain handling 2
+        ];
+
+        let mut reader = Reader::new(&wire);
+        let decoded =
+            Subscribe::decode_body(&mut reader, Version::V5, &Limits::default()).expect("decodes");
+
+        assert_eq!(decoded.packet_id, 42);
+        assert_eq!(decoded.properties.subscription_identifiers, vec![5]);
+
+        assert_eq!(decoded.filters.len(), 2);
+        assert_eq!(
+            decoded.filters[0],
+            SubscriptionOptions {
+                filter: "a/b".into(),
+                qos: QoS::AtLeastOnce,
+                no_local: true,
+                retain_as_published: false,
+                retain_handling: RetainHandling::SendAlways,
+            }
+        );
+        assert_eq!(
+            decoded.filters[1],
+            SubscriptionOptions {
+                filter: "c/d".into(),
+                qos: QoS::ExactlyOnce,
+                no_local: false,
+                retain_as_published: true,
+                retain_handling: RetainHandling::DoNotSend,
+            }
+        );
+    }
+}
