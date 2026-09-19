@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod header;
+pub mod properties;
 pub mod reader;
 pub mod reason;
 pub mod topic;
@@ -16,6 +17,7 @@ pub mod writer;
 
 pub use error::CodecError;
 pub use header::{FixedHeader, Limits, PacketKind};
+pub use properties::Properties;
 pub use reason::ReasonCode;
 
 /// The MQTT protocol version a packet is encoded for.
