@@ -247,6 +247,17 @@ impl Outbound {
         self.queue.len()
     }
 
+    /// Every message still held, queued or outstanding.
+    ///
+    /// Exposed so the conservation property can assert that nothing is
+    /// lost rather than assume it.
+    pub fn pending_ids(&self) -> impl Iterator<Item = crate::session::MessageId> + '_ {
+        self.queue
+            .iter()
+            .map(|d| d.message.id)
+            .chain(self.inflight.iter().map(|e| e.delivery.message.id))
+    }
+
     fn report(scratch: &mut Vec<(Delivery, DropReason)>, out: &mut Vec<Action>) {
         for (item, reason) in scratch.drain(..) {
             out.push(Action::Dropped {

@@ -207,6 +207,14 @@ impl Queue {
         self.bytes = 0;
     }
 
+    /// Every message waiting, in order.
+    ///
+    /// Exposed so the conservation property can assert that nothing is
+    /// lost rather than assume it.
+    pub fn iter(&self) -> impl Iterator<Item = &Delivery> {
+        self.entries.iter()
+    }
+
     /// How many messages are waiting.
     pub fn len(&self) -> usize {
         self.entries.len()
