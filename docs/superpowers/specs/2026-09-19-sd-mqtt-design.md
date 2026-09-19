@@ -181,9 +181,21 @@ offline cases. The online bound protects memory, the offline bound protects
 disk.
 
 **No retransmission on a live connection.** MQTT 5 forbids it and TCP makes
-it pointless. On session resume, inflight messages are reset to their
-initial state and requeued with the duplicate flag, and queued messages are
-promoted into inflight slots.
+it pointless. On session resume, inflight messages are requeued with the
+duplicate flag and **their original packet identifiers**, and queued
+messages are promoted into inflight slots.
+
+Keeping the identifier is not a detail. A peer that received the first copy
+and lost its acknowledgement is waiting on that identifier; a redelivery
+under a new one looks like an unrelated message and is delivered twice,
+breaking exactly-once by an ordinary dropped connection. The old identifier
+is also stranded on the peer forever, so when the broker's counter wraps
+onto it, a genuinely new message is discarded as a duplicate. One mistake,
+both duplication and loss.
+
+Resume is also not uniform. A message whose receipt has already arrived is
+resumed by resending the release, not the publish, because the peer has
+taken ownership of it.
 
 **Overflow** is configurable per queue, `drop_newest` by default and
 `drop_oldest` available. Every drop increments a counter labelled with a
