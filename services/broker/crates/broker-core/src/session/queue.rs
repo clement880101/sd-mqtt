@@ -23,6 +23,9 @@ pub struct Delivery {
     /// MQTT 5 subscription identifiers to echo back, one per matching
     /// subscription that carried one.
     pub subscription_ids: Vec<u32>,
+    /// Whether this is a redelivery, set when a message is requeued on
+    /// resume. It becomes the duplicate flag on the wire.
+    pub dup: bool,
 }
 
 impl Delivery {
@@ -177,7 +180,8 @@ impl Queue {
     /// acknowledged must go out before anything that arrived since. It
     /// bypasses the bounds deliberately: the message was already accepted,
     /// and refusing it now would lose something the peer may be expecting.
-    pub fn requeue(&mut self, item: Delivery) {
+    pub fn requeue(&mut self, mut item: Delivery) {
+        item.dup = true;
         self.bytes += item.size_in_queue();
         self.entries.push_front(item);
     }
@@ -237,6 +241,7 @@ mod tests {
             qos,
             retain: false,
             subscription_ids: Vec::new(),
+            dup: false,
         }
     }
 
@@ -444,5 +449,6 @@ mod tests {
 
         let first = queue.pop(0, &mut dropped).unwrap();
         assert_eq!(&first.message.payload[..], b"old");
+        assert!(first.dup, "a requeued message goes out as a duplicate");
     }
 }

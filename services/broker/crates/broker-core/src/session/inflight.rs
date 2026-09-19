@@ -119,6 +119,7 @@ mod tests {
                 qos,
                 retain: false,
                 subscription_ids: Vec::new(),
+                dup: false,
             },
             state: InflightState::AwaitingAck,
             sent_at: 0,
