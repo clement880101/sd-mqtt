@@ -395,6 +395,25 @@ mod tests {
     }
 
     #[test]
+    fn skips_past_held_identifiers_when_the_counter_wraps() {
+        // The loop that steps over occupied slots only earns its keep when
+        // the counter lands on one that is still held, which needs the
+        // wrap. Without this the loop can be deleted and the suite passes.
+        let mut ids = PacketIds::default();
+        for _ in 0..u16::MAX {
+            ids.allocate().expect("space remains");
+        }
+        ids.release(100);
+
+        assert_eq!(
+            ids.allocate(),
+            Some(100),
+            "allocation must skip every held identifier to reach the free one"
+        );
+        assert!(ids.is_in_use(1), "and must not have reused the first");
+    }
+
+    #[test]
     fn reports_how_many_are_outstanding() {
         let mut ids = PacketIds::default();
         assert_eq!(ids.in_use(), 0);
@@ -495,15 +514,21 @@ impl PacketIds {
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `cd services/broker && cargo test -p broker-core packet_ids`
-Expected: PASS, eight tests.
+Expected: PASS, nine tests.
 
 Note that `never_allocates_zero` and `does_not_reuse_an_identifier_still_in_use` each loop sixty-five thousand times. If either is slow enough to notice, say so rather than shrinking the loop, because the wrap is the interesting case.
 
 - [ ] **Step 6: Prove the occupancy check is load-bearing**
 
 Make `allocate` return the counter without consulting the set, confirm
-`does_not_reuse_an_identifier_still_in_use` fails, then restore from a
-`cp` backup. Report what you saw.
+`skips_past_held_identifiers_when_the_counter_wraps` fails, then restore
+from a `cp` backup. Report what you saw.
+
+Note which test this is, and which it is not. With no gaps in the
+identifier space the length guard already handles exhaustion, so
+`does_not_reuse_an_identifier_still_in_use` passes even with the skip loop
+removed. Only the wrap makes the counter land on something still held. An
+earlier draft of this plan named the wrong test and the mutation survived.
 
 - [ ] **Step 7: Commit**
 
