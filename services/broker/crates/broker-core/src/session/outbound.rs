@@ -515,6 +515,121 @@ mod tests {
     }
 
     #[test]
+    fn clearing_reports_every_message_it_discards() {
+        // Both halves must be accounted for: what is waiting and what is
+        // already on the wire. A message that disappears without a drop
+        // action is a support case nobody can answer.
+        let mut out = online(1);
+        let mut actions = Vec::new();
+        let sent_one = delivery(QoS::AtLeastOnce, b"1");
+        let queued_one = delivery(QoS::AtLeastOnce, b"2");
+        let expected = vec![sent_one.message.id, queued_one.message.id];
+        out.offer(sent_one, 0, &mut actions);
+        out.offer(queued_one, 0, &mut actions);
+        assert_eq!(out.inflight_len(), 1);
+        assert_eq!(out.queued_len(), 1);
+
+        actions.clear();
+        out.clear(DropReason::SessionEnded, &mut actions);
+
+        let mut reported: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Dropped { id, reason, .. } => {
+                    assert_eq!(*reason, DropReason::SessionEnded);
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect();
+        reported.sort();
+        let mut expected = expected;
+        expected.sort();
+        assert_eq!(reported, expected, "every message must be reported");
+        assert_eq!(out.queued_len(), 0);
+        assert_eq!(out.inflight_len(), 0);
+    }
+
+    #[test]
+    fn disconnecting_stops_anything_further_going_out() {
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtLeastOnce, b"1"), 0, &mut actions);
+        assert_eq!(sent(&actions).len(), 1);
+
+        out.on_disconnect();
+        actions.clear();
+        out.offer(delivery(QoS::AtLeastOnce, b"2"), 0, &mut actions);
+
+        assert!(sent(&actions).is_empty(), "nobody is attached");
+        assert_eq!(out.queued_len(), 1, "it waits instead");
+        assert_eq!(out.inflight_len(), 1, "and the window is held, not lost");
+    }
+
+    #[test]
+    fn the_subscription_identifiers_are_echoed_on_the_packet() {
+        // This is how an MQTT 5 client learns which of its subscriptions
+        // matched, and the identifiers differ per subscriber, which is
+        // why the property block is cloned per delivery.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        let mut item = delivery(QoS::AtLeastOnce, b"x");
+        item.subscription_ids = vec![7, 9];
+        out.offer(item, 0, &mut actions);
+
+        let published = sent(&actions);
+        assert_eq!(published.len(), 1);
+        assert_eq!(
+            published[0].properties.subscription_identifiers,
+            vec![7, 9],
+            "both identifiers, in order"
+        );
+    }
+
+    #[test]
+    fn a_message_that_expired_while_waiting_is_dropped_rather_than_sent() {
+        let mut out = Outbound::new(QueueLimits::default(), 10);
+        let mut actions = Vec::new();
+        let mut item = delivery(QoS::AtLeastOnce, b"stale");
+        item.message.expires_at = Some(100);
+        let id = item.message.id;
+        out.offer(item, 0, &mut actions);
+        assert_eq!(out.queued_len(), 1, "it waits while nobody is attached");
+
+        actions.clear();
+        out.on_resume(101, &mut actions);
+
+        assert!(sent(&actions).is_empty(), "the deadline has passed");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Dropped {
+                    id: dropped,
+                    reason: DropReason::Expired,
+                    ..
+                } if *dropped == id
+            )),
+            "the drop must be reported with its reason, got {actions:?}"
+        );
+        assert_eq!(out.queued_len(), 0);
+    }
+
+    #[test]
+    fn narrowing_the_window_lets_fewer_out() {
+        // A peer may advertise a smaller receive maximum than the default.
+        let mut out = online(10);
+        out.set_inflight_limit(1);
+        let mut actions = Vec::new();
+        for _ in 0..3 {
+            out.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+        }
+
+        assert_eq!(sent(&actions).len(), 1, "only the narrowed window");
+        assert_eq!(out.inflight_len(), 1);
+        assert_eq!(out.queued_len(), 2);
+    }
+
+    #[test]
     fn an_acknowledgement_for_an_unknown_identifier_is_reported() {
         let mut out = online(10);
         let mut actions = Vec::new();
