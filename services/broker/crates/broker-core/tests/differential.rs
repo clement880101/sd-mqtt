@@ -346,6 +346,17 @@ proptest! {
                 model.values().map(Vec::len).sum::<usize>()
             );
             prop_assert_eq!(shared.is_empty(), model.is_empty());
+
+            // One synthetic trie entry per live group, always. This is
+            // what makes matching yield groups directly, and a stale
+            // entry is invisible to every other assertion here: `select`
+            // skips a synthetic whose group is gone, so the leak shows
+            // up in nothing but the count itself.
+            prop_assert_eq!(
+                shared.synthetic_count(),
+                shared.group_count(),
+                "a synthetic entry outlived its group, or a group lost one"
+            );
         }
 
         for topic in &topics {

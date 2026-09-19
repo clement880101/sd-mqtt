@@ -208,6 +208,27 @@ impl SharedSubscriptions {
             .sum()
     }
 
+    /// How many synthetic entries the inner trie holds.
+    ///
+    /// The design rests on one entry per live group, which is what lets
+    /// matching a topic yield the matching groups directly rather than
+    /// scanning every group that exists. That invariant holds by
+    /// construction, and a violation of it leaks quietly rather than
+    /// returning a wrong answer: a stale entry names a group that
+    /// [`select`] will simply skip. Exposed so the invariant can be
+    /// asserted rather than assumed, for the same reason
+    /// [`SubscriptionTrie::node_count`] and [`RetainedStore::node_count`]
+    /// are.
+    ///
+    /// This should equal [`group_count`] after every operation.
+    ///
+    /// [`select`]: Self::select
+    /// [`group_count`]: Self::group_count
+    /// [`RetainedStore::node_count`]: crate::retained::RetainedStore::node_count
+    pub fn synthetic_count(&self) -> usize {
+        self.trie.len()
+    }
+
     /// Whether no group exists.
     pub fn is_empty(&self) -> bool {
         self.group_count() == 0
