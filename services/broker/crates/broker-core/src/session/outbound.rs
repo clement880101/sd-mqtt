@@ -304,6 +304,32 @@ impl Outbound {
         }
     }
 
+    /// Put back a message that was outstanding when this session was
+    /// last written to storage, reserving the identifier it was sent
+    /// under.
+    ///
+    /// The mirror of [`Inbound::reserve`](crate::session::Inbound::reserve).
+    /// Without it a session rebuilt from storage, or taken over by
+    /// another node, starts with an empty window and hands identifiers
+    /// the peer is still holding to unrelated messages.
+    ///
+    /// Reports whether the identifier was free. A clash means the stored
+    /// state disagrees with itself; the entry is restored either way,
+    /// because dropping a message is worse than holding a suspect
+    /// identifier, and the caller is better placed to say what to do.
+    pub fn restore(&mut self, entry: InflightEntry) -> bool {
+        let was_free = self.packet_ids.reserve(entry.packet_id);
+        self.inflight.push(entry);
+        was_free
+    }
+
+    /// Every message outstanding, in the order sent, for persistence.
+    ///
+    /// The mirror of [`Inbound::held`](crate::session::Inbound::held).
+    pub fn outstanding(&self) -> impl Iterator<Item = &InflightEntry> + '_ {
+        self.inflight.iter()
+    }
+
     /// How many are outstanding.
     pub fn inflight_len(&self) -> usize {
         self.inflight.len()
@@ -795,6 +821,75 @@ mod tests {
                 .any(|a| matches!(a, Action::Send(Packet::PubRel(_)))),
             "and no release, because the client never took ownership"
         );
+    }
+
+    #[test]
+    fn a_restored_window_keeps_its_identifiers_out_of_circulation() {
+        // Takeover and cluster resume both rebuild a session from
+        // storage. If the window comes back empty the peer is still
+        // holding identifiers this allocator thinks are free.
+        let mut out = online(10);
+
+        assert!(out.restore(InflightEntry {
+            packet_id: 1,
+            delivery: delivery(QoS::AtLeastOnce, b"stored"),
+            state: InflightState::AwaitingAck,
+            sent_at: 0,
+        }));
+
+        assert_eq!(out.inflight_len(), 1);
+        assert_eq!(out.outstanding().count(), 1);
+        assert!(out.packet_ids.is_in_use(1));
+
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtLeastOnce, b"new"), 0, &mut actions);
+        assert_ne!(
+            sent(&actions)[0].packet_id,
+            Some(1),
+            "a new message must not take an identifier the peer holds"
+        );
+    }
+
+    #[test]
+    fn a_restored_window_is_redelivered_on_resume() {
+        // The whole point of restoring it: the takeover node resends
+        // what the old one had outstanding, under the same identifiers.
+        let mut out = Outbound::new(QueueLimits::default(), 10);
+        out.restore(InflightEntry {
+            packet_id: 7,
+            delivery: delivery(QoS::ExactlyOnce, b"stored"),
+            state: InflightState::AwaitingReceived,
+            sent_at: 0,
+        });
+
+        let mut actions = Vec::new();
+        out.on_resume(0, &mut actions);
+
+        let resent = sent(&actions);
+        assert_eq!(resent.len(), 1);
+        assert_eq!(resent[0].packet_id, Some(7));
+        assert!(resent[0].dup);
+    }
+
+    #[test]
+    fn restoring_an_identifier_twice_reports_the_clash() {
+        let mut out = online(10);
+        assert!(out.restore(InflightEntry {
+            packet_id: 3,
+            delivery: delivery(QoS::AtLeastOnce, b"a"),
+            state: InflightState::AwaitingAck,
+            sent_at: 0,
+        }));
+        assert!(
+            !out.restore(InflightEntry {
+                packet_id: 3,
+                delivery: delivery(QoS::AtLeastOnce, b"b"),
+                state: InflightState::AwaitingAck,
+                sent_at: 0,
+            }),
+            "the second says the stored state disagrees with itself"
+        );
+        assert_eq!(out.inflight_len(), 2, "but neither message is dropped");
     }
 
     #[test]

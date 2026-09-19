@@ -8,6 +8,28 @@ use mqtt_codec::{Packet, Properties, QoS, ReasonCode};
 
 use crate::session::Action;
 
+/// An acknowledgement a client is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Acknowledgement {
+    /// The identifier to answer.
+    pub packet_id: u16,
+    /// Which acknowledgement the level calls for.
+    pub qos: QoS,
+}
+
+/// What the caller must do with a publish that has arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Received {
+    /// Whether the message goes to subscribers. False for a redelivery
+    /// of an exactly-once message already held, which must be answered
+    /// again but must not reach a subscriber twice.
+    pub dispatch: bool,
+    /// What the client is owed once the caller knows the outcome. It is
+    /// returned rather than sent so that the reason code can say what
+    /// actually happened; see [`Inbound::acknowledge`].
+    pub owed: Option<Acknowledgement>,
+}
+
 /// Tracks what a client has sent that is not yet complete.
 ///
 /// Only exactly-once delivery needs memory here. At-least-once is
@@ -31,44 +53,52 @@ impl Inbound {
         }
     }
 
-    /// Handle a publish from the client.
+    /// Decide what to do with a publish from the client.
     ///
-    /// Returns whether to dispatch the message to subscribers. A
-    /// redelivery of an exactly-once message already held returns false:
-    /// it is receipted again, because the first receipt may have been
-    /// lost, but it must not reach a subscriber twice. [MQTT-4.3.3-10]
-    /// requires exactly that pair.
+    /// This emits nothing. The acknowledgement is owed rather than sent,
+    /// because its reason code depends on what happens to the message:
+    /// the useful answers, and 0x10 no-matching-subscribers above all,
+    /// are not knowable until the caller has tried to dispatch it. The
+    /// caller acts on [`Received::dispatch`] and then calls
+    /// [`Inbound::acknowledge`] with what it learned.
     ///
     /// An error is the reason code the caller must close the connection
     /// with; [MQTT-3.3.4-9] names a disconnect, not a refusal packet, as
     /// the answer to a peer that exceeds the receive maximum.
-    pub fn on_publish(
-        &mut self,
-        publish: &Publish,
-        out: &mut Vec<Action>,
-    ) -> Result<bool, ReasonCode> {
+    pub fn on_publish(&mut self, publish: &Publish) -> Result<Received, ReasonCode> {
         match publish.qos {
-            QoS::AtMostOnce => Ok(true),
+            QoS::AtMostOnce => Ok(Received {
+                dispatch: true,
+                owed: None,
+            }),
             QoS::AtLeastOnce => {
                 let packet_id = publish.packet_id.ok_or(ReasonCode::ProtocolError)?;
-                out.push(Action::Send(Packet::PubAck(ack(
-                    packet_id,
-                    ReasonCode::Success,
-                ))));
-                Ok(true)
+                Ok(Received {
+                    dispatch: true,
+                    owed: Some(Acknowledgement {
+                        packet_id,
+                        qos: QoS::AtLeastOnce,
+                    }),
+                })
             }
             QoS::ExactlyOnce => {
                 let packet_id = publish.packet_id.ok_or(ReasonCode::ProtocolError)?;
+                let owed = Some(Acknowledgement {
+                    packet_id,
+                    qos: QoS::ExactlyOnce,
+                });
 
                 if self.awaiting_release.contains(&packet_id) {
-                    // Already held. Receipt it again and stop; it is
-                    // already counted against the receive maximum, so
-                    // refusing it here would deadlock the exchange.
-                    out.push(Action::Send(Packet::PubRec(ack(
-                        packet_id,
-                        ReasonCode::Success,
-                    ))));
-                    return Ok(false);
+                    // Already held. It is receipted again, because the
+                    // first receipt may have been lost, but it must not
+                    // reach a subscriber twice: [MQTT-4.3.3-10] requires
+                    // exactly that pair. It is also already counted
+                    // against the receive maximum, so refusing it here
+                    // would deadlock the exchange.
+                    return Ok(Received {
+                        dispatch: false,
+                        owed,
+                    });
                 }
 
                 if self.receive_maximum != 0 && self.awaiting_release.len() >= self.receive_maximum
@@ -77,11 +107,38 @@ impl Inbound {
                 }
 
                 self.awaiting_release.insert(packet_id);
-                out.push(Action::Send(Packet::PubRec(ack(
-                    packet_id,
-                    ReasonCode::Success,
-                ))));
-                Ok(true)
+                Ok(Received {
+                    dispatch: true,
+                    owed,
+                })
+            }
+        }
+    }
+
+    /// Answer a publish, once the caller knows how it went.
+    ///
+    /// A failing receipt forgets the identifier: [MQTT-4.3.3-9] requires
+    /// a later publish carrying it to be treated as a new message rather
+    /// than a redelivery, because the broker has said it never took this
+    /// one.
+    pub fn acknowledge(
+        &mut self,
+        packet_id: u16,
+        qos: QoS,
+        reason: ReasonCode,
+        out: &mut Vec<Action>,
+    ) {
+        match qos {
+            // Nothing is owed, and nothing may be sent.
+            QoS::AtMostOnce => {}
+            QoS::AtLeastOnce => {
+                out.push(Action::Send(Packet::PubAck(ack(packet_id, reason))));
+            }
+            QoS::ExactlyOnce => {
+                if reason.is_failure() {
+                    self.awaiting_release.remove(&packet_id);
+                }
+                out.push(Action::Send(Packet::PubRec(ack(packet_id, reason))));
             }
         }
     }
@@ -161,13 +218,24 @@ mod tests {
             .collect()
     }
 
+    /// The whole of what a caller does: decide, then answer with success.
+    fn accept(inbound: &mut Inbound, publish: &Publish, out: &mut Vec<Action>) -> bool {
+        let received = inbound.on_publish(publish).expect("accepted");
+        if let Some(owed) = received.owed {
+            inbound.acknowledge(owed.packet_id, owed.qos, ReasonCode::Success, out);
+        }
+        received.dispatch
+    }
+
     #[test]
     fn fire_and_forget_is_dispatched_and_not_acknowledged() {
         let mut inbound = Inbound::new(10);
         let mut actions = Vec::new();
-        assert!(inbound
-            .on_publish(&publish(QoS::AtMostOnce, None, false), &mut actions)
-            .unwrap());
+        assert!(accept(
+            &mut inbound,
+            &publish(QoS::AtMostOnce, None, false),
+            &mut actions
+        ));
         assert!(acks(&actions).is_empty());
     }
 
@@ -175,9 +243,11 @@ mod tests {
     fn at_least_once_is_dispatched_and_acknowledged() {
         let mut inbound = Inbound::new(10);
         let mut actions = Vec::new();
-        assert!(inbound
-            .on_publish(&publish(QoS::AtLeastOnce, Some(5), false), &mut actions)
-            .unwrap());
+        assert!(accept(
+            &mut inbound,
+            &publish(QoS::AtLeastOnce, Some(5), false),
+            &mut actions
+        ));
         assert!(matches!(acks(&actions)[0], Packet::PubAck(a) if a.packet_id == 5));
     }
 
@@ -187,12 +257,16 @@ mod tests {
         // because the publisher is entitled to a second attempt.
         let mut inbound = Inbound::new(10);
         let mut actions = Vec::new();
-        assert!(inbound
-            .on_publish(&publish(QoS::AtLeastOnce, Some(5), false), &mut actions)
-            .unwrap());
-        assert!(inbound
-            .on_publish(&publish(QoS::AtLeastOnce, Some(5), true), &mut actions)
-            .unwrap());
+        assert!(accept(
+            &mut inbound,
+            &publish(QoS::AtLeastOnce, Some(5), false),
+            &mut actions
+        ));
+        assert!(accept(
+            &mut inbound,
+            &publish(QoS::AtLeastOnce, Some(5), true),
+            &mut actions
+        ));
     }
 
     #[test]
@@ -200,16 +274,20 @@ mod tests {
         let mut inbound = Inbound::new(10);
         let mut actions = Vec::new();
 
-        assert!(inbound
-            .on_publish(&publish(QoS::ExactlyOnce, Some(7), false), &mut actions)
-            .unwrap());
+        assert!(accept(
+            &mut inbound,
+            &publish(QoS::ExactlyOnce, Some(7), false),
+            &mut actions
+        ));
         assert_eq!(inbound.outstanding(), 1);
 
         actions.clear();
         assert!(
-            !inbound
-                .on_publish(&publish(QoS::ExactlyOnce, Some(7), true), &mut actions)
-                .unwrap(),
+            !accept(
+                &mut inbound,
+                &publish(QoS::ExactlyOnce, Some(7), true),
+                &mut actions
+            ),
             "a redelivery must not reach the subscriber twice"
         );
         assert!(
@@ -222,9 +300,11 @@ mod tests {
     fn a_release_completes_the_exchange_and_forgets_the_identifier() {
         let mut inbound = Inbound::new(10);
         let mut actions = Vec::new();
-        inbound
-            .on_publish(&publish(QoS::ExactlyOnce, Some(7), false), &mut actions)
-            .unwrap();
+        accept(
+            &mut inbound,
+            &publish(QoS::ExactlyOnce, Some(7), false),
+            &mut actions,
+        );
 
         actions.clear();
         inbound.on_pubrel(7, &mut actions);
@@ -236,9 +316,11 @@ mod tests {
 
         // The identifier is free again, so the same one may be reused.
         actions.clear();
-        assert!(inbound
-            .on_publish(&publish(QoS::ExactlyOnce, Some(7), false), &mut actions)
-            .unwrap());
+        assert!(accept(
+            &mut inbound,
+            &publish(QoS::ExactlyOnce, Some(7), false),
+            &mut actions
+        ));
     }
 
     #[test]
@@ -256,15 +338,19 @@ mod tests {
     fn exceeding_the_receive_maximum_is_refused() {
         let mut inbound = Inbound::new(2);
         let mut actions = Vec::new();
-        inbound
-            .on_publish(&publish(QoS::ExactlyOnce, Some(1), false), &mut actions)
-            .unwrap();
-        inbound
-            .on_publish(&publish(QoS::ExactlyOnce, Some(2), false), &mut actions)
-            .unwrap();
+        accept(
+            &mut inbound,
+            &publish(QoS::ExactlyOnce, Some(1), false),
+            &mut actions,
+        );
+        accept(
+            &mut inbound,
+            &publish(QoS::ExactlyOnce, Some(2), false),
+            &mut actions,
+        );
 
         assert_eq!(
-            inbound.on_publish(&publish(QoS::ExactlyOnce, Some(3), false), &mut actions),
+            inbound.on_publish(&publish(QoS::ExactlyOnce, Some(3), false)),
             Err(ReasonCode::ReceiveMaximumExceeded)
         );
     }
@@ -274,11 +360,13 @@ mod tests {
         // It is already counted; refusing it would deadlock the exchange.
         let mut inbound = Inbound::new(1);
         let mut actions = Vec::new();
-        inbound
-            .on_publish(&publish(QoS::ExactlyOnce, Some(1), false), &mut actions)
-            .unwrap();
+        accept(
+            &mut inbound,
+            &publish(QoS::ExactlyOnce, Some(1), false),
+            &mut actions,
+        );
         assert!(inbound
-            .on_publish(&publish(QoS::ExactlyOnce, Some(1), true), &mut actions)
+            .on_publish(&publish(QoS::ExactlyOnce, Some(1), true))
             .is_ok());
     }
 
@@ -289,8 +377,78 @@ mod tests {
         let mut inbound = Inbound::new(10);
         inbound.reserve(7);
         let mut actions = Vec::new();
-        assert!(!inbound
-            .on_publish(&publish(QoS::ExactlyOnce, Some(7), true), &mut actions)
-            .unwrap());
+        assert!(!accept(
+            &mut inbound,
+            &publish(QoS::ExactlyOnce, Some(7), true),
+            &mut actions
+        ));
+    }
+
+    #[test]
+    fn the_acknowledgement_carries_the_reason_the_caller_supplies() {
+        // The point of the split. A broker cannot know there are no
+        // matching subscribers until it has tried to dispatch, so the
+        // reason code cannot be decided in the same call that asks it to.
+        let mut inbound = Inbound::new(10);
+        let mut actions = Vec::new();
+
+        let received = inbound
+            .on_publish(&publish(QoS::AtLeastOnce, Some(4), false))
+            .expect("accepted");
+        let owed = received.owed.expect("an acknowledgement is owed");
+        inbound.acknowledge(
+            owed.packet_id,
+            owed.qos,
+            ReasonCode::NoMatchingSubscribers,
+            &mut actions,
+        );
+
+        assert!(matches!(
+            acks(&actions)[0],
+            Packet::PubAck(a) if a.reason == ReasonCode::NoMatchingSubscribers
+        ));
+    }
+
+    #[test]
+    fn a_failing_receipt_forgets_the_identifier() {
+        // [MQTT-4.3.3-9]: once the broker has said it never took the
+        // message, a later publish under that identifier is a new
+        // message, not a redelivery, and must be dispatched.
+        let mut inbound = Inbound::new(10);
+        let mut actions = Vec::new();
+
+        let received = inbound
+            .on_publish(&publish(QoS::ExactlyOnce, Some(7), false))
+            .expect("accepted");
+        let owed = received.owed.expect("an acknowledgement is owed");
+        inbound.acknowledge(
+            owed.packet_id,
+            owed.qos,
+            ReasonCode::QuotaExceeded,
+            &mut actions,
+        );
+        assert_eq!(inbound.outstanding(), 0, "the exchange never started");
+
+        actions.clear();
+        assert!(
+            accept(
+                &mut inbound,
+                &publish(QoS::ExactlyOnce, Some(7), true),
+                &mut actions
+            ),
+            "a later publish under that identifier is a new message"
+        );
+    }
+
+    #[test]
+    fn a_successful_receipt_keeps_the_identifier() {
+        let mut inbound = Inbound::new(10);
+        let mut actions = Vec::new();
+        let received = inbound
+            .on_publish(&publish(QoS::ExactlyOnce, Some(7), false))
+            .expect("accepted");
+        let owed = received.owed.expect("an acknowledgement is owed");
+        inbound.acknowledge(owed.packet_id, owed.qos, ReasonCode::Success, &mut actions);
+        assert_eq!(inbound.outstanding(), 1);
     }
 }

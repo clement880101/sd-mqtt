@@ -52,7 +52,7 @@ pub enum Action {
     Close(ReasonCode),
 }
 
-pub use inbound::Inbound;
+pub use inbound::{Acknowledgement, Inbound, Received};
 pub use inflight::{Inflight, InflightEntry, InflightState};
 pub use message::{Message, MessageId};
 pub use outbound::Outbound;
