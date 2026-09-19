@@ -1266,3 +1266,356 @@ mod subscribe {
         );
     }
 }
+
+mod control {
+    // DISCONNECT and AUTH both have a legal zero-length body, and that is
+    // the property this vector set exists to pin. A round trip cannot see
+    // the difference between "the short form was used" and "the long form
+    // was used and read back", because both decode to the same value; only
+    // literal bytes can.
+    //
+    // PINGREQ and PINGRESP have no body at all, so there is nothing for an
+    // encoder vector to pin. Their whole wire form is the fixed header, so
+    // they are pinned below through `PacketKind::nibble` and `header::peek`
+    // instead. The fixed-header *encoder* arrives with the packet enum in
+    // the next task; when it does, `0xC0 0x00` and `0xD0 0x00` should also
+    // be asserted in the encode direction.
+
+    use bytes::Bytes;
+    use mqtt_codec::header::{self, PacketKind};
+    use mqtt_codec::packet::{Auth, Disconnect};
+    use mqtt_codec::reader::Reader;
+    use mqtt_codec::{Limits, Properties, ReasonCode, Version};
+
+    /// An MQTT 3.1.1 DISCONNECT has an entirely empty body.
+    ///
+    /// MQTT-v3.1.1 section 3.14.2: "The DISCONNECT Packet has no variable
+    /// header." Section 3.14.3: "The DISCONNECT Packet has no payload."
+    /// Figure 3.35 fixes the whole packet at two bytes, the second being a
+    /// remaining length of 0. So there is no place on the wire for a reason
+    /// code or a property block, and both are dropped rather than encoded:
+    /// this vector sets both and still expects nothing.
+    #[test]
+    fn encodes_a_v311_disconnect_as_an_empty_body() {
+        let packet = Disconnect {
+            reason: ReasonCode::SessionTakenOver,
+            properties: Properties {
+                reason_string: Some("dropped".into()),
+                ..Default::default()
+            },
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V311, &mut out).unwrap();
+
+        assert_eq!(out, Vec::<u8>::new());
+    }
+
+    /// An MQTT 5 normal disconnection is also an empty body.
+    ///
+    /// MQTT-v5.0 section 3.14.2.1: "Byte 1 in the Variable Header is the
+    /// Disconnect Reason Code. If the Remaining Length is less than 1 the
+    /// value of 0x00 (Normal disconnection) is used." Section 3.14.2.2.1
+    /// adds: "If the Remaining Length is less than 2, a value of 0 is
+    /// used" for the property length. Together those make a zero-length
+    /// body the canonical spelling of "success, no properties", so the
+    /// encoder must not emit the two bytes `0x00 0x00` that would say the
+    /// same thing the long way.
+    #[test]
+    fn encodes_a_v5_normal_disconnection_as_an_empty_body() {
+        let packet = Disconnect {
+            reason: ReasonCode::Success,
+            properties: Properties::default(),
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V5, &mut out).unwrap();
+
+        assert_eq!(out, Vec::<u8>::new());
+    }
+
+    /// An MQTT 5 DISCONNECT with a reason code and nothing else.
+    ///
+    /// MQTT-v5.0 section 3.14.2: "The Variable Header of the DISCONNECT
+    /// Packet contains the following fields in the order: Disconnect
+    /// Reason Code, and Properties." Table 3-10 gives 0x8D for "Keep Alive
+    /// timeout", sent by the server. Section 2.2.2.1 makes the property
+    /// length a Variable Byte Integer that is present whenever the
+    /// properties are, and zero when the set is empty, so the long form of
+    /// this packet is two bytes: the reason code, then a property length
+    /// of 0.
+    ///
+    /// The short form of section 3.14.2.2.1 -- the reason byte alone, with
+    /// the property length omitted -- is also legal, and is pinned in the
+    /// decode direction by `decodes_a_v5_disconnect_that_omits_the_
+    /// property_length` below. This codec reads both and writes this one.
+    #[test]
+    fn encodes_a_v5_disconnect_with_a_reason_and_no_properties() {
+        let packet = Disconnect {
+            reason: ReasonCode::KeepAliveTimeout,
+            properties: Properties::default(),
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V5, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                0x8D, // keep alive timeout
+                0x00, // property block: empty
+            ]
+        );
+    }
+
+    /// An MQTT 5 DISCONNECT carrying a reason code and one property.
+    ///
+    /// MQTT-v5.0 table 3-10 gives 0x9D for "Server moved". Section
+    /// 3.14.2.2.5: "28 (0x1C) Byte, Identifier of the Server Reference.
+    /// Followed by a UTF-8 Encoded String which can be used by the Client
+    /// to identify another Server to use", and "The Server sends
+    /// DISCONNECT including a Server Reference and Reason Code 0x9C (Use
+    /// another server) or 0x9D (Server moved)". So this is the pairing the
+    /// specification names, not an arbitrary one.
+    ///
+    /// The block is the identifier byte plus a UTF-8 Encoded String, which
+    /// section 1.5.4 length-prefixes with two bytes: 1 + 2 + 13 = 16, or
+    /// 0x10.
+    ///
+    /// A caution for whoever extends this set. The specification's own
+    /// figure 3-24, the DISCONNECT variable header non-normative example,
+    /// labels its property length "Length (5)" but draws the bit row as
+    /// 0000 0111, or 7, for a block that is structurally 5 bytes: one
+    /// identifier byte plus a Four Byte Integer. The label and the
+    /// structure agree; the bit row is wrong. Derive property lengths by
+    /// counting the encoded block, not by reading that figure.
+    #[test]
+    fn encodes_a_v5_disconnect_with_a_reason_and_a_server_reference() {
+        let packet = Disconnect {
+            reason: ReasonCode::ServerMoved,
+            properties: Properties {
+                server_reference: Some("b.example.com".into()),
+                ..Default::default()
+            },
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V5, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                0x9D, // server moved
+                0x10, // property block length = 16 bytes
+                0x1C, // server reference identifier (28)
+                0x00, 0x0D, // string length = 13
+                0x62, 0x2E, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, 0x2E, 0x63, 0x6F,
+                0x6D, // "b.example.com"
+            ]
+        );
+    }
+
+    /// An MQTT 5 AUTH continuing an authentication exchange.
+    ///
+    /// MQTT-v5.0 section 3.15.2: "The Variable Header of the AUTH Packet
+    /// contains the following fields in the order: Authenticate Reason
+    /// Code, and Properties." Table 3-11 gives 0x18 for "Continue
+    /// authentication", sent by client or server. Section 3.15.2.2.2: "21
+    /// (0x15) Byte, Identifier of the Authentication Method. Followed by a
+    /// UTF-8 Encoded String". Section 3.15.2.2.3: "22 (0x16) Byte,
+    /// Identifier of the Authentication Data. Followed by Binary Data",
+    /// which section 1.5.6 also length-prefixes with two bytes. Section
+    /// 3.15.3: "The AUTH packet has no Payload", so the body ends with the
+    /// property block.
+    ///
+    /// Block length: method is 1 + 2 + 13 = 16, data is 1 + 2 + 7 = 10,
+    /// total 26, or 0x1A. The specification does not fix the order of
+    /// properties within a block (section 2.2.2); this codec emits them in
+    /// ascending identifier order, which puts the method before the data,
+    /// and that is what the bytes below pin.
+    #[test]
+    fn encodes_a_v5_auth_continuing_authentication() {
+        let packet = Auth {
+            reason: ReasonCode::ContinueAuthentication,
+            properties: Properties {
+                authentication_method: Some("SCRAM-SHA-256".into()),
+                authentication_data: Some(Bytes::from_static(b"r=nonce")),
+                ..Default::default()
+            },
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V5, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                0x18, // continue authentication
+                0x1A, // property block length = 26 bytes
+                0x15, // authentication method identifier (21)
+                0x00, 0x0D, // string length = 13
+                0x53, 0x43, 0x52, 0x41, 0x4D, 0x2D, 0x53, 0x48, 0x41, 0x2D, 0x32, 0x35,
+                0x36, // "SCRAM-SHA-256"
+                0x16, // authentication data identifier (22)
+                0x00, 0x07, // binary data length = 7
+                0x72, 0x3D, 0x6E, 0x6F, 0x6E, 0x63, 0x65, // "r=nonce"
+            ]
+        );
+    }
+
+    /// An empty MQTT 5 DISCONNECT body decodes as a normal disconnection.
+    ///
+    /// MQTT-v5.0 section 3.14.2.1: "If the Remaining Length is less than 1
+    /// the value of 0x00 (Normal disconnection) is used." Pinned from
+    /// literal bytes -- an empty slice -- rather than from this crate's
+    /// encoder, so that the decoder keeps reading the short form even if
+    /// the encoder stopped writing it.
+    #[test]
+    fn decodes_an_empty_v5_disconnect_body_as_a_normal_disconnection() {
+        let wire: [u8; 0] = [];
+
+        let mut reader = Reader::new(&wire);
+        let decoded = Disconnect::decode_body(&mut reader, Version::V5).expect("decodes");
+
+        assert_eq!(decoded.reason, ReasonCode::Success);
+        assert_eq!(decoded.properties, Properties::default());
+    }
+
+    /// A one-byte MQTT 5 DISCONNECT body: a reason code with the property
+    /// length omitted.
+    ///
+    /// MQTT-v5.0 section 3.14.2.2.1: "The length of Properties in the
+    /// DISCONNECT packet Variable Header encoded as a Variable Byte
+    /// Integer. If the Remaining Length is less than 2, a value of 0 is
+    /// used." So a body of exactly one byte is the reason code and an
+    /// implied empty property block, and must not be read as a reason code
+    /// followed by a truncated property length. Table 3-10 gives 0x8D for
+    /// "Keep Alive timeout".
+    #[test]
+    fn decodes_a_v5_disconnect_that_omits_the_property_length() {
+        let wire = [0x8D]; // keep alive timeout, property length omitted
+
+        let mut reader = Reader::new(&wire);
+        let decoded = Disconnect::decode_body(&mut reader, Version::V5).expect("decodes");
+
+        assert_eq!(decoded.reason, ReasonCode::KeepAliveTimeout);
+        assert_eq!(decoded.properties, Properties::default());
+    }
+
+    /// Decodes a hand-built MQTT 5 DISCONNECT, pinning the decoder's
+    /// layout independently of this crate's encoder.
+    ///
+    /// MQTT-v5.0 section 3.14.2: reason code, then the property block.
+    /// Table 3-10 gives 0x98 for "Administrative action". Section
+    /// 3.14.2.2.3: "31 (0x1F) Byte, Identifier of the Reason String.
+    /// Followed by the UTF-8 Encoded String". Block length: 1 + 2 + 3 = 6.
+    #[test]
+    fn decodes_a_hand_built_v5_disconnect() {
+        let wire = [
+            0x98, // administrative action
+            0x06, // property block length = 6 bytes
+            0x1F, // reason string identifier (31)
+            0x00, 0x03, 0x62, 0x79, 0x65, // "bye"
+        ];
+
+        let mut reader = Reader::new(&wire);
+        let decoded = Disconnect::decode_body(&mut reader, Version::V5).expect("decodes");
+
+        assert_eq!(decoded.reason, ReasonCode::AdministrativeAction);
+        assert_eq!(decoded.properties.reason_string.as_deref(), Some("bye"));
+    }
+
+    /// An empty AUTH body decodes as success.
+    ///
+    /// MQTT-v5.0 section 3.15.2.1: "The Reason Code and Property Length
+    /// can be omitted if the Reason Code is 0x00 (Success) and there are
+    /// no Properties. In this case the AUTH has a Remaining Length of 0."
+    /// Pinned from literal bytes so that the meaning of a zero-length AUTH
+    /// body is fixed here and not inferred from the encoder.
+    #[test]
+    fn decodes_an_empty_auth_body_as_success() {
+        let wire: [u8; 0] = [];
+
+        let mut reader = Reader::new(&wire);
+        let decoded = Auth::decode_body(&mut reader).expect("decodes");
+
+        assert_eq!(decoded.reason, ReasonCode::Success);
+        assert_eq!(decoded.properties, Properties::default());
+    }
+
+    /// Decodes a hand-built MQTT 5 AUTH, pinning the decoder's layout
+    /// independently of this crate's encoder.
+    ///
+    /// MQTT-v5.0 section 3.15.2: reason code, then the property block.
+    /// Table 3-11 gives 0x19 for "Re-authenticate", sent by the client.
+    /// Section 3.15.2.2.2 makes the authentication method identifier 21
+    /// (0x15) followed by a UTF-8 Encoded String; section 3.15.2.2.3 makes
+    /// the authentication data identifier 22 (0x16) followed by Binary
+    /// Data. Block length: method is 1 + 2 + 6 = 9, data is 1 + 2 + 4 = 7,
+    /// total 16, or 0x10.
+    ///
+    /// The data below is non-UTF-8 on purpose: section 1.5.6 Binary Data
+    /// has no character encoding, so a decoder that reads it as a string
+    /// must fail here rather than pass.
+    #[test]
+    fn decodes_a_hand_built_v5_auth() {
+        let wire = [
+            0x19, // re-authenticate
+            0x10, // property block length = 16 bytes
+            0x15, // authentication method identifier (21)
+            0x00, 0x06, 0x6D, 0x65, 0x74, 0x68, 0x6F, 0x64, // "method"
+            0x16, // authentication data identifier (22)
+            0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF, // four bytes, not UTF-8
+        ];
+
+        let mut reader = Reader::new(&wire);
+        let decoded = Auth::decode_body(&mut reader).expect("decodes");
+
+        assert_eq!(decoded.reason, ReasonCode::ReAuthenticate);
+        assert_eq!(
+            decoded.properties.authentication_method.as_deref(),
+            Some("method")
+        );
+        assert_eq!(
+            decoded.properties.authentication_data,
+            Some(Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF]))
+        );
+    }
+
+    /// The fixed-header first byte of each packet this module covers.
+    ///
+    /// MQTT-v5.0 figure 3.35 for PINGREQ draws byte 1 as 1100 0000, with
+    /// the control packet type (12) in bits 7-4 and bits 3-0 reserved and
+    /// zero, and byte 2 as a remaining length of 0. The PINGRESP figure
+    /// draws 1101 0000 the same way, type 13. Section 3.14.1 draws
+    /// DISCONNECT as 1110 0000, type 14, and section 3.15.1 draws AUTH as
+    /// 1111 0000, type 15, both with bits 3-0 reserved and zero
+    /// [MQTT-3.14.1-1], [MQTT-3.15.1-1]. MQTT-v3.1.1 figure 3.35 draws its
+    /// DISCONNECT identically, with a remaining length fixed at 0.
+    ///
+    /// Only the decode direction can be pinned today: the fixed-header
+    /// encoder belongs to the packet enum in the next task. When it lands,
+    /// `0xC0 0x00` and `0xD0 0x00` should be asserted against it too.
+    #[test]
+    fn pins_the_fixed_header_first_byte_of_each_control_packet() {
+        assert_eq!(PacketKind::PingReq.nibble() << 4, 0xC0);
+        assert_eq!(PacketKind::PingResp.nibble() << 4, 0xD0);
+        assert_eq!(PacketKind::Disconnect.nibble() << 4, 0xE0);
+        assert_eq!(PacketKind::Auth.nibble() << 4, 0xF0);
+
+        // A whole PINGREQ and a whole PINGRESP, read back from the bytes
+        // the next task's encoder must produce.
+        for (wire, kind) in [
+            ([0xC0, 0x00], PacketKind::PingReq),
+            ([0xD0, 0x00], PacketKind::PingResp),
+        ] {
+            let parsed = header::peek(&wire, &Limits::default())
+                .expect("well formed")
+                .expect("complete");
+            assert_eq!(parsed.kind, kind);
+            assert_eq!(parsed.flags, 0);
+            assert_eq!(parsed.body_len, 0);
+            assert_eq!(parsed.total_len(), 2);
+        }
+    }
+}
