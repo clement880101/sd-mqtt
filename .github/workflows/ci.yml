@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  broker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/broker
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/broker
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - uses: taiki-e/install-action@nextest
+      - name: Test
+        run: cargo nextest run --all-features
+      - name: Doc tests
+        run: cargo test --doc --all-features
+
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
+      - name: License and advisory gate
+        run: cargo deny --manifest-path services/broker/Cargo.toml --config deny.toml check
