@@ -5,3 +5,6 @@ dist/
 .DS_Store
 /data/
 THIRD-PARTY-LICENSES.md
+
+# proptest regression seeds produced by deliberate mutation runs
+*.proptest-regressions

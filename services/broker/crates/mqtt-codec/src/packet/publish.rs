@@ -129,6 +129,13 @@ impl Publish {
     /// data loss. The depth limit is not checked here, because encoding
     /// takes no [`Limits`].
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        // [`Publish::flags`] would happily set the bit, and
+        // [`Publish::decode_body`] rejects it; MQTT-v5.0 section 3.3.1.1.
+        if self.dup && self.qos == QoS::AtMostOnce {
+            return Err(CodecError::MalformedPacket(
+                "duplicate flag set on a quality of service zero publish",
+            ));
+        }
         if self.qos == QoS::AtMostOnce && self.packet_id.is_some() {
             return Err(CodecError::ProtocolError(
                 "a quality of service zero publish must not carry a packet identifier",
@@ -513,6 +520,26 @@ mod tests {
             ack.encode_body(Version::V311, PacketKind::PubAck, &mut out)
                 .unwrap_err(),
             CodecError::ProtocolError("packet identifier must not be zero")
+        );
+    }
+
+    /// The mirror of `rejects_the_duplicate_flag_on_a_qos_zero_publish`.
+    /// `flags()` sets the bit from `dup` without consulting the QoS, so
+    /// without this check the encoder writes a frame its own decoder
+    /// refuses.
+    #[test]
+    fn rejects_the_duplicate_flag_at_qos_zero_when_encoding() {
+        let packet = Publish {
+            dup: true,
+            ..qos_zero_publish("a")
+        };
+        assert_eq!(
+            encode_err(&packet, Version::V311),
+            CodecError::MalformedPacket("duplicate flag set on a quality of service zero publish")
+        );
+        assert_eq!(
+            encode_err(&packet, Version::V5),
+            CodecError::MalformedPacket("duplicate flag set on a quality of service zero publish")
         );
     }
 

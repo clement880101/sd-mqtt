@@ -68,6 +68,26 @@ pub struct Subscribe {
     pub properties: Properties,
 }
 
+/// Reject the no-local option on a shared subscription.
+///
+/// MQTT-v5.0 section 3.8.3.1, [MQTT-3.8.3-4]: "It is a Protocol Error to set
+/// the No Local bit to 1 on a Shared Subscription." This is a rule tying two
+/// fields together rather than a statement about filter validity, so it is
+/// not covered by the note on [`Subscribe::encode_body`] that filter validity
+/// belongs to the caller. Both sides call this so they cannot drift.
+///
+/// A filter carrying the share prefix but no well-formed group is rejected
+/// earlier on decode by [`crate::topic::validate_subscription`], so testing
+/// the prefix here agrees with that path while needing no [`Limits`].
+fn check_no_local(filter: &str, no_local: bool) -> Result<(), CodecError> {
+    if no_local && filter.starts_with(crate::topic::SHARE_PREFIX) {
+        return Err(CodecError::ProtocolError(
+            "no local is not permitted on a shared subscription",
+        ));
+    }
+    Ok(())
+}
+
 fn read_packet_id(reader: &mut Reader<'_>) -> Result<u16, CodecError> {
     let id = reader.u16()?;
     if id == 0 {
@@ -112,12 +132,8 @@ impl Subscribe {
             let retain_as_published = options & 0x08 != 0;
             let retain_handling = RetainHandling::from_u8((options & 0x30) >> 4)?;
 
-            let shared = crate::topic::validate_subscription(&filter, limits)?;
-            if no_local && shared.is_some() {
-                return Err(CodecError::ProtocolError(
-                    "no local is not permitted on a shared subscription",
-                ));
-            }
+            crate::topic::validate_subscription(&filter, limits)?;
+            check_no_local(&filter, no_local)?;
 
             filters.push(SubscriptionOptions {
                 filter,
@@ -151,6 +167,9 @@ impl Subscribe {
     /// Filter validity is the caller's responsibility; use
     /// [`crate::topic::validate_subscription`]. This method has no access to
     /// [`Limits`](crate::header::Limits) and so cannot check topic depth.
+    /// The no-local rule for shared subscriptions is not filter validity but
+    /// a relation between two fields, so it is checked here; see
+    /// [`check_no_local`].
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
         if self.packet_id == 0 {
             return Err(CodecError::ProtocolError(
@@ -170,6 +189,7 @@ impl Subscribe {
             put_string(out, &entry.filter)?;
             let mut options = entry.qos.as_u8();
             if version == Version::V5 {
+                check_no_local(&entry.filter, entry.no_local)?;
                 if entry.no_local {
                     options |= 0x04;
                 }
@@ -511,6 +531,39 @@ mod tests {
             Subscribe::decode_body(&mut reader, Version::V5, &Limits::default()).unwrap_err(),
             CodecError::ProtocolError("no local is not permitted on a shared subscription")
         );
+    }
+
+    /// The mirror of the decode-side check above. Without it the encoder
+    /// writes a SUBSCRIBE its own decoder refuses to read back.
+    #[test]
+    fn rejects_no_local_on_a_shared_subscription_when_encoding() {
+        let packet = Subscribe {
+            packet_id: 1,
+            filters: vec![SubscriptionOptions {
+                filter: "$share/g/a".into(),
+                qos: QoS::AtMostOnce,
+                no_local: true,
+                retain_as_published: false,
+                retain_handling: RetainHandling::SendAlways,
+            }],
+            properties: Default::default(),
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            packet.encode_body(Version::V5, &mut out).unwrap_err(),
+            CodecError::ProtocolError("no local is not permitted on a shared subscription")
+        );
+
+        // The same subscription without no-local is fine.
+        let allowed = Subscribe {
+            filters: vec![SubscriptionOptions {
+                no_local: false,
+                ..packet.filters[0].clone()
+            }],
+            ..packet
+        };
+        let mut out = Vec::new();
+        allowed.encode_body(Version::V5, &mut out).expect("encodes");
     }
 
     #[test]
