@@ -158,4 +158,22 @@ mod tests {
         assert!(ids.is_in_use(500));
         assert!(!ids.reserve(500), "reserving twice should report the clash");
     }
+
+    #[test]
+    fn skips_past_held_identifiers_when_the_counter_wraps() {
+        let mut ids = PacketIds::default();
+        for _ in 0..u16::MAX {
+            ids.allocate().expect("space remains");
+        }
+        // The counter has wrapped back to one, which is still held, so the
+        // single released identifier in the middle is the only free slot.
+        ids.release(100);
+
+        assert_eq!(
+            ids.allocate(),
+            Some(100),
+            "allocation must skip every held identifier to reach the free one"
+        );
+        assert!(ids.is_in_use(1), "and must not have reused the first");
+    }
 }
