@@ -16,7 +16,7 @@ allow = [
     "CC0-1.0",
     "Unlicense",
 ]
-confidence-threshold = 0.93
+confidence-threshold = 0.8
 
 [bans]
 multiple-versions = "warn"

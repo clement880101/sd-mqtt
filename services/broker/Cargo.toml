@@ -14,8 +14,11 @@ bytes = "1"
 thiserror = "2"
 proptest = "1"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
 strip = true
