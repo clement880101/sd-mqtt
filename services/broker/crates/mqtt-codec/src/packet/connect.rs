@@ -400,7 +400,36 @@ mod tests {
         crate::writer::put_string(&mut out, "c").unwrap();
         let mut reader = Reader::new(&out);
         let err = Connect::decode_body(&mut reader, &Limits::default()).unwrap_err();
-        assert!(matches!(err, CodecError::MalformedPacket(_)));
+        assert_eq!(
+            err,
+            CodecError::MalformedPacket("quality of service must be 0, 1 or 2")
+        );
+    }
+
+    #[test]
+    fn rejects_a_311_password_without_a_user_name() {
+        let packet = Connect {
+            password: Some(Bytes::from_static(b"secret")),
+            ..minimal(Version::V311)
+        };
+        let mut out = Vec::new();
+        packet.encode_body(Version::V311, &mut out).unwrap();
+        let mut reader = Reader::new(&out);
+        let err = Connect::decode_body(&mut reader, &Limits::default()).unwrap_err();
+        assert_eq!(
+            err,
+            CodecError::MalformedPacket("password without a user name is not permitted in 3.1.1")
+        );
+    }
+
+    #[test]
+    fn accepts_a_v5_password_without_a_user_name() {
+        let packet = Connect {
+            password: Some(Bytes::from_static(b"secret")),
+            ..minimal(Version::V5)
+        };
+        let decoded = round_trip_connect(&packet, Version::V5);
+        assert_eq!(decoded, packet);
     }
 
     #[test]
