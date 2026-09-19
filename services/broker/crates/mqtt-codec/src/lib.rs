@@ -19,6 +19,7 @@ pub mod writer;
 
 pub use error::CodecError;
 pub use header::{FixedHeader, Limits, PacketKind};
+pub use packet::{decode, encode, Packet};
 pub use properties::Properties;
 pub use qos::QoS;
 pub use reason::ReasonCode;
