@@ -142,6 +142,11 @@ impl Properties {
             put_binary(&mut body, v)?;
         }
         for v in &self.subscription_identifiers {
+            if *v == 0 {
+                return Err(CodecError::ProtocolError(
+                    "subscription identifier must not be zero",
+                ));
+            }
             body.push(0x0B);
             varint::encode(*v, &mut body)?;
         }
@@ -286,7 +291,7 @@ mod tests {
 
     #[test]
     fn rejects_a_duplicated_single_valued_property() {
-        // Length 4, then session expiry (0x11) twice with truncated values.
+        // Length 10 (0x0A), then session expiry (0x11) twice with truncated values.
         let bytes = [0x0A, 0x11, 0, 0, 0, 1, 0x11, 0, 0, 0, 2];
         let mut reader = Reader::new(&bytes);
         let err = Properties::decode(&mut reader).unwrap_err();
@@ -314,6 +319,17 @@ mod tests {
         let bytes = [0x02, 0x0B, 0x00];
         let mut reader = Reader::new(&bytes);
         let err = Properties::decode(&mut reader).unwrap_err();
+        assert!(matches!(err, CodecError::ProtocolError(_)));
+    }
+
+    #[test]
+    fn rejects_encoding_a_zero_subscription_identifier() {
+        let props = Properties {
+            subscription_identifiers: vec![0],
+            ..Properties::default()
+        };
+        let mut out = Vec::new();
+        let err = props.encode(&mut out).unwrap_err();
         assert!(matches!(err, CodecError::ProtocolError(_)));
     }
 

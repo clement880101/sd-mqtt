@@ -116,8 +116,16 @@ impl ReasonCode {
 
     /// Project onto the MQTT 3.1.1 CONNACK return codes.
     ///
-    /// Codes with no legacy equivalent become "server unavailable", which is
-    /// the broadest failure a 3.1.1 client understands.
+    /// Defined only for codes that can legally appear in a 3.1.1 CONNACK.
+    /// Any other code collapses to 3 ("server unavailable"), the broadest
+    /// failure a 3.1.1 client understands.
+    ///
+    /// This projection must not be used to answer a CONNECT that is
+    /// malformed or that violates the protocol: MQTT 3.1.1 requires the
+    /// server to close the connection with no CONNACK at all in that case.
+    /// Sending a CONNACK with return code 3 tells the client the failure is
+    /// transient and invites a retry, which is the wrong signal for a
+    /// malformed or protocol-violating CONNECT.
     pub fn to_v311_connack(self) -> u8 {
         use ReasonCode::*;
         match self {
@@ -132,6 +140,14 @@ impl ReasonCode {
     }
 
     /// Project onto the MQTT 3.1.1 SUBACK return codes.
+    ///
+    /// Defined only for codes that can legally appear in a 3.1.1 SUBACK.
+    /// Any other code collapses to 0x80, the broadest failure a 3.1.1
+    /// client understands. This includes codes such as
+    /// [`ReasonCode::NoSubscriptionExisted`] and
+    /// [`ReasonCode::NoMatchingSubscribers`], which cannot legally appear
+    /// in a 3.1.1 SUBACK in the first place, so their mapping to 0x80 is
+    /// unreachable in practice rather than meaningful.
     pub fn to_v311_suback(self) -> u8 {
         use ReasonCode::*;
         match self {
