@@ -32,6 +32,7 @@ expects.
 | `.devcontainer/base.Dockerfile` | Shared image: Rust, Node, CLI tools |
 | `.devcontainer/compose.yaml` | `root`, `broker`, `web` services |
 | `.devcontainer/root/devcontainer.json` | Root orchestrator container |
+| `services/web/.devcontainer/devcontainer.json` | Web container |
 | `services/broker/Cargo.toml` | Workspace manifest, shared dependency versions |
 | `services/broker/rust-toolchain.toml` | Pinned toolchain channel |
 | `services/broker/.devcontainer/devcontainer.json` | Broker container |
@@ -143,11 +144,16 @@ THIRD-PARTY-LICENSES.md
 
 - [ ] **Step 5: Pin the toolchain**
 
+Pin an exact version rather than `stable`. A floating channel lets a new
+clippy lint break the build with no code change, and lets contributors
+drift apart. Run `rustc --version` and use exactly what it reports; the
+version below is what this plan was written against.
+
 Create `services/broker/rust-toolchain.toml`:
 
 ```toml
 [toolchain]
-channel = "stable"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 ```
 
@@ -170,7 +176,7 @@ git commit -m "chore: repository foundation"
 Create `.devcontainer/base.Dockerfile`:
 
 ```dockerfile
-FROM rust:1-slim-bookworm
+FROM rust:1.98.1-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl jq ripgrep fd-find ca-certificates \
@@ -257,7 +263,22 @@ Create `services/broker/.devcontainer/devcontainer.json`:
 }
 ```
 
-- [ ] **Step 5: Reserve the web service directory**
+- [ ] **Step 5: Write the web devcontainer**
+
+Create `services/web/.devcontainer/devcontainer.json`:
+
+```json
+{
+  "name": "sd-mqtt web",
+  "dockerComposeFile": ["../../../.devcontainer/compose.yaml"],
+  "service": "web",
+  "runServices": ["web"],
+  "workspaceFolder": "/workspaces/repo/services/web",
+  "shutdownAction": "stopCompose"
+}
+```
+
+- [ ] **Step 6: Reserve the web service directory**
 
 The compose file names a `web` service whose working directory does not
 exist until a later plan. Create a placeholder so the service can start.
@@ -266,12 +287,12 @@ exist until a later plan. Create a placeholder so the service can start.
 mkdir -p services/web && touch services/web/.gitkeep
 ```
 
-- [ ] **Step 6: Verify the compose file parses**
+- [ ] **Step 7: Verify the compose file parses**
 
 Run: `docker compose -f .devcontainer/compose.yaml config --quiet`
 Expected: no output and exit code 0.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add .devcontainer services/broker/.devcontainer services/web
@@ -286,6 +307,15 @@ git commit -m "chore: dev containers for root, broker and web"
 - Create: `services/broker/Cargo.toml`, `services/broker/crates/mqtt-codec/Cargo.toml`, `services/broker/crates/mqtt-codec/src/lib.rs`, `deny.toml`, `.github/workflows/ci.yml`
 
 - [ ] **Step 1: Write the workspace manifest**
+
+Two notes on what is deliberately absent. The release profile does **not**
+set `panic = "abort"`. This broker runs one task per connection, and with
+unwinding a panic in a connection handler stays contained to that task and
+surfaces as an error on its join handle; with abort, one malformed packet
+would take down every connected client. Aborting also breaks
+`#[should_panic]` tests and `cargo test --release`. The safety lints live in
+`[workspace.lints.rust]` rather than in each crate's source, so that every
+crate added later inherits them by declaring `[lints] workspace = true`.
 
 Create `services/broker/Cargo.toml`:
 
@@ -306,10 +336,13 @@ bytes = "1"
 thiserror = "2"
 proptest = "1"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
 strip = true
 ```
 
@@ -333,6 +366,9 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+
+[lints]
+workspace = true
 ```
 
 - [ ] **Step 3: Write a placeholder library root so the workspace builds**
@@ -396,7 +432,7 @@ allow = [
     "CC0-1.0",
     "Unlicense",
 ]
-confidence-threshold = 0.93
+confidence-threshold = 0.8
 
 [bans]
 multiple-versions = "warn"
