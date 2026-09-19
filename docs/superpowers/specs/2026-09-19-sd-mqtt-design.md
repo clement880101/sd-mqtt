@@ -709,6 +709,18 @@ shippable.
 
 ## 17. Open questions
 
+- **Packet size on the hot path.** The MQTT 5 property block is one struct
+  of 27 mostly-unset optional fields, around 344 bytes, carried by value
+  inside every packet. Making it an optional boxed value would shrink the
+  common no-properties case to a pointer, at the cost of an allocation when
+  properties are present. The trade depends on how often real traffic
+  carries properties, so it needs a benchmark rather than a guess. Decide
+  during the broker core work, where benchmarks exist. The codec crate boxes
+  only the connect packet today, on the reasoning that it arrives once per
+  connection while a publish is the hot path and already owns two heap
+  allocations.
+
+
 None of these block milestone 1. Each is resolved by the milestone that
 needs it, and the resolution is recorded as an architecture decision record.
 
