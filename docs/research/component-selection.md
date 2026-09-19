@@ -4,11 +4,11 @@ Decisions for every third-party component in sd-mqtt, ranked on three
 criteria in order: MIT-compatible permissive license, light dependency tree,
 and capability at scale.
 
-Facts were verified against crates.io, lib.rs, docs.rs, npm and GitHub on
-2026-09-19. Where a fact could not be verified it is marked. Two areas
-(UI charts/tables/styling and allocator/rate-limiting/timers) were decided
-from first principles without independent verification; they are marked
-UNVERIFIED and should be re-checked before the milestone that needs them.
+Facts were verified against crates.io, lib.rs, docs.rs, npm, bundlephobia
+and GitHub on 2026-09-19, including published tarballs where a repository's
+license metadata was ambiguous. Every area has been verified. A few
+individual figures remain estimates and are marked inline: mimalloc's exact
+static binary cost, and snmalloc's musl support.
 
 ## Summary table
 
