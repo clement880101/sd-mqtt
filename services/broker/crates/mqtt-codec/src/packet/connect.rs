@@ -4,7 +4,7 @@ use bytes::Bytes;
 
 use crate::error::CodecError;
 use crate::header::Limits;
-use crate::properties::Properties;
+use crate::properties::{Properties, PropertyScope};
 use crate::qos::QoS;
 use crate::reader::Reader;
 use crate::reason::ReasonCode;
@@ -94,7 +94,7 @@ impl Connect {
         let keep_alive = reader.u16()?;
 
         let properties = if version == Version::V5 {
-            Properties::decode(reader)?
+            Properties::decode_for(reader, PropertyScope::Connect)?
         } else {
             Properties::default()
         };
@@ -108,7 +108,7 @@ impl Connect {
 
         let will = if has_will {
             let will_properties = if version == Version::V5 {
-                Properties::decode(reader)?
+                Properties::decode_for(reader, PropertyScope::Will)?
             } else {
                 Properties::default()
             };
@@ -185,14 +185,14 @@ impl Connect {
         put_u16(out, self.keep_alive);
 
         if version == Version::V5 {
-            self.properties.encode(out)?;
+            self.properties.encode_for(PropertyScope::Connect, out)?;
         }
 
         put_string(out, &self.client_id)?;
 
         if let Some(will) = &self.will {
             if version == Version::V5 {
-                will.properties.encode(out)?;
+                will.properties.encode_for(PropertyScope::Will, out)?;
             }
             put_string(out, &will.topic)?;
             put_binary(out, &will.payload)?;
@@ -260,7 +260,7 @@ impl ConnAck {
         }
 
         let properties = if version == Version::V5 {
-            Properties::decode(reader)?
+            Properties::decode_for(reader, PropertyScope::ConnAck)?
         } else {
             Properties::default()
         };
@@ -284,7 +284,7 @@ impl ConnAck {
         match version {
             Version::V5 => {
                 put_u8(out, self.reason as u8);
-                self.properties.encode(out)?;
+                self.properties.encode_for(PropertyScope::ConnAck, out)?;
             }
             Version::V311 => put_u8(out, self.reason.to_v311_connack()),
         }

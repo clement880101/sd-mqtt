@@ -5,7 +5,9 @@ use mqtt_codec::packet::{
     Ack, ConnAck, Connect, Disconnect, Publish, RetainHandling, SubAck, Subscribe,
     SubscriptionOptions, UnsubAck, Unsubscribe, Will,
 };
-use mqtt_codec::{decode, encode, Limits, Packet, Properties, QoS, ReasonCode, Version};
+use mqtt_codec::{
+    decode, encode, Limits, Packet, Properties, PropertyScope, QoS, ReasonCode, Version,
+};
 use proptest::prelude::*;
 
 fn any_qos() -> impl Strategy<Value = QoS> {
@@ -34,25 +36,105 @@ fn any_payload() -> impl Strategy<Value = Bytes> {
     prop::collection::vec(any::<u8>(), 0..64).prop_map(Bytes::from)
 }
 
-/// Properties that every packet type accepts, so one generator serves all.
-fn any_properties() -> impl Strategy<Value = Properties> {
-    (
-        prop::option::of(any::<u32>()),
-        prop::option::of("[a-z ]{0,16}"),
-        prop::collection::vec(("[a-z]{1,4}", "[a-z]{0,8}"), 0..3),
-    )
-        .prop_map(|(expiry, reason, user)| Properties {
-            message_expiry_interval: expiry,
-            reason_string: reason,
-            user_properties: user,
-            ..Properties::default()
-        })
+/// User properties, which are the one kind every packet permits.
+fn any_user_properties() -> impl Strategy<Value = Vec<(String, String)>> {
+    prop::collection::vec(("[a-z]{1,4}", "[a-z]{0,8}"), 0..3)
+}
+
+/// Properties legal on the packet being generated.
+///
+/// One generator cannot serve every packet: MQTT 5 permits a different
+/// subset on each, and the codec now rejects anything outside it at both
+/// ends. Each arm below stays inside its packet's subset, taken from the
+/// cross-reference table in specification section 2.2.2.2. Every arm varies
+/// at least the user properties, and each arm that has a scalar of its own
+/// varies that too, so the generated blocks are still empty sometimes and
+/// populated others rather than being fixed.
+fn any_properties(scope: PropertyScope) -> BoxedStrategy<Properties> {
+    match scope {
+        // Session Expiry Interval (0x11) and User Property (0x26).
+        PropertyScope::Connect => (prop::option::of(any::<u32>()), any_user_properties())
+            .prop_map(|(expiry, user)| Properties {
+                session_expiry_interval: expiry,
+                user_properties: user,
+                ..Properties::default()
+            })
+            .boxed(),
+        // Will Delay Interval (0x18), Content Type (0x03) and User Property.
+        PropertyScope::Will => (
+            prop::option::of(any::<u32>()),
+            prop::option::of("[a-z/]{1,12}"),
+            any_user_properties(),
+        )
+            .prop_map(|(delay, content_type, user)| Properties {
+                will_delay_interval: delay,
+                content_type,
+                user_properties: user,
+                ..Properties::default()
+            })
+            .boxed(),
+        // Message Expiry Interval (0x02), Content Type (0x03) and User Property.
+        PropertyScope::Publish => (
+            prop::option::of(any::<u32>()),
+            prop::option::of("[a-z/]{1,12}"),
+            any_user_properties(),
+        )
+            .prop_map(|(expiry, content_type, user)| Properties {
+                message_expiry_interval: expiry,
+                content_type,
+                user_properties: user,
+                ..Properties::default()
+            })
+            .boxed(),
+        // Subscription Identifier (0x0B), which must not be zero, and User
+        // Property.
+        PropertyScope::Subscribe => (prop::option::of(1u32..=268_435_455), any_user_properties())
+            .prop_map(|(id, user)| Properties {
+                subscription_identifiers: id.into_iter().collect(),
+                user_properties: user,
+                ..Properties::default()
+            })
+            .boxed(),
+        // Reason String (0x1F) and User Property.
+        PropertyScope::Ack | PropertyScope::SubAck | PropertyScope::UnsubAck => {
+            (prop::option::of("[a-z ]{0,16}"), any_user_properties())
+                .prop_map(|(reason, user)| Properties {
+                    reason_string: reason,
+                    user_properties: user,
+                    ..Properties::default()
+                })
+                .boxed()
+        }
+        // Session Expiry Interval (0x11), Reason String (0x1F) and User
+        // Property.
+        PropertyScope::Disconnect => (
+            prop::option::of(any::<u32>()),
+            prop::option::of("[a-z ]{0,16}"),
+            any_user_properties(),
+        )
+            .prop_map(|(expiry, reason, user)| Properties {
+                session_expiry_interval: expiry,
+                reason_string: reason,
+                user_properties: user,
+                ..Properties::default()
+            })
+            .boxed(),
+        // User Property only.
+        PropertyScope::Unsubscribe | PropertyScope::ConnAck | PropertyScope::Auth => {
+            any_user_properties()
+                .prop_map(|user| Properties {
+                    user_properties: user,
+                    ..Properties::default()
+                })
+                .boxed()
+        }
+    }
 }
 
 /// Properties are only encoded for MQTT 5, so 3.1.1 packets carry none.
-fn properties_for(version: Version) -> BoxedStrategy<Properties> {
+fn properties_for(version: Version, scope: PropertyScope) -> BoxedStrategy<Properties> {
     match version {
-        Version::V5 => any_properties().boxed(),
+        Version::V5 => any_properties(scope),
         Version::V311 => Just(Properties::default()).boxed(),
     }
 }
@@ -68,7 +150,7 @@ fn any_publish(version: Version) -> impl Strategy<Value = Packet> {
         any_topic(),
         any_packet_id(),
         any_payload(),
-        properties_for(version),
+        properties_for(version, PropertyScope::Publish),
     )
         .prop_map(|(qos, retain, topic, id, payload, properties)| {
             Packet::Publish(Publish {
@@ -118,7 +200,7 @@ fn any_subscribe(version: Version) -> impl Strategy<Value = Packet> {
     (
         any_packet_id(),
         prop::collection::vec(option, 1..4),
-        properties_for(version),
+        properties_for(version, PropertyScope::Subscribe),
     )
         .prop_map(|(packet_id, filters, properties)| {
             Packet::Subscribe(Subscribe {
@@ -136,8 +218,14 @@ fn any_connect(version: Version) -> impl Strategy<Value = Packet> {
         any::<u16>(),
         prop::option::of("[a-z]{1,8}"),
         prop::option::of(any_payload()),
-        prop::option::of((any_topic(), any_payload(), any_qos(), any::<bool>())),
-        properties_for(version),
+        prop::option::of((
+            any_topic(),
+            any_payload(),
+            any_qos(),
+            any::<bool>(),
+            properties_for(version, PropertyScope::Will),
+        )),
+        properties_for(version, PropertyScope::Connect),
     )
         .prop_map(
             move |(client_id, clean_start, keep_alive, username, password, will, properties)| {
@@ -156,12 +244,12 @@ fn any_connect(version: Version) -> impl Strategy<Value = Packet> {
                     keep_alive,
                     username,
                     password,
-                    will: will.map(|(topic, payload, qos, retain)| Will {
+                    will: will.map(|(topic, payload, qos, retain, properties)| Will {
                         topic,
                         payload,
                         qos,
                         retain,
-                        properties: Properties::default(),
+                        properties,
                     }),
                     properties,
                 }))
@@ -170,26 +258,28 @@ fn any_connect(version: Version) -> impl Strategy<Value = Packet> {
 }
 
 fn any_ack(version: Version) -> impl Strategy<Value = Packet> {
-    (any_packet_id(), properties_for(version)).prop_map(move |(packet_id, properties)| {
-        // Only success survives the 3.1.1 short form, which carries no code.
-        let reason = ReasonCode::Success;
-        Packet::PubAck(Ack {
-            packet_id,
-            reason,
-            properties: if version == Version::V5 {
-                properties
-            } else {
-                Properties::default()
-            },
-        })
-    })
+    (any_packet_id(), properties_for(version, PropertyScope::Ack)).prop_map(
+        move |(packet_id, properties)| {
+            // Only success survives the 3.1.1 short form, which carries no code.
+            let reason = ReasonCode::Success;
+            Packet::PubAck(Ack {
+                packet_id,
+                reason,
+                properties: if version == Version::V5 {
+                    properties
+                } else {
+                    Properties::default()
+                },
+            })
+        },
+    )
 }
 
 fn any_unsubscribe(version: Version) -> impl Strategy<Value = Packet> {
     (
         any_packet_id(),
         prop::collection::vec(any_filter(), 1..4),
-        properties_for(version),
+        properties_for(version, PropertyScope::Unsubscribe),
     )
         .prop_map(|(packet_id, filters, properties)| {
             Packet::Unsubscribe(Unsubscribe {
@@ -198,6 +288,16 @@ fn any_unsubscribe(version: Version) -> impl Strategy<Value = Packet> {
                 properties,
             })
         })
+}
+
+fn any_disconnect(version: Version) -> impl Strategy<Value = Packet> {
+    properties_for(version, PropertyScope::Disconnect).prop_map(|properties| {
+        // 3.1.1 DISCONNECT has no body, so only success survives it.
+        Packet::Disconnect(Disconnect {
+            reason: ReasonCode::Success,
+            properties,
+        })
+    })
 }
 
 fn any_packet(version: Version) -> BoxedStrategy<Packet> {
@@ -209,10 +309,7 @@ fn any_packet(version: Version) -> BoxedStrategy<Packet> {
         any_ack(version),
         Just(Packet::PingReq),
         Just(Packet::PingResp),
-        Just(Packet::Disconnect(Disconnect {
-            reason: ReasonCode::Success,
-            properties: Properties::default(),
-        })),
+        any_disconnect(version),
     ]
     .boxed()
 }

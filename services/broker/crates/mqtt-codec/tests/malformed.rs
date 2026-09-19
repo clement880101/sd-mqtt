@@ -6,7 +6,8 @@
 //! byte, without which the decoder would fail with a truncation instead.
 
 use bytes::BytesMut;
-use mqtt_codec::{decode, CodecError, Limits, Version};
+use mqtt_codec::packet::Connect;
+use mqtt_codec::{decode, encode, CodecError, Limits, Packet, Properties, Version};
 
 /// Each case is a name, the bytes, and the error the decoder must return.
 fn cases() -> Vec<(&'static str, Vec<u8>, CodecError)> {
@@ -68,6 +69,20 @@ fn cases() -> Vec<(&'static str, Vec<u8>, CodecError)> {
             CodecError::MalformedPacket("trailing bytes after the packet body"),
         ),
         (
+            // A whole MQTT 5 CONNECT: protocol name, level 5, clean start,
+            // keep alive zero, a property block holding a topic alias, and
+            // an empty client identifier. A topic alias is legal only on
+            // PUBLISH (specification 2.2.2.2), so the property block is the
+            // one defect: replacing it with an empty block (0x00, and a
+            // remaining length of 0x0D) decodes cleanly.
+            "topic alias in a connect",
+            vec![
+                0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x00, 0x03, 0x23,
+                0x00, 0x0A, 0x00, 0x00,
+            ],
+            CodecError::ProtocolError("property is not permitted on this packet type"),
+        ),
+        (
             "a string that is not valid UTF-8",
             vec![0x30, 0x05, 0x00, 0x02, 0xFF, 0xFE, 0x00],
             CodecError::InvalidUtf8,
@@ -120,5 +135,60 @@ fn a_topic_deeper_than_the_limit_is_rejected() {
     assert_eq!(
         decode(&mut buf, Version::V5, &limits),
         Err(CodecError::TopicTooDeep)
+    );
+}
+
+/// The motivating example, checked from both ends.
+///
+/// A topic alias in a CONNECT is the clearest case of a property outside its
+/// packet's subset, and before this check the decoder accepted it silently.
+/// The encoder must refuse it too, or the crate would write packets it would
+/// not read back.
+#[test]
+fn a_topic_alias_is_refused_on_a_connect_and_accepted_on_a_publish() {
+    let mut buf = BytesMut::from(
+        &[
+            0x10u8, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x00, 0x03, 0x23,
+            0x00, 0x0A, 0x00, 0x00,
+        ][..],
+    );
+    assert_eq!(
+        decode(&mut buf, Version::V5, &Limits::default()),
+        Err(CodecError::ProtocolError(
+            "property is not permitted on this packet type"
+        ))
+    );
+
+    // The identical property block on a PUBLISH is legal, so the rejection
+    // above is about the packet type and not about the bytes.
+    let mut buf = BytesMut::from(&[0x30u8, 0x07, 0x00, 0x01, b'a', 0x03, 0x23, 0x00, 0x0A][..]);
+    let publish = decode(&mut buf, Version::V5, &Limits::default())
+        .expect("decodes")
+        .expect("a whole frame");
+    match publish {
+        Packet::Publish(publish) => assert_eq!(publish.properties.topic_alias, Some(10)),
+        other => panic!("expected a publish, got {other:?}"),
+    }
+
+    // And the encoder refuses what the decoder rejects.
+    let connect = Connect {
+        version: Version::V5,
+        client_id: String::new(),
+        clean_start: true,
+        keep_alive: 0,
+        username: None,
+        password: None,
+        will: None,
+        properties: Properties {
+            topic_alias: Some(10),
+            ..Properties::default()
+        },
+    };
+    let mut out = BytesMut::new();
+    assert_eq!(
+        encode(&Packet::Connect(Box::new(connect)), Version::V5, &mut out),
+        Err(CodecError::ProtocolError(
+            "property is not permitted on this packet type"
+        ))
     );
 }

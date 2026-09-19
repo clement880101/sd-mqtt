@@ -7,10 +7,81 @@ use crate::reader::Reader;
 use crate::varint;
 use crate::writer::{put_binary, put_string, put_u16, put_u32, put_u8};
 
+/// Which packet a property block belongs to.
+///
+/// MQTT 5 permits a different subset of properties on each packet, and a
+/// property outside that subset is a protocol error rather than something to
+/// ignore. The will has its own subset, distinct from the CONNECT that
+/// carries it.
+///
+/// The subsets are taken from the OASIS MQTT 5.0 specification: the
+/// cross-reference table in 2.2.2.2, confirmed against the per-packet
+/// property subsections 3.1.2.11 (CONNECT), 3.1.3.2 (will), 3.2.2.3
+/// (CONNACK), 3.3.2.3 (PUBLISH), 3.4.2.2 and its PUBREC, PUBREL and PUBCOMP
+/// siblings, 3.8.2.1 (SUBSCRIBE), 3.9.2.1 (SUBACK), 3.10.2.1 (UNSUBSCRIBE),
+/// 3.11.2.1 (UNSUBACK), 3.14.2.2 (DISCONNECT) and 3.15.2.2 (AUTH). PINGREQ
+/// and PINGRESP carry no property block at all and so have no scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum PropertyScope {
+    Connect,
+    Will,
+    ConnAck,
+    Publish,
+    /// PUBACK, PUBREC, PUBREL and PUBCOMP share one subset.
+    Ack,
+    Subscribe,
+    SubAck,
+    Unsubscribe,
+    UnsubAck,
+    Disconnect,
+    Auth,
+}
+
+/// Build a membership mask from a list of property identifiers.
+///
+/// Identifiers run from 0x01 to 0x2A, so the whole set fits in 64 bits and
+/// membership is one shift and one test.
+const fn mask(ids: &[u8]) -> u64 {
+    let mut bits = 0u64;
+    let mut index = 0;
+    while index < ids.len() {
+        bits |= 1u64 << ids[index];
+        index += 1;
+    }
+    bits
+}
+
+impl PropertyScope {
+    fn allowed(self) -> u64 {
+        match self {
+            PropertyScope::Connect => mask(&[0x11, 0x15, 0x16, 0x17, 0x19, 0x21, 0x22, 0x26, 0x27]),
+            PropertyScope::Will => mask(&[0x01, 0x02, 0x03, 0x08, 0x09, 0x18, 0x26]),
+            PropertyScope::ConnAck => mask(&[
+                0x11, 0x12, 0x13, 0x15, 0x16, 0x1A, 0x1C, 0x1F, 0x21, 0x22, 0x24, 0x25, 0x26, 0x27,
+                0x28, 0x29, 0x2A,
+            ]),
+            PropertyScope::Publish => mask(&[0x01, 0x02, 0x03, 0x08, 0x09, 0x0B, 0x23, 0x26]),
+            PropertyScope::Ack => mask(&[0x1F, 0x26]),
+            PropertyScope::Subscribe => mask(&[0x0B, 0x26]),
+            PropertyScope::SubAck => mask(&[0x1F, 0x26]),
+            PropertyScope::Unsubscribe => mask(&[0x26]),
+            PropertyScope::UnsubAck => mask(&[0x1F, 0x26]),
+            PropertyScope::Disconnect => mask(&[0x11, 0x1C, 0x1F, 0x26]),
+            PropertyScope::Auth => mask(&[0x15, 0x16, 0x1F, 0x26]),
+        }
+    }
+
+    fn permits(self, id: u32) -> bool {
+        id < 64 && self.allowed() & (1u64 << id) != 0
+    }
+}
+
 /// Every MQTT 5 property, gathered into one structure.
 ///
-/// A given packet type permits only a subset. Enforcing which subset belongs
-/// to which packet is the job of the packet decoders, not of this type.
+/// A given packet type permits only a subset. [`PropertyScope`] holds those
+/// subsets, and [`Properties::decode_for`] and [`Properties::encode_for`]
+/// enforce them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub struct Properties {
@@ -43,6 +114,22 @@ pub struct Properties {
     pub shared_subscription_available: Option<u8>,
 }
 
+/// Write a property identifier, refusing it when the scope does not permit it.
+///
+/// The check sits on the write itself so the identifier checked is literally
+/// the identifier emitted, with no parallel list to drift out of step.
+fn push_id(body: &mut Vec<u8>, id: u8, scope: Option<PropertyScope>) -> Result<(), CodecError> {
+    if let Some(scope) = scope {
+        if !scope.permits(u32::from(id)) {
+            return Err(CodecError::ProtocolError(
+                "property is not permitted on this packet type",
+            ));
+        }
+    }
+    body.push(id);
+    Ok(())
+}
+
 /// Reject a second occurrence of a property that may appear only once.
 fn once<T>(slot: &mut Option<T>, value: T) -> Result<(), CodecError> {
     if slot.is_some() {
@@ -58,11 +145,28 @@ impl Properties {
         *self == Properties::default()
     }
 
+    /// Decode a property block without checking which packet permits what.
+    ///
+    /// Prefer [`Properties::decode_for`]. This exists for callers that have
+    /// no packet context, such as a property block read in isolation by a
+    /// test or a tool.
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Self::decode_inner(reader, None)
+    }
+
+    /// Decode a property block, rejecting anything the packet does not permit.
+    pub fn decode_for(reader: &mut Reader<'_>, scope: PropertyScope) -> Result<Self, CodecError> {
+        Self::decode_inner(reader, Some(scope))
+    }
+
     /// Decode a property block from the current position.
     ///
     /// Reads the block length, then exactly that many bytes, leaving the
     /// reader positioned at the first byte after the block.
-    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+    fn decode_inner(
+        reader: &mut Reader<'_>,
+        scope: Option<PropertyScope>,
+    ) -> Result<Self, CodecError> {
         let len = reader.varint()? as usize;
         let body = reader.slice(len)?;
         let mut inner = Reader::new(body);
@@ -70,6 +174,13 @@ impl Properties {
 
         while !inner.is_empty() {
             let id = inner.varint()?;
+            if let Some(scope) = scope {
+                if !scope.permits(id) {
+                    return Err(CodecError::ProtocolError(
+                        "property is not permitted on this packet type",
+                    ));
+                }
+            }
             match id {
                 0x01 => once(&mut props.payload_format_indicator, inner.u8()?)?,
                 0x02 => once(&mut props.message_expiry_interval, inner.u32()?)?,
@@ -118,27 +229,47 @@ impl Properties {
     }
 
     /// Append the property block, including its length prefix.
+    ///
+    /// Prefer [`Properties::encode_for`]. This writes whatever is set,
+    /// without checking which packet permits what.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        self.encode_inner(None, out)
+    }
+
+    /// Append the property block, refusing anything the packet does not permit.
+    ///
+    /// The encoder refuses what the decoder rejects: a packet this crate
+    /// wrote must be one it would accept, so a property outside the packet's
+    /// subset is an error here as well as on the way in.
+    pub fn encode_for(&self, scope: PropertyScope, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        self.encode_inner(Some(scope), out)
+    }
+
+    fn encode_inner(
+        &self,
+        scope: Option<PropertyScope>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), CodecError> {
         let mut body = Vec::new();
 
         if let Some(v) = self.payload_format_indicator {
-            body.push(0x01);
+            push_id(&mut body, 0x01, scope)?;
             put_u8(&mut body, v);
         }
         if let Some(v) = self.message_expiry_interval {
-            body.push(0x02);
+            push_id(&mut body, 0x02, scope)?;
             put_u32(&mut body, v);
         }
         if let Some(v) = &self.content_type {
-            body.push(0x03);
+            push_id(&mut body, 0x03, scope)?;
             put_string(&mut body, v)?;
         }
         if let Some(v) = &self.response_topic {
-            body.push(0x08);
+            push_id(&mut body, 0x08, scope)?;
             put_string(&mut body, v)?;
         }
         if let Some(v) = &self.correlation_data {
-            body.push(0x09);
+            push_id(&mut body, 0x09, scope)?;
             put_binary(&mut body, v)?;
         }
         for v in &self.subscription_identifiers {
@@ -147,92 +278,92 @@ impl Properties {
                     "subscription identifier must not be zero",
                 ));
             }
-            body.push(0x0B);
+            push_id(&mut body, 0x0B, scope)?;
             varint::encode(*v, &mut body)?;
         }
         if let Some(v) = self.session_expiry_interval {
-            body.push(0x11);
+            push_id(&mut body, 0x11, scope)?;
             put_u32(&mut body, v);
         }
         if let Some(v) = &self.assigned_client_identifier {
-            body.push(0x12);
+            push_id(&mut body, 0x12, scope)?;
             put_string(&mut body, v)?;
         }
         if let Some(v) = self.server_keep_alive {
-            body.push(0x13);
+            push_id(&mut body, 0x13, scope)?;
             put_u16(&mut body, v);
         }
         if let Some(v) = &self.authentication_method {
-            body.push(0x15);
+            push_id(&mut body, 0x15, scope)?;
             put_string(&mut body, v)?;
         }
         if let Some(v) = &self.authentication_data {
-            body.push(0x16);
+            push_id(&mut body, 0x16, scope)?;
             put_binary(&mut body, v)?;
         }
         if let Some(v) = self.request_problem_information {
-            body.push(0x17);
+            push_id(&mut body, 0x17, scope)?;
             put_u8(&mut body, v);
         }
         if let Some(v) = self.will_delay_interval {
-            body.push(0x18);
+            push_id(&mut body, 0x18, scope)?;
             put_u32(&mut body, v);
         }
         if let Some(v) = self.request_response_information {
-            body.push(0x19);
+            push_id(&mut body, 0x19, scope)?;
             put_u8(&mut body, v);
         }
         if let Some(v) = &self.response_information {
-            body.push(0x1A);
+            push_id(&mut body, 0x1A, scope)?;
             put_string(&mut body, v)?;
         }
         if let Some(v) = &self.server_reference {
-            body.push(0x1C);
+            push_id(&mut body, 0x1C, scope)?;
             put_string(&mut body, v)?;
         }
         if let Some(v) = &self.reason_string {
-            body.push(0x1F);
+            push_id(&mut body, 0x1F, scope)?;
             put_string(&mut body, v)?;
         }
         if let Some(v) = self.receive_maximum {
-            body.push(0x21);
+            push_id(&mut body, 0x21, scope)?;
             put_u16(&mut body, v);
         }
         if let Some(v) = self.topic_alias_maximum {
-            body.push(0x22);
+            push_id(&mut body, 0x22, scope)?;
             put_u16(&mut body, v);
         }
         if let Some(v) = self.topic_alias {
-            body.push(0x23);
+            push_id(&mut body, 0x23, scope)?;
             put_u16(&mut body, v);
         }
         if let Some(v) = self.maximum_qos {
-            body.push(0x24);
+            push_id(&mut body, 0x24, scope)?;
             put_u8(&mut body, v);
         }
         if let Some(v) = self.retain_available {
-            body.push(0x25);
+            push_id(&mut body, 0x25, scope)?;
             put_u8(&mut body, v);
         }
         for (key, value) in &self.user_properties {
-            body.push(0x26);
+            push_id(&mut body, 0x26, scope)?;
             put_string(&mut body, key)?;
             put_string(&mut body, value)?;
         }
         if let Some(v) = self.maximum_packet_size {
-            body.push(0x27);
+            push_id(&mut body, 0x27, scope)?;
             put_u32(&mut body, v);
         }
         if let Some(v) = self.wildcard_subscription_available {
-            body.push(0x28);
+            push_id(&mut body, 0x28, scope)?;
             put_u8(&mut body, v);
         }
         if let Some(v) = self.subscription_identifier_available {
-            body.push(0x29);
+            push_id(&mut body, 0x29, scope)?;
             put_u8(&mut body, v);
         }
         if let Some(v) = self.shared_subscription_available {
-            body.push(0x2A);
+            push_id(&mut body, 0x2A, scope)?;
             put_u8(&mut body, v);
         }
 
@@ -395,5 +526,125 @@ mod tests {
                 50, 51, 0, 3, 118, 50, 51, 39, 0, 0, 0, 24, 40, 25, 41, 26, 42, 27,
             ]
         );
+    }
+
+    #[test]
+    fn rejects_a_property_the_packet_does_not_permit() {
+        // A topic alias is legal on PUBLISH and illegal on CONNECT.
+        let bytes = [0x03, 0x23, 0x00, 0x0A];
+
+        let mut reader = Reader::new(&bytes);
+        let ok = Properties::decode_for(&mut reader, PropertyScope::Publish);
+        assert_eq!(ok.unwrap().topic_alias, Some(10));
+
+        let mut reader = Reader::new(&bytes);
+        let err = Properties::decode_for(&mut reader, PropertyScope::Connect).unwrap_err();
+        assert_eq!(
+            err,
+            CodecError::ProtocolError("property is not permitted on this packet type")
+        );
+    }
+
+    #[test]
+    fn permits_user_properties_everywhere_they_are_allowed() {
+        let bytes = [0x07, 0x26, 0x00, 0x01, b'k', 0x00, 0x01, b'v'];
+        for scope in [
+            PropertyScope::Connect,
+            PropertyScope::Will,
+            PropertyScope::ConnAck,
+            PropertyScope::Publish,
+            PropertyScope::Ack,
+            PropertyScope::Subscribe,
+            PropertyScope::SubAck,
+            PropertyScope::Unsubscribe,
+            PropertyScope::UnsubAck,
+            PropertyScope::Disconnect,
+            PropertyScope::Auth,
+        ] {
+            let mut reader = Reader::new(&bytes);
+            let props = Properties::decode_for(&mut reader, scope).expect("allowed");
+            assert_eq!(props.user_properties.len(), 1, "{scope:?}");
+        }
+    }
+
+    #[test]
+    fn the_unscoped_decoder_still_permits_everything() {
+        let bytes = [0x03, 0x23, 0x00, 0x0A];
+        let mut reader = Reader::new(&bytes);
+        assert!(Properties::decode(&mut reader).is_ok());
+    }
+
+    /// The whole table, checked one identifier at a time against every scope.
+    ///
+    /// Each row is a scope and the identifiers the OASIS MQTT 5.0
+    /// specification permits on it (2.2.2.2, confirmed against each packet's
+    /// own property subsection). Every identifier from 0x01 to 0x2A is then
+    /// offered to every scope, so an identifier wrongly *added* to a mask
+    /// fails here just as loudly as one wrongly left out. The rows are
+    /// written out again rather than read from `PropertyScope::allowed`, so
+    /// this pins the table rather than restating it.
+    #[test]
+    fn the_table_matches_the_specification() {
+        const TABLE: &[(PropertyScope, &[u8])] = &[
+            (
+                PropertyScope::Connect,
+                &[0x11, 0x15, 0x16, 0x17, 0x19, 0x21, 0x22, 0x26, 0x27],
+            ),
+            (
+                PropertyScope::Will,
+                &[0x01, 0x02, 0x03, 0x08, 0x09, 0x18, 0x26],
+            ),
+            (
+                PropertyScope::ConnAck,
+                &[
+                    0x11, 0x12, 0x13, 0x15, 0x16, 0x1A, 0x1C, 0x1F, 0x21, 0x22, 0x24, 0x25, 0x26,
+                    0x27, 0x28, 0x29, 0x2A,
+                ],
+            ),
+            (
+                PropertyScope::Publish,
+                &[0x01, 0x02, 0x03, 0x08, 0x09, 0x0B, 0x23, 0x26],
+            ),
+            (PropertyScope::Ack, &[0x1F, 0x26]),
+            (PropertyScope::Subscribe, &[0x0B, 0x26]),
+            (PropertyScope::SubAck, &[0x1F, 0x26]),
+            (PropertyScope::Unsubscribe, &[0x26]),
+            (PropertyScope::UnsubAck, &[0x1F, 0x26]),
+            (PropertyScope::Disconnect, &[0x11, 0x1C, 0x1F, 0x26]),
+            (PropertyScope::Auth, &[0x15, 0x16, 0x1F, 0x26]),
+        ];
+
+        for (scope, permitted) in TABLE {
+            for id in 0x01u8..=0x2A {
+                assert_eq!(
+                    scope.permits(u32::from(id)),
+                    permitted.contains(&id),
+                    "{scope:?} and identifier {id:#04x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_scoped_encoder_refuses_what_the_scoped_decoder_would_reject() {
+        let props = Properties {
+            topic_alias: Some(10),
+            ..Properties::default()
+        };
+
+        let mut out = Vec::new();
+        props
+            .encode_for(PropertyScope::Publish, &mut out)
+            .expect("a topic alias is legal on PUBLISH");
+
+        let mut out = Vec::new();
+        let err = props
+            .encode_for(PropertyScope::Connect, &mut out)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            CodecError::ProtocolError("property is not permitted on this packet type")
+        );
+        assert!(out.is_empty(), "a refused block must write nothing");
     }
 }

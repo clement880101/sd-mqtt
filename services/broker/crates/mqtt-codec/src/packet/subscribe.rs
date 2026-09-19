@@ -2,7 +2,7 @@
 
 use crate::error::CodecError;
 use crate::header::Limits;
-use crate::properties::Properties;
+use crate::properties::{Properties, PropertyScope};
 use crate::qos::QoS;
 use crate::reader::Reader;
 use crate::reason::ReasonCode;
@@ -87,7 +87,7 @@ impl Subscribe {
     ) -> Result<Self, CodecError> {
         let packet_id = read_packet_id(reader)?;
         let properties = if version == Version::V5 {
-            Properties::decode(reader)?
+            Properties::decode_for(reader, PropertyScope::Subscribe)?
         } else {
             Properties::default()
         };
@@ -164,7 +164,7 @@ impl Subscribe {
         }
         put_u16(out, self.packet_id);
         if version == Version::V5 {
-            self.properties.encode(out)?;
+            self.properties.encode_for(PropertyScope::Subscribe, out)?;
         }
         for entry in &self.filters {
             put_string(out, &entry.filter)?;
@@ -200,7 +200,7 @@ impl SubAck {
     pub fn decode_body(reader: &mut Reader<'_>, version: Version) -> Result<Self, CodecError> {
         let packet_id = read_packet_id(reader)?;
         let properties = if version == Version::V5 {
-            Properties::decode(reader)?
+            Properties::decode_for(reader, PropertyScope::SubAck)?
         } else {
             Properties::default()
         };
@@ -249,7 +249,7 @@ impl SubAck {
         }
         put_u16(out, self.packet_id);
         if version == Version::V5 {
-            self.properties.encode(out)?;
+            self.properties.encode_for(PropertyScope::SubAck, out)?;
         }
         for reason in &self.reasons {
             let byte = match version {
@@ -282,7 +282,7 @@ impl Unsubscribe {
     ) -> Result<Self, CodecError> {
         let packet_id = read_packet_id(reader)?;
         let properties = if version == Version::V5 {
-            Properties::decode(reader)?
+            Properties::decode_for(reader, PropertyScope::Unsubscribe)?
         } else {
             Properties::default()
         };
@@ -324,7 +324,8 @@ impl Unsubscribe {
         }
         put_u16(out, self.packet_id);
         if version == Version::V5 {
-            self.properties.encode(out)?;
+            self.properties
+                .encode_for(PropertyScope::Unsubscribe, out)?;
         }
         for filter in &self.filters {
             put_string(out, filter)?;
@@ -359,7 +360,7 @@ impl UnsubAck {
             });
         }
 
-        let properties = Properties::decode(reader)?;
+        let properties = Properties::decode_for(reader, PropertyScope::UnsubAck)?;
         let mut reasons = Vec::new();
         while !reader.is_empty() {
             let code = reader.u8()?;
@@ -390,7 +391,7 @@ impl UnsubAck {
         if version == Version::V311 {
             return Ok(());
         }
-        self.properties.encode(out)?;
+        self.properties.encode_for(PropertyScope::UnsubAck, out)?;
         for reason in &self.reasons {
             put_u8(out, *reason as u8);
         }

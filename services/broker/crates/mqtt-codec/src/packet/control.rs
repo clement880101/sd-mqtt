@@ -1,7 +1,7 @@
 //! DISCONNECT and AUTH. PINGREQ and PINGRESP have no body at all.
 
 use crate::error::CodecError;
-use crate::properties::Properties;
+use crate::properties::{Properties, PropertyScope};
 use crate::reader::Reader;
 use crate::reason::ReasonCode;
 use crate::writer::put_u8;
@@ -32,7 +32,7 @@ impl Disconnect {
         let properties = if reader.is_empty() {
             Properties::default()
         } else {
-            Properties::decode(reader)?
+            Properties::decode_for(reader, PropertyScope::Disconnect)?
         };
 
         Ok(Disconnect { reason, properties })
@@ -47,7 +47,7 @@ impl Disconnect {
             return Ok(());
         }
         put_u8(out, self.reason as u8);
-        self.properties.encode(out)?;
+        self.properties.encode_for(PropertyScope::Disconnect, out)?;
         Ok(())
     }
 }
@@ -80,7 +80,7 @@ impl Auth {
         let properties = if reader.is_empty() {
             Properties::default()
         } else {
-            Properties::decode(reader)?
+            Properties::decode_for(reader, PropertyScope::Auth)?
         };
 
         Ok(Auth { reason, properties })
@@ -100,7 +100,7 @@ impl Auth {
             return Ok(());
         }
         put_u8(out, self.reason as u8);
-        self.properties.encode(out)?;
+        self.properties.encode_for(PropertyScope::Auth, out)?;
         Ok(())
     }
 }

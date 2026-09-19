@@ -4,7 +4,7 @@ use bytes::Bytes;
 
 use crate::error::CodecError;
 use crate::header::{Limits, PacketKind};
-use crate::properties::Properties;
+use crate::properties::{Properties, PropertyScope};
 use crate::qos::QoS;
 use crate::reader::Reader;
 use crate::reason::ReasonCode;
@@ -100,7 +100,7 @@ impl Publish {
         };
 
         let properties = if version == Version::V5 {
-            Properties::decode(reader)?
+            Properties::decode_for(reader, PropertyScope::Publish)?
         } else {
             Properties::default()
         };
@@ -162,7 +162,7 @@ impl Publish {
             put_u16(out, id);
         }
         if version == Version::V5 {
-            self.properties.encode(out)?;
+            self.properties.encode_for(PropertyScope::Publish, out)?;
         }
         out.extend_from_slice(&self.payload);
         Ok(())
@@ -240,7 +240,7 @@ impl Ack {
             let properties = if reader.is_empty() {
                 Properties::default()
             } else {
-                Properties::decode(reader)?
+                Properties::decode_for(reader, PropertyScope::Ack)?
             };
 
             (reason, properties)
@@ -297,7 +297,7 @@ impl Ack {
             return Ok(());
         }
         put_u8(out, self.reason as u8);
-        self.properties.encode(out)?;
+        self.properties.encode_for(PropertyScope::Ack, out)?;
         Ok(())
     }
 }
