@@ -3629,7 +3629,26 @@ impl Subscribe {
     }
 
     /// Append the body, excluding the fixed header.
+    ///
+    /// Encoding as 3.1.1 silently drops the no-local, retain-as-published
+    /// and retain-handling options, because that version has no way to
+    /// express them. A caller bridging a v5 subscription down to 3.1.1 gets
+    /// a plain subscription, which is the best that version allows.
+    ///
+    /// Filter validity is the caller's responsibility; use
+    /// [`crate::topic::validate_subscription`]. This method has no access to
+    /// [`Limits`](crate::header::Limits) and so cannot check topic depth.
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        if self.packet_id == 0 {
+            return Err(CodecError::ProtocolError(
+                "packet identifier must not be zero",
+            ));
+        }
+        if self.filters.is_empty() {
+            return Err(CodecError::ProtocolError(
+                "subscribe must carry at least one filter",
+            ));
+        }
         put_u16(out, self.packet_id);
         if version == Version::V5 {
             self.properties.encode(out)?;
@@ -3705,6 +3724,16 @@ impl SubAck {
 
     /// Append the body, excluding the fixed header.
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        if self.packet_id == 0 {
+            return Err(CodecError::ProtocolError(
+                "packet identifier must not be zero",
+            ));
+        }
+        if self.reasons.is_empty() {
+            return Err(CodecError::ProtocolError(
+                "suback must carry at least one reason code",
+            ));
+        }
         put_u16(out, self.packet_id);
         if version == Version::V5 {
             self.properties.encode(out)?;
@@ -3766,7 +3795,20 @@ impl Unsubscribe {
     }
 
     /// Append the body, excluding the fixed header.
+    ///
+    /// Filter validity is the caller's responsibility; use
+    /// [`crate::topic::validate_subscription`].
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        if self.packet_id == 0 {
+            return Err(CodecError::ProtocolError(
+                "packet identifier must not be zero",
+            ));
+        }
+        if self.filters.is_empty() {
+            return Err(CodecError::ProtocolError(
+                "unsubscribe must carry at least one filter",
+            ));
+        }
         put_u16(out, self.packet_id);
         if version == Version::V5 {
             self.properties.encode(out)?;
@@ -3822,7 +3864,15 @@ impl UnsubAck {
     }
 
     /// Append the body, excluding the fixed header.
+    ///
+    /// Encoding as 3.1.1 drops every reason code, because that version's
+    /// UNSUBACK carries none. The drop is silent and correct.
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        if self.packet_id == 0 {
+            return Err(CodecError::ProtocolError(
+                "packet identifier must not be zero",
+            ));
+        }
         put_u16(out, self.packet_id);
         if version == Version::V311 {
             return Ok(());
@@ -4073,7 +4123,15 @@ impl Auth {
     }
 
     /// Append the body, excluding the fixed header.
-    pub fn encode_body(&self, _version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+    ///
+    /// AUTH exists only in MQTT 5, so encoding one as 3.1.1 is refused
+    /// rather than silently producing a packet that version cannot carry.
+    pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        if version == Version::V311 {
+            return Err(CodecError::ProtocolError(
+                "authentication packets do not exist in 3.1.1",
+            ));
+        }
         if self.reason == ReasonCode::Success && self.properties.is_empty() {
             return Ok(());
         }
