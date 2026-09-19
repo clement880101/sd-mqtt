@@ -128,7 +128,8 @@ impl Outbound {
     /// Handle an exactly-once receipt.
     ///
     /// A failure reason ends the exchange: the peer has refused the
-    /// message, so there is nothing to release.
+    /// message, so there is nothing to release. The message is reported
+    /// as discarded, because it was.
     ///
     /// A receipt for an identifier that is not outstanding is answered
     /// with a release carrying `PacketIdentifierNotFound`, not refused.
@@ -146,7 +147,18 @@ impl Outbound {
         out: &mut Vec<Action>,
     ) -> Result<(), ReasonCode> {
         if reason.is_failure() {
-            self.complete(packet_id, InflightState::AwaitingReceived)?;
+            // The peer will never take it, and [MQTT-4.4.0-2] forbids
+            // retransmitting it. That is a discard, and this module's
+            // rule is that nothing is discarded without an action saying
+            // so: otherwise the message leaves the window and no counter
+            // anywhere moves.
+            let entry = self.complete(packet_id, InflightState::AwaitingReceived)?;
+            out.push(Action::Dropped {
+                id: entry.delivery.message.id,
+                reason: DropReason::RejectedByPeer,
+                qos: entry.delivery.qos,
+                topic: Arc::clone(&entry.delivery.message.topic),
+            });
             self.pump(now, out);
             return Ok(());
         }
@@ -209,16 +221,23 @@ impl Outbound {
     /// identifier and mark the message delivered, with no drop action
     /// and no error: the message is simply gone. The state is what tells
     /// a legitimate final packet from one that arrives out of sequence.
-    fn complete(&mut self, packet_id: u16, expected: InflightState) -> Result<(), ReasonCode> {
+    fn complete(
+        &mut self,
+        packet_id: u16,
+        expected: InflightState,
+    ) -> Result<InflightEntry, ReasonCode> {
         let Some(entry) = self.inflight.get_mut(packet_id) else {
             return Err(ReasonCode::PacketIdentifierNotFound);
         };
         if entry.state != expected {
             return Err(ReasonCode::ProtocolError);
         }
-        self.inflight.remove(packet_id);
+        let entry = self
+            .inflight
+            .remove(packet_id)
+            .expect("the entry was found a moment ago");
         self.packet_ids.release(packet_id);
-        Ok(())
+        Ok(entry)
     }
 
     /// The connection went away. Nothing is discarded; the window is held
@@ -271,7 +290,11 @@ impl Outbound {
         self.scratch.clear();
         self.queue.clear(reason, &mut self.scratch);
         self.report(out);
-        for entry in self.inflight.drain() {
+        let drained: Vec<InflightEntry> = self.inflight.drain().collect();
+        for entry in drained {
+            // The window held these identifiers; nothing will
+            // acknowledge them now, so they come back here or never.
+            self.packet_ids.release(entry.packet_id);
             out.push(Action::Dropped {
                 id: entry.delivery.message.id,
                 reason,
@@ -833,6 +856,64 @@ mod tests {
         assert_eq!(reported, expected, "every message must be reported");
         assert_eq!(out.queued_len(), 0);
         assert_eq!(out.inflight_len(), 0);
+    }
+
+    #[test]
+    fn a_refused_message_is_reported_as_discarded() {
+        // It leaves the window and will never be retransmitted, so it is
+        // as discarded as one the queue evicted. This module's rule is
+        // that nothing goes without an action naming why.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        let item = delivery(QoS::ExactlyOnce, b"x");
+        let message_id = item.message.id;
+        out.offer(item, 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+
+        actions.clear();
+        out.on_pubrec(packet_id, ReasonCode::NotAuthorized, 0, &mut actions)
+            .expect("known");
+
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Dropped { id, reason: DropReason::RejectedByPeer, .. } if *id == message_id
+            )),
+            "the refusal must be counted, not swallowed"
+        );
+    }
+
+    #[test]
+    fn a_refused_message_gives_its_identifier_back() {
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::ExactlyOnce, b"x"), 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+
+        out.on_pubrec(packet_id, ReasonCode::NotAuthorized, 0, &mut actions)
+            .expect("known");
+        assert!(!out.packet_ids.is_in_use(packet_id));
+    }
+
+    #[test]
+    fn clearing_gives_back_the_identifiers_the_window_held() {
+        // A session that is torn down and rebuilt keeps its allocator.
+        // Without this, every takeover leaks the whole window.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+        out.offer(delivery(QoS::ExactlyOnce, b"y"), 0, &mut actions);
+        assert_eq!(out.packet_ids.in_use(), 2);
+
+        actions.clear();
+        out.clear(DropReason::SessionEnded, &mut actions);
+
+        assert_eq!(out.inflight_len(), 0);
+        assert_eq!(
+            out.packet_ids.in_use(),
+            0,
+            "nothing will acknowledge them now, so they come back here or never"
+        );
     }
 
     #[test]

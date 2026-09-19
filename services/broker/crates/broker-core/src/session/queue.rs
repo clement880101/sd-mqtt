@@ -57,6 +57,10 @@ pub enum DropReason {
     Expired,
     /// The session was destroyed.
     SessionEnded,
+    /// The peer answered with a failure reason, so it will never take
+    /// the message. The exchange is over by [MQTT-4.4.0-2] and the
+    /// message must not be retransmitted.
+    RejectedByPeer,
 }
 
 /// What to discard when the queue is full.

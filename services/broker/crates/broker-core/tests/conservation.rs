@@ -140,9 +140,14 @@ impl Run {
                 };
                 self.actions.clear();
                 if self.out.on_pubrec(id, reason, 0, &mut self.actions).is_ok() && !*accepted {
-                    // A refused message ends the exchange here; an accepted
-                    // one stays outstanding until it completes.
-                    self.release(id);
+                    // A refused message ends the exchange here; an
+                    // accepted one stays outstanding until it completes.
+                    // Refusal is not delivery: the state machine reports
+                    // it as a discard, and counting it as finished here
+                    // as well would put it in two buckets at once and
+                    // hide the difference between delivered and thrown
+                    // away.
+                    self.abandon(id);
                 }
             }
             Op::Complete => {
@@ -170,6 +175,15 @@ impl Run {
             }
         }
         self.absorb();
+    }
+
+    /// The peer refused the message. The identifier is free and the
+    /// entry is gone, but the message was thrown away rather than
+    /// delivered, and the drop action is what accounts for it.
+    fn abandon(&mut self, id: u16) {
+        self.live.remove(&id);
+        self.outstanding.retain(|x| *x != id);
+        self.carrying.remove(&id);
     }
 
     /// An exchange ended: the entry has left the window and the
