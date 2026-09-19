@@ -213,8 +213,6 @@ for that topic. It is not stored, and it is not sent to future subscribers,
 but it is delivered to subscribers matching at the time. This is easy to
 miss because the codec correctly treats an empty payload as ordinary.
 
-**Retained messages** live in their own trie
-
 ## 7. Persistence
 
 ### 7.1 The Storage trait
@@ -708,6 +706,13 @@ shippable.
    published.
 
 ## 17. Open questions
+
+- **Zero-copy payloads.** The codec's reader copies every payload out of
+  the connection's read buffer. Since decoding already owns that buffer
+  mutably, splitting and freezing it instead would remove one full payload
+  copy per message on the hottest path, and the publish payload is already
+  the right type for it, so the change is not breaking. Like the question
+  below, it wants a benchmark rather than a guess.
 
 - **Packet size on the hot path.** The MQTT 5 property block is one struct
   of 27 mostly-unset optional fields, around 344 bytes, carried by value
