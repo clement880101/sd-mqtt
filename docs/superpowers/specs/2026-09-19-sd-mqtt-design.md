@@ -707,6 +707,16 @@ shippable.
 
 ## 17. Open questions
 
+- **A contradiction in the MQTT 5 specification, resolved permissively.**
+  The reason-code table for DISCONNECT omits bad-authentication-method,
+  while the cross-reference table listing which packets may carry each code
+  includes it for DISCONNECT. Both published copies of the standard say
+  this, and OASIS has issued no errata. The codec accepts it, because the
+  re-authentication section tells a peer whose re-authentication fails to
+  disconnect with an appropriate reason code and this is the only code that
+  describes that failure. If a conformance suite ever rejects it, this is
+  the line to revisit, and the stricter reading is a one-line change.
+
 - **Zero-copy payloads.** The codec's reader copies every payload out of
   the connection's read buffer. Since decoding already owns that buffer
   mutably, splitting and freezing it instead would remove one full payload
