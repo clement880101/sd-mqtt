@@ -13,6 +13,32 @@ use crate::topic::levels::Interner;
 /// Filters whose first level is literal live in the shard that level hashes
 /// to. Filters whose first level is a wildcard can match a topic in any
 /// shard, so they live in a separate root that every publish also consults.
+///
+/// # Concurrency
+///
+/// Locking is per shard, and no operation holds more than one lock at a
+/// time. That makes a single insert or remove of one filter atomic, and
+/// makes anything spanning shards not atomic:
+///
+/// - [`matching`] reads one shard, releases it, then reads the wildcard
+///   root. A session being torn down concurrently can therefore be
+///   observed half gone, with its shard subscriptions already removed and
+///   its wildcard subscription still present, or the reverse.
+/// - [`len`], [`node_count`], [`is_empty`] and [`remove_subscriber`] take
+///   each lock in turn, so a total they return may correspond to no
+///   single instant.
+///
+/// The session layer will reason about teardown ordering, so this is
+/// stated rather than left to be discovered: if a caller needs a session
+/// to become invisible atomically, it has to arrange that above this
+/// type, for instance by marking the session dead where delivery checks
+/// it, and treating [`remove_subscriber`] as reclamation afterwards.
+///
+/// [`matching`]: Self::matching
+/// [`len`]: Self::len
+/// [`node_count`]: Self::node_count
+/// [`is_empty`]: Self::is_empty
+/// [`remove_subscriber`]: Self::remove_subscriber
 pub struct SubscriptionTrie {
     interner: Interner,
     shards: Box<[RwLock<Node>]>,
@@ -74,6 +100,19 @@ impl SubscriptionTrie {
     /// A topic whose first level begins with a dollar sign skips the
     /// wildcard root entirely, which is how the protocol's rule that a
     /// leading wildcard must not match a dollar topic is enforced.
+    ///
+    /// # One entry per matching filter, not per subscriber
+    ///
+    /// A subscriber holding both `a/#` and `a/+` appears twice in the
+    /// results for `a/b`, once per filter it matched. That is deliberate:
+    /// this answers which subscriptions matched, and only the caller
+    /// knows what to do with several from one session.
+    ///
+    /// MQTT 5 requires that this become a single delivery carrying every
+    /// matching subscription identifier, sent at the greatest quality of
+    /// service among the matching subscriptions. Nothing here does that,
+    /// so it is the caller's job, and a caller that forwards these
+    /// straight to a session will duplicate messages.
     pub fn matching(&self, topic: &str, out: &mut Vec<Subscription>) {
         let first = topic.split('/').next().unwrap_or("");
         self.shard_of(first)

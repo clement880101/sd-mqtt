@@ -69,6 +69,22 @@ impl Interner {
     /// Matching uses this: a level that has never been subscribed to cannot
     /// match anything, and interning it would grow the table with traffic
     /// rather than with vocabulary.
+    ///
+    /// # A tried and rejected optimisation
+    ///
+    /// This takes the read lock once per level per node visited, which
+    /// looks wasteful, and the obvious fix is to look every level up once
+    /// under a single guard into a `Vec<Option<LevelId>>` and walk that.
+    /// It was implemented and benchmarked, and it is slower: matching one
+    /// deep topic went from 290ns to 379ns, and matching a topic nothing
+    /// wants from 112ns to 172ns, regressions of 30% and 53%.
+    ///
+    /// The reason is that hoisting trades a cheap uncontended read lock
+    /// for an allocation per publish, and gives up the short circuit. The
+    /// walk looks up only the levels it actually reaches and stops at the
+    /// first miss, which is most of the work on a topic nobody wants,
+    /// while the hoist eagerly resolves every level first. Do not redo
+    /// it without a contended workload showing the lock is the problem.
     pub fn lookup(&self, level: &str) -> Option<LevelId> {
         self.inner.read().to_id.get(level).copied()
     }

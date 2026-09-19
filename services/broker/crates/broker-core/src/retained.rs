@@ -192,6 +192,15 @@ impl RetainedStore {
     /// Append every retained message whose topic matches `filter` to `out`,
     /// each with its topic.
     ///
+    /// A filter whose first level is a wildcard does not reach a topic
+    /// whose first level begins with a dollar sign, the same rule
+    /// [`SubscriptionTrie::matching`] documents. The traversal runs the
+    /// other way here, so the rule is enforced differently: the root's
+    /// wildcard arms skip dollar children, rather than a dollar topic
+    /// skipping the wildcard root.
+    ///
+    /// [`SubscriptionTrie::matching`]: crate::subscriptions::SubscriptionTrie::matching
+    ///
     /// `now` is the current coarse time in seconds. A message whose
     /// deadline has passed is skipped whether or not a sweep has run, so a
     /// reader never sees an expired message; [`Self::sweep_expired`]

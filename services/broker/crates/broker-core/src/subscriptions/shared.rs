@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use foldhash::fast::RandomState;
 use parking_lot::RwLock;
 
+use mqtt_codec::QoS;
+
 use crate::subscriptions::node::{SubscriberId, Subscription};
 use crate::subscriptions::trie::SubscriptionTrie;
 
@@ -77,12 +79,21 @@ impl SharedSubscriptions {
                         cursor: 0,
                     },
                 );
-                // One synthetic entry stands for the whole group.
+                // One synthetic entry stands for the whole group. Only
+                // its subscriber identifier is ever read, by `select`,
+                // to learn which groups matched; the options come from
+                // the chosen member, never from here. They are spelled
+                // out as defaults rather than copied from whichever
+                // member happened to create the group, which made them
+                // look as though they meant something.
                 self.trie.insert(
                     filter,
                     Subscription {
                         subscriber: SubscriberId(id),
-                        ..sub.clone()
+                        qos: QoS::AtMostOnce,
+                        no_local: false,
+                        retain_as_published: false,
+                        id: None,
                     },
                 );
                 id
