@@ -1187,7 +1187,7 @@ mod tests {
     fn total_len_accounts_for_a_multibyte_length_prefix() {
         // Body of 128 bytes needs a two-byte length prefix.
         let mut buf = vec![0x30, 0x80, 0x01];
-        buf.extend(std::iter::repeat(0u8).take(128));
+        buf.extend(std::iter::repeat_n(0u8, 128));
         let header = peek(&buf, &limits(1024)).unwrap().expect("complete");
         assert_eq!(header.body_len, 128);
         assert_eq!(header.header_len, 3);
