@@ -110,13 +110,17 @@ impl Outbound {
     }
 
     /// Handle an at-least-once acknowledgement.
+    ///
+    /// It must name an entry that is waiting for one. An acknowledgement
+    /// settling an exactly-once entry would end a four-packet exchange
+    /// after one packet.
     pub fn on_puback(
         &mut self,
         packet_id: u16,
         now: u32,
         out: &mut Vec<Action>,
     ) -> Result<(), ReasonCode> {
-        self.complete(packet_id)?;
+        self.complete(packet_id, InflightState::AwaitingAck)?;
         self.pump(now, out);
         Ok(())
     }
@@ -142,9 +146,21 @@ impl Outbound {
         out: &mut Vec<Action>,
     ) -> Result<(), ReasonCode> {
         if reason.is_failure() {
-            self.complete(packet_id)?;
+            self.complete(packet_id, InflightState::AwaitingReceived)?;
             self.pump(now, out);
             return Ok(());
+        }
+
+        if self
+            .inflight
+            .get_mut(packet_id)
+            .is_some_and(|e| e.state != InflightState::AwaitingReceived)
+        {
+            // Present, but not waiting for a receipt. Answering with a
+            // release would put an at-least-once exchange into a state
+            // it has no fourth packet for, and a second receipt for an
+            // entry already released is the peer contradicting itself.
+            return Err(ReasonCode::ProtocolError);
         }
 
         let Some(entry) = self.inflight.get_mut(packet_id) else {
@@ -181,19 +197,28 @@ impl Outbound {
         now: u32,
         out: &mut Vec<Action>,
     ) -> Result<(), ReasonCode> {
-        self.complete(packet_id)?;
+        self.complete(packet_id, InflightState::AwaitingComplete)?;
         self.pump(now, out);
         Ok(())
     }
 
-    fn complete(&mut self, packet_id: u16) -> Result<(), ReasonCode> {
-        match self.inflight.remove(packet_id) {
-            Some(_) => {
-                self.packet_ids.release(packet_id);
-                Ok(())
-            }
-            None => Err(ReasonCode::PacketIdentifierNotFound),
+    /// Settle an exchange, but only from the state that ends it.
+    ///
+    /// Matching on the identifier alone is not enough. A completion for
+    /// an entry that was never receipted would free the slot and the
+    /// identifier and mark the message delivered, with no drop action
+    /// and no error: the message is simply gone. The state is what tells
+    /// a legitimate final packet from one that arrives out of sequence.
+    fn complete(&mut self, packet_id: u16, expected: InflightState) -> Result<(), ReasonCode> {
+        let Some(entry) = self.inflight.get_mut(packet_id) else {
+            return Err(ReasonCode::PacketIdentifierNotFound);
+        };
+        if entry.state != expected {
+            return Err(ReasonCode::ProtocolError);
         }
+        self.inflight.remove(packet_id);
+        self.packet_ids.release(packet_id);
+        Ok(())
     }
 
     /// The connection went away. Nothing is discarded; the window is held
@@ -441,6 +466,77 @@ mod tests {
         assert_eq!(ack.packet_id, 99);
         assert_eq!(ack.reason, ReasonCode::PacketIdentifierNotFound);
         assert_eq!(out.inflight_len(), 0, "there is nothing to track");
+    }
+
+    #[test]
+    fn an_acknowledgement_does_not_settle_an_exactly_once_entry() {
+        // One packet would end a four-packet exchange.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::ExactlyOnce, b"x"), 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+
+        assert_eq!(
+            out.on_puback(packet_id, 0, &mut actions),
+            Err(ReasonCode::ProtocolError)
+        );
+        assert_eq!(out.inflight_len(), 1, "the exchange is still running");
+    }
+
+    #[test]
+    fn a_completion_does_not_settle_an_entry_that_was_never_receipted() {
+        // The dangerous one. Without the state check the broker frees the
+        // slot and the identifier and counts the message delivered, with
+        // no drop action and no error: it is simply gone.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::ExactlyOnce, b"x"), 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+
+        assert_eq!(
+            out.on_pubcomp(packet_id, 0, &mut actions),
+            Err(ReasonCode::ProtocolError)
+        );
+        assert_eq!(out.inflight_len(), 1, "the message is still held");
+        assert!(
+            out.packet_ids.is_in_use(packet_id),
+            "and its identifier is still reserved"
+        );
+    }
+
+    #[test]
+    fn a_receipt_does_not_answer_an_at_least_once_entry_with_a_release() {
+        // At-least-once has no third packet, so a release would put the
+        // exchange into a state with no way out.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+
+        actions.clear();
+        assert_eq!(
+            out.on_pubrec(packet_id, ReasonCode::Success, 0, &mut actions),
+            Err(ReasonCode::ProtocolError)
+        );
+        assert!(actions.is_empty(), "and no release goes out");
+    }
+
+    #[test]
+    fn a_failing_receipt_does_not_remove_an_entry_the_peer_still_owns() {
+        // Once the peer has receipted successfully it owns the message
+        // and we are holding the release. A refusal now contradicts that.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::ExactlyOnce, b"x"), 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+        out.on_pubrec(packet_id, ReasonCode::Success, 0, &mut actions)
+            .expect("the first receipt is in order");
+
+        assert_eq!(
+            out.on_pubrec(packet_id, ReasonCode::NotAuthorized, 0, &mut actions),
+            Err(ReasonCode::ProtocolError)
+        );
+        assert_eq!(out.inflight_len(), 1, "the peer still owns it");
     }
 
     #[test]
