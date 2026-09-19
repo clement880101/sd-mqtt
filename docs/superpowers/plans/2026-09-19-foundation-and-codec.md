@@ -16,6 +16,16 @@ to the compiler until `lib.rs` declares it, so writing the test before the
 declaration produces "no tests ran" rather than the compile failure the step
 expects.
 
+**Hand-built MQTT 5 bodies need a property block.** Every MQTT 5 packet
+body that carries properties has a mandatory property-length byte, zero when
+there are none. A test that hand-builds a v5 body and omits it does not test
+what its name says: the decoder consumes the next field's length byte as the
+property length and fails with a truncation error. Four tests in this plan
+had that bug, and two of them passed anyway because they asserted only the
+error variant, which truncation happens to satisfy. When hand-building a v5
+body, include the `0x00`, and assert the exact error string rather than the
+variant.
+
 **Golden vectors.** Round-trip tests cannot catch a wire format that is
 consistently wrong in both directions: a property identifier read from and
 written to the same wrong byte, or a flag read from and written to the same
@@ -3369,6 +3379,7 @@ mod tests {
     fn rejects_reserved_bits_in_the_options_byte() {
         let mut out = Vec::new();
         crate::writer::put_u16(&mut out, 1);
+        out.push(0x00); // empty property block, mandatory in v5
         crate::writer::put_string(&mut out, "a").unwrap();
         out.push(0xC0); // both reserved high bits set
         let mut reader = Reader::new(&out);
@@ -3380,6 +3391,7 @@ mod tests {
     fn rejects_retain_handling_three() {
         let mut out = Vec::new();
         crate::writer::put_u16(&mut out, 1);
+        out.push(0x00); // empty property block, mandatory in v5
         crate::writer::put_string(&mut out, "a").unwrap();
         out.push(0x30); // retain handling bits both set
         let mut reader = Reader::new(&out);
@@ -3391,6 +3403,7 @@ mod tests {
     fn rejects_no_local_on_a_shared_subscription() {
         let mut out = Vec::new();
         crate::writer::put_u16(&mut out, 1);
+        out.push(0x00); // empty property block, mandatory in v5
         crate::writer::put_string(&mut out, "$share/g/a").unwrap();
         out.push(0x04); // no local
         let mut reader = Reader::new(&out);
@@ -3402,6 +3415,7 @@ mod tests {
     fn rejects_an_invalid_filter() {
         let mut out = Vec::new();
         crate::writer::put_u16(&mut out, 1);
+        out.push(0x00); // empty property block, mandatory in v5
         crate::writer::put_string(&mut out, "a/#/b").unwrap();
         out.push(0x00);
         let mut reader = Reader::new(&out);
@@ -4932,8 +4946,12 @@ fn cases() -> Vec<(&'static str, Vec<u8>, CodecError)> {
             CodecError::InvalidTopicName,
         ),
         (
-            "empty publish topic",
-            vec![0x30, 0x02, 0x00, 0x00],
+            // An empty topic is legal in MQTT 5 when a topic alias is
+            // present, so the check runs after the property block. The
+            // block must therefore be supplied, or the failure is a
+            // truncation rather than the rejection this case is about.
+            "empty publish topic with no alias",
+            vec![0x30, 0x03, 0x00, 0x00, 0x00],
             CodecError::InvalidTopicName,
         ),
         (
