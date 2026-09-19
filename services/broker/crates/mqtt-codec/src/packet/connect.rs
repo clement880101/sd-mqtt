@@ -214,6 +214,14 @@ pub struct ConnAck {
     /// Whether the broker resumed an existing session.
     pub session_present: bool,
     /// Why the connection was accepted or refused.
+    ///
+    /// After a 3.1.1 decode this value is reconstructed from one of five
+    /// legacy return codes, not read off the wire intact: return code 3
+    /// always becomes `ServerUnavailable` even if the sender meant a
+    /// narrower failure, and `Banned` is indistinguishable from
+    /// `NotAuthorized`. A session layer must not log or act on this field,
+    /// after a 3.1.1 decode, as though it were the exact reason the peer
+    /// sent.
     pub reason: ReasonCode,
     /// MQTT 5 properties.
     pub properties: Properties,
