@@ -695,4 +695,50 @@ mod publish {
         assert_eq!(decoded.reason, ReasonCode::Success);
         assert_eq!(decoded.properties, Properties::default());
     }
+
+    /// An MQTT 5 PUBLISH whose topic name is empty because a topic alias
+    /// stands in for it.
+    ///
+    /// MQTT-v5.0 section 3.3.2.3.4: "If a Topic Alias mapping has been set
+    /// at the receiver, a sender can send a PUBLISH packet that contains
+    /// that Topic Alias and a zero length Topic Name." The topic is still
+    /// a length-prefixed string, so it is two zero bytes; the alias is
+    /// property identifier 35 (0x23) followed by a two-byte integer.
+    #[test]
+    fn encodes_a_v5_publish_with_an_empty_topic_and_an_alias() {
+        let packet = Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: String::new(),
+            packet_id: None,
+            payload: Bytes::from_static(b"hi"),
+            properties: Properties {
+                topic_alias: Some(7),
+                ..Default::default()
+            },
+        };
+
+        assert_eq!(first_byte(&packet), 0x30);
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V5, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x00, // topic name: zero length
+                0x03, // property block length = 3 bytes
+                0x23, 0x00, 0x07, // topic alias = 7
+                0x68, 0x69, // payload "hi"
+            ]
+        );
+
+        // The same bytes decode back to the same shape, so this legal wire
+        // form is pinned in both directions.
+        let mut reader = Reader::new(&out);
+        let decoded =
+            Publish::decode_body(&mut reader, 0x00, Version::V5, &Limits::default()).unwrap();
+        assert_eq!(decoded, packet);
+    }
 }

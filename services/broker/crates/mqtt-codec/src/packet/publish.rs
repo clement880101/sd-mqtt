@@ -11,6 +11,23 @@ use crate::reason::ReasonCode;
 use crate::writer::{put_string, put_u16, put_u8};
 use crate::Version;
 
+/// The MQTT 5 rules tying an empty topic name to a topic alias.
+///
+/// MQTT-v5.0 section 3.3.2.3.4: a topic alias of zero is never permitted,
+/// and a zero-length topic name is a protocol error unless an alias stands
+/// in for it. Whether the alias has actually been mapped on this connection
+/// is session state, so a later layer decides that; the codec only checks
+/// that the shape is one the specification allows on the wire.
+fn check_topic_alias(topic: &str, properties: &Properties) -> Result<(), CodecError> {
+    if properties.topic_alias == Some(0) {
+        return Err(CodecError::ProtocolError("topic alias must not be zero"));
+    }
+    if topic.is_empty() && properties.topic_alias.is_none() {
+        return Err(CodecError::InvalidTopicName);
+    }
+    Ok(())
+}
+
 /// An application message travelling in either direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Publish {
@@ -44,6 +61,11 @@ impl Publish {
     }
 
     /// Decode the body, given the flags taken from the fixed header.
+    ///
+    /// In MQTT 5 an empty topic name is legal when a topic alias stands in
+    /// for it, so that decision waits until the property block has been
+    /// read; MQTT-v5.0 section 3.3.2.3.4. MQTT 3.1.1 has no aliases and
+    /// rejects an empty topic outright.
     pub fn decode_body(
         reader: &mut Reader<'_>,
         flags: u8,
@@ -61,7 +83,9 @@ impl Publish {
         }
 
         let topic = reader.string()?;
-        crate::topic::validate_name(&topic, limits)?;
+        if version == Version::V311 || !topic.is_empty() {
+            crate::topic::validate_name(&topic, limits)?;
+        }
 
         let packet_id = if qos == QoS::AtMostOnce {
             None
@@ -80,6 +104,10 @@ impl Publish {
         } else {
             Properties::default()
         };
+
+        if version == Version::V5 {
+            check_topic_alias(&topic, &properties)?;
+        }
 
         let payload = reader.take_rest();
 
@@ -107,6 +135,11 @@ impl Publish {
             ));
         }
         if self.topic.contains('+') || self.topic.contains('#') || self.topic.contains('\0') {
+            return Err(CodecError::InvalidTopicName);
+        }
+        if version == Version::V5 {
+            check_topic_alias(&self.topic, &self.properties)?;
+        } else if self.topic.is_empty() {
             return Err(CodecError::InvalidTopicName);
         }
 
@@ -427,6 +460,106 @@ mod tests {
         assert_eq!(
             encode_err(&qos_zero_publish("a\0b"), Version::V311),
             CodecError::InvalidTopicName
+        );
+    }
+
+    /// An MQTT 5 publish may leave the topic empty when an alias stands in
+    /// for it; MQTT-v5.0 section 3.3.2.3.4.
+    #[test]
+    fn accepts_an_empty_topic_with_a_topic_alias() {
+        let mut out = Vec::new();
+        crate::writer::put_string(&mut out, "").unwrap();
+        crate::writer::put_u8(&mut out, 3); // property block length
+        crate::writer::put_u8(&mut out, 0x23); // topic alias
+        crate::writer::put_u16(&mut out, 7);
+        let mut reader = Reader::new(&out);
+
+        let decoded =
+            Publish::decode_body(&mut reader, 0x00, Version::V5, &Limits::default()).unwrap();
+
+        assert_eq!(decoded.topic, "");
+        assert_eq!(decoded.properties.topic_alias, Some(7));
+    }
+
+    #[test]
+    fn rejects_an_empty_topic_without_a_topic_alias() {
+        let mut out = Vec::new();
+        crate::writer::put_string(&mut out, "").unwrap();
+        crate::writer::put_u8(&mut out, 0); // empty property block
+        let mut reader = Reader::new(&out);
+
+        let err =
+            Publish::decode_body(&mut reader, 0x00, Version::V5, &Limits::default()).unwrap_err();
+
+        assert_eq!(err, CodecError::InvalidTopicName);
+    }
+
+    #[test]
+    fn rejects_a_zero_topic_alias() {
+        let mut out = Vec::new();
+        crate::writer::put_string(&mut out, "a").unwrap();
+        crate::writer::put_u8(&mut out, 3); // property block length
+        crate::writer::put_u8(&mut out, 0x23); // topic alias
+        crate::writer::put_u16(&mut out, 0);
+        let mut reader = Reader::new(&out);
+
+        let err =
+            Publish::decode_body(&mut reader, 0x00, Version::V5, &Limits::default()).unwrap_err();
+
+        assert_eq!(
+            err,
+            CodecError::ProtocolError("topic alias must not be zero")
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_topic_in_v311_which_has_no_aliases() {
+        let mut out = Vec::new();
+        crate::writer::put_string(&mut out, "").unwrap();
+        let mut reader = Reader::new(&out);
+
+        let err =
+            Publish::decode_body(&mut reader, 0x00, Version::V311, &Limits::default()).unwrap_err();
+
+        assert_eq!(err, CodecError::InvalidTopicName);
+    }
+
+    #[test]
+    fn round_trips_an_empty_topic_with_a_topic_alias() {
+        let packet = Publish {
+            properties: crate::Properties {
+                topic_alias: Some(7),
+                ..Default::default()
+            },
+            ..qos_zero_publish("")
+        };
+        assert_eq!(round_trip(&packet, Version::V5), packet);
+    }
+
+    #[test]
+    fn rejects_encoding_an_empty_topic_without_a_topic_alias() {
+        assert_eq!(
+            encode_err(&qos_zero_publish(""), Version::V5),
+            CodecError::InvalidTopicName
+        );
+        assert_eq!(
+            encode_err(&qos_zero_publish(""), Version::V311),
+            CodecError::InvalidTopicName
+        );
+    }
+
+    #[test]
+    fn rejects_encoding_a_zero_topic_alias() {
+        let packet = Publish {
+            properties: crate::Properties {
+                topic_alias: Some(0),
+                ..Default::default()
+            },
+            ..qos_zero_publish("a")
+        };
+        assert_eq!(
+            encode_err(&packet, Version::V5),
+            CodecError::ProtocolError("topic alias must not be zero")
         );
     }
 }
