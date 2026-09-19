@@ -358,7 +358,7 @@ mod publish {
     use bytes::Bytes;
     use mqtt_codec::packet::{Ack, Publish};
     use mqtt_codec::reader::Reader;
-    use mqtt_codec::{Limits, Properties, QoS, ReasonCode, Version};
+    use mqtt_codec::{Limits, PacketKind, Properties, QoS, ReasonCode, Version};
 
     /// The first byte of a PUBLISH: type 3 in the high nibble, flags low.
     ///
@@ -584,7 +584,8 @@ mod publish {
         };
 
         let mut out = Vec::new();
-        ack.encode_body(Version::V311, &mut out).unwrap();
+        ack.encode_body(Version::V311, PacketKind::PubAck, &mut out)
+            .unwrap();
 
         assert_eq!(out, vec![0x00, 0x07]); // packet identifier 7
     }
@@ -604,7 +605,8 @@ mod publish {
         };
 
         let mut out = Vec::new();
-        ack.encode_body(Version::V5, &mut out).unwrap();
+        ack.encode_body(Version::V5, PacketKind::PubAck, &mut out)
+            .unwrap();
 
         assert_eq!(out, vec![0x00, 0x07]); // packet identifier 7, nothing else
     }
@@ -628,7 +630,8 @@ mod publish {
         };
 
         let mut out = Vec::new();
-        ack.encode_body(Version::V5, &mut out).unwrap();
+        ack.encode_body(Version::V5, PacketKind::PubRec, &mut out)
+            .unwrap();
 
         assert_eq!(
             out,
@@ -689,7 +692,8 @@ mod publish {
         let wire = [0x00, 0x2A]; // packet identifier 42, nothing else
 
         let mut reader = Reader::new(&wire);
-        let decoded = Ack::decode_body(&mut reader, Version::V5).expect("decodes");
+        let decoded =
+            Ack::decode_body(&mut reader, Version::V5, PacketKind::PubAck).expect("decodes");
 
         assert_eq!(decoded.packet_id, 42);
         assert_eq!(decoded.reason, ReasonCode::Success);

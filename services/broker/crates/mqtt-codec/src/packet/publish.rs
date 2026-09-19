@@ -3,7 +3,7 @@
 use bytes::Bytes;
 
 use crate::error::CodecError;
-use crate::header::Limits;
+use crate::header::{Limits, PacketKind};
 use crate::properties::Properties;
 use crate::qos::QoS;
 use crate::reader::Reader;
@@ -169,6 +169,34 @@ impl Publish {
     }
 }
 
+/// Whether `reason` is one the specification permits on `kind`.
+///
+/// MQTT-v5.0 Table 3-4 (PUBACK) and Table 3-5 (PUBREC) list the same nine
+/// codes; Table 3-6 (PUBREL) and Table 3-7 (PUBCOMP) list only success and
+/// packet identifier not found. Any other packet kind is a caller mistake
+/// and is refused rather than panicked on.
+fn reason_is_permitted(kind: PacketKind, reason: ReasonCode) -> bool {
+    match kind {
+        PacketKind::PubAck | PacketKind::PubRec => matches!(
+            reason,
+            ReasonCode::Success
+                | ReasonCode::NoMatchingSubscribers
+                | ReasonCode::UnspecifiedError
+                | ReasonCode::ImplementationSpecificError
+                | ReasonCode::NotAuthorized
+                | ReasonCode::TopicNameInvalid
+                | ReasonCode::PacketIdentifierInUse
+                | ReasonCode::QuotaExceeded
+                | ReasonCode::PayloadFormatInvalid
+        ),
+        PacketKind::PubRel | PacketKind::PubComp => matches!(
+            reason,
+            ReasonCode::Success | ReasonCode::PacketIdentifierNotFound
+        ),
+        _ => false,
+    }
+}
+
 /// The body shared by PUBACK, PUBREC, PUBREL and PUBCOMP.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ack {
@@ -185,7 +213,16 @@ impl Ack {
     ///
     /// A two-byte body means success with no properties, which is the common
     /// case and the only legal shape in 3.1.1.
-    pub fn decode_body(reader: &mut Reader<'_>, version: Version) -> Result<Self, CodecError> {
+    ///
+    /// `kind` says which of the four acknowledgements this is, because the
+    /// body alone does not: the legal reason codes differ between them. It
+    /// is passed in rather than stored, so it cannot disagree with the
+    /// enum variant that holds the result.
+    pub fn decode_body(
+        reader: &mut Reader<'_>,
+        version: Version,
+        kind: PacketKind,
+    ) -> Result<Self, CodecError> {
         let packet_id = reader.u16()?;
         if packet_id == 0 {
             return Err(CodecError::ProtocolError(
@@ -193,23 +230,27 @@ impl Ack {
             ));
         }
 
-        if version == Version::V311 || reader.is_empty() {
-            return Ok(Ack {
-                packet_id,
-                reason: ReasonCode::Success,
-                properties: Properties::default(),
-            });
-        }
-
-        let code = reader.u8()?;
-        let reason = ReasonCode::from_byte(code)
-            .ok_or(CodecError::MalformedPacket("unknown reason code"))?;
-
-        let properties = if reader.is_empty() {
-            Properties::default()
+        let (reason, properties) = if version == Version::V311 || reader.is_empty() {
+            (ReasonCode::Success, Properties::default())
         } else {
-            Properties::decode(reader)?
+            let code = reader.u8()?;
+            let reason = ReasonCode::from_byte(code)
+                .ok_or(CodecError::MalformedPacket("unknown reason code"))?;
+
+            let properties = if reader.is_empty() {
+                Properties::default()
+            } else {
+                Properties::decode(reader)?
+            };
+
+            (reason, properties)
         };
+
+        if !reason_is_permitted(kind, reason) {
+            return Err(CodecError::ProtocolError(
+                "reason code is not permitted on this packet type",
+            ));
+        }
 
         Ok(Ack {
             packet_id,
@@ -222,10 +263,23 @@ impl Ack {
     ///
     /// A successful acknowledgement with no properties is written in its
     /// short form, which every version understands.
-    pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+    ///
+    /// `kind` says which of the four acknowledgements this is, so that the
+    /// reason code can be checked against the set that packet permits.
+    pub fn encode_body(
+        &self,
+        version: Version,
+        kind: PacketKind,
+        out: &mut Vec<u8>,
+    ) -> Result<(), CodecError> {
         if self.packet_id == 0 {
             return Err(CodecError::ProtocolError(
                 "packet identifier must not be zero",
+            ));
+        }
+        if !reason_is_permitted(kind, self.reason) {
+            return Err(CodecError::ProtocolError(
+                "reason code is not permitted on this packet type",
             ));
         }
 
@@ -246,7 +300,7 @@ impl Ack {
 mod tests {
     use super::*;
     use crate::error::CodecError;
-    use crate::header::Limits;
+    use crate::header::{Limits, PacketKind};
     use crate::qos::QoS;
     use crate::reader::Reader;
     use crate::reason::ReasonCode;
@@ -346,11 +400,15 @@ mod tests {
             properties: Default::default(),
         };
         let mut out = Vec::new();
-        ack.encode_body(Version::V311, &mut out).unwrap();
+        ack.encode_body(Version::V311, PacketKind::PubAck, &mut out)
+            .unwrap();
         assert_eq!(out, vec![0x00, 0x07]);
 
         let mut reader = Reader::new(&out);
-        assert_eq!(Ack::decode_body(&mut reader, Version::V311).unwrap(), ack);
+        assert_eq!(
+            Ack::decode_body(&mut reader, Version::V311, PacketKind::PubAck).unwrap(),
+            ack
+        );
     }
 
     #[test]
@@ -361,11 +419,15 @@ mod tests {
             properties: Default::default(),
         };
         let mut out = Vec::new();
-        ack.encode_body(Version::V5, &mut out).unwrap();
+        ack.encode_body(Version::V5, PacketKind::PubAck, &mut out)
+            .unwrap();
         assert_eq!(out, vec![0x00, 0x07]);
 
         let mut reader = Reader::new(&out);
-        assert_eq!(Ack::decode_body(&mut reader, Version::V5).unwrap(), ack);
+        assert_eq!(
+            Ack::decode_body(&mut reader, Version::V5, PacketKind::PubAck).unwrap(),
+            ack
+        );
     }
 
     #[test]
@@ -379,9 +441,13 @@ mod tests {
             },
         };
         let mut out = Vec::new();
-        ack.encode_body(Version::V5, &mut out).unwrap();
+        ack.encode_body(Version::V5, PacketKind::PubAck, &mut out)
+            .unwrap();
         let mut reader = Reader::new(&out);
-        assert_eq!(Ack::decode_body(&mut reader, Version::V5).unwrap(), ack);
+        assert_eq!(
+            Ack::decode_body(&mut reader, Version::V5, PacketKind::PubAck).unwrap(),
+            ack
+        );
     }
 
     /// A helper for the encode-side rejections below.
@@ -438,7 +504,8 @@ mod tests {
         };
         let mut out = Vec::new();
         assert_eq!(
-            ack.encode_body(Version::V311, &mut out).unwrap_err(),
+            ack.encode_body(Version::V311, PacketKind::PubAck, &mut out)
+                .unwrap_err(),
             CodecError::ProtocolError("packet identifier must not be zero")
         );
     }
@@ -560,6 +627,124 @@ mod tests {
         assert_eq!(
             encode_err(&packet, Version::V5),
             CodecError::ProtocolError("topic alias must not be zero")
+        );
+    }
+
+    /// The nine codes MQTT-v5.0 Table 3-4 and Table 3-5 permit on PUBACK
+    /// and PUBREC, which share one set.
+    const PUBACK_CODES: [ReasonCode; 9] = [
+        ReasonCode::Success,
+        ReasonCode::NoMatchingSubscribers,
+        ReasonCode::UnspecifiedError,
+        ReasonCode::ImplementationSpecificError,
+        ReasonCode::NotAuthorized,
+        ReasonCode::TopicNameInvalid,
+        ReasonCode::PacketIdentifierInUse,
+        ReasonCode::QuotaExceeded,
+        ReasonCode::PayloadFormatInvalid,
+    ];
+
+    /// The two codes MQTT-v5.0 Table 3-6 and Table 3-7 permit on PUBREL
+    /// and PUBCOMP.
+    const PUBREL_CODES: [ReasonCode; 2] =
+        [ReasonCode::Success, ReasonCode::PacketIdentifierNotFound];
+
+    #[test]
+    fn accepts_the_reason_codes_legal_for_each_acknowledgement() {
+        let sets = [
+            (PacketKind::PubAck, &PUBACK_CODES[..]),
+            (PacketKind::PubRec, &PUBACK_CODES[..]),
+            (PacketKind::PubRel, &PUBREL_CODES[..]),
+            (PacketKind::PubComp, &PUBREL_CODES[..]),
+        ];
+
+        for (kind, codes) in sets {
+            for &reason in codes {
+                let ack = Ack {
+                    packet_id: 4,
+                    reason,
+                    properties: Default::default(),
+                };
+                let mut out = Vec::new();
+                ack.encode_body(Version::V5, kind, &mut out)
+                    .expect("encodes");
+                let mut reader = Reader::new(&out);
+                assert_eq!(
+                    Ack::decode_body(&mut reader, Version::V5, kind).expect("decodes"),
+                    ack,
+                    "{kind:?} should accept {reason:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_a_pubrel_carrying_a_reason_only_legal_on_a_puback() {
+        let ack = Ack {
+            packet_id: 3,
+            reason: ReasonCode::NotAuthorized,
+            properties: Default::default(),
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            ack.encode_body(Version::V5, PacketKind::PubRel, &mut out)
+                .unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
+        );
+
+        // Hand-built: identifier 3, reason 0x87 (not authorized), no
+        // properties. Legal on a PUBACK, not on a PUBREL.
+        let wire = [0x00, 0x03, 0x87, 0x00];
+        let mut reader = Reader::new(&wire);
+        assert_eq!(
+            Ack::decode_body(&mut reader, Version::V5, PacketKind::PubRel).unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
+        );
+
+        // The same bytes are fine as a PUBACK.
+        let mut reader = Reader::new(&wire);
+        assert_eq!(
+            Ack::decode_body(&mut reader, Version::V5, PacketKind::PubAck)
+                .unwrap()
+                .reason,
+            ReasonCode::NotAuthorized
+        );
+    }
+
+    #[test]
+    fn rejects_a_pubcomp_carrying_no_matching_subscribers() {
+        let ack = Ack {
+            packet_id: 3,
+            reason: ReasonCode::NoMatchingSubscribers,
+            properties: Default::default(),
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            ack.encode_body(Version::V5, PacketKind::PubComp, &mut out)
+                .unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
+        );
+    }
+
+    #[test]
+    fn rejects_a_kind_that_is_not_an_acknowledgement() {
+        let ack = Ack {
+            packet_id: 3,
+            reason: ReasonCode::Success,
+            properties: Default::default(),
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            ack.encode_body(Version::V5, PacketKind::Connect, &mut out)
+                .unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
+        );
+
+        let wire = [0x00, 0x03];
+        let mut reader = Reader::new(&wire);
+        assert_eq!(
+            Ack::decode_body(&mut reader, Version::V311, PacketKind::Connect).unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
         );
     }
 }
