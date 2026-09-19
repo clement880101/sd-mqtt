@@ -114,13 +114,28 @@ impl Outbound {
     /// It must name an entry that is waiting for one. An acknowledgement
     /// settling an exactly-once entry would end a four-packet exchange
     /// after one packet.
+    ///
+    /// A failure reason means the peer refused the message rather than
+    /// took it, so it is reported as discarded. [MQTT-4.4.0-2] treats
+    /// the publish as acknowledged either way and forbids retransmitting
+    /// it, which is exactly what makes a refusal a discard: nothing will
+    /// ever carry this message again.
     pub fn on_puback(
         &mut self,
         packet_id: u16,
+        reason: ReasonCode,
         now: u32,
         out: &mut Vec<Action>,
     ) -> Result<(), ReasonCode> {
-        self.complete(packet_id, InflightState::AwaitingAck)?;
+        let entry = self.complete(packet_id, InflightState::AwaitingAck)?;
+        if reason.is_failure() {
+            out.push(Action::Dropped {
+                id: entry.delivery.message.id,
+                reason: DropReason::RejectedByPeer,
+                qos: entry.delivery.qos,
+                topic: Arc::clone(&entry.delivery.message.topic),
+            });
+        }
         self.pump(now, out);
         Ok(())
     }
@@ -453,7 +468,8 @@ mod tests {
         assert_eq!(out.inflight_len(), 1);
 
         actions.clear();
-        out.on_puback(packet_id, 0, &mut actions).expect("known");
+        out.on_puback(packet_id, ReasonCode::Success, 0, &mut actions)
+            .expect("known");
         assert_eq!(out.inflight_len(), 0);
     }
 
@@ -526,7 +542,7 @@ mod tests {
         let packet_id = sent(&actions)[0].packet_id.unwrap();
 
         assert_eq!(
-            out.on_puback(packet_id, 0, &mut actions),
+            out.on_puback(packet_id, ReasonCode::Success, 0, &mut actions),
             Err(ReasonCode::ProtocolError)
         );
         assert_eq!(out.inflight_len(), 1, "the exchange is still running");
@@ -608,7 +624,8 @@ mod tests {
         let first = sent(&actions)[0].packet_id.unwrap();
 
         actions.clear();
-        out.on_puback(first, 0, &mut actions).expect("known");
+        out.on_puback(first, ReasonCode::Success, 0, &mut actions)
+            .expect("known");
         assert_eq!(sent(&actions).len(), 1, "the queue drains as room appears");
         assert_eq!(out.queued_len(), 0);
     }
@@ -770,7 +787,8 @@ mod tests {
 
         out.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
         let first = sent(&actions)[0].packet_id.unwrap();
-        out.on_puback(first, 0, &mut actions).expect("known");
+        out.on_puback(first, ReasonCode::Success, 0, &mut actions)
+            .expect("known");
         assert!(
             !out.packet_ids.is_in_use(first),
             "an acknowledged message gives its identifier back"
@@ -979,6 +997,50 @@ mod tests {
     }
 
     #[test]
+    fn an_at_least_once_refusal_is_reported_as_discarded() {
+        // The mirror of a_refused_message_is_reported_as_discarded, on
+        // the other packet. [MQTT-4.4.0-2] forbids retransmitting it, so
+        // nothing will ever carry this message again: that is a discard,
+        // and a peer refusing must not look like a peer accepting.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        let item = delivery(QoS::AtLeastOnce, b"x");
+        let message_id = item.message.id;
+        out.offer(item, 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+
+        actions.clear();
+        out.on_puback(packet_id, ReasonCode::NotAuthorized, 0, &mut actions)
+            .expect("known");
+
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Dropped { id, reason: DropReason::RejectedByPeer, .. } if *id == message_id
+            )),
+            "the refusal must be counted, not swallowed"
+        );
+        assert_eq!(out.inflight_len(), 0, "and the exchange is over either way");
+        assert!(!out.packet_ids.is_in_use(packet_id));
+    }
+
+    #[test]
+    fn an_at_least_once_success_is_not_reported_as_discarded() {
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+
+        actions.clear();
+        out.on_puback(packet_id, ReasonCode::Success, 0, &mut actions)
+            .expect("known");
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Dropped { .. })),
+            "a delivered message is not a discarded one"
+        );
+    }
+
+    #[test]
     fn a_refused_message_gives_its_identifier_back() {
         let mut out = online(10);
         let mut actions = Vec::new();
@@ -1094,6 +1156,8 @@ mod tests {
     fn an_acknowledgement_for_an_unknown_identifier_is_reported() {
         let mut out = online(10);
         let mut actions = Vec::new();
-        assert!(out.on_puback(99, 0, &mut actions).is_err());
+        assert!(out
+            .on_puback(99, ReasonCode::Success, 0, &mut actions)
+            .is_err());
     }
 }

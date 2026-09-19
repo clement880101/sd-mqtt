@@ -22,7 +22,7 @@ enum Op {
     /// Acknowledge an outstanding entry, chosen by position rather than
     /// always the oldest, so removal from the middle of the window is
     /// reached.
-    Ack(usize),
+    Ack(usize, bool),
     Receipt(usize, bool),
     Complete(usize),
     Disconnect,
@@ -43,7 +43,7 @@ fn any_op() -> impl Strategy<Value = Op> {
             // enough that the generated clock reaches it.
             prop_oneof![3 => Just(None), 2 => (0u32..4).prop_map(Some)],
         ).prop_map(|(qos, ttl)| Op::Offer(qos, ttl)),
-        4 => (0usize..6).prop_map(Op::Ack),
+        4 => (0usize..6, prop::bool::ANY).prop_map(|(i, ok)| Op::Ack(i, ok)),
         3 => (0usize..6, prop::bool::ANY).prop_map(|(i, ok)| Op::Receipt(i, ok)),
         3 => (0usize..6).prop_map(Op::Complete),
         1 => Just(Op::Disconnect),
@@ -150,13 +150,29 @@ impl Run {
                 self.now = self.now.saturating_add(*delta);
                 return;
             }
-            Op::Ack(index) => {
+            Op::Ack(index, accepted) => {
                 let Some(id) = self.pick(*index) else {
                     return;
                 };
+                let reason = if *accepted {
+                    ReasonCode::Success
+                } else {
+                    ReasonCode::QuotaExceeded
+                };
                 self.actions.clear();
-                if self.out.on_puback(id, self.now, &mut self.actions).is_ok() {
-                    self.release(id);
+                let now = self.now;
+                if self
+                    .out
+                    .on_puback(id, reason, now, &mut self.actions)
+                    .is_ok()
+                {
+                    // A refusal is a discard, not a delivery; the drop
+                    // action is what accounts for it.
+                    if *accepted {
+                        self.release(id);
+                    } else {
+                        self.abandon(id);
+                    }
                 }
             }
             Op::Receipt(index, accepted) => {
@@ -420,7 +436,7 @@ proptest! {
             if run.outstanding.is_empty() {
                 break;
             }
-            run.step(&Op::Ack(0));
+            run.step(&Op::Ack(0, true));
         }
 
         prop_assert_eq!(run.out.inflight_len(), 0);
