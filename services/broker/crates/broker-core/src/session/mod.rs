@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use mqtt_codec::{Packet, QoS, ReasonCode};
 
+pub mod inbound;
 pub mod inflight;
 pub mod message;
 pub mod outbound;
@@ -51,6 +52,7 @@ pub enum Action {
     Close(ReasonCode),
 }
 
+pub use inbound::Inbound;
 pub use inflight::{Inflight, InflightEntry, InflightState};
 pub use message::{Message, MessageId};
 pub use outbound::Outbound;
