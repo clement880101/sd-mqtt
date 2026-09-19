@@ -3588,14 +3588,12 @@ impl Subscribe {
             let retain_as_published = options & 0x08 != 0;
             let retain_handling = RetainHandling::from_u8((options & 0x30) >> 4)?;
 
-            let shared = crate::topic::parse_shared(&filter)?;
+            let shared = crate::topic::validate_subscription(&filter, limits)?;
             if no_local && shared.is_some() {
                 return Err(CodecError::ProtocolError(
                     "no local is not permitted on a shared subscription",
                 ));
             }
-            let to_validate = shared.map(|(_, inner)| inner).unwrap_or(filter.as_str());
-            crate::topic::validate_filter(to_validate, limits)?;
 
             filters.push(SubscriptionOptions {
                 filter,
@@ -3739,9 +3737,7 @@ impl Unsubscribe {
         let mut filters = Vec::new();
         while !reader.is_empty() {
             let filter = reader.string()?;
-            let shared = crate::topic::parse_shared(&filter)?;
-            let to_validate = shared.map(|(_, inner)| inner).unwrap_or(filter.as_str());
-            crate::topic::validate_filter(to_validate, limits)?;
+            crate::topic::validate_subscription(&filter, limits)?;
             filters.push(filter);
         }
 
@@ -5300,6 +5296,49 @@ git commit -m "feat(codec): reject properties a packet does not permit"
 ```
 
 ---
+
+## Amendments after review
+
+These changes were made during execution, after review found problems with
+the plan as written. They are recorded here so the plan matches the code.
+
+**Non-minimal variable byte integers are rejected** (commit `f2277df`).
+MQTT requires a variable byte integer to use the fewest possible bytes, and
+`decode` accepted padded spellings such as `0x81 0x00` for the value one.
+That lets an attacker re-spell any length or property identifier, which
+defeats signature-based filtering and would poison a fuzz corpus. A
+terminating zero byte is now rejected anywhere but the first position.
+
+**Properties and reason codes are pinned to literal bytes** (commit
+`bbbc547`). The round-trip tests encoded and decoded through the same table,
+so a transposed property identifier was invisible to them: it would round
+trip perfectly here and be wrong against every other implementation. A
+reviewer verified all 27 identifiers and wire types, and all 43 reason code
+values, against the OASIS specification; a golden vector now locks that
+verified encoding in. The reason code test iterates an exhaustive list and
+asserts its length, so adding a variant without listing it fails.
+
+**Subscription filters have one safe entry point** (commit `2f1cda0`).
+`parse_shared` and `validate_filter` each accept filters the other rejects,
+so calling either alone is wrong. `validate_subscription` composes them in
+the right order and is what tasks 13 uses. Both validators also now reject a
+null character; `Reader::string` already did, but they are public and read
+as standalone validators.
+
+**The subscription identifier round trip is closed** (commit `721ccb3`).
+`encode` accepted a zero subscription identifier that `decode` rejected. The
+projections onto MQTT 3.1.1 return codes also gained doc comments saying
+they are defined only for codes that can legally appear in that packet, and
+that a malformed 3.1.1 CONNECT must be answered by closing the connection
+rather than by return code three, which a client reads as transient and
+retries.
+
+**Earlier amendments.** The release profile does not set `panic = "abort"`,
+because one panicking connection task would otherwise kill every connected
+client. The toolchain and base image are pinned to an exact version. Safety
+lints moved to the workspace. The web service gained a devcontainer. A test
+pins the packet size boundary, which a relaxed comparison would otherwise
+have passed.
 
 ## Done when
 
