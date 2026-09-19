@@ -84,10 +84,6 @@ commit access, but it has had no release in 18 months and lacks post-quantum
 support. aws-lc-rs is the default; ring stays available as a feature for
 exotic targets where a C compiler is a problem.
 
-**musl's allocator is pathologically slow** under multithreaded async work,
-with reported slowdowns of 7x and worse. Static musl builds therefore enable
-mimalloc as the global allocator.
-
 **musl's allocator is not merely slow, it is disqualifying.** On a six-core
 machine the same workload takes 0.17s under glibc and 1.18s under musl, with
 system time going from 0.37s to 6.13s and voluntary context switches from
