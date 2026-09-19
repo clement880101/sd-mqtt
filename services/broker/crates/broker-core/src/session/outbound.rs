@@ -710,6 +710,71 @@ mod tests {
     }
 
     #[test]
+    fn an_identifier_is_free_again_once_the_exchange_completes() {
+        // Nothing else asserts this, and the failure it guards against is
+        // invisible: the session keeps working until it has sent 65,535
+        // messages, then stalls forever because every identifier is
+        // recorded as outstanding. It looks like a healthy broker right
+        // up to the point a client stops receiving.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+
+        out.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+        let first = sent(&actions)[0].packet_id.unwrap();
+        out.on_puback(first, 0, &mut actions).expect("known");
+        assert!(
+            !out.packet_ids.is_in_use(first),
+            "an acknowledged message gives its identifier back"
+        );
+
+        actions.clear();
+        out.offer(delivery(QoS::ExactlyOnce, b"y"), 0, &mut actions);
+        let second = sent(&actions)[0].packet_id.unwrap();
+        out.on_pubrec(second, ReasonCode::Success, 0, &mut actions)
+            .expect("known");
+        assert!(
+            out.packet_ids.is_in_use(second),
+            "but not before the exchange is over"
+        );
+        out.on_pubcomp(second, 0, &mut actions).expect("known");
+        assert!(
+            !out.packet_ids.is_in_use(second),
+            "a completed exchange gives its identifier back"
+        );
+
+        assert_eq!(out.packet_ids.in_use(), 0);
+    }
+
+    #[test]
+    fn resume_republishes_a_message_whose_receipt_never_arrived() {
+        // The mirror of resume_resends_a_release_rather_than_the_publish.
+        // Only an entry whose receipt arrived may be resumed with a
+        // release. Doing it for one still awaiting a receipt sends a
+        // release for a message the client never received; the client
+        // answers packet-identifier-not-found, the broker counts the
+        // message delivered, and it is silently lost.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::ExactlyOnce, b"x"), 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+
+        out.set_online(false);
+        actions.clear();
+        out.on_resume(0, &mut actions);
+
+        let resent = sent(&actions);
+        assert_eq!(resent.len(), 1, "the publish itself must go out again");
+        assert_eq!(resent[0].packet_id, Some(packet_id));
+        assert!(resent[0].dup);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Send(Packet::PubRel(_)))),
+            "and no release, because the client never took ownership"
+        );
+    }
+
+    #[test]
     fn a_drop_is_reported_with_its_reason_and_topic() {
         let mut out = Outbound::new(
             QueueLimits {
