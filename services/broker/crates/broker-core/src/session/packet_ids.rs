@@ -36,7 +36,11 @@ impl PacketIds {
         // free slot exists, so this terminates.
         loop {
             let candidate = self.next;
-            self.next = if self.next == u16::MAX { 1 } else { self.next + 1 };
+            self.next = if self.next == u16::MAX {
+                1
+            } else {
+                self.next + 1
+            };
             if self.in_use.insert(candidate) {
                 return Some(candidate);
             }
