@@ -20,6 +20,9 @@ pub fn validate_name(name: &str, limits: &Limits) -> Result<(), CodecError> {
     if name.contains('+') || name.contains('#') {
         return Err(CodecError::InvalidTopicName);
     }
+    if name.contains('\0') {
+        return Err(CodecError::InvalidTopicName);
+    }
     if level_count(name) > usize::from(limits.max_topic_depth) {
         return Err(CodecError::TopicTooDeep);
     }
@@ -32,6 +35,9 @@ pub fn validate_name(name: &str, limits: &Limits) -> Result<(), CodecError> {
 /// wildcard must occupy an entire level and be the final one.
 pub fn validate_filter(filter: &str, limits: &Limits) -> Result<(), CodecError> {
     if filter.is_empty() {
+        return Err(CodecError::InvalidTopicFilter);
+    }
+    if filter.contains('\0') {
         return Err(CodecError::InvalidTopicFilter);
     }
 
@@ -83,6 +89,22 @@ pub fn parse_shared(filter: &str) -> Result<Option<(&str, &str)>, CodecError> {
     }
 
     Ok(Some((group, inner)))
+}
+
+/// Validate a filter as it appears in SUBSCRIBE or UNSUBSCRIBE.
+///
+/// Returns the share group and inner filter for a shared subscription,
+/// or `None` for an ordinary one. This is the correct entry point for
+/// subscription filters: calling [`parse_shared`] or [`validate_filter`]
+/// alone accepts filters the other would reject.
+pub fn validate_subscription<'a>(
+    filter: &'a str,
+    limits: &Limits,
+) -> Result<Option<(&'a str, &'a str)>, CodecError> {
+    let shared = parse_shared(filter)?;
+    let inner = shared.map(|(_, inner)| inner).unwrap_or(filter);
+    validate_filter(inner, limits)?;
+    Ok(shared)
 }
 
 #[cfg(test)]
@@ -184,5 +206,49 @@ mod tests {
         // Missing the filter after the group.
         assert!(parse_shared("$share/group").is_err());
         assert!(parse_shared("$share/group/").is_err());
+    }
+
+    #[test]
+    fn rejects_a_null_character_in_a_topic_name() {
+        assert_eq!(
+            validate_name("a/\0/b", &depth(16)).unwrap_err(),
+            CodecError::InvalidTopicName
+        );
+    }
+
+    #[test]
+    fn rejects_a_null_character_in_a_topic_filter() {
+        assert_eq!(
+            validate_filter("a/\0/b", &depth(16)).unwrap_err(),
+            CodecError::InvalidTopicFilter
+        );
+    }
+
+    #[test]
+    fn validate_subscription_accepts_an_ordinary_filter() {
+        assert_eq!(validate_subscription("sport/#", &depth(16)), Ok(None));
+    }
+
+    #[test]
+    fn validate_subscription_splits_and_validates_a_shared_filter() {
+        assert_eq!(
+            validate_subscription("$share/g/a/#", &depth(16)),
+            Ok(Some(("g", "a/#")))
+        );
+    }
+
+    #[test]
+    fn validate_subscription_rejects_an_empty_share_group() {
+        assert!(validate_subscription("$share//x", &depth(16)).is_err());
+    }
+
+    #[test]
+    fn validate_subscription_rejects_a_misplaced_wildcard_inside_a_shared_filter() {
+        assert!(validate_subscription("$share/g/a/#/b", &depth(16)).is_err());
+    }
+
+    #[test]
+    fn validate_subscription_rejects_a_misplaced_wildcard_in_an_ordinary_filter() {
+        assert!(validate_subscription("a/#/b", &depth(16)).is_err());
     }
 }
