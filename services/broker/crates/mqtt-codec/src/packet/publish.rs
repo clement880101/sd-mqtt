@@ -95,12 +95,37 @@ impl Publish {
     }
 
     /// Append the body, excluding the fixed header.
+    ///
+    /// Refuses to write anything [`Publish::decode_body`] would refuse to
+    /// read back, so an incoherent packet is an error rather than silent
+    /// data loss. The depth limit is not checked here, because encoding
+    /// takes no [`Limits`].
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
-        put_string(out, &self.topic)?;
-        if self.qos != QoS::AtMostOnce {
+        if self.qos == QoS::AtMostOnce && self.packet_id.is_some() {
+            return Err(CodecError::ProtocolError(
+                "a quality of service zero publish must not carry a packet identifier",
+            ));
+        }
+        if self.topic.contains('+') || self.topic.contains('#') || self.topic.contains('\0') {
+            return Err(CodecError::InvalidTopicName);
+        }
+
+        let packet_id = if self.qos == QoS::AtMostOnce {
+            None
+        } else {
             let id = self.packet_id.ok_or(CodecError::ProtocolError(
                 "a publish above quality of service zero needs a packet identifier",
             ))?;
+            if id == 0 {
+                return Err(CodecError::ProtocolError(
+                    "packet identifier must not be zero",
+                ));
+            }
+            Some(id)
+        };
+
+        put_string(out, &self.topic)?;
+        if let Some(id) = packet_id {
             put_u16(out, id);
         }
         if version == Version::V5 {
@@ -165,6 +190,12 @@ impl Ack {
     /// A successful acknowledgement with no properties is written in its
     /// short form, which every version understands.
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        if self.packet_id == 0 {
+            return Err(CodecError::ProtocolError(
+                "packet identifier must not be zero",
+            ));
+        }
+
         put_u16(out, self.packet_id);
         if version == Version::V311 {
             return Ok(());
@@ -318,5 +349,84 @@ mod tests {
         ack.encode_body(Version::V5, &mut out).unwrap();
         let mut reader = Reader::new(&out);
         assert_eq!(Ack::decode_body(&mut reader, Version::V5).unwrap(), ack);
+    }
+
+    /// A helper for the encode-side rejections below.
+    fn encode_err(packet: &Publish, version: Version) -> CodecError {
+        let mut out = Vec::new();
+        packet.encode_body(version, &mut out).unwrap_err()
+    }
+
+    fn qos_zero_publish(topic: &str) -> Publish {
+        Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: topic.into(),
+            packet_id: None,
+            payload: Bytes::new(),
+            properties: Default::default(),
+        }
+    }
+
+    #[test]
+    fn rejects_a_packet_identifier_on_a_qos_zero_publish_when_encoding() {
+        let packet = Publish {
+            packet_id: Some(1),
+            ..qos_zero_publish("a")
+        };
+        assert_eq!(
+            encode_err(&packet, Version::V311),
+            CodecError::ProtocolError(
+                "a quality of service zero publish must not carry a packet identifier",
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_a_zero_packet_identifier_when_encoding_a_publish() {
+        let packet = Publish {
+            qos: QoS::AtLeastOnce,
+            packet_id: Some(0),
+            ..qos_zero_publish("a")
+        };
+        assert_eq!(
+            encode_err(&packet, Version::V311),
+            CodecError::ProtocolError("packet identifier must not be zero")
+        );
+    }
+
+    #[test]
+    fn rejects_a_zero_packet_identifier_when_encoding_an_acknowledgement() {
+        let ack = Ack {
+            packet_id: 0,
+            reason: ReasonCode::Success,
+            properties: Default::default(),
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            ack.encode_body(Version::V311, &mut out).unwrap_err(),
+            CodecError::ProtocolError("packet identifier must not be zero")
+        );
+    }
+
+    #[test]
+    fn rejects_a_wildcard_topic_when_encoding() {
+        assert_eq!(
+            encode_err(&qos_zero_publish("a/+"), Version::V311),
+            CodecError::InvalidTopicName
+        );
+        assert_eq!(
+            encode_err(&qos_zero_publish("a/#"), Version::V311),
+            CodecError::InvalidTopicName
+        );
+    }
+
+    #[test]
+    fn rejects_a_null_character_in_a_topic_when_encoding() {
+        assert_eq!(
+            encode_err(&qos_zero_publish("a\0b"), Version::V311),
+            CodecError::InvalidTopicName
+        );
     }
 }
