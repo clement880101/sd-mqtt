@@ -9,6 +9,7 @@
 pub mod error;
 pub mod reader;
 pub mod varint;
+pub mod writer;
 
 pub use error::CodecError;
 
