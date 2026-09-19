@@ -464,9 +464,10 @@ mod tests {
         let mut out = Vec::new();
         crate::writer::put_u16(&mut out, 1);
         let mut reader = Reader::new(&out);
-        let err =
-            Subscribe::decode_body(&mut reader, Version::V311, &Limits::default()).unwrap_err();
-        assert!(matches!(err, CodecError::ProtocolError(_)));
+        assert_eq!(
+            Subscribe::decode_body(&mut reader, Version::V311, &Limits::default()).unwrap_err(),
+            CodecError::ProtocolError("subscribe must carry at least one filter")
+        );
     }
 
     #[test]
@@ -477,8 +478,10 @@ mod tests {
         crate::writer::put_string(&mut out, "a").unwrap();
         out.push(0xC0); // both reserved high bits set
         let mut reader = Reader::new(&out);
-        let err = Subscribe::decode_body(&mut reader, Version::V5, &Limits::default()).unwrap_err();
-        assert!(matches!(err, CodecError::MalformedPacket(_)));
+        assert_eq!(
+            Subscribe::decode_body(&mut reader, Version::V5, &Limits::default()).unwrap_err(),
+            CodecError::MalformedPacket("reserved bits in the subscription options are set")
+        );
     }
 
     #[test]
@@ -489,8 +492,10 @@ mod tests {
         crate::writer::put_string(&mut out, "a").unwrap();
         out.push(0x30); // retain handling bits both set
         let mut reader = Reader::new(&out);
-        let err = Subscribe::decode_body(&mut reader, Version::V5, &Limits::default()).unwrap_err();
-        assert!(matches!(err, CodecError::MalformedPacket(_)));
+        assert_eq!(
+            Subscribe::decode_body(&mut reader, Version::V5, &Limits::default()).unwrap_err(),
+            CodecError::MalformedPacket("retain handling must be 0, 1 or 2")
+        );
     }
 
     #[test]
@@ -501,8 +506,10 @@ mod tests {
         crate::writer::put_string(&mut out, "$share/g/a").unwrap();
         out.push(0x04); // no local
         let mut reader = Reader::new(&out);
-        let err = Subscribe::decode_body(&mut reader, Version::V5, &Limits::default()).unwrap_err();
-        assert!(matches!(err, CodecError::ProtocolError(_)));
+        assert_eq!(
+            Subscribe::decode_body(&mut reader, Version::V5, &Limits::default()).unwrap_err(),
+            CodecError::ProtocolError("no local is not permitted on a shared subscription")
+        );
     }
 
     #[test]
