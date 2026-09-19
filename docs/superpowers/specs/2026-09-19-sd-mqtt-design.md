@@ -726,6 +726,14 @@ shippable.
   designing before the session layer's access patterns exist, and neither
   is on a path a benchmark currently covers.
 
+- **The action enum's size.** A session returns a list of actions, and
+  the variant carrying a packet is around 400 bytes, which trips the
+  compiler's large-variant lint. Boxing the packet silences it at the cost
+  of one allocation per message sent, which is the same allocation the
+  codec deliberately declined when it left the publish packet unboxed. The
+  lint is suppressed with that reasoning recorded. Like the two questions
+  below, the trade wants a benchmark rather than an argument.
+
 - **Zero-copy payloads.** The codec's reader copies every payload out of
   the connection's read buffer. Since decoding already owns that buffer
   mutably, splitting and freezing it instead would remove one full payload
