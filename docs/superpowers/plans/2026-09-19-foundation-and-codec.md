@@ -16,6 +16,16 @@ to the compiler until `lib.rs` declares it, so writing the test before the
 declaration produces "no tests ran" rather than the compile failure the step
 expects.
 
+**Golden vectors.** Round-trip tests cannot catch a wire format that is
+consistently wrong in both directions: a property identifier read from and
+written to the same wrong byte, or a flag read from and written to the same
+wrong bit, round trips perfectly and is wrong against every other MQTT
+implementation. This was not a hypothetical; it was found twice during
+execution. Every packet type therefore pins its encoding to literal bytes in
+`tests/golden.rs`, derived from the specification rather than captured from
+the encoder, with the spec section cited. When adding a packet type, add its
+vectors in the same task.
+
 **Scope note:** This plan stops at the codec. The in-memory broker core (topic trie, sessions, delivery, listener, conformance suite) is the next plan and depends on this one.
 
 ---
@@ -50,6 +60,7 @@ expects.
 | `services/broker/crates/mqtt-codec/src/packet/publish.rs` | PUBLISH and the four acks |
 | `services/broker/crates/mqtt-codec/src/packet/subscribe.rs` | SUBSCRIBE, SUBACK, UNSUBSCRIBE, UNSUBACK |
 | `services/broker/crates/mqtt-codec/src/packet/control.rs` | PINGREQ, PINGRESP, DISCONNECT, AUTH |
+| `services/broker/crates/mqtt-codec/tests/golden.rs` | Literal wire vectors per packet type |
 | `services/broker/crates/mqtt-codec/tests/roundtrip.rs` | Property-based round trips |
 | `services/broker/crates/mqtt-codec/tests/malformed.rs` | Corpus asserting exact errors |
 | `services/broker/crates/mqtt-codec/fuzz/fuzz_targets/decode.rs` | Fuzz target |
