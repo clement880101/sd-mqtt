@@ -9,6 +9,7 @@
 pub mod error;
 pub mod header;
 pub mod reader;
+pub mod topic;
 pub mod varint;
 pub mod writer;
 
