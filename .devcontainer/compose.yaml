@@ -1,0 +1,32 @@
+services:
+  root:
+    build:
+      context: ..
+      dockerfile: .devcontainer/base.Dockerfile
+    volumes:
+      - ..:/workspaces/repo:cached
+      - cargo-registry:/usr/local/cargo/registry
+    working_dir: /workspaces/repo
+    command: sleep infinity
+
+  broker:
+    build:
+      context: ..
+      dockerfile: .devcontainer/base.Dockerfile
+    volumes:
+      - ..:/workspaces/repo:cached
+      - cargo-registry:/usr/local/cargo/registry
+    working_dir: /workspaces/repo/services/broker
+    command: sleep infinity
+
+  web:
+    build:
+      context: ..
+      dockerfile: .devcontainer/base.Dockerfile
+    volumes:
+      - ..:/workspaces/repo:cached
+    working_dir: /workspaces/repo/services/web
+    command: sleep infinity
+
+volumes:
+  cargo-registry:
