@@ -1275,11 +1275,12 @@ mod control {
     // literal bytes can.
     //
     // PINGREQ and PINGRESP have no body at all, so there is nothing for an
-    // encoder vector to pin. Their whole wire form is the fixed header, so
-    // they are pinned below through `PacketKind::nibble` and `header::peek`
-    // instead. The fixed-header *encoder* arrives with the packet enum in
-    // the next task; when it does, `0xC0 0x00` and `0xD0 0x00` should also
-    // be asserted in the encode direction.
+    // encoder vector to pin here. Their whole wire form is the fixed
+    // header, so they are pinned below through `PacketKind::nibble` and
+    // `header::peek`, and in the encode direction by
+    // `frame::encodes_pingreq_and_pingresp_as_exactly_two_bytes`, which
+    // asserts `0xC0 0x00` and `0xD0 0x00` against the fixed-header encoder
+    // that arrived with the packet enum.
 
     use bytes::Bytes;
     use mqtt_codec::header::{self, PacketKind};
@@ -1584,18 +1585,18 @@ mod control {
 
     /// The fixed-header first byte of each packet this module covers.
     ///
-    /// MQTT-v5.0 figure 3.35 for PINGREQ draws byte 1 as 1100 0000, with
+    /// MQTT-v5.0 figure 3.33 for PINGREQ draws byte 1 as 1100 0000, with
     /// the control packet type (12) in bits 7-4 and bits 3-0 reserved and
-    /// zero, and byte 2 as a remaining length of 0. The PINGRESP figure
-    /// draws 1101 0000 the same way, type 13. Section 3.14.1 draws
+    /// zero, and byte 2 as a remaining length of 0. Figure 3.34 draws
+    /// PINGRESP as 1101 0000 the same way, type 13. Section 3.14.1 draws
     /// DISCONNECT as 1110 0000, type 14, and section 3.15.1 draws AUTH as
     /// 1111 0000, type 15, both with bits 3-0 reserved and zero
     /// [MQTT-3.14.1-1], [MQTT-3.15.1-1]. MQTT-v3.1.1 figure 3.35 draws its
     /// DISCONNECT identically, with a remaining length fixed at 0.
     ///
-    /// Only the decode direction can be pinned today: the fixed-header
-    /// encoder belongs to the packet enum in the next task. When it lands,
-    /// `0xC0 0x00` and `0xD0 0x00` should be asserted against it too.
+    /// Only the decode direction is pinned here. The encode direction now
+    /// lives in the `frame` module, which asserts `0xC0 0x00` and
+    /// `0xD0 0x00` against the fixed-header encoder directly.
     #[test]
     fn pins_the_fixed_header_first_byte_of_each_control_packet() {
         assert_eq!(PacketKind::PingReq.nibble() << 4, 0xC0);
@@ -1616,6 +1617,293 @@ mod control {
             assert_eq!(parsed.flags, 0);
             assert_eq!(parsed.body_len, 0);
             assert_eq!(parsed.total_len(), 2);
+        }
+    }
+}
+
+mod frame {
+    // What this module pins that the per-packet modules cannot: those
+    // vectors all assert a *body*, because until the packet enum landed
+    // there was no encoder for the fixed header. The two bytes in front of
+    // every body -- the type nibble, the reserved flags nibble, and the
+    // variable byte integer holding the remaining length -- were therefore
+    // pinned in the decode direction only, through `header::peek`. A type
+    // nibble read from and written to the same wrong value would have
+    // round tripped perfectly and been wrong against every other MQTT
+    // implementation, which is the hazard golden vectors exist to catch.
+    //
+    // The first byte of all fifteen packet types is pinned below, along
+    // with the remaining-length encoding either side of the one-byte
+    // boundary, all derived from the specification's own tables.
+
+    use bytes::{Bytes, BytesMut};
+    use mqtt_codec::packet::{
+        Ack, Auth, ConnAck, Connect, Disconnect, Publish, RetainHandling, SubAck, Subscribe,
+        SubscriptionOptions, UnsubAck, Unsubscribe,
+    };
+    use mqtt_codec::{decode, encode, Limits, Packet, QoS, ReasonCode, Version};
+
+    /// One legal packet of every type, each the smallest form that decodes
+    /// back to exactly what was encoded, paired with the whole first byte
+    /// the specification requires for it.
+    ///
+    /// MQTT-v5.0 Table 2-1 fixes the type value in bits 7-4: CONNECT 1,
+    /// CONNACK 2, PUBLISH 3, PUBACK 4, PUBREC 5, PUBREL 6, PUBCOMP 7,
+    /// SUBSCRIBE 8, SUBACK 9, UNSUBSCRIBE 10, UNSUBACK 11, PINGREQ 12,
+    /// PINGRESP 13, DISCONNECT 14, AUTH 15. Table 2-2 fixes bits 3-0: they
+    /// are reserved and zero for every type except PUBLISH, which carries
+    /// DUP, QoS and RETAIN there, and PUBREL, SUBSCRIBE and UNSUBSCRIBE,
+    /// whose reserved nibble is 0,0,1,0 rather than all zero.
+    ///
+    /// The PUBLISH here is QoS 1 with neither DUP nor RETAIN, so its low
+    /// nibble is 0b0010 by section 3.3.1.2 and its first byte is 0x32. The
+    /// flag bits themselves are pinned in the `publish` module; what is
+    /// pinned here is that the enum puts the packet's own flags into the
+    /// nibble rather than zero.
+    fn one_of_each() -> Vec<(Packet, u8)> {
+        vec![
+            (
+                Packet::Connect(Connect {
+                    version: Version::V5,
+                    client_id: "c".into(),
+                    clean_start: true,
+                    keep_alive: 10,
+                    username: None,
+                    password: None,
+                    will: None,
+                    properties: Default::default(),
+                }),
+                0x10,
+            ),
+            (
+                Packet::ConnAck(ConnAck {
+                    session_present: false,
+                    reason: ReasonCode::Success,
+                    properties: Default::default(),
+                }),
+                0x20,
+            ),
+            (
+                Packet::Publish(Publish {
+                    dup: false,
+                    qos: QoS::AtLeastOnce,
+                    retain: false,
+                    topic: "a/b".into(),
+                    packet_id: Some(1),
+                    payload: Bytes::from_static(b"hello"),
+                    properties: Default::default(),
+                }),
+                0x32,
+            ),
+            (Packet::PubAck(ack()), 0x40),
+            (Packet::PubRec(ack()), 0x50),
+            (Packet::PubRel(ack()), 0x62),
+            (Packet::PubComp(ack()), 0x70),
+            (
+                Packet::Subscribe(Subscribe {
+                    packet_id: 1,
+                    filters: vec![SubscriptionOptions {
+                        filter: "a/b".into(),
+                        qos: QoS::AtMostOnce,
+                        no_local: false,
+                        retain_as_published: false,
+                        retain_handling: RetainHandling::SendAlways,
+                    }],
+                    properties: Default::default(),
+                }),
+                0x82,
+            ),
+            (
+                Packet::SubAck(SubAck {
+                    packet_id: 1,
+                    reasons: vec![ReasonCode::Success],
+                    properties: Default::default(),
+                }),
+                0x90,
+            ),
+            (
+                Packet::Unsubscribe(Unsubscribe {
+                    packet_id: 1,
+                    filters: vec!["a/b".into()],
+                    properties: Default::default(),
+                }),
+                0xA2,
+            ),
+            (
+                Packet::UnsubAck(UnsubAck {
+                    packet_id: 1,
+                    reasons: vec![ReasonCode::Success],
+                    properties: Default::default(),
+                }),
+                0xB0,
+            ),
+            (Packet::PingReq, 0xC0),
+            (Packet::PingResp, 0xD0),
+            (
+                Packet::Disconnect(Disconnect {
+                    reason: ReasonCode::Success,
+                    properties: Default::default(),
+                }),
+                0xE0,
+            ),
+            (
+                Packet::Auth(Auth {
+                    reason: ReasonCode::Success,
+                    properties: Default::default(),
+                }),
+                0xF0,
+            ),
+        ]
+    }
+
+    /// A plain successful acknowledgement, legal on all four ack types.
+    fn ack() -> Ack {
+        Ack {
+            packet_id: 1,
+            reason: ReasonCode::Success,
+            properties: Default::default(),
+        }
+    }
+
+    /// The first byte of the fixed header, for every packet type.
+    ///
+    /// Derived from MQTT-v5.0 Table 2-1 and Table 2-2, quoted in the doc
+    /// comment on `one_of_each`. MQTT-v3.1.1 Table 2.1, "Control packet
+    /// types", and Table 2.2, "Flag Bits", give the same values for the
+    /// fourteen types that version has.
+    #[test]
+    fn pins_the_fixed_header_first_byte_of_every_packet_type() {
+        for (packet, first) in one_of_each() {
+            let mut buf = BytesMut::new();
+            encode(&packet, Version::V5, &mut buf).unwrap();
+            assert_eq!(
+                buf[0],
+                first,
+                "wrong first byte for {:?}: got {:#04X}, want {first:#04X}",
+                packet.kind(),
+                buf[0]
+            );
+        }
+    }
+
+    /// PUBLISH puts its own flags in the low nibble rather than zero.
+    ///
+    /// MQTT-v5.0 section 3.3.1: bit 3 is DUP, bits 2-1 are QoS and bit 0 is
+    /// RETAIN. A QoS 0 publish with neither DUP nor RETAIN therefore has an
+    /// all-zero low nibble and a first byte of 0x30, while the QoS 1
+    /// publish in `one_of_each` has 0x32. Both are asserted so that an
+    /// encoder which hard-coded either value is caught.
+    #[test]
+    fn pins_the_publish_flags_nibble_in_the_first_byte() {
+        let mut buf = BytesMut::new();
+        encode(
+            &Packet::Publish(Publish {
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: false,
+                topic: "a/b".into(),
+                packet_id: None,
+                payload: Bytes::from_static(b"hi"),
+                properties: Default::default(),
+            }),
+            Version::V311,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(buf[0], 0x30);
+    }
+
+    /// PINGREQ is exactly `C0 00` and PINGRESP exactly `D0 00`.
+    ///
+    /// MQTT-v3.1.1 figure 3.33 draws the PINGREQ fixed header as 1100 0000
+    /// followed by a remaining length of 0, and figure 3.34 draws PINGRESP
+    /// as 1101 0000 followed by a remaining length of 0. MQTT-v5.0 figures
+    /// 3.33 and 3.34, in sections 3.12.1 and 3.13.1, are identical. Neither
+    /// packet has a variable header or a payload, so those two bytes are
+    /// the whole packet, and an encoder that appended anything at all would
+    /// be wrong. The `control` module pinned these in the decode direction
+    /// and left the encode direction for the fixed-header encoder; this is
+    /// it.
+    #[test]
+    fn encodes_pingreq_and_pingresp_as_exactly_two_bytes() {
+        let mut buf = BytesMut::new();
+        encode(&Packet::PingReq, Version::V311, &mut buf).unwrap();
+        assert_eq!(&buf[..], &[0xC0, 0x00]);
+
+        let mut buf = BytesMut::new();
+        encode(&Packet::PingResp, Version::V311, &mut buf).unwrap();
+        assert_eq!(&buf[..], &[0xD0, 0x00]);
+    }
+
+    /// The remaining length either side of the one-byte boundary.
+    ///
+    /// MQTT-v5.0 section 2.1.4 makes the Remaining Length a Variable Byte
+    /// Integer, and Table 1-1, "Size of Variable Byte Integer", in section
+    /// 1.5.5 gives the ranges each digit count covers: one byte encodes 0
+    /// (0x00) through 127 (0x7F), and two bytes encode 128 (0x80, 0x01)
+    /// through 16,383 (0xFF, 0x7F). So a 127-byte body is preceded by the
+    /// single byte 0x7F and a 128-byte body by the pair 0x80 0x01 --
+    /// continuation bit set on the first, clear on the second, least
+    /// significant group first. MQTT-v3.1.1 section 2.2.3, Table 2.4,
+    /// "Size of Remaining Length field", is the same table.
+    ///
+    /// A QoS 0 PUBLISH to "a/b" as MQTT 3.1.1 has a body of two length
+    /// bytes, three topic bytes and the payload, so payloads of 122 and 123
+    /// bytes land exactly on either side of the boundary.
+    #[test]
+    fn pins_the_remaining_length_across_the_one_byte_boundary() {
+        for (payload_len, length_bytes) in [(122usize, vec![0x7Fu8]), (123, vec![0x80, 0x01])] {
+            let payload = vec![0xAB; payload_len];
+            let mut buf = BytesMut::new();
+            encode(
+                &Packet::Publish(Publish {
+                    dup: false,
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                    topic: "a/b".into(),
+                    packet_id: None,
+                    payload: Bytes::from(payload.clone()),
+                    properties: Default::default(),
+                }),
+                Version::V311,
+                &mut buf,
+            )
+            .unwrap();
+
+            let mut expected = vec![0x30];
+            expected.extend_from_slice(&length_bytes);
+            expected.extend_from_slice(&[0x00, 0x03, b'a', b'/', b'b']);
+            expected.extend_from_slice(&payload);
+            assert_eq!(&buf[..], &expected[..]);
+            assert_eq!(buf.len(), 1 + length_bytes.len() + 5 + payload_len);
+        }
+    }
+
+    /// Every packet type survives the two public entry points unchanged.
+    ///
+    /// This is the round trip the per-packet modules could not run, because
+    /// they call `encode_body` and `decode_body` directly and so never see
+    /// a fixed header. Here the whole frame goes out and comes back, and
+    /// the buffer must be empty afterwards: a length that was written one
+    /// byte short or one byte long leaves the buffer non-empty or fails to
+    /// decode, and neither the body vectors nor the header vectors above
+    /// would notice on their own.
+    #[test]
+    fn round_trips_every_packet_type_through_the_entry_points() {
+        for (packet, _) in one_of_each() {
+            let mut buf = BytesMut::new();
+            encode(&packet, Version::V5, &mut buf).unwrap();
+
+            let decoded = decode(&mut buf, Version::V5, &Limits::default())
+                .unwrap()
+                .unwrap_or_else(|| panic!("a whole frame for {:?}", packet.kind()));
+            assert_eq!(decoded, packet);
+            assert!(
+                buf.is_empty(),
+                "{:?} left {} bytes behind",
+                packet.kind(),
+                buf.len()
+            );
         }
     }
 }
