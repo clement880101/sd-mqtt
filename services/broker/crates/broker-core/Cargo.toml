@@ -17,5 +17,14 @@ parking_lot = "0.12"
 [dev-dependencies]
 proptest.workspace = true
 
+[dev-dependencies.criterion]
+version = "0.8"
+default-features = false
+features = ["cargo_bench_support"]
+
+[[bench]]
+name = "matching"
+harness = false
+
 [lints]
 workspace = true
