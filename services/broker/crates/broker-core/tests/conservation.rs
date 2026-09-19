@@ -8,34 +8,47 @@
 
 use broker_core::session::message::Message;
 use broker_core::session::queue::{Delivery, Overflow, QueueLimits};
-use broker_core::session::{Action, MessageId, Outbound};
+use broker_core::session::{Action, Inbound, MessageId, Outbound};
 use bytes::Bytes;
+use mqtt_codec::packet::Publish;
 use mqtt_codec::{Packet, QoS, ReasonCode};
 use proptest::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 enum Op {
-    Offer(QoS),
-    Ack,
-    Receipt(bool),
-    Complete,
+    /// Offer a message, optionally with a deadline this many seconds out.
+    Offer(QoS, Option<u32>),
+    /// Acknowledge an outstanding entry, chosen by position rather than
+    /// always the oldest, so removal from the middle of the window is
+    /// reached.
+    Ack(usize),
+    Receipt(usize, bool),
+    Complete(usize),
     Disconnect,
     Resume,
+    /// Move the clock on, so deadlines can pass.
+    Tick(u32),
 }
 
 fn any_op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        6 => prop_oneof![
-            Just(QoS::AtMostOnce),
-            Just(QoS::AtLeastOnce),
-            Just(QoS::ExactlyOnce),
-        ].prop_map(Op::Offer),
-        4 => Just(Op::Ack),
-        3 => prop::bool::ANY.prop_map(Op::Receipt),
-        3 => Just(Op::Complete),
+        6 => (
+            prop_oneof![
+                Just(QoS::AtMostOnce),
+                Just(QoS::AtLeastOnce),
+                Just(QoS::ExactlyOnce),
+            ],
+            // Mostly no deadline, and when there is one it is short
+            // enough that the generated clock reaches it.
+            prop_oneof![3 => Just(None), 2 => (0u32..4).prop_map(Some)],
+        ).prop_map(|(qos, ttl)| Op::Offer(qos, ttl)),
+        4 => (0usize..6).prop_map(Op::Ack),
+        3 => (0usize..6, prop::bool::ANY).prop_map(|(i, ok)| Op::Receipt(i, ok)),
+        3 => (0usize..6).prop_map(Op::Complete),
         1 => Just(Op::Disconnect),
         2 => Just(Op::Resume),
+        2 => (1u32..3).prop_map(Op::Tick),
     ]
 }
 
@@ -61,6 +74,8 @@ struct Run {
     live: HashSet<u16>,
     /// Set if an identifier was reused while outstanding.
     reused: bool,
+    /// The coarse clock the state machine is driven with.
+    now: u32,
     /// The identifier each message was last sent under.
     last_id: HashMap<u32, u16>,
     /// Set if a redelivery went out under a different identifier from
@@ -84,6 +99,7 @@ impl Run {
             outstanding: Vec::new(),
             live: HashSet::new(),
             reused: false,
+            now: 0,
             last_id: HashMap::new(),
             renumbered: false,
             next_tag: 0,
@@ -91,14 +107,16 @@ impl Run {
     }
 
     /// A unique tag per offer, so a payload identifies exactly one message.
-    fn offer(&mut self, qos: QoS) {
+    fn offer(&mut self, qos: QoS, ttl: Option<u32>) {
         let tag = self.next_tag;
         self.next_tag += 1;
 
-        let message = Message::new("t", Bytes::from(tag.to_be_bytes().to_vec()), qos, false);
+        let mut message = Message::new("t", Bytes::from(tag.to_be_bytes().to_vec()), qos, false);
+        message.expires_at = ttl.map(|ttl| self.now.saturating_add(ttl));
         self.offered.insert(tag, message.id);
 
         self.actions.clear();
+        let now = self.now;
         self.out.offer(
             Delivery {
                 message,
@@ -108,29 +126,41 @@ impl Run {
                 subscription_ids: Vec::new(),
                 packet_id: None,
             },
-            0,
+            now,
             &mut self.actions,
         );
         self.absorb();
     }
 
+    /// The identifier at `index`, wrapped into what is outstanding.
+    fn pick(&self, index: usize) -> Option<u16> {
+        if self.outstanding.is_empty() {
+            return None;
+        }
+        Some(self.outstanding[index % self.outstanding.len()])
+    }
+
     fn step(&mut self, op: &Op) {
         match op {
-            Op::Offer(qos) => {
-                self.offer(*qos);
+            Op::Offer(qos, ttl) => {
+                self.offer(*qos, *ttl);
                 return;
             }
-            Op::Ack => {
-                let Some(id) = self.outstanding.first().copied() else {
+            Op::Tick(delta) => {
+                self.now = self.now.saturating_add(*delta);
+                return;
+            }
+            Op::Ack(index) => {
+                let Some(id) = self.pick(*index) else {
                     return;
                 };
                 self.actions.clear();
-                if self.out.on_puback(id, 0, &mut self.actions).is_ok() {
+                if self.out.on_puback(id, self.now, &mut self.actions).is_ok() {
                     self.release(id);
                 }
             }
-            Op::Receipt(accepted) => {
-                let Some(id) = self.outstanding.first().copied() else {
+            Op::Receipt(index, accepted) => {
+                let Some(id) = self.pick(*index) else {
                     return;
                 };
                 let reason = if *accepted {
@@ -139,7 +169,13 @@ impl Run {
                     ReasonCode::NotAuthorized
                 };
                 self.actions.clear();
-                if self.out.on_pubrec(id, reason, 0, &mut self.actions).is_ok() && !*accepted {
+                let now = self.now;
+                if self
+                    .out
+                    .on_pubrec(id, reason, now, &mut self.actions)
+                    .is_ok()
+                    && !*accepted
+                {
                     // A refused message ends the exchange here; an
                     // accepted one stays outstanding until it completes.
                     // Refusal is not delivery: the state machine reports
@@ -150,12 +186,12 @@ impl Run {
                     self.abandon(id);
                 }
             }
-            Op::Complete => {
-                let Some(id) = self.outstanding.first().copied() else {
+            Op::Complete(index) => {
+                let Some(id) = self.pick(*index) else {
                     return;
                 };
                 self.actions.clear();
-                if self.out.on_pubcomp(id, 0, &mut self.actions).is_ok() {
+                if self.out.on_pubcomp(id, self.now, &mut self.actions).is_ok() {
                     self.release(id);
                 }
             }
@@ -171,7 +207,8 @@ impl Run {
                 // Reallocating across a resume is a fault, not a
                 // correction, so the watch carries straight through.
                 self.actions.clear();
-                self.out.on_resume(0, &mut self.actions);
+                let now = self.now;
+                self.out.on_resume(now, &mut self.actions);
             }
         }
         self.absorb();
@@ -358,7 +395,7 @@ proptest! {
     ) {
         let mut run = Run::new(QueueLimits::default(), window);
         for _ in 0..count {
-            run.offer(QoS::AtLeastOnce);
+            run.offer(QoS::AtLeastOnce, None);
         }
 
         // Acknowledge the oldest repeatedly until nothing is outstanding.
@@ -366,10 +403,298 @@ proptest! {
             if run.outstanding.is_empty() {
                 break;
             }
-            run.step(&Op::Ack);
+            run.step(&Op::Ack(0));
         }
 
         prop_assert_eq!(run.out.inflight_len(), 0);
         prop_assert_eq!(run.out.queued_len(), 0);
+    }
+}
+
+// ---------------------------------------------------------------------
+// The receive path, closed into a loop.
+//
+// The properties above drive one direction. The claim this subsystem
+// actually exists to make spans both: a client publishes exactly once,
+// and a subscriber's application sees it exactly once, however the two
+// connections are interrupted. That needs the receive state machine at
+// each end and the delivery state machine between them.
+// ---------------------------------------------------------------------
+
+/// One publishing client, the broker, and one subscribing client.
+struct Loop {
+    /// The broker receiving from the publishing client.
+    from_publisher: Inbound,
+    /// The broker sending to the subscribing client.
+    to_subscriber: Outbound,
+    /// The subscribing client receiving from the broker. Its state is
+    /// session state: it survives the connection dropping, which is what
+    /// lets it recognise a redelivery.
+    at_subscriber: Inbound,
+
+    actions: Vec<Action>,
+    /// How many times each payload reached the subscriber's application.
+    delivered: HashMap<u32, usize>,
+    /// Identifiers the publishing client may still use.
+    free_ids: Vec<u16>,
+    /// What the publishing client has open, oldest first.
+    publisher_open: Vec<u16>,
+    /// The publish it sent last, so it can repeat it after a reconnect.
+    last_publish: Option<Publish>,
+    /// Receipts the subscriber has not handed to the broker yet.
+    owed_receipts: Vec<u16>,
+    /// Completions the subscriber has not handed to the broker yet.
+    owed_completions: Vec<u16>,
+    next_tag: u32,
+}
+
+#[derive(Debug, Clone)]
+enum Hop {
+    /// The publishing client sends a new message.
+    Publish,
+    /// It repeats its last one, as it would after its own reconnect.
+    RepeatPublish,
+    /// It releases its oldest open exchange.
+    Release,
+    /// The subscriber hands the broker one of its outstanding receipts.
+    Receipt(usize),
+    /// The subscriber hands the broker one of its outstanding completions.
+    Complete(usize),
+    /// The broker's link to the subscriber drops and comes back.
+    Reconnect,
+}
+
+fn any_hop() -> impl Strategy<Value = Hop> {
+    prop_oneof![
+        5 => Just(Hop::Publish),
+        2 => Just(Hop::RepeatPublish),
+        3 => Just(Hop::Release),
+        4 => (0usize..6).prop_map(Hop::Receipt),
+        4 => (0usize..6).prop_map(Hop::Complete),
+        2 => Just(Hop::Reconnect),
+    ]
+}
+
+impl Loop {
+    fn new(window: usize) -> Self {
+        let mut to_subscriber = Outbound::new(QueueLimits::default(), window);
+        to_subscriber.set_online(true);
+        Self {
+            // Small enough that the publishing client runs into it.
+            from_publisher: Inbound::new(2),
+            to_subscriber,
+            at_subscriber: Inbound::new(0),
+            actions: Vec::new(),
+            delivered: HashMap::new(),
+            free_ids: vec![1, 2, 3, 4],
+            publisher_open: Vec::new(),
+            last_publish: None,
+            owed_receipts: Vec::new(),
+            owed_completions: Vec::new(),
+            next_tag: 0,
+        }
+    }
+
+    fn step(&mut self, hop: &Hop) {
+        match hop {
+            Hop::Publish => {
+                let Some(packet_id) = self.free_ids.pop() else {
+                    return;
+                };
+                let tag = self.next_tag;
+                self.next_tag += 1;
+                let publish = Publish {
+                    dup: false,
+                    qos: QoS::ExactlyOnce,
+                    retain: false,
+                    topic: "t".into(),
+                    packet_id: Some(packet_id),
+                    payload: Bytes::from(tag.to_be_bytes().to_vec()),
+                    properties: Default::default(),
+                };
+                if self.receive(&publish).is_none() {
+                    // Refused for exceeding the receive maximum; the
+                    // exchange never opened, so the identifier is free.
+                    self.free_ids.push(packet_id);
+                    return;
+                }
+                self.publisher_open.push(packet_id);
+                self.last_publish = Some(publish);
+            }
+            Hop::RepeatPublish => {
+                // The publisher's own resume. The broker must recognise
+                // it and not offer the message to the subscriber twice.
+                //
+                // Only an exchange still open may be repeated.
+                // [MQTT-4.4.0-1] permits resending an unacknowledged
+                // publish and nothing else, and once the broker has sent
+                // the completion [MQTT-4.3.3-12] *requires* it to treat
+                // the same identifier as a new application message. A
+                // client that repeats a completed exchange has published
+                // twice, so a second delivery there is correct and this
+                // property would be asserting something the protocol
+                // does not promise.
+                let Some(mut publish) = self.last_publish.clone() else {
+                    return;
+                };
+                let packet_id = publish.packet_id.expect("an exactly-once publish has one");
+                if !self.publisher_open.contains(&packet_id) {
+                    return;
+                }
+                publish.dup = true;
+                self.receive(&publish);
+            }
+            Hop::Release => {
+                if self.publisher_open.is_empty() {
+                    return;
+                }
+                let packet_id = self.publisher_open.remove(0);
+                let mut sink = Vec::new();
+                self.from_publisher.on_pubrel(packet_id, &mut sink);
+                self.free_ids.push(packet_id);
+            }
+            Hop::Receipt(index) => {
+                if self.owed_receipts.is_empty() {
+                    return;
+                }
+                let packet_id = self.owed_receipts[index % self.owed_receipts.len()];
+                self.actions.clear();
+                if self
+                    .to_subscriber
+                    .on_pubrec(packet_id, ReasonCode::Success, 0, &mut self.actions)
+                    .is_ok()
+                {
+                    self.owed_receipts.retain(|x| *x != packet_id);
+                }
+                self.absorb();
+            }
+            Hop::Complete(index) => {
+                if self.owed_completions.is_empty() {
+                    return;
+                }
+                let packet_id = self.owed_completions[index % self.owed_completions.len()];
+                self.actions.clear();
+                if self
+                    .to_subscriber
+                    .on_pubcomp(packet_id, 0, &mut self.actions)
+                    .is_ok()
+                {
+                    self.owed_completions.retain(|x| *x != packet_id);
+                }
+                self.absorb();
+            }
+            Hop::Reconnect => {
+                self.to_subscriber.on_disconnect();
+                self.actions.clear();
+                self.to_subscriber.on_resume(0, &mut self.actions);
+                self.absorb();
+            }
+        }
+    }
+
+    /// The broker takes a publish from the client and, if it is not a
+    /// repeat it already holds, offers it to the subscriber.
+    ///
+    /// Returns nothing when the client exceeded the receive maximum.
+    fn receive(&mut self, publish: &Publish) -> Option<()> {
+        let received = self.from_publisher.on_publish(publish).ok()?;
+        let mut sink = Vec::new();
+        if let Some(owed) = received.owed {
+            self.from_publisher.acknowledge(
+                owed.packet_id,
+                owed.qos,
+                ReasonCode::Success,
+                &mut sink,
+            );
+        }
+        if received.dispatch {
+            let message = Message::new("t", publish.payload.clone(), QoS::ExactlyOnce, false);
+            self.actions.clear();
+            self.to_subscriber.offer(
+                Delivery {
+                    message,
+                    qos: QoS::ExactlyOnce,
+                    retain: false,
+                    dup: false,
+                    subscription_ids: Vec::new(),
+                    packet_id: None,
+                },
+                0,
+                &mut self.actions,
+            );
+            self.absorb();
+        }
+        Some(())
+    }
+
+    /// Everything the broker asked to be sent to the subscriber, put
+    /// through the subscriber's own receive state machine.
+    fn absorb(&mut self) {
+        for action in std::mem::take(&mut self.actions) {
+            match action {
+                Action::Send(Packet::Publish(publish)) => {
+                    let tag = u32::from_be_bytes(
+                        publish.payload[..4].try_into().expect("a four byte tag"),
+                    );
+                    let received = self
+                        .at_subscriber
+                        .on_publish(&publish)
+                        .expect("the subscriber's receive maximum is unbounded");
+                    if received.dispatch {
+                        *self.delivered.entry(tag).or_default() += 1;
+                    }
+                    if let Some(owed) = received.owed {
+                        let mut sink = Vec::new();
+                        self.at_subscriber.acknowledge(
+                            owed.packet_id,
+                            owed.qos,
+                            ReasonCode::Success,
+                            &mut sink,
+                        );
+                        if !self.owed_receipts.contains(&owed.packet_id) {
+                            self.owed_receipts.push(owed.packet_id);
+                        }
+                    }
+                }
+                Action::Send(Packet::PubRel(ack)) => {
+                    let mut sink = Vec::new();
+                    self.at_subscriber.on_pubrel(ack.packet_id, &mut sink);
+                    if !self.owed_completions.contains(&ack.packet_id) {
+                        self.owed_completions.push(ack.packet_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+proptest! {
+    /// End to end: a payload published exactly once reaches the
+    /// subscriber's application at most once, however the connection
+    /// between the broker and the subscriber is interrupted.
+    ///
+    /// This is the claim the whole subsystem exists to make, and it is
+    /// the only property that involves both directions. A redelivery
+    /// under a new identifier, a resume that republishes something the
+    /// subscriber already holds, or a receive path that forgets what it
+    /// is holding all show up here as a second delivery.
+    #[test]
+    fn a_message_never_reaches_the_subscriber_twice(
+        hops in prop::collection::vec(any_hop(), 1..80),
+        window in 1usize..4,
+    ) {
+        let mut run = Loop::new(window);
+        for hop in &hops {
+            run.step(hop);
+        }
+        for (tag, count) in &run.delivered {
+            prop_assert!(
+                *count <= 1,
+                "payload {} reached the subscriber's application {} times",
+                tag,
+                count
+            );
+        }
     }
 }
