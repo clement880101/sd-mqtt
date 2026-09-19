@@ -7,7 +7,7 @@
 
 use bytes::BytesMut;
 use mqtt_codec::packet::Connect;
-use mqtt_codec::{decode, encode, CodecError, Limits, Packet, Properties, Version};
+use mqtt_codec::{decode, encode, CodecError, Limits, Packet, Properties, ReasonCode, Version};
 
 /// Each case is a name, the bytes, and the error the decoder must return.
 fn cases() -> Vec<(&'static str, Vec<u8>, CodecError)> {
@@ -134,8 +134,32 @@ fn a_topic_deeper_than_the_limit_is_rejected() {
         BytesMut::from(&[0x30u8, 0x08, 0x00, 0x05, b'a', b'/', b'b', b'/', b'c', 0x00][..]);
     assert_eq!(
         decode(&mut buf, Version::V5, &limits),
-        Err(CodecError::TopicTooDeep)
+        Err(CodecError::TopicNameTooDeep)
     );
+}
+
+/// A filter deeper than the limit reports the filter error, not the name
+/// error, so the obvious `ReasonCode::from` idiom yields a code a SUBACK
+/// may legally carry.
+///
+/// 0x90, topic name invalid, is absent from MQTT-v5.0 Table 3-8, so the
+/// old mapping turned a configuration limit into an off-spec SUBACK.
+#[test]
+fn a_filter_deeper_than_the_limit_reports_the_filter_error() {
+    let limits = Limits {
+        max_topic_depth: 2,
+        ..Limits::default()
+    };
+    // SUBSCRIBE, identifier 1, empty property block, filter "a/b/c",
+    // options 0.
+    let mut buf = BytesMut::from(
+        &[
+            0x82u8, 0x0B, 0x00, 0x01, 0x00, 0x00, 0x05, b'a', b'/', b'b', b'/', b'c', 0x00,
+        ][..],
+    );
+    let err = decode(&mut buf, Version::V5, &limits).unwrap_err();
+    assert_eq!(err, CodecError::TopicFilterTooDeep);
+    assert_eq!(ReasonCode::from(err), ReasonCode::TopicFilterInvalid);
 }
 
 /// The motivating example, checked from both ends.

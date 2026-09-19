@@ -326,8 +326,12 @@ impl From<CodecError> for ReasonCode {
             CodecError::ProtocolError(_) => ReasonCode::ProtocolError,
             CodecError::PacketTooLarge => ReasonCode::PacketTooLarge,
             CodecError::UnsupportedVersion(_) => ReasonCode::UnsupportedProtocolVersion,
-            CodecError::InvalidTopicName | CodecError::TopicTooDeep => ReasonCode::TopicNameInvalid,
-            CodecError::InvalidTopicFilter => ReasonCode::TopicFilterInvalid,
+            CodecError::InvalidTopicName | CodecError::TopicNameTooDeep => {
+                ReasonCode::TopicNameInvalid
+            }
+            CodecError::InvalidTopicFilter | CodecError::TopicFilterTooDeep => {
+                ReasonCode::TopicFilterInvalid
+            }
         }
     }
 }
@@ -559,8 +563,18 @@ mod tests {
             ReasonCode::TopicFilterInvalid
         );
         assert_eq!(
-            ReasonCode::from(CodecError::TopicTooDeep),
+            ReasonCode::from(CodecError::TopicNameTooDeep),
             ReasonCode::TopicNameInvalid
         );
+        // 0x90 is not a legal SUBACK code, so an over-deep filter must not
+        // convert to it; MQTT-v5.0 Table 3-8.
+        assert_eq!(
+            ReasonCode::from(CodecError::TopicFilterTooDeep),
+            ReasonCode::TopicFilterInvalid
+        );
+        assert!(permitted(
+            PacketKind::SubAck,
+            ReasonCode::from(CodecError::TopicFilterTooDeep)
+        ));
     }
 }

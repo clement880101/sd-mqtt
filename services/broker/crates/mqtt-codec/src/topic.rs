@@ -24,7 +24,7 @@ pub fn validate_name(name: &str, limits: &Limits) -> Result<(), CodecError> {
         return Err(CodecError::InvalidTopicName);
     }
     if level_count(name) > usize::from(limits.max_topic_depth) {
-        return Err(CodecError::TopicTooDeep);
+        return Err(CodecError::TopicNameTooDeep);
     }
     Ok(())
 }
@@ -43,7 +43,7 @@ pub fn validate_filter(filter: &str, limits: &Limits) -> Result<(), CodecError> 
 
     let levels: Vec<&str> = filter.split('/').collect();
     if levels.len() > usize::from(limits.max_topic_depth) {
-        return Err(CodecError::TopicTooDeep);
+        return Err(CodecError::TopicFilterTooDeep);
     }
 
     let last = levels.len() - 1;
@@ -150,7 +150,7 @@ mod tests {
         assert!(validate_name("a/b/c", &depth(3)).is_ok());
         assert_eq!(
             validate_name("a/b/c/d", &depth(3)).unwrap_err(),
-            CodecError::TopicTooDeep
+            CodecError::TopicNameTooDeep
         );
     }
 

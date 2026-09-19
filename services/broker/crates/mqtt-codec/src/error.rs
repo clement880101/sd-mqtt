@@ -6,7 +6,12 @@ use thiserror::Error;
 ///
 /// Every variant carries a static description so that logs can identify the
 /// exact check that failed without allocating.
+///
+/// Marked `#[non_exhaustive]`: MQTT 5 has checks this crate does not yet
+/// make, and adding a variant for one of them must not be a breaking change
+/// for a released crate. Downstream matches need a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum CodecError {
     /// The bytes do not form a valid packet.
     #[error("malformed packet: {0}")]
@@ -36,7 +41,16 @@ pub enum CodecError {
     #[error("invalid topic filter")]
     InvalidTopicFilter,
 
-    /// The topic had more levels than the configured maximum.
-    #[error("topic too deep")]
-    TopicTooDeep,
+    /// A publish topic name had more levels than the configured maximum.
+    ///
+    /// Separate from [`CodecError::TopicFilterTooDeep`] because the two
+    /// convert to different reason codes: 0x90 is not a legal SUBACK code,
+    /// so an over-deep filter reported as an over-deep name would produce
+    /// an off-spec SUBACK through the obvious `ReasonCode::from` idiom.
+    #[error("topic name too deep")]
+    TopicNameTooDeep,
+
+    /// A subscription filter had more levels than the configured maximum.
+    #[error("topic filter too deep")]
+    TopicFilterTooDeep,
 }
