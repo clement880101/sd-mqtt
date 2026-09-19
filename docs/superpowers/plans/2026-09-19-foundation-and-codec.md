@@ -16,6 +16,20 @@ to the compiler until `lib.rs` declares it, so writing the test before the
 declaration produces "no tests ran" rather than the compile failure the step
 expects.
 
+**Assert exact errors, not error variants.** A test that asserts only
+`matches!(err, CodecError::MalformedPacket(_))` passes for any other cause
+of the same variant, so it does not pin the check it is named after. Six
+tests in this plan had that weakness, and a truncation bug was hiding behind
+two of them. Where the error carries a static string, assert the string:
+`assert_eq!(expr.unwrap_err(), CodecError::MalformedPacket("..."))`.
+
+**Proving a test has teeth.** When a test guards something a reviewer cannot
+verify by reading, break the implementation deliberately, confirm that test
+and only that test fails, then restore. Back the file up with `cp` first
+rather than restoring with `git checkout --`, because the change you are
+trying to prove is usually itself uncommitted and `git checkout` will throw
+it away.
+
 **Hand-built MQTT 5 bodies need a property block.** Every MQTT 5 packet
 body that carries properties has a mandatory property-length byte, zero when
 there are none. A test that hand-builds a v5 body and omits it does not test
