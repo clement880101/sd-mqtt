@@ -195,7 +195,7 @@ proptest! {
 
         for filter in &filters {
             let mut matched = Vec::new();
-            store.matching(filter, &mut matched);
+            store.matching(filter, 0, &mut matched);
             let mut got: Vec<String> = matched.into_iter().map(|(topic, _)| topic).collect();
             got.sort();
             got.dedup();

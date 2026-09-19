@@ -49,13 +49,20 @@ impl RetainedNode {
 
     /// Collect this node's message and every descendant's, which is what a
     /// multi-level wildcard means.
-    fn collect_subtree(&self, prefix: &mut Vec<String>, out: &mut Vec<(String, RetainedMessage)>) {
+    fn collect_subtree(
+        &self,
+        now: u32,
+        prefix: &mut Vec<String>,
+        out: &mut Vec<(String, RetainedMessage)>,
+    ) {
         if let Some(message) = &self.message {
-            out.push((prefix.join("/"), message.clone()));
+            if !is_expired(message, now) {
+                out.push((prefix.join("/"), message.clone()));
+            }
         }
         for (level, child) in &self.children {
             prefix.push(level.to_string());
-            child.collect_subtree(prefix, out);
+            child.collect_subtree(now, prefix, out);
             prefix.pop();
         }
     }
@@ -63,13 +70,16 @@ impl RetainedNode {
     fn matching(
         &self,
         filter: &[&str],
+        now: u32,
         prefix: &mut Vec<String>,
         at_root: bool,
         out: &mut Vec<(String, RetainedMessage)>,
     ) {
         let Some((level, rest)) = filter.split_first() else {
             if let Some(message) = &self.message {
-                out.push((prefix.join("/"), message.clone()));
+                if !is_expired(message, now) {
+                    out.push((prefix.join("/"), message.clone()));
+                }
             }
             return;
         };
@@ -82,14 +92,16 @@ impl RetainedNode {
                         continue;
                     }
                     prefix.push(child_level.to_string());
-                    child.collect_subtree(prefix, out);
+                    child.collect_subtree(now, prefix, out);
                     prefix.pop();
                 }
                 // A multi-level wildcard also matches the parent level, but
                 // never the root, where it would name the empty topic.
                 if !at_root {
                     if let Some(message) = &self.message {
-                        out.push((prefix.join("/"), message.clone()));
+                        if !is_expired(message, now) {
+                            out.push((prefix.join("/"), message.clone()));
+                        }
                     }
                 }
             }
@@ -99,14 +111,14 @@ impl RetainedNode {
                         continue;
                     }
                     prefix.push(child_level.to_string());
-                    child.matching(rest, prefix, false, out);
+                    child.matching(rest, now, prefix, false, out);
                     prefix.pop();
                 }
             }
             literal => {
                 if let Some(child) = self.children.get(literal) {
                     prefix.push(literal.to_string());
-                    child.matching(rest, prefix, false, out);
+                    child.matching(rest, now, prefix, false, out);
                     prefix.pop();
                 }
             }
@@ -116,7 +128,7 @@ impl RetainedNode {
     fn sweep(&mut self, now: u32) -> usize {
         let mut removed = 0;
         if let Some(message) = &self.message {
-            if message.expires_at.is_some_and(|deadline| now > deadline) {
+            if is_expired(message, now) {
                 self.message = None;
                 removed += 1;
             }
@@ -164,10 +176,19 @@ impl RetainedStore {
 
     /// Append every retained message whose topic matches `filter` to `out`,
     /// each with its topic.
-    pub fn matching(&self, filter: &str, out: &mut Vec<(String, RetainedMessage)>) {
+    ///
+    /// `now` is the current coarse time in seconds. A message whose
+    /// deadline has passed is skipped whether or not a sweep has run, so a
+    /// reader never sees an expired message; [`Self::sweep_expired`]
+    /// reclaims the memory but is not what enforces the deadline. Both use
+    /// the same strictly-after comparison, so they never disagree about
+    /// whether one particular message is still live.
+    pub fn matching(&self, filter: &str, now: u32, out: &mut Vec<(String, RetainedMessage)>) {
         let levels: Vec<&str> = filter.split('/').collect();
         let mut prefix = Vec::new();
-        self.root.read().matching(&levels, &mut prefix, true, out);
+        self.root
+            .read()
+            .matching(&levels, now, &mut prefix, true, out);
     }
 
     /// Discard every message whose deadline has passed. Returns how many
@@ -197,6 +218,15 @@ impl Default for RetainedStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether `message`'s deadline has passed at `now`.
+///
+/// Strictly after: a message whose deadline is exactly `now` is still
+/// live. Both reading and sweeping go through here so that the two can
+/// never disagree about one message.
+fn is_expired(message: &RetainedMessage, now: u32) -> bool {
+    message.expires_at.is_some_and(|deadline| now > deadline)
 }
 
 fn remove_at(node: &mut RetainedNode, levels: &[&str]) -> bool {
@@ -231,8 +261,12 @@ mod tests {
     }
 
     fn topics(store: &RetainedStore, filter: &str) -> Vec<String> {
+        topics_at(store, filter, 0)
+    }
+
+    fn topics_at(store: &RetainedStore, filter: &str, now: u32) -> Vec<String> {
         let mut out = Vec::new();
-        store.matching(filter, &mut out);
+        store.matching(filter, now, &mut out);
         let mut names: Vec<String> = out.into_iter().map(|(topic, _)| topic).collect();
         names.sort();
         names
@@ -284,7 +318,7 @@ mod tests {
         assert_eq!(store.len(), 1);
 
         let mut out = Vec::new();
-        store.matching("a/b", &mut out);
+        store.matching("a/b", 0, &mut out);
         assert_eq!(&out[0].1.payload[..], b"second");
     }
 
@@ -360,5 +394,58 @@ mod tests {
             "the deadline itself is not past"
         );
         assert_eq!(store.len(), 1);
+    }
+
+    /// The deadline is enforced on read, not by the sweep. Delivery on
+    /// subscribe calls `matching` and may run long after the last sweep,
+    /// so an expired message must be invisible with no sweep at all.
+    #[test]
+    fn an_expired_message_is_absent_from_matching_without_a_sweep() {
+        let store = RetainedStore::new();
+        store.set(
+            "a/b",
+            RetainedMessage {
+                expires_at: Some(100),
+                ..message("v")
+            },
+        );
+        store.set("a/c", message("v"));
+
+        assert_eq!(
+            topics_at(&store, "a/+", 100),
+            vec!["a/b".to_string(), "a/c".into()]
+        );
+        assert_eq!(
+            topics_at(&store, "a/+", 101),
+            vec!["a/c".to_string()],
+            "past the deadline it must not be returned"
+        );
+        assert_eq!(store.len(), 2, "but nothing has been reclaimed yet");
+    }
+
+    /// Every path into the tree applies the deadline, not only the exact
+    /// one: the subtree walk a multi-level wildcard takes, and the parent
+    /// message a multi-level wildcard also matches.
+    #[test]
+    fn expiry_is_applied_on_every_traversal_path() {
+        let store = RetainedStore::new();
+        for topic in ["a", "a/b", "a/b/c"] {
+            store.set(
+                topic,
+                RetainedMessage {
+                    expires_at: Some(100),
+                    ..message("v")
+                },
+            );
+        }
+
+        assert_eq!(topics_at(&store, "a/#", 100).len(), 3);
+        assert!(
+            topics_at(&store, "a/#", 101).is_empty(),
+            "the subtree walk and the parent level both apply it"
+        );
+        assert!(topics_at(&store, "+", 101).is_empty());
+        assert!(topics_at(&store, "a/b", 101).is_empty());
+        assert!(topics_at(&store, "a/+", 101).is_empty());
     }
 }

@@ -1,6 +1,6 @@
 //! Subscription storage and matching.
 
-pub mod node;
+pub(crate) mod node;
 pub mod shared;
 pub mod trie;
 

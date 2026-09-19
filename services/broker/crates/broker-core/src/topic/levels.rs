@@ -66,28 +66,9 @@ impl Interner {
         self.inner.read().to_id.get(level).copied()
     }
 
-    /// The text an identifier stands for.
-    pub fn resolve(&self, id: LevelId) -> Option<String> {
-        self.inner
-            .read()
-            .to_text
-            .get(id.0 as usize)
-            .map(|text| text.to_string())
-    }
-
-    /// Split a topic or filter and intern every level.
-    pub fn intern_topic(&self, topic: &str) -> Vec<LevelId> {
-        topic.split('/').map(|level| self.intern(level)).collect()
-    }
-
     /// How many distinct levels have been interned.
     pub fn len(&self) -> usize {
         self.inner.read().to_text.len()
-    }
-
-    /// Whether nothing has been interned.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
@@ -124,33 +105,11 @@ mod tests {
     }
 
     #[test]
-    fn resolves_an_identifier_back_to_its_text() {
-        let interner = Interner::new();
-        let id = interner.intern("sport");
-        assert_eq!(interner.resolve(id).as_deref(), Some("sport"));
-    }
-
-    #[test]
-    fn an_unknown_identifier_resolves_to_nothing() {
-        let interner = Interner::new();
-        assert_eq!(interner.resolve(LevelId(9999)), None);
-    }
-
-    #[test]
     fn lookup_does_not_intern() {
         let interner = Interner::new();
         assert_eq!(interner.lookup("sport"), None);
         let id = interner.intern("sport");
         assert_eq!(interner.lookup("sport"), Some(id));
-    }
-
-    #[test]
-    fn splits_a_topic_into_interned_levels() {
-        let interner = Interner::new();
-        let levels = interner.intern_topic("a/b/a");
-        assert_eq!(levels.len(), 3);
-        assert_eq!(levels[0], levels[2], "the repeated level interns once");
-        assert_ne!(levels[0], levels[1]);
     }
 
     #[test]

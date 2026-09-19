@@ -1,4 +1,4 @@
 //! Topic representation and matching.
 
-pub mod levels;
+pub(crate) mod levels;
 pub mod reference;
