@@ -573,8 +573,16 @@ mod publish {
     /// An MQTT 3.1.1 PUBACK body: the packet identifier and nothing else.
     ///
     /// MQTT-v3.1.1 section 3.4.2: the variable header contains the packet
-    /// identifier from the PUBLISH being acknowledged, and 3.4.1 fixes the
-    /// first byte at 0x40 with no reason code or properties in this version.
+    /// identifier from the PUBLISH being acknowledged, with no reason code
+    /// or properties in this version.
+    ///
+    /// Section 3.4.1 fixes the first byte at 0x40, but nothing here asserts
+    /// it: `Ack` has no `flags()` and does not build a fixed header, unlike
+    /// `Publish`, whose flags nibble is part of the packet. The first byte
+    /// of each acknowledgement is pinned at the frame level in a later
+    /// task, when the frame encoder exists. The same applies to the PUBREC
+    /// and PUBACK vectors below, whose names say which packet the body
+    /// belongs to even though these bytes are the body alone.
     #[test]
     fn encodes_a_v311_puback() {
         let ack = Ack {
@@ -618,6 +626,11 @@ mod publish {
     /// subscribers". Section 3.5.2.2.2: the reason string is property
     /// identifier 31 (0x1F) followed by a UTF-8 string, so the block is 5
     /// bytes: `1F 00 02 6E 6F`.
+    ///
+    /// What makes these bytes a PUBREC rather than a PUBACK is the packet
+    /// kind, which selects the permitted reason codes here and becomes the
+    /// fixed header's type nibble in a later task; the body shape is the
+    /// same for both.
     #[test]
     fn encodes_a_v5_pubrec_with_a_reason_and_a_property() {
         let ack = Ack {

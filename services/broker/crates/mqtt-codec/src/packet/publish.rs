@@ -266,6 +266,12 @@ impl Ack {
     ///
     /// `kind` says which of the four acknowledgements this is, so that the
     /// reason code can be checked against the set that packet permits.
+    ///
+    /// Encoding as 3.1.1 is lossy and silently so: that version has no
+    /// reason code and no properties, so a failure reason and any
+    /// properties are dropped and the peer sees a plain acknowledgement.
+    /// The degradation is what the protocol requires, but a caller that
+    /// needs to know a refusal was conveyed must check the version itself.
     pub fn encode_body(
         &self,
         version: Version,
