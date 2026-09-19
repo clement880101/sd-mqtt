@@ -326,4 +326,58 @@ mod tests {
         assert_eq!(props.payload_format_indicator, Some(1));
         assert_eq!(reader.u8().unwrap(), 0xAA);
     }
+
+    /// Every identifier has now been checked by hand against the OASIS
+    /// MQTT 5.0 property table, so this locks in a verified-correct
+    /// encoding rather than merely locking in whatever the code currently
+    /// does. Encoding and decoding through the *same* identifier table (as
+    /// `round_trip` above does) cannot catch a transposed identifier; this
+    /// literal byte vector can.
+    #[test]
+    fn golden_vector_for_every_property() {
+        let props = Properties {
+            payload_format_indicator: Some(1),
+            message_expiry_interval: Some(2),
+            content_type: Some("s3".into()),
+            response_topic: Some("s4".into()),
+            correlation_data: Some(Bytes::from_static(&[5])),
+            subscription_identifiers: vec![6],
+            session_expiry_interval: Some(7),
+            assigned_client_identifier: Some("s8".into()),
+            server_keep_alive: Some(9),
+            authentication_method: Some("s10".into()),
+            authentication_data: Some(Bytes::from_static(&[11])),
+            request_problem_information: Some(12),
+            will_delay_interval: Some(13),
+            request_response_information: Some(14),
+            response_information: Some("s15".into()),
+            server_reference: Some("s16".into()),
+            reason_string: Some("s17".into()),
+            receive_maximum: Some(18),
+            topic_alias_maximum: Some(19),
+            topic_alias: Some(20),
+            maximum_qos: Some(21),
+            retain_available: Some(22),
+            user_properties: vec![("k23".into(), "v23".into())],
+            maximum_packet_size: Some(24),
+            wildcard_subscription_available: Some(25),
+            subscription_identifier_available: Some(26),
+            shared_subscription_available: Some(27),
+        };
+        let mut out = Vec::new();
+        props.encode(&mut out).unwrap();
+        // Identifier bytes below (1, 2, 3, 8, 9, 11, 17, 18, 19, 21, 22, 23,
+        // 24, 25, 26, 28, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42) are
+        // 0x01..0x2A, ascending and matching the table in this file.
+        assert_eq!(
+            out,
+            vec![
+                108, 1, 1, 2, 0, 0, 0, 2, 3, 0, 2, 115, 51, 8, 0, 2, 115, 52, 9, 0, 1, 5, 11, 6,
+                17, 0, 0, 0, 7, 18, 0, 2, 115, 56, 19, 0, 9, 21, 0, 3, 115, 49, 48, 22, 0, 1, 11,
+                23, 12, 24, 0, 0, 0, 13, 25, 14, 26, 0, 3, 115, 49, 53, 28, 0, 3, 115, 49, 54, 31,
+                0, 3, 115, 49, 55, 33, 0, 18, 34, 0, 19, 35, 0, 20, 36, 21, 37, 22, 38, 0, 3, 107,
+                50, 51, 0, 3, 118, 50, 51, 39, 0, 0, 0, 24, 40, 25, 41, 26, 42, 27,
+            ]
+        );
+    }
 }

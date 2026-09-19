@@ -161,22 +161,58 @@ mod tests {
     use super::*;
     use crate::error::CodecError;
 
+    /// Every variant, in ascending numeric order. Exhaustive so that adding a
+    /// variant without adding it here trips the length assertion below.
+    const ALL: &[ReasonCode] = &[
+        ReasonCode::Success,
+        ReasonCode::GrantedQos1,
+        ReasonCode::GrantedQos2,
+        ReasonCode::DisconnectWithWillMessage,
+        ReasonCode::NoMatchingSubscribers,
+        ReasonCode::NoSubscriptionExisted,
+        ReasonCode::ContinueAuthentication,
+        ReasonCode::ReAuthenticate,
+        ReasonCode::UnspecifiedError,
+        ReasonCode::MalformedPacket,
+        ReasonCode::ProtocolError,
+        ReasonCode::ImplementationSpecificError,
+        ReasonCode::UnsupportedProtocolVersion,
+        ReasonCode::ClientIdentifierNotValid,
+        ReasonCode::BadUserNameOrPassword,
+        ReasonCode::NotAuthorized,
+        ReasonCode::ServerUnavailable,
+        ReasonCode::ServerBusy,
+        ReasonCode::Banned,
+        ReasonCode::ServerShuttingDown,
+        ReasonCode::BadAuthenticationMethod,
+        ReasonCode::KeepAliveTimeout,
+        ReasonCode::SessionTakenOver,
+        ReasonCode::TopicFilterInvalid,
+        ReasonCode::TopicNameInvalid,
+        ReasonCode::PacketIdentifierInUse,
+        ReasonCode::PacketIdentifierNotFound,
+        ReasonCode::ReceiveMaximumExceeded,
+        ReasonCode::TopicAliasInvalid,
+        ReasonCode::PacketTooLarge,
+        ReasonCode::MessageRateTooHigh,
+        ReasonCode::QuotaExceeded,
+        ReasonCode::AdministrativeAction,
+        ReasonCode::PayloadFormatInvalid,
+        ReasonCode::RetainNotSupported,
+        ReasonCode::QosNotSupported,
+        ReasonCode::UseAnotherServer,
+        ReasonCode::ServerMoved,
+        ReasonCode::SharedSubscriptionsNotSupported,
+        ReasonCode::ConnectionRateExceeded,
+        ReasonCode::MaximumConnectTime,
+        ReasonCode::SubscriptionIdentifiersNotSupported,
+        ReasonCode::WildcardSubscriptionsNotSupported,
+    ];
+
     #[test]
     fn round_trips_through_its_byte_value() {
-        for code in [
-            ReasonCode::Success,
-            ReasonCode::GrantedQos1,
-            ReasonCode::GrantedQos2,
-            ReasonCode::NoMatchingSubscribers,
-            ReasonCode::ContinueAuthentication,
-            ReasonCode::UnspecifiedError,
-            ReasonCode::MalformedPacket,
-            ReasonCode::BadAuthenticationMethod,
-            ReasonCode::SessionTakenOver,
-            ReasonCode::PacketTooLarge,
-            ReasonCode::QuotaExceeded,
-            ReasonCode::SharedSubscriptionsNotSupported,
-        ] {
+        assert_eq!(ALL.len(), 43);
+        for &code in ALL {
             assert_eq!(ReasonCode::from_byte(code as u8), Some(code));
         }
     }
