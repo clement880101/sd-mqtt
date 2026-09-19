@@ -164,8 +164,8 @@ receive maximum in both directions, maximum packet size, maximum QoS,
 retain availability, assigned client identifier, and reason codes with
 optional reason strings on every acknowledgement.
 
-Enhanced authentication (the AUTH exchange) is deferred to a later milestone.
-The session state machine reserves a state for it so adding it is additive.
+Enhanced authentication (the AUTH exchange) is in scope, with SCRAM-SHA-256
+as the shipped mechanism. See section 12.2.
 
 ## 6. Delivery, queues and ordering
 
@@ -195,6 +195,13 @@ wrapping through 1 to 65535, skipping identifiers currently inflight.
 **Message identifiers** are UUID v7, which sorts by time and is unique
 across nodes without coordination.
 
+**Queue sequence numbers.** Every queue operation for a session carries a
+sequence number from a per-session monotonic counter. The queue is therefore
+a log, which is what makes replication in section 8.6 tractable: a replica
+reports the highest sequence it has applied, and a recovering owner can ask
+which replica is furthest ahead. Sequence numbers exist from milestone 2 so
+that replication is additive rather than a retrofit.
+
 **Shared subscriptions** on `$share/<group>/<filter>` balance across the
 cluster. Selection prefers a local online member, then the least loaded
 remote node, round-robin within a node. A member whose queue is full is
@@ -208,12 +215,16 @@ shared group queue.
 `storage` defines a trait covering:
 
 - durable session records, subscriptions and inbound QoS 2 state
-- queue append, head read, head delete, and depth per session
+- queue append, head read, head delete, depth, and the highest applied
+  sequence number per session
+- replica queues for sessions this node does not own, with the same
+  operations plus an apply-remote-operation path
 - message bodies stored once, referenced by queue entries, with a persisted
   reference count
 - retained messages
 - cluster metadata records with their version stamps
-- users, access control rules, rules, API keys, node identity
+- users with both an argon2 password hash and a SCRAM verifier, access
+  control rules, rules, API keys, node identity
 
 The default backend is fjall, chosen because the queue workload is appends
 with deletion from the head and values up to megabytes, which is the shape a
@@ -317,10 +328,62 @@ taken over". Retained messages and rules converge by last writer wins.
 Messages published on either side during the partition are not retroactively
 exchanged.
 
-**Known limit for v1.** Offline queues are durable on disk but are not
-replicated. If a node's storage is lost, the offline messages of sessions it
-owned are lost with it. Queue replication is scheduled for v2 and the storage
-trait is shaped to accommodate it.
+A node that accepted and acknowledged messages on the losing side of a
+partition, and that never managed to replicate them, loses those messages
+when it rejoins. Synchronous replication shrinks this window to nothing for
+any publish that reached a replica, because such a publish is never
+acknowledged until it did. Eliminating the window entirely would require
+consensus, which this design deliberately does not take on.
+
+### 8.6 Queue replication
+
+Offline queues are replicated, so losing a node does not lose the durable
+messages of the sessions it owned.
+
+**Placement.** Each session has a replica set of size R, default 2 and
+configurable from 1 to 3, chosen by rendezvous hashing of the session
+identity across live members. The highest-weighted member is the owner and
+the next R-1 are followers. Rendezvous hashing is deterministic, needs no
+coordination, and moves only the sessions that must move when membership
+changes. With fewer than R live members the set is as large as membership
+allows, and is repaired when members return.
+
+**Streaming.** The owner sends each queue operation, as an append, an
+acknowledgement or a removal, to its followers over the existing node link,
+tagged with the session sequence number. Followers apply operations in order
+and report their high-water mark. Message bodies travel once and are
+reference counted on the follower exactly as on the owner.
+
+**Durability modes.** Configurable globally and overridable per listener.
+
+- `async`, the default. The publisher is acknowledged as soon as the owner
+  has the message durably. Replication proceeds in the background. The loss
+  window is the replication lag, which is exposed as a metric and alerted on.
+- `sync`. A QoS 1 or 2 publish to a durable session is not acknowledged
+  until at least one follower confirms the append. A single node failure
+  loses nothing. The cost is one local network round trip per durable
+  publish.
+
+The code path is the same in both modes. Synchronous mode awaits the
+confirmation that asynchronous mode ignores.
+
+**Failover.** When a session's owner is declared dead, or a client
+reconnects elsewhere, the new owner asks every reachable member of the
+replica set for its high-water mark, pulls from the most advanced one,
+becomes authoritative, and resumes streaming to the remaining followers.
+Ownership is recorded in the same epoch-stamped register that governs
+takeover, so a stale owner returning from a partition loses and discards its
+copy.
+
+**Re-replication.** When a member leaves permanently, the replica sets that
+included it are short. Repair is rate limited and runs in the background so
+that losing one node does not saturate the cluster, and its progress is
+visible in the UI.
+
+**Cost.** With the default replication factor, each node holds roughly twice
+the durable queue data it would otherwise, and durable queue writes generate
+proportionate inter-node traffic. This is the price of the guarantee and is
+stated in the budgets.
 
 ## 9. Sidecars: rules and connectors
 
@@ -358,8 +421,12 @@ publish anywhere.
 a topic. It runs on exactly one node, selected as described below.
 
 **mqtt_bridge** connects to a remote broker as a client. Topic rules carry a
-direction of in, out or both, a QoS, and optional local and remote prefixes
-for rewriting. Reconnection uses exponential backoff with jitter. A state
+direction of in, out or both, a QoS, and a topic rewrite. Rewriting supports
+a prefix on either side, and for the outbound direction a template that
+captures wildcard segments from the matched filter and substitutes them by
+position, so `sensors/+/temp` can be published remotely as
+`site-a/temp/{1}`. Inbound messages need no such facility, because a bridge
+publishes them into the local broker where any rule can act on them. Reconnection uses exponential backoff with jitter. A state
 topic reports connectivity, with a will supplying the offline value. Loop
 prevention uses an origin identifier carried in a user property, and messages
 that have already traversed this bridge are not sent back.
@@ -488,11 +555,44 @@ without being counted.
 
 ## 12. Security
 
+### 12.1 Authentication and access control
+
 Authentication is anonymous, or username and password with argon2 hashing
-and PHC-formatted storage. Access control rules map a user or client pattern
+and PHC-formatted storage, or SCRAM-SHA-256. Access control rules map a user or client pattern
 to topic filters with publish and subscribe permissions, deny by default once
 any rule exists. TLS and WebSocket listeners are supported, with certificate
 hot reload through a certificate resolver so renewal needs no restart.
+
+### 12.2 Enhanced authentication
+
+SCRAM-SHA-256 is implemented per the SASL SCRAM specification and its
+SHA-256 profile, carried over MQTT 5's authentication exchange. The client
+names the mechanism in CONNECT and puts its first message in the
+authentication data. The broker replies with an AUTH packet carrying the
+server first message, the client answers with an AUTH packet carrying its
+proof, and the broker completes with CONNACK carrying the server signature.
+Re-authentication mid-session uses the same exchange initiated by the client.
+
+Channel binding, the `-PLUS` variant, is not implemented in v1. The broker
+handles the client's channel-binding flag correctly and advertises only the
+unbound mechanism.
+
+A user may hold both credential forms. They are computed together when a
+password is set, because a SCRAM verifier cannot be derived from an argon2
+hash: it requires the password itself. The verifier stores a salt, an
+iteration count, and the derived stored and server keys, never the password.
+The iteration count is configurable and defaults to a value chosen to balance
+security against constrained clients, which must perform the same derivation.
+
+A SCRAM verifier is a weaker secret at rest than an argon2 hash, because
+possession of the stored key permits impersonating that client. Verifiers are
+therefore treated as secrets equivalent to private keys, are never returned
+by the API, and exist only for users explicitly enrolled in SCRAM.
+
+A client requesting any other mechanism receives the bad authentication
+method reason code.
+
+### 12.3 Secret handling
 
 Passwords and tokens are held in a wrapper that refuses to print itself, so
 they cannot reach logs or crash output. Repeated authentication failures from
@@ -526,6 +626,14 @@ type at the top level and converts at the boundary.
   a client library as a by-product.
 - **Cluster**: three nodes in one process over an in-memory link, covering
   takeover, migration, partition and heal.
+- **Replication**: the same harness kills an owner mid-queue and asserts
+  that synchronous mode loses nothing, that asynchronous mode loses only
+  what the lag metric predicted, that failover selects the most advanced
+  replica, and that a stale owner returning from a partition discards its
+  copy. Re-replication is asserted to respect its rate limit.
+- **Authentication**: the SCRAM exchange is tested against vectors from the
+  specification, including a failed proof, a mid-session re-authentication,
+  and a client requesting an unsupported mechanism.
 - **Connectors**: a stub HTTP server asserts envelope shape, retry timing,
   outbox durability across restart, and dead-lettering.
 - **Conformance**: an independent MQTT interoperability suite runs in CI.
@@ -545,6 +653,11 @@ in CI, not when the code is written.
 | Direct dependencies across broker crates | under 35 |
 | Concurrent connections per node, target hardware | 100,000 |
 
+Durable queue storage and inter-node traffic scale with the replication
+factor. At the default factor of 2, plan for roughly twice the queue disk a
+single node would need, and inter-node bandwidth proportionate to durable
+publish volume.
+
 Budgets are checked in CI. Exceeding one fails the build and requires either
 a fix or an explicit, recorded decision to move the budget.
 
@@ -555,37 +668,57 @@ shippable.
 
 1. **Codec and core.** MQTT 3.1.1 and 5.0 over TCP, in memory only. Sessions,
    QoS 0, 1 and 2, retained messages, wills, shared subscriptions, keep-alive
-   ring. Exit criteria: a single node passes the conformance suite over
-   plain TCP, with the suite's TLS and WebSocket sections deferred to
-   milestone 6. The suite is chosen and pinned during this milestone.
+   ring. Exit criteria: a single node passes the conformance suite over plain
+   TCP, with the suite's TLS and WebSocket sections deferred to milestone 7.
+   The suite is chosen and pinned during this milestone.
 2. **Persistence.** The storage trait, the fjall backend, durable sessions and
-   queues, restore on start. Exit criteria: a broker restart preserves durable
-   sessions, their subscriptions and their queued messages.
+   queues with per-session sequence numbers, restore on start. Exit criteria:
+   a broker restart preserves durable sessions, their subscriptions and their
+   queued messages, and queue operations carry gapless sequence numbers.
 3. **API, metrics and UI shell.** HTTP API, events stream, Prometheus, health,
    and the Overview, Clients and Topics pages. Exit criteria: the UI shows
    live clients and retained messages against a running broker.
-4. **Rules and connectors.** The rule engine, four connector types, the
-   durable outbox, dead lettering, and the Rules page. Exit criteria: a
-   message published to MQTT reaches an HTTP endpoint, and an HTTP post
-   reaches an MQTT subscriber, both surviving a broker restart mid-flight.
+4. **Rules and connectors.** The rule engine, four connector types with
+   outbound topic templates, the durable outbox, dead lettering, and the Rules
+   page. Exit criteria: a message published to MQTT reaches an HTTP endpoint,
+   and an HTTP post reaches an MQTT subscriber, both surviving a broker
+   restart mid-flight.
 5. **Clustering.** Membership, metadata replication, routing, session
    ownership and migration, and the Cluster page. Exit criteria: a three-node
    cluster delivers across nodes, migrates a session on reconnect, and
    converges after a partition heals.
-6. **Hardening.** TLS, WebSocket, the authentication and access control UI,
-   rate limits, the container image, cross-compiled release artifacts and
-   documentation. Exit criteria: all budgets met, conformance green, and a
-   published release.
+6. **Queue replication.** Rendezvous placement, the replication stream,
+   asynchronous and synchronous modes, failover to the most advanced replica,
+   and rate-limited re-replication. Exit criteria: killing the owner of a
+   session with a non-empty offline queue loses no messages in synchronous
+   mode, and the replication lag metric bounds the loss in asynchronous mode.
+   The UI shows replica health and re-replication progress.
+7. **Hardening.** TLS with certificate hot reload, WebSocket, SCRAM-SHA-256,
+   the authentication and access control UI, rate limits, the container image,
+   cross-compiled release artifacts and documentation. Exit criteria: all
+   budgets met, the full conformance suite green including TLS and WebSocket,
+   a SCRAM client authenticates and re-authenticates, and a release is
+   published.
 
 ## 17. Open questions
 
-These do not block milestone 1 and will be resolved by the milestone that
-needs them.
+None of these block milestone 1. Each is resolved by the milestone that
+needs it, and the resolution is recorded as an architecture decision record.
 
-- Whether offline queue replication in v2 replicates eagerly to one follower
-  or lazily on ownership change. Milestone 5 should record which, with an
-  architecture decision record.
-- Whether enhanced authentication arrives in milestone 6 or later. It
-  depends on whether any target deployment needs it.
-- Whether the bridge should expose message transformation beyond prefix
-  rewriting. Deferred until there is a concrete request.
+- **Replication factor default.** The spec sets 2. Whether 3 should be the
+  default for clusters above some size is a milestone 6 question, and it
+  depends on how expensive re-replication turns out to be in practice.
+- **Sync mode granularity.** Durability mode is specified as global with a
+  per-listener override. Whether it should also be settable per session, via
+  the authenticate hook, is a milestone 6 question. It is cheap to add and
+  should only be added if a real deployment wants it.
+- **SCRAM iteration count default.** The trade-off is between resistance to
+  offline attack and the work a constrained client must perform, since the
+  client runs the same derivation. Milestone 7 should pick a number against
+  measurements on representative hardware rather than guessing now.
+- **Channel binding.** SCRAM-SHA-256-PLUS defends against an attacker who
+  terminates TLS in the middle. Whether that threat model applies depends on
+  whether deployments terminate TLS at a proxy. Milestone 7 decides.
+- **Conformance suite choice.** Milestone 1 selects and pins one. The
+  criteria are that it is independent of any broker implementation, that it
+  covers both protocol versions, and that its license permits use in CI.
