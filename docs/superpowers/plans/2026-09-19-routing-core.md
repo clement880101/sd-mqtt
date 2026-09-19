@@ -2415,6 +2415,53 @@ git commit -m "bench(core): baseline matching timings"
 
 ---
 
+## Amendments after review
+
+Changes made during execution, after review found problems with the plan as
+written. Recorded so the plan matches the code.
+
+**Retained expiry is checked on read** (commit `6a59062`). `matching`
+returned expired messages until a sweep ran, while the field was documented
+as a deadline past which a message is discarded. The next plan calls
+`matching` to deliver retained messages on subscribe, so as written it
+would have delivered expired ones. `matching` now takes the current time
+and shares one expiry helper with the sweep so the two cannot drift.
+
+**The trie node and the interner are crate-private** (same commit). Both
+were public, and every node method takes a caller-supplied interner.
+Passing the wrong one makes every literal level miss silently and matching
+return wrong answers with no error. `topic::reference` stays public because
+the differential test needs it. Three now-dead methods went with them.
+
+**The generators could not produce a bare multi-level wildcard** (commit
+`668ec79`). This was the real finding. A reviewer proved it by deleting the
+dollar-topic guard in the retained store, which only a bare `#` reaches,
+and watching all five properties stay green at 20,000 cases. That mutation
+is exactly the failure of exposing broker status topics to a
+subscribe-to-everything client. With the widened generators the same
+deletion fails in the default 256 cases, on `stored = ["$SYS"], filters =
+["#"]`. A bare single-level wildcard turned out to be reachable already.
+
+**Pruning is asserted, not assumed** (same commit). The removal property
+checked the subscription count, which an orphaned empty branch passes. The
+retained store already exposed a node count for exactly this reason; the
+trie now does too.
+
+**Traversal depth has a ceiling** (commit `efcc8a3`). Every traversal
+recurses per topic level, and the only bound was a `u16` configuration
+value with no upper limit, so an operator could crash the broker by raising
+it. Measured: a worker thread on a 2 MiB stack survives about 6,500 levels
+and aborts by 7,000. The codec now clamps the depth check to a ceiling of
+1024, roughly six times inside the measured limit.
+
+**An optimisation that does not work, recorded so nobody repeats it**
+(commit `26c1944`). The interner takes a read lock per level per node
+visited. Hoisting every lookup under one guard into a vector is the obvious
+fix and measures 30 percent slower on a match and 53 percent slower on a
+miss, because it trades an uncontended read lock for an allocation per
+publish and gives up the early exit on the first unknown level, which is
+most of the work on a topic nobody wants.
+
 ## Done when
 
 - `cargo test -p broker-core` passes, covering unit tests and the five
