@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 3 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -40,3 +42,20 @@ jobs:
       - uses: taiki-e/install-action@cargo-deny
       - name: License and advisory gate
         run: cargo deny --manifest-path services/broker/Cargo.toml --config deny.toml check
+
+  fuzz:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Fuzz the decoder
+        working-directory: services/broker/crates/mqtt-codec/fuzz
+        run: cargo fuzz run decode -- -max_total_time=600
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: services/broker/crates/mqtt-codec/fuzz/artifacts/
