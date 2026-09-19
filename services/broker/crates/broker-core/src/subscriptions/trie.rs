@@ -110,6 +110,24 @@ impl SubscriptionTrie {
         self.len() == 0
     }
 
+    /// How many trie nodes exist, across every shard and the wildcard
+    /// root, each root included.
+    ///
+    /// Exposed so that pruning can be tested rather than assumed. [`len`]
+    /// counts subscriptions, so a remove that leaves an orphaned empty
+    /// branch behind is invisible to it; this notices. A fresh trie of
+    /// `shards` shards starts at `shards + 1`.
+    ///
+    /// [`len`]: Self::len
+    pub fn node_count(&self) -> usize {
+        self.wildcard.read().node_count()
+            + self
+                .shards
+                .iter()
+                .map(|shard| shard.read().node_count())
+                .sum::<usize>()
+    }
+
     /// How many distinct topic levels have been interned.
     pub fn interned_levels(&self) -> usize {
         self.interner.len()

@@ -7,8 +7,12 @@
 //! bug becomes a shrunk counterexample instead of a delivery fault found in
 //! production.
 
+use std::collections::BTreeMap;
+
 use broker_core::retained::{RetainedMessage, RetainedStore};
-use broker_core::subscriptions::{SubscriberId, Subscription, SubscriptionTrie};
+use broker_core::subscriptions::{
+    SharedSubscriptions, SubscriberId, Subscription, SubscriptionTrie,
+};
 use broker_core::topic::reference;
 use bytes::Bytes;
 use mqtt_codec::QoS;
@@ -24,17 +28,47 @@ fn sub(id: u64) -> Subscription {
     }
 }
 
+/// Levels beginning with a dollar sign.
+///
+/// `$SYS` is the conventional one, but the protocol's rule is about the
+/// sign rather than the name, so an implementation that special-cased the
+/// string `$SYS` would be wrong and these catch it.
+fn any_dollar_level() -> impl Strategy<Value = String> {
+    prop_oneof![
+        2 => Just("$SYS".to_string()),
+        1 => Just("$share".to_string()),
+        1 => Just("$a".to_string()),
+    ]
+}
+
 /// A small alphabet, so that collisions and shared prefixes are common
-/// rather than vanishingly rare. Empty levels are legal and included.
+/// rather than vanishingly rare. Empty levels are legal and included, and
+/// so are dollar levels, which below the first position are ordinary
+/// levels and must not be treated otherwise.
 fn any_level() -> impl Strategy<Value = String> {
     prop_oneof![
-        4 => "[ab]",
-        2 => "[ab]{2}",
-        1 => Just(String::new()),
+        8 => "[ab]",
+        4 => "[ab]{2}",
+        2 => Just(String::new()),
+        1 => any_dollar_level(),
     ]
 }
 
 fn any_filter() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // A bare multi-level wildcard is the subscribe-to-everything
+        // filter, and the structured strategy below cannot produce one:
+        // it always joins `#` onto at least one preceding level. Some
+        // code is reachable only through it, notably the retained store's
+        // guard against a leading wildcard reaching a dollar topic, so it
+        // gets its own arm rather than being left to chance.
+        1 => Just("#".to_string()),
+        1 => Just("+".to_string()),
+        8 => structured_filter(),
+    ]
+}
+
+fn structured_filter() -> impl Strategy<Value = String> {
     (
         prop::collection::vec(
             prop_oneof![3 => any_level(), 1 => Just("+".to_string())],
@@ -78,6 +112,37 @@ fn oracle(filters: &[String], topic: &str) -> Vec<u64> {
     ids
 }
 
+/// One mutating call on [`SharedSubscriptions`].
+#[derive(Debug, Clone)]
+enum Op {
+    Insert {
+        group: String,
+        filter: String,
+        subscriber: u64,
+    },
+    Remove {
+        group: String,
+        filter: String,
+        subscriber: u64,
+    },
+    RemoveSubscriber {
+        subscriber: u64,
+    },
+}
+
+/// A tiny space of group names and subscribers, so that sequences collide
+/// on the same group and the same member often rather than by luck.
+fn any_op() -> impl Strategy<Value = Op> {
+    let group = prop_oneof![Just("g".to_string()), Just("h".to_string())];
+    prop_oneof![
+        6 => (group.clone(), any_filter(), 0u64..4)
+            .prop_map(|(group, filter, subscriber)| Op::Insert { group, filter, subscriber }),
+        3 => (group, any_filter(), 0u64..4)
+            .prop_map(|(group, filter, subscriber)| Op::Remove { group, filter, subscriber }),
+        1 => (0u64..4).prop_map(|subscriber| Op::RemoveSubscriber { subscriber }),
+    ]
+}
+
 proptest! {
     /// The core claim: the sharded trie and the naive matcher never disagree.
     #[test]
@@ -101,13 +166,19 @@ proptest! {
         }
     }
 
-    /// Whatever was inserted can be removed, leaving nothing behind. This
-    /// catches pruning bugs that leave orphaned nodes holding subscriptions.
+    /// Whatever was inserted can be removed, leaving nothing behind.
+    ///
+    /// `len` counts subscriptions, so on its own it would pass for a trie
+    /// that had pruned nothing and merely emptied its leaves. The node
+    /// count has to return to its baseline too, which is what actually
+    /// says the branches went.
     #[test]
     fn inserting_then_removing_everything_empties_the_trie(
         filters in prop::collection::vec(any_filter(), 1..12),
     ) {
         let trie = SubscriptionTrie::new(4);
+        let baseline = trie.node_count();
+
         for (index, filter) in filters.iter().enumerate() {
             trie.insert(filter, sub(index as u64));
         }
@@ -115,6 +186,7 @@ proptest! {
             trie.remove(filter, SubscriberId(index as u64));
         }
         prop_assert_eq!(trie.len(), 0);
+        prop_assert_eq!(trie.node_count(), baseline, "an empty branch was left behind");
     }
 
     /// Tearing down one session must not disturb another's subscriptions.
@@ -209,6 +281,105 @@ proptest! {
             want.dedup();
 
             prop_assert_eq!(got, want, "filter {:?}", filter);
+        }
+    }
+
+    /// Shared subscriptions against a map model.
+    ///
+    /// The structure keeps two indexes and a synthetic trie entry per
+    /// group in step with one another across three mutating operations,
+    /// which is the kind of bookkeeping that drifts. The model is a plain
+    /// map doing the obvious thing, so any drift shows up as a count that
+    /// disagrees or a group that stops matching.
+    #[test]
+    fn shared_subscriptions_agree_with_a_map_model(
+        ops in prop::collection::vec(any_op(), 1..40),
+        topics in prop::collection::vec(any_topic(), 1..6),
+    ) {
+        let shared = SharedSubscriptions::new(4);
+        let mut model: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
+
+        for op in &ops {
+            match op {
+                Op::Insert { group, filter, subscriber } => {
+                    let got = shared.insert(group, filter, sub(*subscriber));
+
+                    let members = model.entry((group.clone(), filter.clone())).or_default();
+                    let want = members.contains(subscriber);
+                    if !want {
+                        members.push(*subscriber);
+                    }
+                    prop_assert_eq!(got, want, "insert reported the wrong replacement");
+                }
+                Op::Remove { group, filter, subscriber } => {
+                    let got = shared.remove(group, filter, SubscriberId(*subscriber));
+
+                    let key = (group.clone(), filter.clone());
+                    let mut want = false;
+                    if let Some(members) = model.get_mut(&key) {
+                        let before = members.len();
+                        members.retain(|m| m != subscriber);
+                        want = members.len() != before;
+                        if members.is_empty() {
+                            model.remove(&key);
+                        }
+                    }
+                    prop_assert_eq!(got, want, "remove reported the wrong outcome");
+                }
+                Op::RemoveSubscriber { subscriber } => {
+                    let got = shared.remove_subscriber(SubscriberId(*subscriber));
+
+                    let mut want = 0;
+                    model.retain(|_, members| {
+                        let before = members.len();
+                        members.retain(|m| m != subscriber);
+                        want += before - members.len();
+                        !members.is_empty()
+                    });
+                    prop_assert_eq!(got, want, "remove_subscriber counted wrong");
+                }
+            }
+
+            prop_assert_eq!(shared.group_count(), model.len());
+            prop_assert_eq!(
+                shared.member_count(),
+                model.values().map(Vec::len).sum::<usize>()
+            );
+            prop_assert_eq!(shared.is_empty(), model.is_empty());
+        }
+
+        for topic in &topics {
+            let wanted: Vec<&(String, String)> = model
+                .keys()
+                .filter(|(_, filter)| reference::matches(filter, topic))
+                .collect();
+
+            let mut out = Vec::new();
+            shared.select(topic, &mut out);
+            let picked: Vec<u64> = out.into_iter().map(|s| s.subscriber.0).collect();
+
+            // Exactly one member per matching group, no more and no less.
+            prop_assert_eq!(picked.len(), wanted.len(), "topic {:?}", topic);
+
+            // Every pick belongs to a group that matched, and every group
+            // that matched is represented by some pick. Together with the
+            // count, that is one member each.
+            for id in &picked {
+                prop_assert!(
+                    wanted.iter().any(|key| model[*key].contains(id)),
+                    "picked {} for {:?}, which no matching group holds",
+                    id,
+                    topic
+                );
+            }
+            for key in &wanted {
+                prop_assert!(
+                    picked.iter().any(|id| model[*key].contains(id)),
+                    "group {:?} matched {:?} but nothing was picked from it",
+                    key,
+                    topic
+                );
+            }
         }
     }
 }

@@ -191,6 +191,17 @@ impl Node {
         removed
     }
 
+    /// How many nodes this node and its descendants amount to, including
+    /// itself.
+    ///
+    /// Exposed so that pruning can be tested rather than assumed: `len`
+    /// counts subscriptions, so an orphaned empty branch left behind by a
+    /// remove is invisible to it but not to this.
+    pub fn node_count(&self) -> usize {
+        1 + self.plus.as_ref().map_or(0, |child| child.node_count())
+            + self.children.values().map(Node::node_count).sum::<usize>()
+    }
+
     /// How many subscriptions this node and its descendants hold.
     pub fn len(&self) -> usize {
         self.exact.len()
