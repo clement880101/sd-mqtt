@@ -7,5 +7,6 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod retained;
 pub mod subscriptions;
 pub mod topic;
