@@ -602,6 +602,10 @@ impl Loop {
             }
             Hop::Reconnect => {
                 self.to_subscriber.on_disconnect();
+                // The subscribing client sees the drop too. Its
+                // exactly-once state survives it, which is what lets it
+                // recognise what the broker resends.
+                self.at_subscriber.on_disconnect();
                 self.actions.clear();
                 self.to_subscriber.on_resume(0, &mut self.actions);
                 self.absorb();

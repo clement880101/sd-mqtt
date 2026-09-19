@@ -38,25 +38,33 @@ pub struct Received {
 /// requires a publish carrying an identifier already acknowledged to be
 /// treated as a new message whatever its duplicate flag says.
 ///
-/// # What the receive maximum counts here, and the caveat on it
+/// # What the receive maximum counts
 ///
-/// [MQTT-3.3.4-9] counts both levels: a peer may not exceed the receive
-/// maximum in "QoS 1 and QoS 2 PUBLISH packets where it has not sent a
-/// PUBACK or PUBCOMP in response". This counts only the exactly-once
-/// exchanges, in `awaiting_release`.
+/// Both levels, which is what [MQTT-3.3.4-9] requires: a peer may not
+/// exceed the receive maximum in "QoS 1 and QoS 2 PUBLISH packets where
+/// it has not sent a PUBACK or PUBCOMP in response". Section 4.9 says
+/// the same from the sender's side, replenishing the quota on a PUBACK
+/// for at-least-once and a PUBCOMP for exactly-once.
 ///
-/// Those agree exactly as long as the caller answers each publish
-/// before it offers the next one, because then no at-least-once publish
-/// is ever un-acknowledged at the point this is asked. The set the
-/// specification describes is then precisely `awaiting_release`.
+/// So the count is the sum of `awaiting_ack` and `awaiting_release`. An
+/// at-least-once publish occupies a slot from the moment it arrives
+/// until [`Inbound::acknowledge`] emits its packet, and an exactly-once
+/// one until the completion goes out.
 ///
-/// That is a condition on the caller, not a property of this type, and
-/// [`Inbound::acknowledge`] is a separate call precisely so the caller
-/// can wait until it knows the outcome. A shell that defers or batches
-/// acknowledgements breaks the equivalence and will under-count: it
-/// must track its own un-answered at-least-once publishes, or this type
-/// must be extended to do it. Nothing here will notice on its behalf.
+/// Counting only the exactly-once exchanges was equivalent while every
+/// publish was answered inside `on_publish`. It stopped being so when
+/// `acknowledge` became a separate call: a caller that defers would let
+/// a client exceed its limit with nothing noticing.
+///
+/// The two sets differ in lifetime. Section 4.9 says the quota "is not
+/// preserved across Network Connections", so `awaiting_ack` is dropped
+/// by [`Inbound::on_disconnect`], while `awaiting_release` is session
+/// state and survives.
 pub struct Inbound {
+    /// Identifiers whose at-least-once publish has arrived and whose
+    /// acknowledgement has not gone out. Per connection, not session
+    /// state: section 4.9 re-initialises the quota on each one.
+    awaiting_ack: HashSet<u16, RandomState>,
     /// Identifiers whose publish has arrived and whose release has not.
     awaiting_release: HashSet<u16, RandomState>,
     receive_maximum: usize,
@@ -67,6 +75,7 @@ impl Inbound {
     /// exchanges. Zero means unbounded.
     pub fn new(receive_maximum: usize) -> Self {
         Self {
+            awaiting_ack: HashSet::with_hasher(RandomState::default()),
             awaiting_release: HashSet::with_hasher(RandomState::default()),
             receive_maximum,
         }
@@ -92,6 +101,13 @@ impl Inbound {
             }),
             QoS::AtLeastOnce => {
                 let packet_id = publish.packet_id.ok_or(ReasonCode::ProtocolError)?;
+                // A repeat of one still unanswered is already counted,
+                // so refusing it here would deadlock the exchange in
+                // the same way it would for exactly-once.
+                if !self.awaiting_ack.contains(&packet_id) {
+                    self.check_quota()?;
+                    self.awaiting_ack.insert(packet_id);
+                }
                 Ok(Received {
                     dispatch: true,
                     owed: Some(Acknowledgement {
@@ -120,11 +136,7 @@ impl Inbound {
                     });
                 }
 
-                if self.receive_maximum != 0 && self.awaiting_release.len() >= self.receive_maximum
-                {
-                    return Err(ReasonCode::ReceiveMaximumExceeded);
-                }
-
+                self.check_quota()?;
                 self.awaiting_release.insert(packet_id);
                 Ok(Received {
                     dispatch: true,
@@ -151,6 +163,9 @@ impl Inbound {
             // Nothing is owed, and nothing may be sent.
             QoS::AtMostOnce => {}
             QoS::AtLeastOnce => {
+                // The slot is occupied until the acknowledgement is on
+                // the wire, which is this moment and not before.
+                self.awaiting_ack.remove(&packet_id);
                 out.push(Action::Send(Packet::PubAck(ack(packet_id, reason))));
             }
             QoS::ExactlyOnce => {
@@ -178,6 +193,29 @@ impl Inbound {
         out.push(Action::Send(Packet::PubComp(ack(packet_id, reason))));
     }
 
+    /// Whether another publish would exceed the receive maximum.
+    ///
+    /// Zero means unbounded. The error is the reason code the caller
+    /// must close the connection with.
+    fn check_quota(&self) -> Result<(), ReasonCode> {
+        if self.receive_maximum != 0 && self.quota_used() >= self.receive_maximum {
+            return Err(ReasonCode::ReceiveMaximumExceeded);
+        }
+        Ok(())
+    }
+
+    /// The connection went away.
+    ///
+    /// At-least-once publishes left unanswered stop counting: section
+    /// 4.9 says the quota "is not preserved across Network Connections,
+    /// and [is] re-initialized with each new Network Connection", and
+    /// a client that gets no acknowledgement resends the publish on the
+    /// next one. Exactly-once exchanges are session state and are kept,
+    /// because a redelivery must still be recognised as one.
+    pub fn on_disconnect(&mut self) {
+        self.awaiting_ack.clear();
+    }
+
     /// Claim an identifier for state restored on resume.
     pub fn reserve(&mut self, packet_id: u16) {
         self.awaiting_release.insert(packet_id);
@@ -188,13 +226,23 @@ impl Inbound {
         self.awaiting_release.iter().copied()
     }
 
-    /// How many exchanges are incomplete.
+    /// How many exactly-once exchanges are incomplete.
     pub fn outstanding(&self) -> usize {
         self.awaiting_release.len()
     }
 
+    /// How many publishes occupy the receive maximum right now: every
+    /// at-least-once one not yet answered, and every exactly-once one
+    /// not yet completed.
+    ///
+    /// Exposed so the limit can be asserted rather than assumed.
+    pub fn quota_used(&self) -> usize {
+        self.awaiting_ack.len() + self.awaiting_release.len()
+    }
+
     /// Forget everything, for a session that is ending.
     pub fn clear(&mut self) {
+        self.awaiting_ack.clear();
         self.awaiting_release.clear();
     }
 }
@@ -371,6 +419,117 @@ mod tests {
         assert_eq!(
             inbound.on_publish(&publish(QoS::ExactlyOnce, Some(3), false)),
             Err(ReasonCode::ReceiveMaximumExceeded)
+        );
+    }
+
+    #[test]
+    fn a_deferred_at_least_once_acknowledgement_counts_against_the_receive_maximum() {
+        // The case the split made reachable. The caller has not answered
+        // either publish yet, so both still occupy a slot; without this
+        // the client could send without limit and nothing would notice.
+        let mut inbound = Inbound::new(2);
+        inbound
+            .on_publish(&publish(QoS::AtLeastOnce, Some(1), false))
+            .expect("the first fits");
+        inbound
+            .on_publish(&publish(QoS::AtLeastOnce, Some(2), false))
+            .expect("the second fits");
+        assert_eq!(inbound.quota_used(), 2);
+
+        assert_eq!(
+            inbound.on_publish(&publish(QoS::AtLeastOnce, Some(3), false)),
+            Err(ReasonCode::ReceiveMaximumExceeded)
+        );
+    }
+
+    #[test]
+    fn the_receive_maximum_counts_the_two_levels_together() {
+        // [MQTT-3.3.4-9] counts "QoS 1 and QoS 2 PUBLISH packets", not
+        // one or the other.
+        let mut inbound = Inbound::new(2);
+        let mut actions = Vec::new();
+        inbound
+            .on_publish(&publish(QoS::AtLeastOnce, Some(1), false))
+            .expect("the first fits");
+        accept(
+            &mut inbound,
+            &publish(QoS::ExactlyOnce, Some(2), false),
+            &mut actions,
+        );
+        assert_eq!(inbound.quota_used(), 2);
+
+        assert_eq!(
+            inbound.on_publish(&publish(QoS::ExactlyOnce, Some(3), false)),
+            Err(ReasonCode::ReceiveMaximumExceeded)
+        );
+    }
+
+    #[test]
+    fn answering_an_at_least_once_publish_frees_its_slot() {
+        let mut inbound = Inbound::new(1);
+        let mut actions = Vec::new();
+        let received = inbound
+            .on_publish(&publish(QoS::AtLeastOnce, Some(1), false))
+            .expect("it fits");
+        assert_eq!(inbound.quota_used(), 1);
+
+        let owed = received.owed.expect("an acknowledgement is owed");
+        inbound.acknowledge(owed.packet_id, owed.qos, ReasonCode::Success, &mut actions);
+        assert_eq!(
+            inbound.quota_used(),
+            0,
+            "the slot is free once it is on the wire"
+        );
+
+        assert!(inbound
+            .on_publish(&publish(QoS::AtLeastOnce, Some(2), false))
+            .is_ok());
+    }
+
+    #[test]
+    fn an_unanswered_at_least_once_redelivery_does_not_take_a_second_slot() {
+        // It is already counted, and refusing it would deadlock the
+        // exchange in the same way it would for exactly-once.
+        let mut inbound = Inbound::new(1);
+        inbound
+            .on_publish(&publish(QoS::AtLeastOnce, Some(1), false))
+            .expect("it fits");
+        assert!(inbound
+            .on_publish(&publish(QoS::AtLeastOnce, Some(1), true))
+            .is_ok());
+        assert_eq!(inbound.quota_used(), 1);
+    }
+
+    #[test]
+    fn a_disconnect_frees_the_at_least_once_slots_but_keeps_the_exactly_once_ones() {
+        // Section 4.9: the quota is not preserved across connections. A
+        // client that got no acknowledgement resends on the next one.
+        // Exactly-once state is session state and must survive, or a
+        // redelivery comes through as a fresh message.
+        let mut inbound = Inbound::new(10);
+        let mut actions = Vec::new();
+        inbound
+            .on_publish(&publish(QoS::AtLeastOnce, Some(1), false))
+            .expect("it fits");
+        accept(
+            &mut inbound,
+            &publish(QoS::ExactlyOnce, Some(2), false),
+            &mut actions,
+        );
+        assert_eq!(inbound.quota_used(), 2);
+
+        inbound.on_disconnect();
+
+        assert_eq!(inbound.quota_used(), 1, "only the exactly-once one is left");
+        assert_eq!(inbound.outstanding(), 1);
+        actions.clear();
+        assert!(
+            !accept(
+                &mut inbound,
+                &publish(QoS::ExactlyOnce, Some(2), true),
+                &mut actions
+            ),
+            "and it still recognises the redelivery"
         );
     }
 
