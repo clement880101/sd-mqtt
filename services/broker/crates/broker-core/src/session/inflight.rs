@@ -120,6 +120,7 @@ mod tests {
                 retain: false,
                 subscription_ids: Vec::new(),
                 dup: false,
+                packet_id: None,
             },
             state: InflightState::AwaitingAck,
             sent_at: 0,

@@ -51,7 +51,7 @@ impl Outbound {
     pub fn offer(&mut self, item: Delivery, now: u32, out: &mut Vec<Action>) {
         self.scratch.clear();
         self.queue.push(item, now, self.online, &mut self.scratch);
-        Self::report(&mut self.scratch, out);
+        self.report(out);
         self.pump(now, out);
     }
 
@@ -60,7 +60,7 @@ impl Outbound {
         while self.online && self.inflight.has_room() {
             self.scratch.clear();
             let next = self.queue.pop(now, &mut self.scratch);
-            Self::report(&mut self.scratch, out);
+            self.report(out);
             let Some(item) = next else { break };
             if !self.dispatch(item, now, out) {
                 break;
@@ -75,11 +75,23 @@ impl Outbound {
             return true;
         }
 
-        let Some(packet_id) = self.packet_ids.allocate() else {
-            // Every identifier is outstanding. Put it back and wait for an
-            // acknowledgement to free one; this is a stall, not a loss.
-            self.queue.requeue(item);
-            return false;
+        let packet_id = match item.packet_id {
+            // A redelivery keeps the identifier it was first sent with,
+            // which is still reserved because the resume did not release
+            // it. Section 4.4 requires this: the peer is waiting on that
+            // identifier, and a fresh one makes the redelivery look like
+            // an unrelated message.
+            Some(reserved) => reserved,
+            None => {
+                let Some(fresh) = self.packet_ids.allocate() else {
+                    // Every identifier is outstanding. Put it back and
+                    // wait for an acknowledgement to free one; this is a
+                    // stall, not a loss.
+                    self.queue.requeue(item);
+                    return false;
+                };
+                fresh
+            }
         };
 
         out.push(Action::Send(publish(&item, Some(packet_id))));
@@ -194,7 +206,8 @@ impl Outbound {
     ///
     /// Anything whose receipt already arrived stays outstanding and has
     /// its release resent, because the peer owns it. Everything else goes
-    /// back to the head of the queue, marked as a redelivery.
+    /// back to the head of the queue, marked as a redelivery and still
+    /// holding the identifier it was first sent with.
     pub fn on_resume(&mut self, now: u32, out: &mut Vec<Action>) {
         self.online = true;
 
@@ -215,8 +228,14 @@ impl Outbound {
         // Reversed, because each requeue goes to the head, so the last one
         // pushed ends up first.
         for entry in to_resend.into_iter().rev() {
-            self.packet_ids.release(entry.packet_id);
-            self.queue.requeue(entry.delivery);
+            // The identifier stays reserved and travels with the message.
+            // Releasing it here and allocating a fresh one on the way out
+            // would break exactly-once for any peer that received the
+            // first copy and lost its receipt.
+            let mut delivery = entry.delivery;
+            delivery.packet_id = Some(entry.packet_id);
+            delivery.dup = true;
+            self.queue.requeue(delivery);
         }
 
         self.pump(now, out);
@@ -226,7 +245,7 @@ impl Outbound {
     pub fn clear(&mut self, reason: DropReason, out: &mut Vec<Action>) {
         self.scratch.clear();
         self.queue.clear(reason, &mut self.scratch);
-        Self::report(&mut self.scratch, out);
+        self.report(out);
         for entry in self.inflight.drain() {
             out.push(Action::Dropped {
                 id: entry.delivery.message.id,
@@ -258,8 +277,21 @@ impl Outbound {
             .chain(self.inflight.iter().map(|e| e.delivery.message.id))
     }
 
-    fn report(scratch: &mut Vec<(Delivery, DropReason)>, out: &mut Vec<Action>) {
+    /// Turn everything the queue discarded into drop actions.
+    ///
+    /// A discarded message that was holding an identifier gives it back.
+    /// A resumed message carries its identifier in the queue, so without
+    /// this an expiry or an eviction would strand that identifier for the
+    /// life of the session.
+    fn report(&mut self, out: &mut Vec<Action>) {
+        // Taken out so the identifiers can be released while draining;
+        // the buffer goes back afterwards, so the hot path still does not
+        // allocate.
+        let mut scratch = std::mem::take(&mut self.scratch);
         for (item, reason) in scratch.drain(..) {
+            if let Some(packet_id) = item.packet_id {
+                self.packet_ids.release(packet_id);
+            }
             out.push(Action::Dropped {
                 id: item.message.id,
                 reason,
@@ -267,6 +299,7 @@ impl Outbound {
                 topic: Arc::clone(&item.message.topic),
             });
         }
+        self.scratch = scratch;
     }
 }
 
@@ -305,6 +338,7 @@ mod tests {
             retain: false,
             dup: false,
             subscription_ids: Vec::new(),
+            packet_id: None,
         }
     }
 
@@ -458,6 +492,85 @@ mod tests {
         let resent = sent(&actions);
         assert_eq!(resent.len(), 1);
         assert!(resent[0].dup, "a redelivery carries the duplicate flag");
+    }
+
+    #[test]
+    fn resume_keeps_the_identifier_an_at_least_once_message_was_sent_with() {
+        // Section 4.4 requires the resumed publish to carry its original
+        // identifier. A fresh one leaves the peer holding the first one
+        // forever, and the broker will eventually hand that same value to
+        // an unrelated message which the peer then discards as a repeat.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+        let first = sent(&actions)[0].packet_id.expect("an identifier");
+
+        out.set_online(false);
+        actions.clear();
+        out.on_resume(0, &mut actions);
+
+        assert_eq!(
+            sent(&actions)[0].packet_id,
+            Some(first),
+            "the redelivery must name the identifier the peer is waiting on"
+        );
+    }
+
+    #[test]
+    fn resume_keeps_the_identifier_an_exactly_once_message_was_sent_with() {
+        // The same, and worse: a peer that received the publish and lost
+        // the receipt is holding this identifier awaiting a release. A
+        // redelivery under a new one has no record on the peer, so the
+        // payload reaches the application twice and exactly-once is
+        // broken by an ordinary dropped connection.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::ExactlyOnce, b"x"), 0, &mut actions);
+        let first = sent(&actions)[0].packet_id.expect("an identifier");
+
+        out.set_online(false);
+        actions.clear();
+        out.on_resume(0, &mut actions);
+
+        let resent = sent(&actions);
+        assert_eq!(resent.len(), 1);
+        assert_eq!(resent[0].packet_id, Some(first));
+        assert!(resent[0].dup, "and it is still a redelivery");
+    }
+
+    #[test]
+    fn an_identifier_held_for_a_redelivery_is_freed_if_the_message_is_dropped() {
+        // The resumed message keeps its identifier while it waits in the
+        // queue. If it never goes out, the identifier must come back:
+        // otherwise every interrupted delivery leaks one, and a long
+        // lived session runs out.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+
+        let mut item = delivery(QoS::AtLeastOnce, b"x");
+        item.message.expires_at = Some(5);
+        out.offer(item, 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.expect("an identifier");
+
+        out.set_online(false);
+        actions.clear();
+        // Resume after the deadline: the message is requeued holding its
+        // identifier, then discarded on the way out.
+        out.on_resume(9, &mut actions);
+
+        assert!(sent(&actions).is_empty(), "it expired instead of going out");
+        assert!(matches!(
+            actions.first(),
+            Some(Action::Dropped {
+                reason: DropReason::Expired,
+                ..
+            })
+        ));
+
+        assert!(
+            !out.packet_ids.is_in_use(packet_id),
+            "the identifier it was holding must have come back"
+        );
     }
 
     #[test]

@@ -61,6 +61,11 @@ struct Run {
     live: HashSet<u16>,
     /// Set if an identifier was reused while outstanding.
     reused: bool,
+    /// The identifier each message was last sent under.
+    last_id: HashMap<u32, u16>,
+    /// Set if a redelivery went out under a different identifier from
+    /// the send it repeats.
+    renumbered: bool,
     next_tag: u32,
 }
 
@@ -79,6 +84,8 @@ impl Run {
             outstanding: Vec::new(),
             live: HashSet::new(),
             reused: false,
+            last_id: HashMap::new(),
+            renumbered: false,
             next_tag: 0,
         }
     }
@@ -99,6 +106,7 @@ impl Run {
                 retain: false,
                 dup: false,
                 subscription_ids: Vec::new(),
+                packet_id: None,
             },
             0,
             &mut self.actions,
@@ -151,33 +159,14 @@ impl Run {
                 self.actions.clear();
             }
             Op::Resume => {
-                // Resume releases the identifiers of everything it requeues
-                // and allocates fresh ones on the way out, so reallocation
-                // across a resume is correct rather than a fault. The
-                // property therefore watches for reuse within a connection,
-                // which is where it would be a bug.
-                self.outstanding.clear();
-                self.live.clear();
+                // A resume releases nothing. Every identifier outstanding
+                // before it is outstanding after it: one whose receipt
+                // arrived keeps it and has its release resent, and one
+                // that did not keeps it and is republished under it.
+                // Reallocating across a resume is a fault, not a
+                // correction, so the watch carries straight through.
                 self.actions.clear();
                 self.out.on_resume(0, &mut self.actions);
-                // A message whose receipt already arrived keeps its
-                // identifier across the resume and has its release
-                // resent, so that identifier was *not* released and
-                // handing it out again would still be a fault. Put those
-                // back under watch, which also lets a later completion
-                // reach them.
-                let retained: Vec<u16> = self
-                    .actions
-                    .iter()
-                    .filter_map(|a| match a {
-                        Action::Send(Packet::PubRel(ack)) => Some(ack.packet_id),
-                        _ => None,
-                    })
-                    .collect();
-                for id in retained {
-                    self.live.insert(id);
-                    self.outstanding.push(id);
-                }
             }
         }
         self.absorb();
@@ -207,11 +196,25 @@ impl Run {
                     }
                     match publish.packet_id {
                         Some(id) => {
-                            if !self.live.insert(id) {
+                            // An identifier still outstanding may only be
+                            // used again by the very message it is
+                            // already carrying, and only as a
+                            // redelivery. Anything else means the peer
+                            // will acknowledge the wrong message.
+                            // Section 4.4: a redelivery keeps the
+                            // identifier of the send it repeats.
+                            if publish.dup && self.last_id.get(&tag) != Some(&id) {
+                                self.renumbered = true;
+                            }
+                            self.last_id.insert(tag, id);
+
+                            let carried = self.carrying.insert(id, tag);
+                            if self.live.contains(&id) && (carried != Some(tag) || !publish.dup) {
                                 self.reused = true;
                             }
-                            self.outstanding.push(id);
-                            self.carrying.insert(id, tag);
+                            if self.live.insert(id) {
+                                self.outstanding.push(id);
+                            }
                         }
                         // Fire-and-forget: there is no acknowledgement to
                         // wait for, so the exchange is over on the wire.
@@ -250,6 +253,20 @@ proptest! {
     ) {
         let run = drive(&ops, QueueLimits::default(), window);
         prop_assert!(!run.reused);
+    }
+
+    /// A redelivery carries the identifier of the send it repeats.
+    /// Section 4.4 requires it, and a peer that received the first copy
+    /// and lost its acknowledgement is waiting on exactly that value: a
+    /// new one makes the redelivery look like an unrelated message, so
+    /// the payload reaches the application a second time.
+    #[test]
+    fn a_redelivery_keeps_its_original_identifier(
+        ops in prop::collection::vec(any_op(), 1..80),
+        window in 1usize..8,
+    ) {
+        let run = drive(&ops, QueueLimits::default(), window);
+        prop_assert!(!run.renumbered);
     }
 
     /// No message goes out fresh more than once. A second copy must carry

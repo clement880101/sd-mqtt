@@ -26,6 +26,12 @@ pub struct Delivery {
     /// Whether this is a redelivery, set when a message is requeued on
     /// resume. It becomes the duplicate flag on the wire.
     pub dup: bool,
+    /// The identifier this was already sent with, when it is being
+    /// redelivered. Section 4.4 requires a resumed publish to keep its
+    /// original identifier: a peer that received the first copy is
+    /// waiting on that identifier, and a new one makes the message look
+    /// unrelated.
+    pub packet_id: Option<u16>,
 }
 
 impl Delivery {
@@ -180,8 +186,12 @@ impl Queue {
     /// acknowledged must go out before anything that arrived since. It
     /// bypasses the bounds deliberately: the message was already accepted,
     /// and refusing it now would lose something the peer may be expecting.
-    pub fn requeue(&mut self, mut item: Delivery) {
-        item.dup = true;
+    ///
+    /// The duplicate flag is the caller's to set, not this method's. The
+    /// other caller requeues a message because no identifier was free,
+    /// and that message was never sent, so claiming it is a redelivery
+    /// would be a lie to the subscriber.
+    pub fn requeue(&mut self, item: Delivery) {
         self.bytes += item.size_in_queue();
         self.entries.push_front(item);
     }
@@ -250,6 +260,7 @@ mod tests {
             retain: false,
             subscription_ids: Vec::new(),
             dup: false,
+            packet_id: None,
         }
     }
 
@@ -453,10 +464,28 @@ mod tests {
         let mut queue = Queue::new(limits(10, Overflow::DropNewest));
         let mut dropped = Vec::new();
         queue.push(delivery(QoS::AtLeastOnce, b"new"), 0, true, &mut dropped);
-        queue.requeue(delivery(QoS::AtLeastOnce, b"old"));
+        let mut old = delivery(QoS::AtLeastOnce, b"old");
+        old.dup = true;
+        queue.requeue(old);
 
         let first = queue.pop(0, &mut dropped).unwrap();
         assert_eq!(&first.message.payload[..], b"old");
-        assert!(first.dup, "a requeued message goes out as a duplicate");
+        assert!(first.dup, "the flag the caller set survives the requeue");
+    }
+
+    #[test]
+    fn requeueing_does_not_invent_a_duplicate_flag() {
+        // The other caller requeues because no identifier was free. That
+        // message was never sent, so it must not go out claiming to be a
+        // second attempt at something the subscriber already saw.
+        let mut queue = Queue::new(limits(10, Overflow::DropNewest));
+        let mut dropped = Vec::new();
+        queue.requeue(delivery(QoS::AtLeastOnce, b"never sent"));
+
+        let first = queue.pop(0, &mut dropped).unwrap();
+        assert!(
+            !first.dup,
+            "a message that was never sent is not a duplicate"
+        );
     }
 }
