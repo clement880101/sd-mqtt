@@ -5072,10 +5072,241 @@ git commit -m "test(codec): malformed corpus and a decoder fuzz target"
 
 ---
 
+## Task 18: Per-packet property validation
+
+MQTT 5 permits only a specific subset of properties on each packet type. A
+Topic Alias in a CONNECT is a protocol error, not something to accept and
+ignore. Until now `Properties::decode` accepts any property anywhere, which
+means the broker would silently tolerate packets every conforming
+implementation rejects.
+
+The cheap fix is one table rather than fourteen hand-written allow-lists.
+Property identifiers run from 0x01 to 0x2A, so a 64-bit mask holds the whole
+set, and checking membership is one shift and one test inside the loop that
+already exists.
+
+**Files:**
+- Modify: `services/broker/crates/mqtt-codec/src/properties.rs`
+- Modify: every packet decoder that calls `Properties::decode`
+
+- [ ] **Step 1: Derive the allowed sets from the specification**
+
+Do not take the following list on trust. Open MQTT 5.0 and read the property
+subsection for each packet type: 3.1.2.11 for CONNECT, 3.1.3.2 for the will,
+3.2.2.3 for CONNACK, 3.3.2.3 for PUBLISH, 3.4.2.2 for PUBACK and its three
+siblings, 3.8.2.1 for SUBSCRIBE, 3.9.2.1 for SUBACK, 3.10.2.1 for
+UNSUBSCRIBE, 3.11.2.1 for UNSUBACK, 3.14.2.2 for DISCONNECT and 3.15.2.2 for
+AUTH. Write down what each permits, then compare against this list and
+report any disagreement before writing code. A disagreement means either the
+plan is wrong or the reading is wrong, and both are worth knowing.
+
+| Packet | Permitted property identifiers |
+|---|---|
+| CONNECT | 0x11, 0x15, 0x16, 0x17, 0x19, 0x21, 0x22, 0x26, 0x27 |
+| Will | 0x01, 0x02, 0x03, 0x08, 0x09, 0x18, 0x26 |
+| CONNACK | 0x11, 0x12, 0x13, 0x15, 0x16, 0x1A, 0x1C, 0x1F, 0x21, 0x22, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A |
+| PUBLISH | 0x01, 0x02, 0x03, 0x08, 0x09, 0x0B, 0x23, 0x26 |
+| PUBACK, PUBREC, PUBREL, PUBCOMP | 0x1F, 0x26 |
+| SUBSCRIBE | 0x0B, 0x26 |
+| SUBACK | 0x1F, 0x26 |
+| UNSUBSCRIBE | 0x26 |
+| UNSUBACK | 0x1F, 0x26 |
+| DISCONNECT | 0x11, 0x1C, 0x1F, 0x26 |
+| AUTH | 0x15, 0x16, 0x1F, 0x26 |
+| PINGREQ, PINGRESP | none; these packets have no property block at all |
+
+- [ ] **Step 2: Write the failing test**
+
+Add to the test module in `properties.rs`:
+
+```rust
+    #[test]
+    fn rejects_a_property_the_packet_does_not_permit() {
+        // A topic alias is legal on PUBLISH and illegal on CONNECT.
+        let bytes = [0x03, 0x23, 0x00, 0x0A];
+
+        let mut reader = Reader::new(&bytes);
+        let ok = Properties::decode_for(&mut reader, PropertyScope::Publish);
+        assert_eq!(ok.unwrap().topic_alias, Some(10));
+
+        let mut reader = Reader::new(&bytes);
+        let err = Properties::decode_for(&mut reader, PropertyScope::Connect).unwrap_err();
+        assert!(matches!(err, CodecError::ProtocolError(_)));
+    }
+
+    #[test]
+    fn permits_user_properties_everywhere_they_are_allowed() {
+        let bytes = [0x07, 0x26, 0x00, 0x01, b'k', 0x00, 0x01, b'v'];
+        for scope in [
+            PropertyScope::Connect,
+            PropertyScope::Publish,
+            PropertyScope::Disconnect,
+            PropertyScope::Auth,
+        ] {
+            let mut reader = Reader::new(&bytes);
+            let props = Properties::decode_for(&mut reader, scope).expect("allowed");
+            assert_eq!(props.user_properties.len(), 1, "{scope:?}");
+        }
+    }
+
+    #[test]
+    fn the_unscoped_decoder_still_permits_everything() {
+        let bytes = [0x03, 0x23, 0x00, 0x0A];
+        let mut reader = Reader::new(&bytes);
+        assert!(Properties::decode(&mut reader).is_ok());
+    }
+```
+
+- [ ] **Step 3: Run the test to verify it fails**
+
+Run: `cd services/broker && cargo test -p mqtt-codec properties`
+Expected: FAIL to compile, with `PropertyScope` and `decode_for` not found.
+
+- [ ] **Step 4: Write the scope table**
+
+Add to `properties.rs`, above the `Properties` struct:
+
+```rust
+/// Which packet a property block belongs to.
+///
+/// MQTT 5 permits a different subset of properties on each packet, and a
+/// property outside that subset is a protocol error rather than something to
+/// ignore. The will has its own subset, distinct from the CONNECT that
+/// carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum PropertyScope {
+    Connect,
+    Will,
+    ConnAck,
+    Publish,
+    /// PUBACK, PUBREC, PUBREL and PUBCOMP share one subset.
+    Ack,
+    Subscribe,
+    SubAck,
+    Unsubscribe,
+    UnsubAck,
+    Disconnect,
+    Auth,
+}
+
+/// Build a membership mask from a list of property identifiers.
+///
+/// Identifiers run from 0x01 to 0x2A, so the whole set fits in 64 bits and
+/// membership is one shift and one test.
+const fn mask(ids: &[u8]) -> u64 {
+    let mut bits = 0u64;
+    let mut index = 0;
+    while index < ids.len() {
+        bits |= 1u64 << ids[index];
+        index += 1;
+    }
+    bits
+}
+
+impl PropertyScope {
+    fn allowed(self) -> u64 {
+        match self {
+            PropertyScope::Connect => mask(&[0x11, 0x15, 0x16, 0x17, 0x19, 0x21, 0x22, 0x26, 0x27]),
+            PropertyScope::Will => mask(&[0x01, 0x02, 0x03, 0x08, 0x09, 0x18, 0x26]),
+            PropertyScope::ConnAck => mask(&[
+                0x11, 0x12, 0x13, 0x15, 0x16, 0x1A, 0x1C, 0x1F, 0x21, 0x22, 0x24, 0x25, 0x26,
+                0x27, 0x28, 0x29, 0x2A,
+            ]),
+            PropertyScope::Publish => mask(&[0x01, 0x02, 0x03, 0x08, 0x09, 0x0B, 0x23, 0x26]),
+            PropertyScope::Ack => mask(&[0x1F, 0x26]),
+            PropertyScope::Subscribe => mask(&[0x0B, 0x26]),
+            PropertyScope::SubAck => mask(&[0x1F, 0x26]),
+            PropertyScope::Unsubscribe => mask(&[0x26]),
+            PropertyScope::UnsubAck => mask(&[0x1F, 0x26]),
+            PropertyScope::Disconnect => mask(&[0x11, 0x1C, 0x1F, 0x26]),
+            PropertyScope::Auth => mask(&[0x15, 0x16, 0x1F, 0x26]),
+        }
+    }
+
+    fn permits(self, id: u32) -> bool {
+        id < 64 && self.allowed() & (1u64 << id) != 0
+    }
+}
+```
+
+- [ ] **Step 5: Route decoding through the scope**
+
+In `properties.rs`, rename the body of `decode` to `decode_inner`, taking an
+`Option<PropertyScope>`, and give it this check immediately after reading the
+identifier and before the match:
+
+```rust
+            if let Some(scope) = scope {
+                if !scope.permits(id) {
+                    return Err(CodecError::ProtocolError(
+                        "property is not permitted on this packet type",
+                    ));
+                }
+            }
+```
+
+Then provide both entry points:
+
+```rust
+    /// Decode a property block without checking which packet permits what.
+    ///
+    /// Prefer [`Properties::decode_for`]. This exists for callers that have
+    /// no packet context, such as a property block read in isolation by a
+    /// test or a tool.
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Self::decode_inner(reader, None)
+    }
+
+    /// Decode a property block, rejecting anything the packet does not permit.
+    pub fn decode_for(
+        reader: &mut Reader<'_>,
+        scope: PropertyScope,
+    ) -> Result<Self, CodecError> {
+        Self::decode_inner(reader, Some(scope))
+    }
+```
+
+- [ ] **Step 6: Run the test to verify it passes**
+
+Run: `cd services/broker && cargo test -p mqtt-codec properties`
+Expected: PASS.
+
+- [ ] **Step 7: Point every packet decoder at its scope**
+
+Replace each `Properties::decode(reader)` call in `src/packet/` with the
+scoped form. The mapping is one to one with the packet being decoded, and the
+will block inside CONNECT uses `PropertyScope::Will`, not `Connect`.
+
+Run: `cd services/broker && cargo test -p mqtt-codec`
+Expected: PASS. If a round-trip test now fails, it is because a test
+constructs a packet carrying a property that packet does not permit. That is
+the check working. Fix the test's fixture, not the table.
+
+- [ ] **Step 8: Export the scope**
+
+Add `PropertyScope` to the `pub use properties::...` line in `lib.rs`.
+
+- [ ] **Step 9: Prove the table is enforced**
+
+Temporarily remove `0x23` from the PUBLISH mask, confirm a PUBLISH round-trip
+test carrying a topic alias now fails, then restore it. Report what you saw.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add services/broker/crates/mqtt-codec
+git commit -m "feat(codec): reject properties a packet does not permit"
+```
+
+---
+
 ## Done when
 
 - `cargo test -p mqtt-codec` passes, covering unit tests, the malformed
   corpus and the round-trip properties.
+- A property that its packet type does not permit is rejected as a protocol
+  error.
 - `cargo clippy --all-targets -- -D warnings` is clean.
 - `cargo deny check` passes against the allow list in `deny.toml`.
 - The fuzz target runs for ten minutes without a crash.
