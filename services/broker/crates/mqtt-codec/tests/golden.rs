@@ -1663,7 +1663,7 @@ mod frame {
     fn one_of_each() -> Vec<(Packet, u8)> {
         vec![
             (
-                Packet::Connect(Connect {
+                Packet::Connect(Box::new(Connect {
                     version: Version::V5,
                     client_id: "c".into(),
                     clean_start: true,
@@ -1672,7 +1672,7 @@ mod frame {
                     password: None,
                     will: None,
                     properties: Default::default(),
-                }),
+                })),
                 0x10,
             ),
             (

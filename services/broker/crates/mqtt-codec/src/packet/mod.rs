@@ -23,16 +23,23 @@ use crate::Version;
 /// Any MQTT control packet.
 ///
 /// The variants differ widely in size: CONNECT carries a client identifier,
-/// a will and a property block, while PINGREQ carries nothing. Boxing the
-/// large variants would make the common path allocate and would push a
-/// `Box::new` onto every construction site, so the enum is held inline and
-/// callers move it by value rather than copying it about.
+/// a will with a property block of its own, and a property block, while
+/// PINGREQ carries nothing. Boxing trades a move for an allocation, which
+/// is a good trade off the hot path and a bad one on it, so only CONNECT is
+/// boxed. See the note on [`Packet::Publish`] for why the hot path is not.
+/// That one box takes the enum from 840 bytes to 408.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(missing_docs)]
-#[allow(clippy::large_enum_variant)]
 pub enum Packet {
-    Connect(Connect),
+    /// Boxed because it is by far the largest variant and arrives exactly
+    /// once per connection, so the allocation costs nothing in any
+    /// realistic workload and every other variant gets smaller for it.
+    Connect(Box<Connect>),
     ConnAck(ConnAck),
+    /// Deliberately not boxed. This is the hot path, on every message, and
+    /// it already owns a heap-allocated topic and payload; a third
+    /// allocation per message to avoid a move would cost more than it
+    /// saves.
     Publish(Publish),
     PubAck(Ack),
     PubRec(Ack),
@@ -122,7 +129,9 @@ pub fn decode(
     let mut reader = Reader::new(body);
 
     let packet = match header.kind {
-        PacketKind::Connect => Packet::Connect(Connect::decode_body(&mut reader, limits)?),
+        PacketKind::Connect => {
+            Packet::Connect(Box::new(Connect::decode_body(&mut reader, limits)?))
+        }
         PacketKind::ConnAck => Packet::ConnAck(ConnAck::decode_body(&mut reader, version)?),
         PacketKind::Publish => Packet::Publish(Publish::decode_body(
             &mut reader,
@@ -287,7 +296,7 @@ mod tests {
 
     #[test]
     fn connect_is_decoded_without_knowing_the_version_first() {
-        let original = Packet::Connect(Connect {
+        let original = Packet::Connect(Box::new(Connect {
             version: Version::V5,
             client_id: "c".into(),
             clean_start: true,
@@ -296,7 +305,7 @@ mod tests {
             password: None,
             will: None,
             properties: Default::default(),
-        });
+        }));
         let mut buf = BytesMut::new();
         encode(&original, Version::V5, &mut buf).unwrap();
 
