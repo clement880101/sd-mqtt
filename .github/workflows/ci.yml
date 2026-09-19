@@ -43,6 +43,27 @@ jobs:
       - name: License and advisory gate
         run: cargo deny --manifest-path services/broker/Cargo.toml --config deny.toml check
 
+  devcontainer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the development image
+        run: docker build -f .devcontainer/base.Dockerfile -t sd-mqtt-dev .
+      - name: Every gate must pass inside one container
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspaces/repo" \
+            -w /workspaces/repo/services/broker \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            sd-mqtt-dev \
+            bash -lc '
+              set -e
+              cargo fmt --all --check
+              cargo clippy --all-targets -- -D warnings
+              cargo nextest run
+              cargo deny --manifest-path Cargo.toml --config ../../deny.toml check
+            '
+
   fuzz:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'

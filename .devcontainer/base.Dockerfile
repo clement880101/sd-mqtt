@@ -13,4 +13,12 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 RUN rustup component add rustfmt clippy \
     && cargo install cargo-nextest cargo-deny --locked
 
+# /etc/profile assigns PATH wholesale rather than appending, so a login
+# shell drops the toolchain the base image put there. Dev containers run
+# lifecycle commands and terminals through login shells, so put it back
+# for every shell kind rather than only the one docker run happens to use.
+RUN printf '%s\n' 'export PATH="/usr/local/cargo/bin:$PATH"' \
+      > /etc/profile.d/10-cargo.sh \
+    && chmod 0644 /etc/profile.d/10-cargo.sh
+
 WORKDIR /workspaces/repo
