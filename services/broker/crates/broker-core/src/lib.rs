@@ -8,5 +8,6 @@
 #![warn(missing_docs)]
 
 pub mod retained;
+pub mod session;
 pub mod subscriptions;
 pub mod topic;
