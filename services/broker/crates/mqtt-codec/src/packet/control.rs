@@ -1,6 +1,7 @@
 //! DISCONNECT and AUTH. PINGREQ and PINGRESP have no body at all.
 
 use crate::error::CodecError;
+use crate::header::PacketKind;
 use crate::properties::{Properties, PropertyScope};
 use crate::reader::Reader;
 use crate::reason::ReasonCode;
@@ -29,6 +30,7 @@ impl Disconnect {
         let code = reader.u8()?;
         let reason = ReasonCode::from_byte(code)
             .ok_or(CodecError::MalformedPacket("unknown reason code"))?;
+        crate::reason::check_reason(PacketKind::Disconnect, reason)?;
         let properties = if reader.is_empty() {
             Properties::default()
         } else {
@@ -40,6 +42,7 @@ impl Disconnect {
 
     /// Append the body, excluding the fixed header.
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        crate::reason::check_reason(PacketKind::Disconnect, self.reason)?;
         if version == Version::V311 {
             return Ok(());
         }
@@ -77,6 +80,7 @@ impl Auth {
         let code = reader.u8()?;
         let reason = ReasonCode::from_byte(code)
             .ok_or(CodecError::MalformedPacket("unknown reason code"))?;
+        crate::reason::check_reason(PacketKind::Auth, reason)?;
         let properties = if reader.is_empty() {
             Properties::default()
         } else {
@@ -96,6 +100,7 @@ impl Auth {
                 "authentication packets do not exist in 3.1.1",
             ));
         }
+        crate::reason::check_reason(PacketKind::Auth, self.reason)?;
         if self.reason == ReasonCode::Success && self.properties.is_empty() {
             return Ok(());
         }
@@ -216,5 +221,90 @@ mod tests {
             packet.encode_body(Version::V311, &mut out).unwrap_err(),
             CodecError::ProtocolError("authentication packets do not exist in 3.1.1")
         );
+    }
+
+    /// MQTT-v5.0 Table 3-10 lists the codes a DISCONNECT may carry.
+    /// Granted QoS 1, 0x01, is a SUBACK code and belongs to no DISCONNECT.
+    #[test]
+    fn rejects_a_disconnect_reason_code_outside_table_3_10() {
+        let packet = Disconnect {
+            reason: ReasonCode::GrantedQos1,
+            properties: Default::default(),
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            packet.encode_body(Version::V5, &mut out).unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
+        );
+
+        // Hand-built: reason 0x01, empty property block.
+        let wire = [0x01, 0x00];
+        let mut reader = Reader::new(&wire);
+        assert_eq!(
+            Disconnect::decode_body(&mut reader, Version::V5).unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
+        );
+    }
+
+    /// The published specification contradicts itself on 0x8C: Table 3-10
+    /// omits it, while the master table in section 2.4 lists it as sent by
+    /// DISCONNECT. The permissive reading wins; see the note on
+    /// `crate::reason`.
+    #[test]
+    fn accepts_bad_authentication_method_on_a_disconnect() {
+        let packet = Disconnect {
+            reason: ReasonCode::BadAuthenticationMethod,
+            properties: Default::default(),
+        };
+        let mut out = Vec::new();
+        packet.encode_body(Version::V5, &mut out).expect("encodes");
+        let mut reader = Reader::new(&out);
+        assert_eq!(
+            Disconnect::decode_body(&mut reader, Version::V5).expect("decodes"),
+            packet
+        );
+    }
+
+    /// MQTT-v5.0 Table 3-11 lists exactly three codes for AUTH.
+    #[test]
+    fn rejects_an_auth_reason_code_outside_table_3_11() {
+        let packet = Auth {
+            reason: ReasonCode::NotAuthorized,
+            properties: Default::default(),
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            packet.encode_body(Version::V5, &mut out).unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
+        );
+
+        // Hand-built: reason 0x87, empty property block.
+        let wire = [0x87, 0x00];
+        let mut reader = Reader::new(&wire);
+        assert_eq!(
+            Auth::decode_body(&mut reader).unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
+        );
+    }
+
+    #[test]
+    fn accepts_every_auth_reason_code_table_3_11_lists() {
+        for reason in [
+            ReasonCode::Success,
+            ReasonCode::ContinueAuthentication,
+            ReasonCode::ReAuthenticate,
+        ] {
+            let packet = Auth {
+                reason,
+                properties: crate::Properties {
+                    authentication_method: Some("SCRAM-SHA-1".into()),
+                    ..Default::default()
+                },
+            };
+            let mut out = Vec::new();
+            packet.encode_body(Version::V5, &mut out).expect("encodes");
+            let mut reader = Reader::new(&out);
+            assert_eq!(Auth::decode_body(&mut reader).expect("decodes"), packet);
+        }
     }
 }

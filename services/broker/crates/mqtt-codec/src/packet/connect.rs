@@ -3,7 +3,7 @@
 use bytes::Bytes;
 
 use crate::error::CodecError;
-use crate::header::Limits;
+use crate::header::{Limits, PacketKind};
 use crate::properties::{Properties, PropertyScope};
 use crate::qos::QoS;
 use crate::reader::Reader;
@@ -253,6 +253,8 @@ impl ConnAck {
             },
         };
 
+        crate::reason::check_reason(PacketKind::ConnAck, reason)?;
+
         if session_present && reason.is_failure() {
             return Err(CodecError::ProtocolError(
                 "session present must be false when the connect is refused",
@@ -274,6 +276,8 @@ impl ConnAck {
 
     /// Append the body, excluding the fixed header.
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        crate::reason::check_reason(PacketKind::ConnAck, self.reason)?;
+
         if self.session_present && self.reason.is_failure() {
             return Err(CodecError::ProtocolError(
                 "session present must be false when the connect is refused",
@@ -524,6 +528,49 @@ mod tests {
                 // exactly; failures widen to a legacy code.
                 Version::V311 => assert_eq!(decoded.reason.is_failure(), reason.is_failure()),
             }
+        }
+    }
+
+    /// MQTT-v5.0 Table 3-1 lists the 22 codes a CONNACK may carry. Session
+    /// taken over, 0x8E, is a DISCONNECT code and belongs to no CONNACK.
+    #[test]
+    fn rejects_a_connack_reason_code_outside_table_3_1() {
+        let packet = ConnAck {
+            session_present: false,
+            reason: ReasonCode::SessionTakenOver,
+            properties: Default::default(),
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            packet.encode_body(Version::V5, &mut out).unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
+        );
+
+        // Hand-built: flags 0, reason 0x8E, empty property block.
+        let wire = [0x00, 0x8E, 0x00];
+        let mut reader = Reader::new(&wire);
+        assert_eq!(
+            ConnAck::decode_body(&mut reader, Version::V5).unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
+        );
+    }
+
+    /// The 3.1.1 projection maps 0..=5 onto codes that are all inside the
+    /// MQTT 5 table, so the new check leaves that path alone.
+    #[test]
+    fn every_legacy_connack_return_code_still_decodes() {
+        for (code, expected) in [
+            (0u8, ReasonCode::Success),
+            (1, ReasonCode::UnsupportedProtocolVersion),
+            (2, ReasonCode::ClientIdentifierNotValid),
+            (3, ReasonCode::ServerUnavailable),
+            (4, ReasonCode::BadUserNameOrPassword),
+            (5, ReasonCode::NotAuthorized),
+        ] {
+            let wire = [0x00, code];
+            let mut reader = Reader::new(&wire);
+            let decoded = ConnAck::decode_body(&mut reader, Version::V311).expect("decodes");
+            assert_eq!(decoded.reason, expected);
         }
     }
 }

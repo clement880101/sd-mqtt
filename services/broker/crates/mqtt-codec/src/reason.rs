@@ -1,6 +1,7 @@
 //! Reason codes, shared by every acknowledgement path.
 
 use crate::error::CodecError;
+use crate::header::PacketKind;
 
 /// A reason code, as carried by MQTT 5 acknowledgements.
 ///
@@ -159,6 +160,165 @@ impl ReasonCode {
     }
 }
 
+/// Whether the specification permits `reason` on `kind`.
+///
+/// Every MQTT 5 packet that carries a reason code carries its own table of
+/// the codes it may carry, and a code outside that table is off-spec even
+/// though [`ReasonCode::from_byte`] recognises it. The sets below are
+/// transcribed from the OASIS MQTT 5.0 specification and cross-checked
+/// against the master table in section 2.4, which lists for each code the
+/// packets that may send it:
+///
+/// - CONNACK: Table 3-1, section 3.2.2.2. 22 codes.
+/// - PUBACK and PUBREC: Tables 3-4 and 3-5, sections 3.4.2.1 and 3.5.2.1.
+///   One set of 9, shared.
+/// - PUBREL and PUBCOMP: Tables 3-6 and 3-7. One set of 2, shared.
+/// - SUBACK: Table 3-8, section 3.9.3. 12 codes, which include the three
+///   granted-quality-of-service values 0x00, 0x01 and 0x02.
+/// - UNSUBACK: Table 3-9, section 3.11.3. 7 codes.
+/// - DISCONNECT: Table 3-10, section 3.14.2.1. 30 codes; see the note below.
+/// - AUTH: Table 3-11, section 3.15.2.1. 3 codes.
+///
+/// CONNECT, PUBLISH, SUBSCRIBE, UNSUBSCRIBE, PINGREQ and PINGRESP carry no
+/// reason code at all, so every code is refused on them; passing one of
+/// those kinds is a caller mistake and is answered with an error rather
+/// than a panic.
+///
+/// **One deliberate divergence.** Table 3-10 omits 0x8C, bad authentication
+/// method, jumping from 139 to 141, while the master table in section 2.4
+/// lists 0x8C as sent by CONNACK *and* DISCONNECT. The published
+/// specification contradicts itself and OASIS has issued no errata for
+/// MQTT 5.0. Section 4.12.1 tells a peer whose re-authentication fails to
+/// send DISCONNECT with an appropriate reason code, and bad authentication
+/// method is the only code that describes that failure, so the permissive
+/// reading is taken and 0x8C is accepted on DISCONNECT.
+fn permitted(kind: PacketKind, reason: ReasonCode) -> bool {
+    use ReasonCode::*;
+    match kind {
+        PacketKind::ConnAck => matches!(
+            reason,
+            Success
+                | UnspecifiedError
+                | MalformedPacket
+                | ProtocolError
+                | ImplementationSpecificError
+                | UnsupportedProtocolVersion
+                | ClientIdentifierNotValid
+                | BadUserNameOrPassword
+                | NotAuthorized
+                | ServerUnavailable
+                | ServerBusy
+                | Banned
+                | BadAuthenticationMethod
+                | TopicNameInvalid
+                | PacketTooLarge
+                | QuotaExceeded
+                | PayloadFormatInvalid
+                | RetainNotSupported
+                | QosNotSupported
+                | UseAnotherServer
+                | ServerMoved
+                | ConnectionRateExceeded
+        ),
+        PacketKind::PubAck | PacketKind::PubRec => matches!(
+            reason,
+            Success
+                | NoMatchingSubscribers
+                | UnspecifiedError
+                | ImplementationSpecificError
+                | NotAuthorized
+                | TopicNameInvalid
+                | PacketIdentifierInUse
+                | QuotaExceeded
+                | PayloadFormatInvalid
+        ),
+        PacketKind::PubRel | PacketKind::PubComp => {
+            matches!(reason, Success | PacketIdentifierNotFound)
+        }
+        // 0x00 is "granted QoS 0" here rather than plain success.
+        PacketKind::SubAck => matches!(
+            reason,
+            Success
+                | GrantedQos1
+                | GrantedQos2
+                | UnspecifiedError
+                | ImplementationSpecificError
+                | NotAuthorized
+                | TopicFilterInvalid
+                | PacketIdentifierInUse
+                | QuotaExceeded
+                | SharedSubscriptionsNotSupported
+                | SubscriptionIdentifiersNotSupported
+                | WildcardSubscriptionsNotSupported
+        ),
+        PacketKind::UnsubAck => matches!(
+            reason,
+            Success
+                | NoSubscriptionExisted
+                | UnspecifiedError
+                | ImplementationSpecificError
+                | NotAuthorized
+                | TopicFilterInvalid
+                | PacketIdentifierInUse
+        ),
+        // 0x00 is "normal disconnection" here rather than plain success.
+        PacketKind::Disconnect => matches!(
+            reason,
+            Success
+                | DisconnectWithWillMessage
+                | UnspecifiedError
+                | MalformedPacket
+                | ProtocolError
+                | ImplementationSpecificError
+                | NotAuthorized
+                | ServerBusy
+                | ServerShuttingDown
+                | BadAuthenticationMethod
+                | KeepAliveTimeout
+                | SessionTakenOver
+                | TopicFilterInvalid
+                | TopicNameInvalid
+                | ReceiveMaximumExceeded
+                | TopicAliasInvalid
+                | PacketTooLarge
+                | MessageRateTooHigh
+                | QuotaExceeded
+                | AdministrativeAction
+                | PayloadFormatInvalid
+                | RetainNotSupported
+                | QosNotSupported
+                | UseAnotherServer
+                | ServerMoved
+                | SharedSubscriptionsNotSupported
+                | ConnectionRateExceeded
+                | MaximumConnectTime
+                | SubscriptionIdentifiersNotSupported
+                | WildcardSubscriptionsNotSupported
+        ),
+        PacketKind::Auth => matches!(reason, Success | ContinueAuthentication | ReAuthenticate),
+        PacketKind::Connect
+        | PacketKind::Publish
+        | PacketKind::Subscribe
+        | PacketKind::Unsubscribe
+        | PacketKind::PingReq
+        | PacketKind::PingResp => false,
+    }
+}
+
+/// The error every packet reports for a reason code outside its own table.
+///
+/// One string for every packet type, because the failure is the same one:
+/// the code is recognised but does not belong here.
+pub(crate) fn check_reason(kind: PacketKind, reason: ReasonCode) -> Result<(), CodecError> {
+    if permitted(kind, reason) {
+        Ok(())
+    } else {
+        Err(CodecError::ProtocolError(
+            "reason code is not permitted on this packet type",
+        ))
+    }
+}
+
 impl From<CodecError> for ReasonCode {
     fn from(error: CodecError) -> Self {
         match error {
@@ -231,6 +391,107 @@ mod tests {
         for &code in ALL {
             assert_eq!(ReasonCode::from_byte(code as u8), Some(code));
         }
+    }
+
+    /// Every packet that carries a reason code, with the exact set the
+    /// specification permits on it, written out as wire bytes rather than
+    /// variant names so that the table can be read straight off the
+    /// specification's own tables. Checked in both directions below: no
+    /// code outside the set is accepted, and no code inside it is refused.
+    const SETS: &[(PacketKind, &[u8])] = &[
+        // Table 3-1, section 3.2.2.2.
+        (
+            PacketKind::ConnAck,
+            &[
+                0x00, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8C, 0x90,
+                0x95, 0x97, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9F,
+            ],
+        ),
+        // Tables 3-4 and 3-5.
+        (
+            PacketKind::PubAck,
+            &[0x00, 0x10, 0x80, 0x83, 0x87, 0x90, 0x91, 0x97, 0x99],
+        ),
+        (
+            PacketKind::PubRec,
+            &[0x00, 0x10, 0x80, 0x83, 0x87, 0x90, 0x91, 0x97, 0x99],
+        ),
+        // Tables 3-6 and 3-7.
+        (PacketKind::PubRel, &[0x00, 0x92]),
+        (PacketKind::PubComp, &[0x00, 0x92]),
+        // Table 3-8, section 3.9.3.
+        (
+            PacketKind::SubAck,
+            &[
+                0x00, 0x01, 0x02, 0x80, 0x83, 0x87, 0x8F, 0x91, 0x97, 0x9E, 0xA1, 0xA2,
+            ],
+        ),
+        // Table 3-9, section 3.11.3.
+        (
+            PacketKind::UnsubAck,
+            &[0x00, 0x11, 0x80, 0x83, 0x87, 0x8F, 0x91],
+        ),
+        // Table 3-10, section 3.14.2.1, plus 0x8C from the section 2.4
+        // master table; see the note on `permitted`.
+        (
+            PacketKind::Disconnect,
+            &[
+                0x00, 0x04, 0x80, 0x81, 0x82, 0x83, 0x87, 0x89, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F, 0x90,
+                0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F, 0xA0,
+                0xA1, 0xA2,
+            ],
+        ),
+        // Table 3-11, section 3.15.2.1.
+        (PacketKind::Auth, &[0x00, 0x18, 0x19]),
+    ];
+
+    #[test]
+    fn permits_exactly_the_codes_each_packet_may_carry() {
+        // The counts each specification table shows, asserted separately so
+        // that a code dropped from a list above is caught even if it is
+        // dropped from `permitted` at the same time.
+        let sizes: Vec<usize> = SETS.iter().map(|(_, codes)| codes.len()).collect();
+        assert_eq!(sizes, vec![22, 9, 9, 2, 2, 12, 7, 30, 3]);
+
+        for (kind, codes) in SETS {
+            for &code in ALL {
+                let expected = codes.contains(&(code as u8));
+                assert_eq!(
+                    permitted(*kind, code),
+                    expected,
+                    "{kind:?} and {code:?} (0x{:02X})",
+                    code as u8
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn permits_no_code_on_a_packet_that_carries_none() {
+        for kind in [
+            PacketKind::Connect,
+            PacketKind::Publish,
+            PacketKind::Subscribe,
+            PacketKind::Unsubscribe,
+            PacketKind::PingReq,
+            PacketKind::PingResp,
+        ] {
+            for &code in ALL {
+                assert!(!permitted(kind, code), "{kind:?} should carry no {code:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn reports_one_error_for_a_code_outside_the_table() {
+        assert_eq!(
+            check_reason(PacketKind::SubAck, ReasonCode::SessionTakenOver).unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
+        );
+        assert_eq!(
+            check_reason(PacketKind::SubAck, ReasonCode::GrantedQos2),
+            Ok(())
+        );
     }
 
     #[test]

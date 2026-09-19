@@ -1,7 +1,7 @@
 //! SUBSCRIBE, SUBACK, UNSUBSCRIBE and UNSUBACK.
 
 use crate::error::CodecError;
-use crate::header::Limits;
+use crate::header::{Limits, PacketKind};
 use crate::properties::{Properties, PropertyScope};
 use crate::qos::QoS;
 use crate::reader::Reader;
@@ -239,6 +239,7 @@ impl SubAck {
                     _ => return Err(CodecError::MalformedPacket("unknown suback return code")),
                 },
             };
+            crate::reason::check_reason(PacketKind::SubAck, reason)?;
             reasons.push(reason);
         }
 
@@ -266,6 +267,9 @@ impl SubAck {
             return Err(CodecError::ProtocolError(
                 "suback must carry at least one reason code",
             ));
+        }
+        for reason in &self.reasons {
+            crate::reason::check_reason(PacketKind::SubAck, *reason)?;
         }
         put_u16(out, self.packet_id);
         if version == Version::V5 {
@@ -384,10 +388,10 @@ impl UnsubAck {
         let mut reasons = Vec::new();
         while !reader.is_empty() {
             let code = reader.u8()?;
-            reasons.push(
-                ReasonCode::from_byte(code)
-                    .ok_or(CodecError::MalformedPacket("unknown reason code"))?,
-            );
+            let reason = ReasonCode::from_byte(code)
+                .ok_or(CodecError::MalformedPacket("unknown reason code"))?;
+            crate::reason::check_reason(PacketKind::UnsubAck, reason)?;
+            reasons.push(reason);
         }
 
         Ok(UnsubAck {
@@ -406,6 +410,9 @@ impl UnsubAck {
             return Err(CodecError::ProtocolError(
                 "packet identifier must not be zero",
             ));
+        }
+        for reason in &self.reasons {
+            crate::reason::check_reason(PacketKind::UnsubAck, *reason)?;
         }
         put_u16(out, self.packet_id);
         if version == Version::V311 {
@@ -646,6 +653,116 @@ mod tests {
         assert_eq!(
             UnsubAck::decode_body(&mut reader, Version::V5).unwrap(),
             packet
+        );
+    }
+
+    /// MQTT-v5.0 Table 3-8 lists the 12 codes a SUBACK may carry. Session
+    /// taken over, 0x8E, is a DISCONNECT code; before this check a SUBACK
+    /// carrying it encoded and decoded cleanly.
+    #[test]
+    fn rejects_a_suback_reason_code_outside_table_3_8() {
+        let packet = SubAck {
+            packet_id: 1,
+            reasons: vec![ReasonCode::SessionTakenOver],
+            properties: Default::default(),
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            packet.encode_body(Version::V5, &mut out).unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
+        );
+
+        // Hand-built: identifier 1, empty property block, reason 0x8E.
+        let wire = [0x00, 0x01, 0x00, 0x8E];
+        let mut reader = Reader::new(&wire);
+        assert_eq!(
+            SubAck::decode_body(&mut reader, Version::V5).unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
+        );
+    }
+
+    /// Every code Table 3-8 does list, including the three granted
+    /// quality-of-service values, survives a round trip.
+    #[test]
+    fn accepts_every_suback_reason_code_table_3_8_lists() {
+        let codes = [
+            ReasonCode::Success,
+            ReasonCode::GrantedQos1,
+            ReasonCode::GrantedQos2,
+            ReasonCode::UnspecifiedError,
+            ReasonCode::ImplementationSpecificError,
+            ReasonCode::NotAuthorized,
+            ReasonCode::TopicFilterInvalid,
+            ReasonCode::PacketIdentifierInUse,
+            ReasonCode::QuotaExceeded,
+            ReasonCode::SharedSubscriptionsNotSupported,
+            ReasonCode::SubscriptionIdentifiersNotSupported,
+            ReasonCode::WildcardSubscriptionsNotSupported,
+        ];
+        for reason in codes {
+            let packet = SubAck {
+                packet_id: 1,
+                reasons: vec![reason],
+                properties: Default::default(),
+            };
+            let mut out = Vec::new();
+            packet.encode_body(Version::V5, &mut out).expect("encodes");
+            let mut reader = Reader::new(&out);
+            assert_eq!(
+                SubAck::decode_body(&mut reader, Version::V5).expect("decodes"),
+                packet,
+                "{reason:?}"
+            );
+        }
+    }
+
+    /// The four 3.1.1 return codes all sit inside the MQTT 5 table, so the
+    /// narrower legacy encoding is untouched.
+    #[test]
+    fn the_legacy_suback_return_codes_still_round_trip() {
+        let packet = SubAck {
+            packet_id: 1,
+            reasons: vec![
+                ReasonCode::Success,
+                ReasonCode::GrantedQos1,
+                ReasonCode::GrantedQos2,
+                ReasonCode::UnspecifiedError,
+            ],
+            properties: Default::default(),
+        };
+        let mut out = Vec::new();
+        packet
+            .encode_body(Version::V311, &mut out)
+            .expect("encodes");
+        assert_eq!(out, vec![0x00, 0x01, 0x00, 0x01, 0x02, 0x80]);
+        let mut reader = Reader::new(&out);
+        assert_eq!(
+            SubAck::decode_body(&mut reader, Version::V311).expect("decodes"),
+            packet
+        );
+    }
+
+    /// MQTT-v5.0 Table 3-9 lists 7 codes for UNSUBACK. Quota exceeded,
+    /// 0x97, is legal on a SUBACK but not here.
+    #[test]
+    fn rejects_an_unsuback_reason_code_outside_table_3_9() {
+        let packet = UnsubAck {
+            packet_id: 1,
+            reasons: vec![ReasonCode::QuotaExceeded],
+            properties: Default::default(),
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            packet.encode_body(Version::V5, &mut out).unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
+        );
+
+        // Hand-built: identifier 1, empty property block, reason 0x97.
+        let wire = [0x00, 0x01, 0x00, 0x97];
+        let mut reader = Reader::new(&wire);
+        assert_eq!(
+            UnsubAck::decode_body(&mut reader, Version::V5).unwrap_err(),
+            CodecError::ProtocolError("reason code is not permitted on this packet type")
         );
     }
 }

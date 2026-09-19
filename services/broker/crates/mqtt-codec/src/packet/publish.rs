@@ -176,34 +176,6 @@ impl Publish {
     }
 }
 
-/// Whether `reason` is one the specification permits on `kind`.
-///
-/// MQTT-v5.0 Table 3-4 (PUBACK) and Table 3-5 (PUBREC) list the same nine
-/// codes; Table 3-6 (PUBREL) and Table 3-7 (PUBCOMP) list only success and
-/// packet identifier not found. Any other packet kind is a caller mistake
-/// and is refused rather than panicked on.
-fn reason_is_permitted(kind: PacketKind, reason: ReasonCode) -> bool {
-    match kind {
-        PacketKind::PubAck | PacketKind::PubRec => matches!(
-            reason,
-            ReasonCode::Success
-                | ReasonCode::NoMatchingSubscribers
-                | ReasonCode::UnspecifiedError
-                | ReasonCode::ImplementationSpecificError
-                | ReasonCode::NotAuthorized
-                | ReasonCode::TopicNameInvalid
-                | ReasonCode::PacketIdentifierInUse
-                | ReasonCode::QuotaExceeded
-                | ReasonCode::PayloadFormatInvalid
-        ),
-        PacketKind::PubRel | PacketKind::PubComp => matches!(
-            reason,
-            ReasonCode::Success | ReasonCode::PacketIdentifierNotFound
-        ),
-        _ => false,
-    }
-}
-
 /// The body shared by PUBACK, PUBREC, PUBREL and PUBCOMP.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ack {
@@ -253,11 +225,7 @@ impl Ack {
             (reason, properties)
         };
 
-        if !reason_is_permitted(kind, reason) {
-            return Err(CodecError::ProtocolError(
-                "reason code is not permitted on this packet type",
-            ));
-        }
+        crate::reason::check_reason(kind, reason)?;
 
         Ok(Ack {
             packet_id,
@@ -290,11 +258,7 @@ impl Ack {
                 "packet identifier must not be zero",
             ));
         }
-        if !reason_is_permitted(kind, self.reason) {
-            return Err(CodecError::ProtocolError(
-                "reason code is not permitted on this packet type",
-            ));
-        }
+        crate::reason::check_reason(kind, self.reason)?;
 
         put_u16(out, self.packet_id);
         if version == Version::V311 {
