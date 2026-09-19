@@ -130,6 +130,28 @@ fn push_id(body: &mut Vec<u8>, id: u8, scope: Option<PropertyScope>) -> Result<(
     Ok(())
 }
 
+/// Reject a second subscription identifier where only one may appear.
+///
+/// PUBLISH may carry several: MQTT-v5.0 section 3.3.2.3.8 says "Multiple
+/// Subscription Identifiers will be included if the publication is the
+/// result of a match to more than one subscription", which is why the field
+/// is a vector. SUBSCRIBE may carry one: section 3.8.2.1.2 says "It is a
+/// Protocol Error to include the Subscription Identifier more than once".
+///
+/// Scopes other than subscribe are left alone, and so is the unscoped form,
+/// which by definition has no packet to judge against.
+fn check_subscription_identifier_count(
+    scope: Option<PropertyScope>,
+    already: usize,
+) -> Result<(), CodecError> {
+    if scope == Some(PropertyScope::Subscribe) && already > 0 {
+        return Err(CodecError::ProtocolError(
+            "subscription identifier appears more than once",
+        ));
+    }
+    Ok(())
+}
+
 /// Reject a second occurrence of a property that may appear only once.
 fn once<T>(slot: &mut Option<T>, value: T) -> Result<(), CodecError> {
     if slot.is_some() {
@@ -194,6 +216,10 @@ impl Properties {
                             "subscription identifier must not be zero",
                         ));
                     }
+                    check_subscription_identifier_count(
+                        scope,
+                        props.subscription_identifiers.len(),
+                    )?;
                     props.subscription_identifiers.push(value);
                 }
                 0x11 => once(&mut props.session_expiry_interval, inner.u32()?)?,
@@ -272,12 +298,13 @@ impl Properties {
             push_id(&mut body, 0x09, scope)?;
             put_binary(&mut body, v)?;
         }
-        for v in &self.subscription_identifiers {
+        for (index, v) in self.subscription_identifiers.iter().enumerate() {
             if *v == 0 {
                 return Err(CodecError::ProtocolError(
                     "subscription identifier must not be zero",
                 ));
             }
+            check_subscription_identifier_count(scope, index)?;
             push_id(&mut body, 0x0B, scope)?;
             varint::encode(*v, &mut body)?;
         }
@@ -646,5 +673,60 @@ mod tests {
             CodecError::ProtocolError("property is not permitted on this packet type")
         );
         assert!(out.is_empty(), "a refused block must write nothing");
+    }
+
+    /// MQTT-v5.0 section 3.8.2.1.2: "It is a Protocol Error to include the
+    /// Subscription Identifier more than once." Section 3.3.2.3.8 says the
+    /// opposite for PUBLISH, where several arrive when one publication
+    /// matched several subscriptions, so the same bytes must be accepted
+    /// there.
+    #[test]
+    fn rejects_a_second_subscription_identifier_on_a_subscribe_only() {
+        // Two subscription identifiers, 1 and 2, in a five-byte block.
+        let wire = [0x04u8, 0x0B, 0x01, 0x0B, 0x02];
+
+        let mut reader = Reader::new(&wire);
+        assert_eq!(
+            Properties::decode_for(&mut reader, PropertyScope::Subscribe).unwrap_err(),
+            CodecError::ProtocolError("subscription identifier appears more than once")
+        );
+
+        let mut reader = Reader::new(&wire);
+        let decoded = Properties::decode_for(&mut reader, PropertyScope::Publish).expect("decodes");
+        assert_eq!(decoded.subscription_identifiers, vec![1, 2]);
+
+        // One is fine on a subscribe.
+        let one = [0x02u8, 0x0B, 0x01];
+        let mut reader = Reader::new(&one);
+        let decoded =
+            Properties::decode_for(&mut reader, PropertyScope::Subscribe).expect("decodes");
+        assert_eq!(decoded.subscription_identifiers, vec![1]);
+    }
+
+    #[test]
+    fn refuses_to_encode_a_second_subscription_identifier_on_a_subscribe() {
+        let props = Properties {
+            subscription_identifiers: vec![1, 2],
+            ..Properties::default()
+        };
+
+        let mut out = Vec::new();
+        assert_eq!(
+            props
+                .encode_for(PropertyScope::Subscribe, &mut out)
+                .unwrap_err(),
+            CodecError::ProtocolError("subscription identifier appears more than once")
+        );
+
+        // The same pair is legal on a publish and round trips.
+        let mut out = Vec::new();
+        props
+            .encode_for(PropertyScope::Publish, &mut out)
+            .expect("encodes");
+        let mut reader = Reader::new(&out);
+        assert_eq!(
+            Properties::decode_for(&mut reader, PropertyScope::Publish).expect("decodes"),
+            props
+        );
     }
 }

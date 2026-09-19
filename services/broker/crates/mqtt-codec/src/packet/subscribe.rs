@@ -22,14 +22,19 @@ pub enum RetainHandling {
 }
 
 impl RetainHandling {
+    /// Interpret bits 4 and 5 of a subscription options byte.
+    ///
+    /// MQTT-v5.0 section 3.8.3.1: "It is a Protocol Error to send a Retain
+    /// Handling value of 3." A protocol error rather than a malformed
+    /// packet, the same classification the same clause gives a maximum
+    /// quality of service of 3, and unlike the reserved bits 6 and 7 which
+    /// that clause does call malformed, [MQTT-3.8.3-5].
     fn from_u8(value: u8) -> Result<Self, CodecError> {
         match value {
             0 => Ok(RetainHandling::SendAlways),
             1 => Ok(RetainHandling::SendIfNew),
             2 => Ok(RetainHandling::DoNotSend),
-            _ => Err(CodecError::MalformedPacket(
-                "retain handling must be 0, 1 or 2",
-            )),
+            _ => Err(CodecError::ProtocolError("retain handling must not be 3")),
         }
     }
 
@@ -127,7 +132,7 @@ impl Subscribe {
                 ));
             }
 
-            let qos = QoS::from_u8(options & 0x03)?;
+            let qos = QoS::from_subscription_options(options & 0x03)?;
             let no_local = options & 0x04 != 0;
             let retain_as_published = options & 0x08 != 0;
             let retain_handling = RetainHandling::from_u8((options & 0x30) >> 4)?;
@@ -512,6 +517,25 @@ mod tests {
         );
     }
 
+    /// MQTT-v5.0 section 3.8.3.1 calls a maximum quality of service of 3 a
+    /// protocol error, unlike the same value in a PUBLISH fixed header,
+    /// which section 3.3.1.2 calls malformed.
+    #[test]
+    fn rejects_a_maximum_quality_of_service_of_three() {
+        let mut out = Vec::new();
+        crate::writer::put_u16(&mut out, 1);
+        out.push(0x00); // empty property block
+        crate::writer::put_string(&mut out, "a").unwrap();
+        out.push(0x03); // both quality of service bits set
+        let mut reader = Reader::new(&out);
+        assert_eq!(
+            Subscribe::decode_body(&mut reader, Version::V5, &Limits::default()).unwrap_err(),
+            CodecError::ProtocolError(
+                "maximum quality of service in the subscription options must not be 3"
+            )
+        );
+    }
+
     #[test]
     fn rejects_retain_handling_three() {
         let mut out = Vec::new();
@@ -522,7 +546,7 @@ mod tests {
         let mut reader = Reader::new(&out);
         assert_eq!(
             Subscribe::decode_body(&mut reader, Version::V5, &Limits::default()).unwrap_err(),
-            CodecError::MalformedPacket("retain handling must be 0, 1 or 2")
+            CodecError::ProtocolError("retain handling must not be 3")
         );
     }
 
