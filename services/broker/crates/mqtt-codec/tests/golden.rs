@@ -32,7 +32,6 @@ mod connect {
     use bytes::Bytes;
     use mqtt_codec::packet::{ConnAck, Connect, Will};
     use mqtt_codec::reader::Reader;
-    use mqtt_codec::writer::{put_binary, put_string, put_u16};
     use mqtt_codec::{Limits, Properties, QoS, ReasonCode, Version};
 
     /// A minimal MQTT 3.1.1 CONNECT.
@@ -305,16 +304,20 @@ mod connect {
     /// user name (bit 7) set.
     #[test]
     fn decodes_a_hand_built_v311_connect() {
-        let mut out = Vec::new();
-        put_string(&mut out, "MQTT").unwrap();
-        out.push(4); // protocol level
-        out.push(0xC6); // connect flags, see above
-        put_u16(&mut out, 42); // keep alive
-        put_string(&mut out, "id1").unwrap(); // client id
-        put_string(&mut out, "status").unwrap(); // will topic
-        put_binary(&mut out, b"bye").unwrap(); // will payload
-        put_string(&mut out, "bob").unwrap(); // user name
-        put_binary(&mut out, b"pw1").unwrap(); // password
+        // Literal bytes rather than this crate's own writer, so the vector
+        // stands on the specification alone.
+        #[rustfmt::skip]
+        let out: Vec<u8> = vec![
+            0x00, 0x04, b'M', b'Q', b'T', b'T',         // protocol name
+            0x04,                                       // protocol level
+            0xC6,                                       // connect flags, see above
+            0x00, 0x2A,                                 // keep alive, 42
+            0x00, 0x03, b'i', b'd', b'1',               // client identifier
+            0x00, 0x06, b's', b't', b'a', b't', b'u', b's', // will topic
+            0x00, 0x03, b'b', b'y', b'e',               // will payload
+            0x00, 0x03, b'b', b'o', b'b',               // user name
+            0x00, 0x03, b'p', b'w', b'1',               // password
+        ];
 
         let mut reader = Reader::new(&out);
         let decoded = Connect::decode_body(&mut reader, &Limits::default()).unwrap();

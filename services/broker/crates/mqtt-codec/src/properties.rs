@@ -171,7 +171,10 @@ impl Properties {
     ///
     /// Prefer [`Properties::decode_for`]. This exists for callers that have
     /// no packet context, such as a property block read in isolation by a
-    /// test or a tool.
+    /// test or a tool. Hidden from the documentation so that it does not
+    /// read as the recommended entry point: it skips the per-packet subset
+    /// check, and every caller that knows its packet should keep it.
+    #[doc(hidden)]
     pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
         Self::decode_inner(reader, None)
     }
@@ -257,7 +260,9 @@ impl Properties {
     /// Append the property block, including its length prefix.
     ///
     /// Prefer [`Properties::encode_for`]. This writes whatever is set,
-    /// without checking which packet permits what.
+    /// without checking which packet permits what. Hidden from the
+    /// documentation for the same reason as [`Properties::decode`].
+    #[doc(hidden)]
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), CodecError> {
         self.encode_inner(None, out)
     }

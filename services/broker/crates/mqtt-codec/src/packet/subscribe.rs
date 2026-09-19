@@ -171,10 +171,9 @@ impl Subscribe {
     ///
     /// Filter validity is the caller's responsibility; use
     /// [`crate::topic::validate_subscription`]. This method has no access to
-    /// [`Limits`](crate::header::Limits) and so cannot check topic depth.
-    /// The no-local rule for shared subscriptions is not filter validity but
-    /// a relation between two fields, so it is checked here; see
-    /// [`check_no_local`].
+    /// [`Limits`] and so cannot check topic depth. The no-local rule for
+    /// shared subscriptions is not filter validity but a relation between
+    /// two fields, so it is checked here.
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
         if self.packet_id == 0 {
             return Err(CodecError::ProtocolError(
