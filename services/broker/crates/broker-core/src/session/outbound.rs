@@ -113,6 +113,15 @@ impl Outbound {
     ///
     /// A failure reason ends the exchange: the peer has refused the
     /// message, so there is nothing to release.
+    ///
+    /// A receipt for an identifier that is not outstanding is answered
+    /// with a release carrying `PacketIdentifierNotFound`, not refused.
+    /// [MQTT-4.3.3-4] requires a release in answer to any receipt whose
+    /// reason is below 0x80, and the release reason table holds exactly
+    /// two values, so 0x92 exists for this case and nothing else. Sending
+    /// nothing would leave the peer waiting for a release that never
+    /// comes, which is worse than a protocol error because nothing
+    /// reports it.
     pub fn on_pubrec(
         &mut self,
         packet_id: u16,
@@ -126,10 +135,18 @@ impl Outbound {
             return Ok(());
         }
 
-        let entry = self
-            .inflight
-            .get_mut(packet_id)
-            .ok_or(ReasonCode::PacketIdentifierNotFound)?;
+        let Some(entry) = self.inflight.get_mut(packet_id) else {
+            // Nothing to track: the exchange is over from our side the
+            // moment this goes out. The completion the peer answers with
+            // will name an identifier we do not hold either, and is
+            // reported to the caller in the same way as any other.
+            out.push(Action::Send(Packet::PubRel(Ack {
+                packet_id,
+                reason: ReasonCode::PacketIdentifierNotFound,
+                properties: Properties::default(),
+            })));
+            return Ok(());
+        };
         entry.state = InflightState::AwaitingComplete;
         out.push(Action::Send(Packet::PubRel(Ack {
             packet_id,
@@ -140,6 +157,12 @@ impl Outbound {
     }
 
     /// Handle an exactly-once completion.
+    ///
+    /// A completion is the last packet of the exchange, so one naming an
+    /// identifier that is not outstanding is answered with silence: the
+    /// specification defines no response to it, and 0x92 may travel only
+    /// on a release or a completion, neither of which follows. It is
+    /// reported to the caller to be counted, and nothing more.
     pub fn on_pubcomp(
         &mut self,
         packet_id: u16,
@@ -353,6 +376,26 @@ mod tests {
             "a refused message is not released"
         );
         assert_eq!(out.inflight_len(), 0);
+    }
+
+    #[test]
+    fn a_receipt_for_an_unknown_identifier_is_answered_with_a_release() {
+        // The release reason table holds exactly two values, so 0x92
+        // exists for this case and nothing else. Answering with an error
+        // and no packet would leave the peer waiting for a release that
+        // never comes, which is worse than a protocol error because
+        // nothing reports it.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        out.on_pubrec(99, ReasonCode::Success, 0, &mut actions)
+            .expect("an unknown identifier is answered, not refused");
+
+        let Some(Action::Send(Packet::PubRel(ack))) = actions.first() else {
+            panic!("a release should have been sent, got {actions:?}");
+        };
+        assert_eq!(ack.packet_id, 99);
+        assert_eq!(ack.reason, ReasonCode::PacketIdentifierNotFound);
+        assert_eq!(out.inflight_len(), 0, "there is nothing to track");
     }
 
     #[test]
