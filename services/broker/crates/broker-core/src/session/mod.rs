@@ -6,5 +6,7 @@
 //! testable by driving millions of generated sequences through them.
 
 pub mod message;
+pub mod packet_ids;
 
 pub use message::{Message, MessageId};
+pub use packet_ids::PacketIds;
