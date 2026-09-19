@@ -4335,9 +4335,10 @@ impl Packet {
             Packet::Connect(p) => p.encode_body(version, out),
             Packet::ConnAck(p) => p.encode_body(version, out),
             Packet::Publish(p) => p.encode_body(version, out),
-            Packet::PubAck(p) | Packet::PubRec(p) | Packet::PubRel(p) | Packet::PubComp(p) => {
-                p.encode_body(version, out)
-            }
+            Packet::PubAck(p) => p.encode_body(version, PacketKind::PubAck, out),
+            Packet::PubRec(p) => p.encode_body(version, PacketKind::PubRec, out),
+            Packet::PubRel(p) => p.encode_body(version, PacketKind::PubRel, out),
+            Packet::PubComp(p) => p.encode_body(version, PacketKind::PubComp, out),
             Packet::Subscribe(p) => p.encode_body(version, out),
             Packet::SubAck(p) => p.encode_body(version, out),
             Packet::Unsubscribe(p) => p.encode_body(version, out),
@@ -4380,10 +4381,18 @@ pub fn decode(
             version,
             limits,
         )?),
-        PacketKind::PubAck => Packet::PubAck(Ack::decode_body(&mut reader, version)?),
-        PacketKind::PubRec => Packet::PubRec(Ack::decode_body(&mut reader, version)?),
-        PacketKind::PubRel => Packet::PubRel(Ack::decode_body(&mut reader, version)?),
-        PacketKind::PubComp => Packet::PubComp(Ack::decode_body(&mut reader, version)?),
+        PacketKind::PubAck => {
+            Packet::PubAck(Ack::decode_body(&mut reader, version, PacketKind::PubAck)?)
+        }
+        PacketKind::PubRec => {
+            Packet::PubRec(Ack::decode_body(&mut reader, version, PacketKind::PubRec)?)
+        }
+        PacketKind::PubRel => {
+            Packet::PubRel(Ack::decode_body(&mut reader, version, PacketKind::PubRel)?)
+        }
+        PacketKind::PubComp => {
+            Packet::PubComp(Ack::decode_body(&mut reader, version, PacketKind::PubComp)?)
+        }
         PacketKind::Subscribe => {
             Packet::Subscribe(Subscribe::decode_body(&mut reader, version, limits)?)
         }

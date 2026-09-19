@@ -208,6 +208,13 @@ remote node, round-robin within a node. A member whose queue is full is
 skipped and the next is tried. Each member keeps its own queue; there is no
 shared group queue.
 
+**A retained publish with an empty payload removes the retained message**
+for that topic. It is not stored, and it is not sent to future subscribers,
+but it is delivered to subscribers matching at the time. This is easy to
+miss because the codec correctly treats an empty payload as ordinary.
+
+**Retained messages** live in their own trie
+
 ## 7. Persistence
 
 ### 7.1 The Storage trait
