@@ -15,6 +15,20 @@
 //! Every later packet type gets its own module here, alongside `connect`.
 
 mod connect {
+    // Independence property for this vector set: every settable flag bit
+    // must appear set in at least one vector where none of its neighbouring
+    // flags are also set, so that swapping any pair of flag constants
+    // changes at least one expected byte. A vector where two flags are
+    // always true together is invariant under swapping exactly those two,
+    // and cannot catch that swap. `encodes_a_v5_connect_with_credentials_
+    // and_a_retained_will` sets both will retain and password, so on its
+    // own it cannot distinguish `FLAG_WILL_RETAIN` from `FLAG_PASSWORD`;
+    // `encodes_a_v5_connect_with_a_retained_will_and_no_password` and
+    // `encodes_a_v5_connect_with_a_password_and_no_user_name` below isolate
+    // those two bits from each other. When adding vectors for the next
+    // packet type, check the same property: no two flags may be "always
+    // both set" across the whole set without a vector that separates them.
+
     use bytes::Bytes;
     use mqtt_codec::packet::{ConnAck, Connect, Will};
     use mqtt_codec::reader::Reader;
@@ -100,6 +114,100 @@ mod connect {
                 0x00, 0x01, 0x70, // will payload "p"
                 0x00, 0x01, 0x75, // user name "u"
                 0x00, 0x02, 0x70, 0x77, // password "pw"
+            ]
+        );
+    }
+
+    /// An MQTT 5 CONNECT with a retained will and no password.
+    ///
+    /// Isolates the will-retain bit from the password bit, which the vector
+    /// above never sets independently: there, retain and password are both
+    /// true, so swapping `FLAG_WILL_RETAIN` and `FLAG_PASSWORD` leaves that
+    /// vector's flags byte unchanged. Here only retain is set.
+    ///
+    /// MQTT-v5.0 section 3.1.2.6 / 3.1.2.7: will retain is bit 5, password
+    /// is bit 6, of the connect flags.
+    #[test]
+    fn encodes_a_v5_connect_with_a_retained_will_and_no_password() {
+        let packet = Connect {
+            version: Version::V5,
+            client_id: "c1".into(),
+            clean_start: true,
+            keep_alive: 10,
+            username: Some("u1".into()),
+            password: None,
+            will: Some(Will {
+                topic: "t1".into(),
+                payload: Bytes::from_static(b"p1"),
+                qos: QoS::AtMostOnce,
+                retain: true,
+                properties: Properties::default(),
+            }),
+            properties: Properties::default(),
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V5, &mut out).unwrap();
+
+        // Connect flags: clean start (0x02) | will (0x04) | will retain
+        // (0x20) | user name (0x80). Password is not set.
+        assert_eq!(out[7], 0xA6);
+
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x04, 0x4D, 0x51, 0x54, 0x54, // "MQTT"
+                0x05, // protocol level 5
+                0xA6, // connect flags, see above
+                0x00, 0x0A, // keep alive = 10
+                0x00, // top-level property block: empty
+                0x00, 0x02, 0x63, 0x31, // client id "c1"
+                0x00, // will property block: empty
+                0x00, 0x02, 0x74, 0x31, // will topic "t1"
+                0x00, 0x02, 0x70, 0x31, // will payload "p1"
+                0x00, 0x02, 0x75, 0x31, // user name "u1"
+            ]
+        );
+    }
+
+    /// An MQTT 5 CONNECT with a password and no user name, no will.
+    ///
+    /// MQTT 5 permits a password without a user name (3.1.1 does not; see
+    /// `rejects_a_311_password_without_a_user_name` in `packet::connect`).
+    /// With no will and no user name, this vector sets only the password
+    /// bit, isolating it from every other flag, including will retain.
+    ///
+    /// MQTT-v5.0 section 3.1.2.9: password is bit 6 of the connect flags.
+    #[test]
+    fn encodes_a_v5_connect_with_a_password_and_no_user_name() {
+        let packet = Connect {
+            version: Version::V5,
+            client_id: "c2".into(),
+            clean_start: true,
+            keep_alive: 20,
+            username: None,
+            password: Some(Bytes::from_static(b"pw2")),
+            will: None,
+            properties: Properties::default(),
+        };
+
+        let mut out = Vec::new();
+        packet.encode_body(Version::V5, &mut out).unwrap();
+
+        // Connect flags: clean start (0x02) | password (0x40). Nothing else
+        // is set.
+        assert_eq!(out[7], 0x42);
+
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x04, 0x4D, 0x51, 0x54, 0x54, // "MQTT"
+                0x05, // protocol level 5
+                0x42, // connect flags, see above
+                0x00, 0x14, // keep alive = 20
+                0x00, // top-level property block: empty
+                0x00, 0x02, 0x63, 0x32, // client id "c2"
+                0x00, 0x03, 0x70, 0x77, 0x32, // password "pw2"
             ]
         );
     }
