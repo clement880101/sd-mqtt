@@ -32,10 +32,12 @@ pub struct InflightEntry {
 
 /// The window of messages sent and not yet acknowledged.
 ///
-/// Backed by a vector in send order rather than a map. The window is small
-/// by design: the default is twenty, and one is the documented way to get
-/// strict ordering, so a linear scan is faster than hashing and keeps
-/// resume order correct for free.
+/// Backed by a vector in send order rather than a map. The limit is set
+/// by whoever constructs this, from the peer's receive maximum, and is
+/// small in every realistic setting: one is the documented way to get
+/// strict ordering, and a peer asking for thousands outstanding is
+/// asking for a memory bound rather than a lookup structure. So a linear
+/// scan beats hashing and keeps resume order correct for free.
 pub struct Inflight {
     entries: Vec<InflightEntry>,
     limit: usize,

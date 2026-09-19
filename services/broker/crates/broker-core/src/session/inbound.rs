@@ -37,6 +37,25 @@ pub struct Received {
 /// again and the broker is not promising to notice: [MQTT-4.3.2-5]
 /// requires a publish carrying an identifier already acknowledged to be
 /// treated as a new message whatever its duplicate flag says.
+///
+/// # What the receive maximum counts here, and the caveat on it
+///
+/// [MQTT-3.3.4-9] counts both levels: a peer may not exceed the receive
+/// maximum in "QoS 1 and QoS 2 PUBLISH packets where it has not sent a
+/// PUBACK or PUBCOMP in response". This counts only the exactly-once
+/// exchanges, in `awaiting_release`.
+///
+/// Those agree exactly as long as the caller answers each publish
+/// before it offers the next one, because then no at-least-once publish
+/// is ever un-acknowledged at the point this is asked. The set the
+/// specification describes is then precisely `awaiting_release`.
+///
+/// That is a condition on the caller, not a property of this type, and
+/// [`Inbound::acknowledge`] is a separate call precisely so the caller
+/// can wait until it knows the outcome. A shell that defers or batches
+/// acknowledgements breaks the equivalence and will under-count: it
+/// must track its own un-answered at-least-once publishes, or this type
+/// must be extended to do it. Nothing here will notice on its behalf.
 pub struct Inbound {
     /// Identifiers whose publish has arrived and whose release has not.
     awaiting_release: HashSet<u16, RandomState>,

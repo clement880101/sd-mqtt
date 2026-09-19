@@ -127,13 +127,15 @@ mod tests {
     }
 
     #[test]
-    fn skips_over_identifiers_that_are_still_held() {
+    fn releasing_one_identifier_leaves_the_others_held() {
+        // Named for what it checks. It does not exercise the skip: the
+        // counter has already moved past both, so nothing is stepped
+        // over here. skips_past_held_identifiers_when_the_counter_wraps
+        // is the test that reaches that loop.
         let mut ids = PacketIds::default();
         let one = ids.allocate().unwrap();
         let two = ids.allocate().unwrap();
         ids.release(two);
-        // The counter has moved past both; releasing the second should let
-        // it be found again on the wrap, while the first stays held.
         assert!(ids.is_in_use(one));
         assert!(!ids.is_in_use(two));
     }

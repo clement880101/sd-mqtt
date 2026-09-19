@@ -277,6 +277,23 @@ impl Run {
                     }
                 }
                 Action::Dropped { id, .. } => {
+                    // A discarded message gives its identifier back
+                    // inside the state machine, so the watch here has to
+                    // let go of it too. A resumed message waits in the
+                    // queue holding its identifier, and expiry or
+                    // eviction can take it from there; leaving the entry
+                    // behind would make the next message to be handed
+                    // that identifier look like a reuse. It cannot
+                    // happen today only because the allocator's counter
+                    // is monotonic, and this should not depend on that.
+                    let stranded = self
+                        .carrying
+                        .iter()
+                        .find(|(_, tag)| self.offered.get(tag) == Some(&id))
+                        .map(|(packet_id, _)| *packet_id);
+                    if let Some(packet_id) = stranded {
+                        self.abandon(packet_id);
+                    }
                     self.dropped.insert(id);
                 }
                 _ => {}
