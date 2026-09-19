@@ -1081,7 +1081,7 @@ Expected: FAIL to compile, with `SubscriptionTrie` not found.
 Insert at the top of `trie.rs`:
 
 ```rust
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::BuildHasher;
 
 use foldhash::fast::RandomState;
 use parking_lot::RwLock;
@@ -1115,9 +1115,7 @@ impl SubscriptionTrie {
     }
 
     fn shard_of(&self, first_level: &str) -> &RwLock<Node> {
-        let mut hasher = self.hasher.build_hasher();
-        first_level.hash(&mut hasher);
-        let index = (hasher.finish() as usize) % self.shards.len();
+        let index = (self.hasher.hash_one(first_level) as usize) % self.shards.len();
         &self.shards[index]
     }
 
