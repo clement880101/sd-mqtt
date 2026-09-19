@@ -2650,6 +2650,47 @@ git commit -m "test(session): conservation properties over generated histories"
 
 ---
 
+## Amendments after review
+
+Recorded so the plan matches the code, and so the reasoning survives.
+
+**A resumed publish keeps its original packet identifier.** This plan said
+to release the identifier and requeue, which meant a redelivery went out
+under a new one. Section 4.4 requires the original. A peer that received
+the first copy and lost its acknowledgement waits on the old identifier,
+sees an unrelated-looking message, and delivers the payload twice; the
+stranded identifier then causes a genuinely new message to be discarded as
+a duplicate once the counter wraps. One mistake, both duplication and
+loss, triggered by an ordinary dropped connection. The design spec was the
+root cause and has been corrected too.
+
+**Acknowledgements are validated against the entry they name.** Matching
+on the identifier alone let a completion settle a message that had never
+been receipted, freeing the slot and counting it delivered with no drop
+reported.
+
+**Three mutations survived the whole suite** and now do not: deleting the
+identifier release on completion, which stalls a session permanently after
+sixty-five thousand messages; and inverting the resume partition, which
+resends a release for a message the peer never received, so the peer
+answers not-found and the broker counts it delivered. Silent loss,
+invisible to a hundred tests and fifty thousand generated histories.
+
+**Separating the acknowledgement from the dispatch decision** made a
+failing receipt reachable for the first time, and with it the rule that a
+later publish under that identifier is a new message. It also made the
+receive maximum's accounting load-bearing: counting only exactly-once
+exchanges was equivalent while every publish was answered in the same
+call, and is not once a caller can defer.
+
+**A known limitation of the property layer.** The conservation harness
+treats any acknowledgement the state machine accepts as a legitimate
+ending, so a bug in that acceptance is mirrored by the harness rather than
+caught by it. Three unit tests cover the specific case. This is the same
+circularity that let a transposed property identifier and a swapped flag
+bit pass in the codec, and an unreachable wildcard pass in the routing
+core, so it is worth revisiting when the shell adds state.
+
 ## Done when
 
 - `cargo test -p broker-core` passes, and the workspace suite still does.
