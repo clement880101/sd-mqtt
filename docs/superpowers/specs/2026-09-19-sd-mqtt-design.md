@@ -717,6 +717,15 @@ shippable.
   describes that failure. If a conformance suite ever rejects it, this is
   the line to revisit, and the stricter reading is a one-line change.
 
+- **Contention in the matching layer.** The subscription trie is sharded
+  by first topic level, but the retained store is one lock, so every
+  retained publish serialises broker-wide and an expiry sweep holds that
+  lock for the whole tree. Shared-subscription selection also takes one
+  write lock across all groups, because it advances a per-group cursor;
+  per-group atomic cursors under a read lock would fix it. Neither is worth
+  designing before the session layer's access patterns exist, and neither
+  is on a path a benchmark currently covers.
+
 - **Zero-copy payloads.** The codec's reader copies every payload out of
   the connection's read buffer. Since decoding already owns that buffer
   mutably, splitting and freezing it instead would remove one full payload
