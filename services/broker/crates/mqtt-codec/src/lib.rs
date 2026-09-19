@@ -6,6 +6,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod error;
+pub mod varint;
+
+pub use error::CodecError;
+
 /// The MQTT protocol version a packet is encoded for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Version {
