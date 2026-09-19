@@ -1148,6 +1148,23 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_frame_exactly_at_the_limit() {
+        // A two-byte header plus a six-byte body is exactly eight.
+        let mut buf = vec![0x30, 0x06];
+        buf.extend(std::iter::repeat_n(0u8, 6));
+        let header = peek(&buf, &limits(8)).unwrap().expect("complete");
+        assert_eq!(header.total_len(), 8);
+
+        // One byte over the limit is rejected.
+        let mut buf = vec![0x30, 0x07];
+        buf.extend(std::iter::repeat_n(0u8, 7));
+        assert_eq!(
+            peek(&buf, &limits(8)).unwrap_err(),
+            CodecError::PacketTooLarge
+        );
+    }
+
+    #[test]
     fn rejects_the_one_unassigned_packet_type() {
         // Nibble 0 is the only unassigned value; 1 through 15 are all real
         // packet types, with 15 being AUTH.
@@ -1391,7 +1408,7 @@ pub use header::{FixedHeader, Limits, PacketKind};
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cd services/broker && cargo test -p mqtt-codec header`
-Expected: PASS, eight tests.
+Expected: PASS, nine tests.
 
 - [ ] **Step 6: Commit**
 
