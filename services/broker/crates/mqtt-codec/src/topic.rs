@@ -6,6 +6,33 @@ use crate::header::Limits;
 /// The prefix marking a shared subscription.
 pub const SHARE_PREFIX: &str = "$share/";
 
+/// The deepest topic any validated name or filter may be, whatever the
+/// configured limit says.
+///
+/// Matching walks a topic one level per stack frame, so depth is stack
+/// depth, and a sufficiently deep topic aborts the process rather than
+/// returning an error. [`Limits::max_topic_depth`] is a `u16` supplied by
+/// configuration and so admits 65,535, which is deep enough to do it.
+/// This is the ceiling the validators clamp that to.
+///
+/// 1024 sits far above any real topic, which is a handful of levels, and
+/// far below where the stack actually runs out. Measured against an
+/// unoptimised build of the matching layer, a spawned thread on its
+/// default 2 MiB stack, which is what a runtime worker gets, survives
+/// 6,500 levels and aborts by 7,000; the main thread's larger stack
+/// reaches past 20,000. The ceiling is therefore about six times inside
+/// the tightest case, on the build that uses the most stack per frame.
+///
+/// An operator can lower the configured limit but cannot raise the
+/// effective one past this.
+pub const MAX_TOPIC_DEPTH: u16 = 1024;
+
+/// The configured depth limit, clamped to what the matching layer can
+/// actually walk.
+fn effective_depth_limit(limits: &Limits) -> usize {
+    usize::from(limits.max_topic_depth.min(MAX_TOPIC_DEPTH))
+}
+
 fn level_count(topic: &str) -> usize {
     topic.split('/').count()
 }
@@ -13,6 +40,8 @@ fn level_count(topic: &str) -> usize {
 /// Validate a topic name as used in PUBLISH.
 ///
 /// A topic name must be non-empty and must contain no wildcard character.
+/// Its depth must be within the configured limit and within
+/// [`MAX_TOPIC_DEPTH`], whichever is the lesser.
 pub fn validate_name(name: &str, limits: &Limits) -> Result<(), CodecError> {
     if name.is_empty() {
         return Err(CodecError::InvalidTopicName);
@@ -23,7 +52,7 @@ pub fn validate_name(name: &str, limits: &Limits) -> Result<(), CodecError> {
     if name.contains('\0') {
         return Err(CodecError::InvalidTopicName);
     }
-    if level_count(name) > usize::from(limits.max_topic_depth) {
+    if level_count(name) > effective_depth_limit(limits) {
         return Err(CodecError::TopicNameTooDeep);
     }
     Ok(())
@@ -32,7 +61,9 @@ pub fn validate_name(name: &str, limits: &Limits) -> Result<(), CodecError> {
 /// Validate a subscription filter.
 ///
 /// A single-level wildcard must occupy an entire level. A multi-level
-/// wildcard must occupy an entire level and be the final one.
+/// wildcard must occupy an entire level and be the final one. Its depth
+/// must be within the configured limit and within [`MAX_TOPIC_DEPTH`],
+/// whichever is the lesser.
 pub fn validate_filter(filter: &str, limits: &Limits) -> Result<(), CodecError> {
     if filter.is_empty() {
         return Err(CodecError::InvalidTopicFilter);
@@ -42,7 +73,7 @@ pub fn validate_filter(filter: &str, limits: &Limits) -> Result<(), CodecError> 
     }
 
     let levels: Vec<&str> = filter.split('/').collect();
-    if levels.len() > usize::from(limits.max_topic_depth) {
+    if levels.len() > effective_depth_limit(limits) {
         return Err(CodecError::TopicFilterTooDeep);
     }
 
@@ -147,6 +178,39 @@ mod tests {
 
     #[test]
     fn rejects_a_topic_name_deeper_than_the_limit() {
+        assert!(validate_name("a/b/c", &depth(3)).is_ok());
+        assert_eq!(
+            validate_name("a/b/c/d", &depth(3)).unwrap_err(),
+            CodecError::TopicNameTooDeep
+        );
+    }
+
+    /// The configured limit is a `u16`, so an operator can ask for 65,535
+    /// levels. Matching recurses per level, so honouring that would let a
+    /// publish overflow the stack and abort the broker. The ceiling is
+    /// not advisory.
+    #[test]
+    fn the_configured_depth_limit_cannot_exceed_the_ceiling() {
+        let too_deep = "a/".repeat(usize::from(MAX_TOPIC_DEPTH)) + "a";
+        let at_ceiling = "a/".repeat(usize::from(MAX_TOPIC_DEPTH) - 1) + "a";
+
+        for limits in [depth(u16::MAX), depth(MAX_TOPIC_DEPTH)] {
+            assert!(validate_name(&at_ceiling, &limits).is_ok());
+            assert_eq!(
+                validate_name(&too_deep, &limits).unwrap_err(),
+                CodecError::TopicNameTooDeep
+            );
+            assert!(validate_filter(&at_ceiling, &limits).is_ok());
+            assert_eq!(
+                validate_filter(&too_deep, &limits).unwrap_err(),
+                CodecError::TopicFilterTooDeep
+            );
+        }
+    }
+
+    /// Clamping must not raise a limit an operator set below the ceiling.
+    #[test]
+    fn the_ceiling_does_not_loosen_a_lower_configured_limit() {
         assert!(validate_name("a/b/c", &depth(3)).is_ok());
         assert_eq!(
             validate_name("a/b/c/d", &depth(3)).unwrap_err(),

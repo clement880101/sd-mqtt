@@ -106,8 +106,16 @@ impl SubscriptionTrie {
     }
 
     /// Whether the trie holds nothing.
+    ///
+    /// Stops at the first subscription found rather than counting them
+    /// all, because the name reads as cheap and callers will treat it
+    /// that way. Like [`len`], it takes each lock in turn rather than all
+    /// at once, so it is a question about no single instant.
+    ///
+    /// [`len`]: Self::len
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        !self.wildcard.read().holds_any()
+            && !self.shards.iter().any(|shard| shard.read().holds_any())
     }
 
     /// How many trie nodes exist, across every shard and the wildcard

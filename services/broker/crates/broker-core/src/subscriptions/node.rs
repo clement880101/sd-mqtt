@@ -50,6 +50,18 @@ impl Node {
             && self.multi.is_empty()
     }
 
+    /// Whether this node or any descendant holds a subscription.
+    ///
+    /// Stops at the first one found, where `len` would count every
+    /// subscription in the subtree. Correct pruning should make this
+    /// agree with `is_empty` at a root, but this does not rely on that.
+    pub fn holds_any(&self) -> bool {
+        !self.exact.is_empty()
+            || !self.multi.is_empty()
+            || self.plus.as_ref().is_some_and(|child| child.holds_any())
+            || self.children.values().any(Node::holds_any)
+    }
+
     /// Add a subscription, replacing any the same subscriber already had on
     /// this filter. Returns whether it replaced one.
     ///

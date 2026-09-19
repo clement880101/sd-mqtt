@@ -1,4 +1,13 @@
 //! Retained message storage.
+//!
+//! # Precondition
+//!
+//! Every topic and filter handed to this module must already have been
+//! validated by [`mqtt_codec::topic`]. Traversal recurses once per level,
+//! so depth is stack depth, and nothing here bounds it: the bound is
+//! [`mqtt_codec::topic::MAX_TOPIC_DEPTH`], enforced at validation. An
+//! unvalidated topic of sufficient depth aborts the process rather than
+//! returning an error.
 
 use std::collections::HashMap;
 
@@ -37,6 +46,12 @@ struct RetainedNode {
 impl RetainedNode {
     fn is_empty(&self) -> bool {
         self.children.is_empty() && self.message.is_none()
+    }
+
+    /// Whether this node or any descendant holds a message. Stops at the
+    /// first one found, where `count` walks the whole tree.
+    fn holds_any(&self) -> bool {
+        self.message.is_some() || self.children.values().any(Self::holds_any)
     }
 
     fn count(&self) -> usize {
@@ -203,8 +218,16 @@ impl RetainedStore {
     }
 
     /// Whether nothing is retained.
+    ///
+    /// Stops at the first message found rather than walking the whole
+    /// tree, because the name reads as cheap and callers will treat it
+    /// that way. Expiry is not considered: a message past its deadline
+    /// that no sweep has reclaimed still counts as retained here, while
+    /// [`matching`] will not return it.
+    ///
+    /// [`matching`]: Self::matching
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        !self.root.read().holds_any()
     }
 
     /// How many nodes the tree holds, including the root. Exposed so that

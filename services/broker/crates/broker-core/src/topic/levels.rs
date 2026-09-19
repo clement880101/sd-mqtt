@@ -49,7 +49,14 @@ impl Interner {
         if let Some(id) = inner.to_id.get(level) {
             return *id;
         }
-        let id = LevelId(inner.to_text.len() as u32);
+        // Truncating here would hand out an identifier already in use,
+        // and two different levels comparing equal is a false match with
+        // nothing to signal it. Unreachable short of four billion
+        // distinct levels, but it is the one place in the matching path
+        // where a silently wrong answer could originate, so it aborts
+        // rather than wraps.
+        let next = u32::try_from(inner.to_text.len()).expect("level identifier space exhausted");
+        let id = LevelId(next);
         let boxed: Box<str> = level.into();
         inner.to_text.push(boxed.clone());
         inner.to_id.insert(boxed, id);
