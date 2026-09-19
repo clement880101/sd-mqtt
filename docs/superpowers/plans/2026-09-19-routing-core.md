@@ -72,7 +72,9 @@ repository.workspace = true
 description = "Subscription matching and retained message storage for sd-mqtt"
 
 [dependencies]
-mqtt-codec = { path = "../mqtt-codec" }
+# cargo-deny's wildcard ban treats a path dependency with no version
+# requirement as a wildcard, so an internal dependency needs both.
+mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
 bytes.workspace = true
 thiserror.workspace = true
 foldhash = "0.2"
