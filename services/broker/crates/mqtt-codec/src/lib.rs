@@ -7,11 +7,13 @@
 #![warn(missing_docs)]
 
 pub mod error;
+pub mod header;
 pub mod reader;
 pub mod varint;
 pub mod writer;
 
 pub use error::CodecError;
+pub use header::{FixedHeader, Limits, PacketKind};
 
 /// The MQTT protocol version a packet is encoded for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
