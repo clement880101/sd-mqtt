@@ -1,0 +1,8 @@
+{
+  "name": "sd-mqtt broker",
+  "dockerComposeFile": ["../../../.devcontainer/compose.yaml"],
+  "service": "broker",
+  "runServices": ["broker"],
+  "workspaceFolder": "/workspaces/repo/services/broker",
+  "shutdownAction": "stopCompose"
+}

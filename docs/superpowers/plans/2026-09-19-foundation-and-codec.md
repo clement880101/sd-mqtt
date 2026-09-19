@@ -16,6 +16,40 @@ to the compiler until `lib.rs` declares it, so writing the test before the
 declaration produces "no tests ran" rather than the compile failure the step
 expects.
 
+**Assert exact errors, not error variants.** A test that asserts only
+`matches!(err, CodecError::MalformedPacket(_))` passes for any other cause
+of the same variant, so it does not pin the check it is named after. Six
+tests in this plan had that weakness, and a truncation bug was hiding behind
+two of them. Where the error carries a static string, assert the string:
+`assert_eq!(expr.unwrap_err(), CodecError::MalformedPacket("..."))`.
+
+**Proving a test has teeth.** When a test guards something a reviewer cannot
+verify by reading, break the implementation deliberately, confirm that test
+and only that test fails, then restore. Back the file up with `cp` first
+rather than restoring with `git checkout --`, because the change you are
+trying to prove is usually itself uncommitted and `git checkout` will throw
+it away.
+
+**Hand-built MQTT 5 bodies need a property block.** Every MQTT 5 packet
+body that carries properties has a mandatory property-length byte, zero when
+there are none. A test that hand-builds a v5 body and omits it does not test
+what its name says: the decoder consumes the next field's length byte as the
+property length and fails with a truncation error. Four tests in this plan
+had that bug, and two of them passed anyway because they asserted only the
+error variant, which truncation happens to satisfy. When hand-building a v5
+body, include the `0x00`, and assert the exact error string rather than the
+variant.
+
+**Golden vectors.** Round-trip tests cannot catch a wire format that is
+consistently wrong in both directions: a property identifier read from and
+written to the same wrong byte, or a flag read from and written to the same
+wrong bit, round trips perfectly and is wrong against every other MQTT
+implementation. This was not a hypothetical; it was found twice during
+execution. Every packet type therefore pins its encoding to literal bytes in
+`tests/golden.rs`, derived from the specification rather than captured from
+the encoder, with the spec section cited. When adding a packet type, add its
+vectors in the same task.
+
 **Scope note:** This plan stops at the codec. The in-memory broker core (topic trie, sessions, delivery, listener, conformance suite) is the next plan and depends on this one.
 
 ---
@@ -32,6 +66,7 @@ expects.
 | `.devcontainer/base.Dockerfile` | Shared image: Rust, Node, CLI tools |
 | `.devcontainer/compose.yaml` | `root`, `broker`, `web` services |
 | `.devcontainer/root/devcontainer.json` | Root orchestrator container |
+| `services/web/.devcontainer/devcontainer.json` | Web container |
 | `services/broker/Cargo.toml` | Workspace manifest, shared dependency versions |
 | `services/broker/rust-toolchain.toml` | Pinned toolchain channel |
 | `services/broker/.devcontainer/devcontainer.json` | Broker container |
@@ -49,6 +84,7 @@ expects.
 | `services/broker/crates/mqtt-codec/src/packet/publish.rs` | PUBLISH and the four acks |
 | `services/broker/crates/mqtt-codec/src/packet/subscribe.rs` | SUBSCRIBE, SUBACK, UNSUBSCRIBE, UNSUBACK |
 | `services/broker/crates/mqtt-codec/src/packet/control.rs` | PINGREQ, PINGRESP, DISCONNECT, AUTH |
+| `services/broker/crates/mqtt-codec/tests/golden.rs` | Literal wire vectors per packet type |
 | `services/broker/crates/mqtt-codec/tests/roundtrip.rs` | Property-based round trips |
 | `services/broker/crates/mqtt-codec/tests/malformed.rs` | Corpus asserting exact errors |
 | `services/broker/crates/mqtt-codec/fuzz/fuzz_targets/decode.rs` | Fuzz target |
@@ -143,11 +179,16 @@ THIRD-PARTY-LICENSES.md
 
 - [ ] **Step 5: Pin the toolchain**
 
+Pin an exact version rather than `stable`. A floating channel lets a new
+clippy lint break the build with no code change, and lets contributors
+drift apart. Run `rustc --version` and use exactly what it reports; the
+version below is what this plan was written against.
+
 Create `services/broker/rust-toolchain.toml`:
 
 ```toml
 [toolchain]
-channel = "stable"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 ```
 
@@ -170,7 +211,7 @@ git commit -m "chore: repository foundation"
 Create `.devcontainer/base.Dockerfile`:
 
 ```dockerfile
-FROM rust:1-slim-bookworm
+FROM rust:1.98.1-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl jq ripgrep fd-find ca-certificates \
@@ -257,7 +298,22 @@ Create `services/broker/.devcontainer/devcontainer.json`:
 }
 ```
 
-- [ ] **Step 5: Reserve the web service directory**
+- [ ] **Step 5: Write the web devcontainer**
+
+Create `services/web/.devcontainer/devcontainer.json`:
+
+```json
+{
+  "name": "sd-mqtt web",
+  "dockerComposeFile": ["../../../.devcontainer/compose.yaml"],
+  "service": "web",
+  "runServices": ["web"],
+  "workspaceFolder": "/workspaces/repo/services/web",
+  "shutdownAction": "stopCompose"
+}
+```
+
+- [ ] **Step 6: Reserve the web service directory**
 
 The compose file names a `web` service whose working directory does not
 exist until a later plan. Create a placeholder so the service can start.
@@ -266,12 +322,12 @@ exist until a later plan. Create a placeholder so the service can start.
 mkdir -p services/web && touch services/web/.gitkeep
 ```
 
-- [ ] **Step 6: Verify the compose file parses**
+- [ ] **Step 7: Verify the compose file parses**
 
 Run: `docker compose -f .devcontainer/compose.yaml config --quiet`
 Expected: no output and exit code 0.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add .devcontainer services/broker/.devcontainer services/web
@@ -286,6 +342,15 @@ git commit -m "chore: dev containers for root, broker and web"
 - Create: `services/broker/Cargo.toml`, `services/broker/crates/mqtt-codec/Cargo.toml`, `services/broker/crates/mqtt-codec/src/lib.rs`, `deny.toml`, `.github/workflows/ci.yml`
 
 - [ ] **Step 1: Write the workspace manifest**
+
+Two notes on what is deliberately absent. The release profile does **not**
+set `panic = "abort"`. This broker runs one task per connection, and with
+unwinding a panic in a connection handler stays contained to that task and
+surfaces as an error on its join handle; with abort, one malformed packet
+would take down every connected client. Aborting also breaks
+`#[should_panic]` tests and `cargo test --release`. The safety lints live in
+`[workspace.lints.rust]` rather than in each crate's source, so that every
+crate added later inherits them by declaring `[lints] workspace = true`.
 
 Create `services/broker/Cargo.toml`:
 
@@ -306,10 +371,13 @@ bytes = "1"
 thiserror = "2"
 proptest = "1"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
 strip = true
 ```
 
@@ -333,6 +401,9 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+
+[lints]
+workspace = true
 ```
 
 - [ ] **Step 3: Write a placeholder library root so the workspace builds**
@@ -396,7 +467,7 @@ allow = [
     "CC0-1.0",
     "Unlicense",
 ]
-confidence-threshold = 0.93
+confidence-threshold = 0.8
 
 [bans]
 multiple-versions = "warn"
@@ -1112,6 +1183,23 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_frame_exactly_at_the_limit() {
+        // A two-byte header plus a six-byte body is exactly eight.
+        let mut buf = vec![0x30, 0x06];
+        buf.extend(std::iter::repeat_n(0u8, 6));
+        let header = peek(&buf, &limits(8)).unwrap().expect("complete");
+        assert_eq!(header.total_len(), 8);
+
+        // One byte over the limit is rejected.
+        let mut buf = vec![0x30, 0x07];
+        buf.extend(std::iter::repeat_n(0u8, 7));
+        assert_eq!(
+            peek(&buf, &limits(8)).unwrap_err(),
+            CodecError::PacketTooLarge
+        );
+    }
+
+    #[test]
     fn rejects_the_one_unassigned_packet_type() {
         // Nibble 0 is the only unassigned value; 1 through 15 are all real
         // packet types, with 15 being AUTH.
@@ -1151,7 +1239,7 @@ mod tests {
     fn total_len_accounts_for_a_multibyte_length_prefix() {
         // Body of 128 bytes needs a two-byte length prefix.
         let mut buf = vec![0x30, 0x80, 0x01];
-        buf.extend(std::iter::repeat(0u8).take(128));
+        buf.extend(std::iter::repeat_n(0u8, 128));
         let header = peek(&buf, &limits(1024)).unwrap().expect("complete");
         assert_eq!(header.body_len, 128);
         assert_eq!(header.header_len, 3);
@@ -1355,7 +1443,7 @@ pub use header::{FixedHeader, Limits, PacketKind};
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cd services/broker && cargo test -p mqtt-codec header`
-Expected: PASS, eight tests.
+Expected: PASS, nine tests.
 
 - [ ] **Step 6: Commit**
 
@@ -3305,6 +3393,7 @@ mod tests {
     fn rejects_reserved_bits_in_the_options_byte() {
         let mut out = Vec::new();
         crate::writer::put_u16(&mut out, 1);
+        out.push(0x00); // empty property block, mandatory in v5
         crate::writer::put_string(&mut out, "a").unwrap();
         out.push(0xC0); // both reserved high bits set
         let mut reader = Reader::new(&out);
@@ -3316,6 +3405,7 @@ mod tests {
     fn rejects_retain_handling_three() {
         let mut out = Vec::new();
         crate::writer::put_u16(&mut out, 1);
+        out.push(0x00); // empty property block, mandatory in v5
         crate::writer::put_string(&mut out, "a").unwrap();
         out.push(0x30); // retain handling bits both set
         let mut reader = Reader::new(&out);
@@ -3327,6 +3417,7 @@ mod tests {
     fn rejects_no_local_on_a_shared_subscription() {
         let mut out = Vec::new();
         crate::writer::put_u16(&mut out, 1);
+        out.push(0x00); // empty property block, mandatory in v5
         crate::writer::put_string(&mut out, "$share/g/a").unwrap();
         out.push(0x04); // no local
         let mut reader = Reader::new(&out);
@@ -3338,6 +3429,7 @@ mod tests {
     fn rejects_an_invalid_filter() {
         let mut out = Vec::new();
         crate::writer::put_u16(&mut out, 1);
+        out.push(0x00); // empty property block, mandatory in v5
         crate::writer::put_string(&mut out, "a/#/b").unwrap();
         out.push(0x00);
         let mut reader = Reader::new(&out);
@@ -3535,14 +3627,12 @@ impl Subscribe {
             let retain_as_published = options & 0x08 != 0;
             let retain_handling = RetainHandling::from_u8((options & 0x30) >> 4)?;
 
-            let shared = crate::topic::parse_shared(&filter)?;
+            let shared = crate::topic::validate_subscription(&filter, limits)?;
             if no_local && shared.is_some() {
                 return Err(CodecError::ProtocolError(
                     "no local is not permitted on a shared subscription",
                 ));
             }
-            let to_validate = shared.map(|(_, inner)| inner).unwrap_or(filter.as_str());
-            crate::topic::validate_filter(to_validate, limits)?;
 
             filters.push(SubscriptionOptions {
                 filter,
@@ -3567,7 +3657,26 @@ impl Subscribe {
     }
 
     /// Append the body, excluding the fixed header.
+    ///
+    /// Encoding as 3.1.1 silently drops the no-local, retain-as-published
+    /// and retain-handling options, because that version has no way to
+    /// express them. A caller bridging a v5 subscription down to 3.1.1 gets
+    /// a plain subscription, which is the best that version allows.
+    ///
+    /// Filter validity is the caller's responsibility; use
+    /// [`crate::topic::validate_subscription`]. This method has no access to
+    /// [`Limits`](crate::header::Limits) and so cannot check topic depth.
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        if self.packet_id == 0 {
+            return Err(CodecError::ProtocolError(
+                "packet identifier must not be zero",
+            ));
+        }
+        if self.filters.is_empty() {
+            return Err(CodecError::ProtocolError(
+                "subscribe must carry at least one filter",
+            ));
+        }
         put_u16(out, self.packet_id);
         if version == Version::V5 {
             self.properties.encode(out)?;
@@ -3643,6 +3752,16 @@ impl SubAck {
 
     /// Append the body, excluding the fixed header.
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        if self.packet_id == 0 {
+            return Err(CodecError::ProtocolError(
+                "packet identifier must not be zero",
+            ));
+        }
+        if self.reasons.is_empty() {
+            return Err(CodecError::ProtocolError(
+                "suback must carry at least one reason code",
+            ));
+        }
         put_u16(out, self.packet_id);
         if version == Version::V5 {
             self.properties.encode(out)?;
@@ -3686,9 +3805,7 @@ impl Unsubscribe {
         let mut filters = Vec::new();
         while !reader.is_empty() {
             let filter = reader.string()?;
-            let shared = crate::topic::parse_shared(&filter)?;
-            let to_validate = shared.map(|(_, inner)| inner).unwrap_or(filter.as_str());
-            crate::topic::validate_filter(to_validate, limits)?;
+            crate::topic::validate_subscription(&filter, limits)?;
             filters.push(filter);
         }
 
@@ -3706,7 +3823,20 @@ impl Unsubscribe {
     }
 
     /// Append the body, excluding the fixed header.
+    ///
+    /// Filter validity is the caller's responsibility; use
+    /// [`crate::topic::validate_subscription`].
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        if self.packet_id == 0 {
+            return Err(CodecError::ProtocolError(
+                "packet identifier must not be zero",
+            ));
+        }
+        if self.filters.is_empty() {
+            return Err(CodecError::ProtocolError(
+                "unsubscribe must carry at least one filter",
+            ));
+        }
         put_u16(out, self.packet_id);
         if version == Version::V5 {
             self.properties.encode(out)?;
@@ -3762,7 +3892,15 @@ impl UnsubAck {
     }
 
     /// Append the body, excluding the fixed header.
+    ///
+    /// Encoding as 3.1.1 drops every reason code, because that version's
+    /// UNSUBACK carries none. The drop is silent and correct.
     pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        if self.packet_id == 0 {
+            return Err(CodecError::ProtocolError(
+                "packet identifier must not be zero",
+            ));
+        }
         put_u16(out, self.packet_id);
         if version == Version::V311 {
             return Ok(());
@@ -4013,7 +4151,15 @@ impl Auth {
     }
 
     /// Append the body, excluding the fixed header.
-    pub fn encode_body(&self, _version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+    ///
+    /// AUTH exists only in MQTT 5, so encoding one as 3.1.1 is refused
+    /// rather than silently producing a packet that version cannot carry.
+    pub fn encode_body(&self, version: Version, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        if version == Version::V311 {
+            return Err(CodecError::ProtocolError(
+                "authentication packets do not exist in 3.1.1",
+            ));
+        }
         if self.reason == ReasonCode::Success && self.properties.is_empty() {
             return Ok(());
         }
@@ -4275,9 +4421,10 @@ impl Packet {
             Packet::Connect(p) => p.encode_body(version, out),
             Packet::ConnAck(p) => p.encode_body(version, out),
             Packet::Publish(p) => p.encode_body(version, out),
-            Packet::PubAck(p) | Packet::PubRec(p) | Packet::PubRel(p) | Packet::PubComp(p) => {
-                p.encode_body(version, out)
-            }
+            Packet::PubAck(p) => p.encode_body(version, PacketKind::PubAck, out),
+            Packet::PubRec(p) => p.encode_body(version, PacketKind::PubRec, out),
+            Packet::PubRel(p) => p.encode_body(version, PacketKind::PubRel, out),
+            Packet::PubComp(p) => p.encode_body(version, PacketKind::PubComp, out),
             Packet::Subscribe(p) => p.encode_body(version, out),
             Packet::SubAck(p) => p.encode_body(version, out),
             Packet::Unsubscribe(p) => p.encode_body(version, out),
@@ -4320,10 +4467,18 @@ pub fn decode(
             version,
             limits,
         )?),
-        PacketKind::PubAck => Packet::PubAck(Ack::decode_body(&mut reader, version)?),
-        PacketKind::PubRec => Packet::PubRec(Ack::decode_body(&mut reader, version)?),
-        PacketKind::PubRel => Packet::PubRel(Ack::decode_body(&mut reader, version)?),
-        PacketKind::PubComp => Packet::PubComp(Ack::decode_body(&mut reader, version)?),
+        PacketKind::PubAck => {
+            Packet::PubAck(Ack::decode_body(&mut reader, version, PacketKind::PubAck)?)
+        }
+        PacketKind::PubRec => {
+            Packet::PubRec(Ack::decode_body(&mut reader, version, PacketKind::PubRec)?)
+        }
+        PacketKind::PubRel => {
+            Packet::PubRel(Ack::decode_body(&mut reader, version, PacketKind::PubRel)?)
+        }
+        PacketKind::PubComp => {
+            Packet::PubComp(Ack::decode_body(&mut reader, version, PacketKind::PubComp)?)
+        }
         PacketKind::Subscribe => {
             Packet::Subscribe(Subscribe::decode_body(&mut reader, version, limits)?)
         }
@@ -4805,8 +4960,12 @@ fn cases() -> Vec<(&'static str, Vec<u8>, CodecError)> {
             CodecError::InvalidTopicName,
         ),
         (
-            "empty publish topic",
-            vec![0x30, 0x02, 0x00, 0x00],
+            // An empty topic is legal in MQTT 5 when a topic alias is
+            // present, so the check runs after the property block. The
+            // block must therefore be supplied, or the failure is a
+            // truncation rather than the rejection this case is about.
+            "empty publish topic with no alias",
+            vec![0x30, 0x03, 0x00, 0x00, 0x00],
             CodecError::InvalidTopicName,
         ),
         (
@@ -5019,10 +5178,284 @@ git commit -m "test(codec): malformed corpus and a decoder fuzz target"
 
 ---
 
+## Task 18: Per-packet property validation
+
+MQTT 5 permits only a specific subset of properties on each packet type. A
+Topic Alias in a CONNECT is a protocol error, not something to accept and
+ignore. Until now `Properties::decode` accepts any property anywhere, which
+means the broker would silently tolerate packets every conforming
+implementation rejects.
+
+The cheap fix is one table rather than fourteen hand-written allow-lists.
+Property identifiers run from 0x01 to 0x2A, so a 64-bit mask holds the whole
+set, and checking membership is one shift and one test inside the loop that
+already exists.
+
+**Files:**
+- Modify: `services/broker/crates/mqtt-codec/src/properties.rs`
+- Modify: every packet decoder that calls `Properties::decode`
+
+- [ ] **Step 1: Derive the allowed sets from the specification**
+
+Do not take the following list on trust. Open MQTT 5.0 and read the property
+subsection for each packet type: 3.1.2.11 for CONNECT, 3.1.3.2 for the will,
+3.2.2.3 for CONNACK, 3.3.2.3 for PUBLISH, 3.4.2.2 for PUBACK and its three
+siblings, 3.8.2.1 for SUBSCRIBE, 3.9.2.1 for SUBACK, 3.10.2.1 for
+UNSUBSCRIBE, 3.11.2.1 for UNSUBACK, 3.14.2.2 for DISCONNECT and 3.15.2.2 for
+AUTH. Write down what each permits, then compare against this list and
+report any disagreement before writing code. A disagreement means either the
+plan is wrong or the reading is wrong, and both are worth knowing.
+
+| Packet | Permitted property identifiers |
+|---|---|
+| CONNECT | 0x11, 0x15, 0x16, 0x17, 0x19, 0x21, 0x22, 0x26, 0x27 |
+| Will | 0x01, 0x02, 0x03, 0x08, 0x09, 0x18, 0x26 |
+| CONNACK | 0x11, 0x12, 0x13, 0x15, 0x16, 0x1A, 0x1C, 0x1F, 0x21, 0x22, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A |
+| PUBLISH | 0x01, 0x02, 0x03, 0x08, 0x09, 0x0B, 0x23, 0x26 |
+| PUBACK, PUBREC, PUBREL, PUBCOMP | 0x1F, 0x26 |
+| SUBSCRIBE | 0x0B, 0x26 |
+| SUBACK | 0x1F, 0x26 |
+| UNSUBSCRIBE | 0x26 |
+| UNSUBACK | 0x1F, 0x26 |
+| DISCONNECT | 0x11, 0x1C, 0x1F, 0x26 |
+| AUTH | 0x15, 0x16, 0x1F, 0x26 |
+| PINGREQ, PINGRESP | none; these packets have no property block at all |
+
+- [ ] **Step 2: Write the failing test**
+
+Add to the test module in `properties.rs`:
+
+```rust
+    #[test]
+    fn rejects_a_property_the_packet_does_not_permit() {
+        // A topic alias is legal on PUBLISH and illegal on CONNECT.
+        let bytes = [0x03, 0x23, 0x00, 0x0A];
+
+        let mut reader = Reader::new(&bytes);
+        let ok = Properties::decode_for(&mut reader, PropertyScope::Publish);
+        assert_eq!(ok.unwrap().topic_alias, Some(10));
+
+        let mut reader = Reader::new(&bytes);
+        let err = Properties::decode_for(&mut reader, PropertyScope::Connect).unwrap_err();
+        assert!(matches!(err, CodecError::ProtocolError(_)));
+    }
+
+    #[test]
+    fn permits_user_properties_everywhere_they_are_allowed() {
+        let bytes = [0x07, 0x26, 0x00, 0x01, b'k', 0x00, 0x01, b'v'];
+        for scope in [
+            PropertyScope::Connect,
+            PropertyScope::Publish,
+            PropertyScope::Disconnect,
+            PropertyScope::Auth,
+        ] {
+            let mut reader = Reader::new(&bytes);
+            let props = Properties::decode_for(&mut reader, scope).expect("allowed");
+            assert_eq!(props.user_properties.len(), 1, "{scope:?}");
+        }
+    }
+
+    #[test]
+    fn the_unscoped_decoder_still_permits_everything() {
+        let bytes = [0x03, 0x23, 0x00, 0x0A];
+        let mut reader = Reader::new(&bytes);
+        assert!(Properties::decode(&mut reader).is_ok());
+    }
+```
+
+- [ ] **Step 3: Run the test to verify it fails**
+
+Run: `cd services/broker && cargo test -p mqtt-codec properties`
+Expected: FAIL to compile, with `PropertyScope` and `decode_for` not found.
+
+- [ ] **Step 4: Write the scope table**
+
+Add to `properties.rs`, above the `Properties` struct:
+
+```rust
+/// Which packet a property block belongs to.
+///
+/// MQTT 5 permits a different subset of properties on each packet, and a
+/// property outside that subset is a protocol error rather than something to
+/// ignore. The will has its own subset, distinct from the CONNECT that
+/// carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum PropertyScope {
+    Connect,
+    Will,
+    ConnAck,
+    Publish,
+    /// PUBACK, PUBREC, PUBREL and PUBCOMP share one subset.
+    Ack,
+    Subscribe,
+    SubAck,
+    Unsubscribe,
+    UnsubAck,
+    Disconnect,
+    Auth,
+}
+
+/// Build a membership mask from a list of property identifiers.
+///
+/// Identifiers run from 0x01 to 0x2A, so the whole set fits in 64 bits and
+/// membership is one shift and one test.
+const fn mask(ids: &[u8]) -> u64 {
+    let mut bits = 0u64;
+    let mut index = 0;
+    while index < ids.len() {
+        bits |= 1u64 << ids[index];
+        index += 1;
+    }
+    bits
+}
+
+impl PropertyScope {
+    fn allowed(self) -> u64 {
+        match self {
+            PropertyScope::Connect => mask(&[0x11, 0x15, 0x16, 0x17, 0x19, 0x21, 0x22, 0x26, 0x27]),
+            PropertyScope::Will => mask(&[0x01, 0x02, 0x03, 0x08, 0x09, 0x18, 0x26]),
+            PropertyScope::ConnAck => mask(&[
+                0x11, 0x12, 0x13, 0x15, 0x16, 0x1A, 0x1C, 0x1F, 0x21, 0x22, 0x24, 0x25, 0x26,
+                0x27, 0x28, 0x29, 0x2A,
+            ]),
+            PropertyScope::Publish => mask(&[0x01, 0x02, 0x03, 0x08, 0x09, 0x0B, 0x23, 0x26]),
+            PropertyScope::Ack => mask(&[0x1F, 0x26]),
+            PropertyScope::Subscribe => mask(&[0x0B, 0x26]),
+            PropertyScope::SubAck => mask(&[0x1F, 0x26]),
+            PropertyScope::Unsubscribe => mask(&[0x26]),
+            PropertyScope::UnsubAck => mask(&[0x1F, 0x26]),
+            PropertyScope::Disconnect => mask(&[0x11, 0x1C, 0x1F, 0x26]),
+            PropertyScope::Auth => mask(&[0x15, 0x16, 0x1F, 0x26]),
+        }
+    }
+
+    fn permits(self, id: u32) -> bool {
+        id < 64 && self.allowed() & (1u64 << id) != 0
+    }
+}
+```
+
+- [ ] **Step 5: Route decoding through the scope**
+
+In `properties.rs`, rename the body of `decode` to `decode_inner`, taking an
+`Option<PropertyScope>`, and give it this check immediately after reading the
+identifier and before the match:
+
+```rust
+            if let Some(scope) = scope {
+                if !scope.permits(id) {
+                    return Err(CodecError::ProtocolError(
+                        "property is not permitted on this packet type",
+                    ));
+                }
+            }
+```
+
+Then provide both entry points:
+
+```rust
+    /// Decode a property block without checking which packet permits what.
+    ///
+    /// Prefer [`Properties::decode_for`]. This exists for callers that have
+    /// no packet context, such as a property block read in isolation by a
+    /// test or a tool.
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Self::decode_inner(reader, None)
+    }
+
+    /// Decode a property block, rejecting anything the packet does not permit.
+    pub fn decode_for(
+        reader: &mut Reader<'_>,
+        scope: PropertyScope,
+    ) -> Result<Self, CodecError> {
+        Self::decode_inner(reader, Some(scope))
+    }
+```
+
+- [ ] **Step 6: Run the test to verify it passes**
+
+Run: `cd services/broker && cargo test -p mqtt-codec properties`
+Expected: PASS.
+
+- [ ] **Step 7: Point every packet decoder at its scope**
+
+Replace each `Properties::decode(reader)` call in `src/packet/` with the
+scoped form. The mapping is one to one with the packet being decoded, and the
+will block inside CONNECT uses `PropertyScope::Will`, not `Connect`.
+
+Run: `cd services/broker && cargo test -p mqtt-codec`
+Expected: PASS. If a round-trip test now fails, it is because a test
+constructs a packet carrying a property that packet does not permit. That is
+the check working. Fix the test's fixture, not the table.
+
+- [ ] **Step 8: Export the scope**
+
+Add `PropertyScope` to the `pub use properties::...` line in `lib.rs`.
+
+- [ ] **Step 9: Prove the table is enforced**
+
+Temporarily remove `0x23` from the PUBLISH mask, confirm a PUBLISH round-trip
+test carrying a topic alias now fails, then restore it. Report what you saw.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add services/broker/crates/mqtt-codec
+git commit -m "feat(codec): reject properties a packet does not permit"
+```
+
+---
+
+## Amendments after review
+
+These changes were made during execution, after review found problems with
+the plan as written. They are recorded here so the plan matches the code.
+
+**Non-minimal variable byte integers are rejected** (commit `f2277df`).
+MQTT requires a variable byte integer to use the fewest possible bytes, and
+`decode` accepted padded spellings such as `0x81 0x00` for the value one.
+That lets an attacker re-spell any length or property identifier, which
+defeats signature-based filtering and would poison a fuzz corpus. A
+terminating zero byte is now rejected anywhere but the first position.
+
+**Properties and reason codes are pinned to literal bytes** (commit
+`bbbc547`). The round-trip tests encoded and decoded through the same table,
+so a transposed property identifier was invisible to them: it would round
+trip perfectly here and be wrong against every other implementation. A
+reviewer verified all 27 identifiers and wire types, and all 43 reason code
+values, against the OASIS specification; a golden vector now locks that
+verified encoding in. The reason code test iterates an exhaustive list and
+asserts its length, so adding a variant without listing it fails.
+
+**Subscription filters have one safe entry point** (commit `2f1cda0`).
+`parse_shared` and `validate_filter` each accept filters the other rejects,
+so calling either alone is wrong. `validate_subscription` composes them in
+the right order and is what tasks 13 uses. Both validators also now reject a
+null character; `Reader::string` already did, but they are public and read
+as standalone validators.
+
+**The subscription identifier round trip is closed** (commit `721ccb3`).
+`encode` accepted a zero subscription identifier that `decode` rejected. The
+projections onto MQTT 3.1.1 return codes also gained doc comments saying
+they are defined only for codes that can legally appear in that packet, and
+that a malformed 3.1.1 CONNECT must be answered by closing the connection
+rather than by return code three, which a client reads as transient and
+retries.
+
+**Earlier amendments.** The release profile does not set `panic = "abort"`,
+because one panicking connection task would otherwise kill every connected
+client. The toolchain and base image are pinned to an exact version. Safety
+lints moved to the workspace. The web service gained a devcontainer. A test
+pins the packet size boundary, which a relaxed comparison would otherwise
+have passed.
+
 ## Done when
 
 - `cargo test -p mqtt-codec` passes, covering unit tests, the malformed
   corpus and the round-trip properties.
+- A property that its packet type does not permit is rejected as a protocol
+  error.
 - `cargo clippy --all-targets -- -D warnings` is clean.
 - `cargo deny check` passes against the allow list in `deny.toml`.
 - The fuzz target runs for ten minutes without a crash.

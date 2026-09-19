@@ -208,6 +208,11 @@ remote node, round-robin within a node. A member whose queue is full is
 skipped and the next is tried. Each member keeps its own queue; there is no
 shared group queue.
 
+**A retained publish with an empty payload removes the retained message**
+for that topic. It is not stored, and it is not sent to future subscribers,
+but it is delivered to subscribers matching at the time. This is easy to
+miss because the codec correctly treats an empty payload as ordinary.
+
 ## 7. Persistence
 
 ### 7.1 The Storage trait
@@ -701,6 +706,35 @@ shippable.
    published.
 
 ## 17. Open questions
+
+- **A contradiction in the MQTT 5 specification, resolved permissively.**
+  The reason-code table for DISCONNECT omits bad-authentication-method,
+  while the cross-reference table listing which packets may carry each code
+  includes it for DISCONNECT. Both published copies of the standard say
+  this, and OASIS has issued no errata. The codec accepts it, because the
+  re-authentication section tells a peer whose re-authentication fails to
+  disconnect with an appropriate reason code and this is the only code that
+  describes that failure. If a conformance suite ever rejects it, this is
+  the line to revisit, and the stricter reading is a one-line change.
+
+- **Zero-copy payloads.** The codec's reader copies every payload out of
+  the connection's read buffer. Since decoding already owns that buffer
+  mutably, splitting and freezing it instead would remove one full payload
+  copy per message on the hottest path, and the publish payload is already
+  the right type for it, so the change is not breaking. Like the question
+  below, it wants a benchmark rather than a guess.
+
+- **Packet size on the hot path.** The MQTT 5 property block is one struct
+  of 27 mostly-unset optional fields, around 344 bytes, carried by value
+  inside every packet. Making it an optional boxed value would shrink the
+  common no-properties case to a pointer, at the cost of an allocation when
+  properties are present. The trade depends on how often real traffic
+  carries properties, so it needs a benchmark rather than a guess. Decide
+  during the broker core work, where benchmarks exist. The codec crate boxes
+  only the connect packet today, on the reasoning that it arrives once per
+  connection while a publish is the hot path and already owns two heap
+  allocations.
+
 
 None of these block milestone 1. Each is resolved by the milestone that
 needs it, and the resolution is recorded as an architecture decision record.

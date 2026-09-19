@@ -1,0 +1,8 @@
+{
+  "name": "sd-mqtt (root)",
+  "dockerComposeFile": ["../compose.yaml"],
+  "service": "root",
+  "runServices": ["root"],
+  "workspaceFolder": "/workspaces/repo",
+  "shutdownAction": "stopCompose"
+}
