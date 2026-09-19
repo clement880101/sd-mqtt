@@ -41,9 +41,12 @@ UNVERIFIED and should be re-checked before the milestone that needs them.
 | UI router | preact-iso | MIT | 2.3 KB, zero deps |
 | UI build | Vite 8 | MIT | Rolldown-based, 5 deps |
 | UI live data | native EventSource | n/a | Auto-reconnect and Last-Event-ID for free |
-| Charts | uPlot | MIT | UNVERIFIED. Smallest capable time-series canvas |
-| Table windowing | own, ~100 lines | n/a | UNVERIFIED. Avoids needing preact/compat |
-| Styling | plain CSS custom properties | n/a | UNVERIFIED. Zero deps |
+| Charts | uPlot | MIT | 23.2 KB gzipped, zero deps, streaming is its design center |
+| Sparklines | own SVG path | n/a | One canvas per table row does not scale |
+| Table windowing | @tanstack/virtual-core | MIT | 7.1 KB, zero deps, genuinely framework-agnostic |
+| Styling | plain CSS + Open Props tokens | MIT | 1 package and 2.2 MB against Tailwind's 32 and 45 MB |
+| Form validation | valibot | MIT | 1.6 KB tree-shaken; plain zod costs 93 KB |
+| UI tests | vitest + happy-dom + Playwright | MIT / Apache-2.0 | happy-dom has 7 direct deps against jsdom's 20 |
 | Allocator | mimalloc, feature-gated | MIT | UNVERIFIED. Required on musl; off elsewhere |
 | Rate limiting | own token bucket | n/a | UNVERIFIED. ~40 lines beats governor's tree |
 | Keep-alive timer | own 1-second bucket ring | n/a | UNVERIFIED. Per-connection sleeps do not scale to 100k |
@@ -132,8 +135,62 @@ cmake. graviola is the pure-Rust option worth revisiting once it matures.
 
 ## License policy
 
-`cargo-deny` allows MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib,
-Unicode-3.0, CDLA-Permissive-2.0 and Unlicense. Anything else fails CI.
-`THIRD-PARTY-LICENSES.md` is generated at release time and shipped with the
-binary, which satisfies the attribution obligations of Apache-2.0 and the
-BSD family. The project itself is MIT.
+The project's own code is MIT. Third-party code is **not** all MIT, and we
+never claim otherwise. The policy is MIT-compatible permissive, which is a
+different and broader statement.
+
+### Two categories with different obligations
+
+**Distributed** code is anything that ends up in something a user receives:
+Rust crates compiled into the binary, JavaScript libraries bundled into the
+admin UI, and the small runtime helpers Vite injects into a production bundle
+(module preload polyfill, dynamic import helpers), which are Vite's own MIT
+code. This category carries real attribution obligations. Apache-2.0 requires
+the license text and any NOTICE file to travel with the distribution.
+BSD-2-Clause and BSD-3-Clause require the copyright notice and conditions.
+ISC and Zlib require the notice. CC0-1.0 requires nothing but is recorded
+anyway.
+
+**Build-time only** code never reaches a user: Vite and its bundled
+dependencies, vitest, Playwright, esbuild, cargo-deny, cargo-about, nextest,
+criterion. Running a tool to produce an artifact does not distribute the
+tool, so there is no attribution obligation here. We still run the license
+check across this category, because a copyleft build tool can create
+obligations in other ways and because a dependency can silently move from
+one category to the other.
+
+Vite itself illustrates the point. The published Vite package bundles
+dependencies under Apache-2.0, BSD-2-Clause, CC0-1.0, ISC and MIT, and Vite
+generates its own LICENSE file enumerating them for exactly this reason. None
+of that reaches our users, because Vite is a devDependency and its bundled
+tooling is not part of the build output. Only Vite's own MIT helper code is.
+
+### Enforcement
+
+`cargo-deny` gates the Rust tree in CI. The allow list is MIT, Apache-2.0,
+Apache-2.0 WITH LLVM-exception, BSD-2-Clause, BSD-3-Clause, ISC, Zlib,
+Unicode-3.0, CDLA-Permissive-2.0, CC0-1.0 and Unlicense. Anything outside it
+fails the build. The same list is applied to the npm tree by a license check
+in the UI package's CI job.
+
+Known non-MIT entries in the current selection, all permissive and all
+allowed: foldhash is Zlib, webpki-roots is CDLA-Permissive-2.0, subtle and
+argh are BSD-3-Clause, hyper-rustls and rustls offer Apache-2.0 OR ISC OR
+MIT, prometheus-client and Playwright are Apache-2.0, libfuzzer-sys carries
+an NCSA component, and aws-lc-rs is ISC AND Apache-2.0 OR ISC.
+
+### Attribution artifact
+
+`THIRD-PARTY-LICENSES.md` is generated at release time, covering the
+distributed category only, and ships alongside the binary and inside the
+container image. `cargo-about` produces the Rust half from the actual
+dependency graph of the release build, so it reflects enabled features
+rather than a hand-maintained list. A small script produces the JavaScript
+half from the UI's production bundle inputs. The file records each
+component, its license identifier, its copyright line, and the full license
+text once per distinct license. Build-time dependencies are listed in a
+separate appendix marked as not distributed, for auditors who ask.
+
+The README states that sd-mqtt is MIT licensed and that it includes
+third-party components under other permissive licenses, with a pointer to
+the attribution file. It does not say that every dependency is MIT.
