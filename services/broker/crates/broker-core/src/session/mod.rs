@@ -7,6 +7,8 @@
 
 pub mod message;
 pub mod packet_ids;
+pub mod queue;
 
 pub use message::{Message, MessageId};
 pub use packet_ids::PacketIds;
+pub use queue::{Delivery, DropReason, Overflow, Queue, QueueLimits};

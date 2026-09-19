@@ -1,0 +1,448 @@
+//! The outbound queue: what waits when the inflight window is full.
+
+use std::collections::VecDeque;
+
+use mqtt_codec::QoS;
+
+use crate::session::message::Message;
+
+/// A message addressed to one subscriber, with everything delivery needs.
+///
+/// The quality of service here is the *delivery* level, the lesser of what
+/// the publisher asked for and what the subscription granted, which is why
+/// it is separate from the message's own.
+#[derive(Debug, Clone)]
+pub struct Delivery {
+    /// The message itself, shared with every other subscriber's copy.
+    pub message: Message,
+    /// The level to deliver at.
+    pub qos: QoS,
+    /// The retain flag as it should appear on the wire, which depends on
+    /// the subscription's retain-as-published option.
+    pub retain: bool,
+    /// MQTT 5 subscription identifiers to echo back, one per matching
+    /// subscription that carried one.
+    pub subscription_ids: Vec<u32>,
+}
+
+impl Delivery {
+    /// Roughly how much of the queue's byte budget this occupies.
+    pub fn size_in_queue(&self) -> usize {
+        self.message.size_in_queue()
+    }
+}
+
+/// Why a message was discarded.
+///
+/// Every discard carries one of these, because a message that disappears
+/// without being counted is a support case nobody can answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DropReason {
+    /// The queue was at its message limit.
+    QueueFull,
+    /// The queue was at its byte limit.
+    ByteBudget,
+    /// Fire-and-forget delivery to a session with nobody attached.
+    QosZeroWhileOffline,
+    /// The message's expiry deadline had passed.
+    Expired,
+    /// The session was destroyed.
+    SessionEnded,
+}
+
+/// What to discard when the queue is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Overflow {
+    /// Refuse the arrival. The default, because it preserves the older
+    /// messages a subscriber has been waiting longest for.
+    #[default]
+    DropNewest,
+    /// Evict the head to make room, which suits a consumer that only
+    /// cares about recent state.
+    DropOldest,
+}
+
+/// Bounds on one queue.
+#[derive(Debug, Clone, Copy)]
+pub struct QueueLimits {
+    /// How many messages may wait.
+    pub max_messages: usize,
+    /// How many bytes they may occupy in total.
+    ///
+    /// Separate from the count because either bound alone is escapable: a
+    /// count permits a thousand enormous payloads, a byte total permits a
+    /// million empty ones.
+    pub max_bytes: usize,
+    /// What to discard when either bound is reached.
+    pub overflow: Overflow,
+    /// Whether to hold fire-and-forget messages for a session with nobody
+    /// attached. Off by default, matching the protocol's intent that such
+    /// a message is worth no effort.
+    pub queue_qos0_while_offline: bool,
+}
+
+impl Default for QueueLimits {
+    fn default() -> Self {
+        Self {
+            max_messages: 1000,
+            max_bytes: 64 * 1024 * 1024,
+            overflow: Overflow::DropNewest,
+            queue_qos0_while_offline: false,
+        }
+    }
+}
+
+/// Messages waiting for room in the inflight window.
+pub struct Queue {
+    entries: VecDeque<Delivery>,
+    bytes: usize,
+    limits: QueueLimits,
+}
+
+impl Queue {
+    /// An empty queue with the given bounds.
+    pub fn new(limits: QueueLimits) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            bytes: 0,
+            limits,
+        }
+    }
+
+    /// Offer a message to the queue.
+    ///
+    /// Returns whether it was accepted. Anything discarded, including the
+    /// arrival itself when it is refused, is appended to `dropped` with
+    /// the reason, so the caller can count it.
+    pub fn push(
+        &mut self,
+        item: Delivery,
+        now: u32,
+        online: bool,
+        dropped: &mut Vec<(Delivery, DropReason)>,
+    ) -> bool {
+        if item.message.is_expired(now) {
+            dropped.push((item, DropReason::Expired));
+            return false;
+        }
+        if item.qos == QoS::AtMostOnce && !online && !self.limits.queue_qos0_while_offline {
+            dropped.push((item, DropReason::QosZeroWhileOffline));
+            return false;
+        }
+
+        let size = item.size_in_queue();
+        // A message larger than the whole budget can never fit, whatever
+        // is evicted, so refuse it rather than emptying the queue trying.
+        if size > self.limits.max_bytes {
+            dropped.push((item, DropReason::ByteBudget));
+            return false;
+        }
+
+        while self.entries.len() >= self.limits.max_messages
+            || self.bytes + size > self.limits.max_bytes
+        {
+            let reason = if self.entries.len() >= self.limits.max_messages {
+                DropReason::QueueFull
+            } else {
+                DropReason::ByteBudget
+            };
+            match self.limits.overflow {
+                Overflow::DropNewest => {
+                    dropped.push((item, reason));
+                    return false;
+                }
+                Overflow::DropOldest => match self.entries.pop_front() {
+                    Some(evicted) => {
+                        self.bytes -= evicted.size_in_queue();
+                        dropped.push((evicted, reason));
+                    }
+                    // Nothing left to evict, which the size check above
+                    // should already have prevented.
+                    None => {
+                        dropped.push((item, reason));
+                        return false;
+                    }
+                },
+            }
+        }
+
+        self.bytes += size;
+        self.entries.push_back(item);
+        true
+    }
+
+    /// Put a message back at the head, ahead of anything newer.
+    ///
+    /// Used on resume, where a message that was already sent but not
+    /// acknowledged must go out before anything that arrived since. It
+    /// bypasses the bounds deliberately: the message was already accepted,
+    /// and refusing it now would lose something the peer may be expecting.
+    pub fn requeue(&mut self, item: Delivery) {
+        self.bytes += item.size_in_queue();
+        self.entries.push_front(item);
+    }
+
+    /// Take the next message, discarding any that expired while waiting.
+    pub fn pop(&mut self, now: u32, dropped: &mut Vec<(Delivery, DropReason)>) -> Option<Delivery> {
+        while let Some(item) = self.entries.pop_front() {
+            self.bytes -= item.size_in_queue();
+            if item.message.is_expired(now) {
+                dropped.push((item, DropReason::Expired));
+                continue;
+            }
+            return Some(item);
+        }
+        None
+    }
+
+    /// Discard everything, reporting each message with the given reason.
+    pub fn clear(&mut self, reason: DropReason, dropped: &mut Vec<(Delivery, DropReason)>) {
+        for item in self.entries.drain(..) {
+            dropped.push((item, reason));
+        }
+        self.bytes = 0;
+    }
+
+    /// How many messages are waiting.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// How many bytes they occupy.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Whether nothing is waiting.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The bounds in force.
+    pub fn limits(&self) -> QueueLimits {
+        self.limits
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::message::Message;
+    use bytes::Bytes;
+    use mqtt_codec::QoS;
+
+    fn delivery(qos: QoS, payload: &'static [u8]) -> Delivery {
+        Delivery {
+            message: Message::new("a/b", Bytes::from_static(payload), qos, false),
+            qos,
+            retain: false,
+            subscription_ids: Vec::new(),
+        }
+    }
+
+    fn limits(max_messages: usize, overflow: Overflow) -> QueueLimits {
+        QueueLimits {
+            max_messages,
+            max_bytes: usize::MAX,
+            overflow,
+            queue_qos0_while_offline: false,
+        }
+    }
+
+    #[test]
+    fn holds_messages_in_order() {
+        let mut queue = Queue::new(limits(10, Overflow::DropNewest));
+        let mut dropped = Vec::new();
+        for n in 0..3u8 {
+            let mut item = delivery(QoS::AtLeastOnce, b"x");
+            item.message.payload = Bytes::from(vec![n]);
+            assert!(queue.push(item, 0, true, &mut dropped));
+        }
+        assert!(dropped.is_empty());
+        assert_eq!(queue.len(), 3);
+
+        for n in 0..3u8 {
+            let item = queue.pop(0, &mut dropped).expect("in order");
+            assert_eq!(&item.message.payload[..], &[n]);
+        }
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn drop_newest_refuses_the_arrival_and_says_why() {
+        let mut queue = Queue::new(limits(2, Overflow::DropNewest));
+        let mut dropped = Vec::new();
+        assert!(queue.push(delivery(QoS::AtLeastOnce, b"1"), 0, true, &mut dropped));
+        assert!(queue.push(delivery(QoS::AtLeastOnce, b"2"), 0, true, &mut dropped));
+
+        assert!(!queue.push(delivery(QoS::AtLeastOnce, b"3"), 0, true, &mut dropped));
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].1, DropReason::QueueFull);
+        assert_eq!(&dropped[0].0.message.payload[..], b"3", "the arrival goes");
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn drop_oldest_evicts_the_head_and_accepts_the_arrival() {
+        let mut queue = Queue::new(limits(2, Overflow::DropOldest));
+        let mut dropped = Vec::new();
+        queue.push(delivery(QoS::AtLeastOnce, b"1"), 0, true, &mut dropped);
+        queue.push(delivery(QoS::AtLeastOnce, b"2"), 0, true, &mut dropped);
+
+        assert!(queue.push(delivery(QoS::AtLeastOnce, b"3"), 0, true, &mut dropped));
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].1, DropReason::QueueFull);
+        assert_eq!(&dropped[0].0.message.payload[..], b"1", "the head goes");
+        assert_eq!(queue.len(), 2);
+
+        let first = queue.pop(0, &mut dropped).unwrap();
+        assert_eq!(&first.message.payload[..], b"2");
+    }
+
+    #[test]
+    fn the_byte_budget_bounds_the_queue_independently_of_the_count() {
+        let mut queue = Queue::new(QueueLimits {
+            max_messages: 1000,
+            max_bytes: delivery(QoS::AtLeastOnce, b"0123456789").size_in_queue() * 2,
+            overflow: Overflow::DropNewest,
+            queue_qos0_while_offline: false,
+        });
+        let mut dropped = Vec::new();
+
+        assert!(queue.push(
+            delivery(QoS::AtLeastOnce, b"0123456789"),
+            0,
+            true,
+            &mut dropped
+        ));
+        assert!(queue.push(
+            delivery(QoS::AtLeastOnce, b"0123456789"),
+            0,
+            true,
+            &mut dropped
+        ));
+        assert!(!queue.push(
+            delivery(QoS::AtLeastOnce, b"0123456789"),
+            0,
+            true,
+            &mut dropped
+        ));
+
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].1, DropReason::ByteBudget);
+        assert_eq!(queue.len(), 2, "the count limit was nowhere near");
+    }
+
+    #[test]
+    fn popping_frees_the_byte_budget() {
+        let mut queue = Queue::new(QueueLimits {
+            max_messages: 1000,
+            max_bytes: delivery(QoS::AtLeastOnce, b"0123456789").size_in_queue(),
+            overflow: Overflow::DropNewest,
+            queue_qos0_while_offline: false,
+        });
+        let mut dropped = Vec::new();
+        assert!(queue.push(
+            delivery(QoS::AtLeastOnce, b"0123456789"),
+            0,
+            true,
+            &mut dropped
+        ));
+        assert!(!queue.push(
+            delivery(QoS::AtLeastOnce, b"0123456789"),
+            0,
+            true,
+            &mut dropped
+        ));
+
+        queue.pop(0, &mut dropped).unwrap();
+        assert_eq!(queue.bytes(), 0);
+        assert!(queue.push(
+            delivery(QoS::AtLeastOnce, b"0123456789"),
+            0,
+            true,
+            &mut dropped
+        ));
+    }
+
+    #[test]
+    fn a_fire_and_forget_message_is_discarded_while_offline_by_default() {
+        let mut queue = Queue::new(limits(10, Overflow::DropNewest));
+        let mut dropped = Vec::new();
+
+        assert!(!queue.push(delivery(QoS::AtMostOnce, b"x"), 0, false, &mut dropped));
+        assert_eq!(dropped[0].1, DropReason::QosZeroWhileOffline);
+        assert!(queue.is_empty());
+
+        // Online, it queues like anything else.
+        dropped.clear();
+        assert!(queue.push(delivery(QoS::AtMostOnce, b"x"), 0, true, &mut dropped));
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn queueing_fire_and_forget_while_offline_can_be_turned_on() {
+        let mut queue = Queue::new(QueueLimits {
+            queue_qos0_while_offline: true,
+            ..limits(10, Overflow::DropNewest)
+        });
+        let mut dropped = Vec::new();
+        assert!(queue.push(delivery(QoS::AtMostOnce, b"x"), 0, false, &mut dropped));
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn an_expired_message_is_discarded_on_the_way_out() {
+        let mut queue = Queue::new(limits(10, Overflow::DropNewest));
+        let mut dropped = Vec::new();
+
+        let mut stale = delivery(QoS::AtLeastOnce, b"stale");
+        stale.message.expires_at = Some(100);
+        queue.push(stale, 0, true, &mut dropped);
+        queue.push(delivery(QoS::AtLeastOnce, b"fresh"), 0, true, &mut dropped);
+        assert!(dropped.is_empty(), "expiry is checked on the way out");
+
+        let got = queue.pop(101, &mut dropped).expect("the fresh one");
+        assert_eq!(&got.message.payload[..], b"fresh");
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].1, DropReason::Expired);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn an_expired_message_is_not_admitted() {
+        let mut queue = Queue::new(limits(10, Overflow::DropNewest));
+        let mut dropped = Vec::new();
+        let mut stale = delivery(QoS::AtLeastOnce, b"x");
+        stale.message.expires_at = Some(100);
+
+        assert!(!queue.push(stale, 101, true, &mut dropped));
+        assert_eq!(dropped[0].1, DropReason::Expired);
+    }
+
+    #[test]
+    fn clearing_reports_everything_it_discards() {
+        let mut queue = Queue::new(limits(10, Overflow::DropNewest));
+        let mut dropped = Vec::new();
+        queue.push(delivery(QoS::AtLeastOnce, b"1"), 0, true, &mut dropped);
+        queue.push(delivery(QoS::AtLeastOnce, b"2"), 0, true, &mut dropped);
+
+        queue.clear(DropReason::SessionEnded, &mut dropped);
+        assert_eq!(dropped.len(), 2);
+        assert!(dropped.iter().all(|(_, r)| *r == DropReason::SessionEnded));
+        assert!(queue.is_empty());
+        assert_eq!(queue.bytes(), 0);
+    }
+
+    #[test]
+    fn requeueing_puts_a_message_back_at_the_head() {
+        // Resume puts unacknowledged messages back before anything newer.
+        let mut queue = Queue::new(limits(10, Overflow::DropNewest));
+        let mut dropped = Vec::new();
+        queue.push(delivery(QoS::AtLeastOnce, b"new"), 0, true, &mut dropped);
+        queue.requeue(delivery(QoS::AtLeastOnce, b"old"));
+
+        let first = queue.pop(0, &mut dropped).unwrap();
+        assert_eq!(&first.message.payload[..], b"old");
+    }
+}
