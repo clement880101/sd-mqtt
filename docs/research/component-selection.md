@@ -47,9 +47,9 @@ UNVERIFIED and should be re-checked before the milestone that needs them.
 | Styling | plain CSS + Open Props tokens | MIT | 1 package and 2.2 MB against Tailwind's 32 and 45 MB |
 | Form validation | valibot | MIT | 1.6 KB tree-shaken; plain zod costs 93 KB |
 | UI tests | vitest + happy-dom + Playwright | MIT / Apache-2.0 | happy-dom has 7 direct deps against jsdom's 20 |
-| Allocator | mimalloc, feature-gated | MIT | UNVERIFIED. Required on musl; off elsewhere |
-| Rate limiting | own token bucket | n/a | UNVERIFIED. ~40 lines beats governor's tree |
-| Keep-alive timer | own 1-second bucket ring | n/a | UNVERIFIED. Per-connection sleeps do not scale to 100k |
+| Allocator | mimalloc, default on, all non-Windows | MIT | One build dependency; musl malloc is 7x to 700x slower |
+| Rate limiting | own GCRA, ~130 lines | n/a | governor's keyed stores never evict on their own |
+| Keep-alive timer | own 1-second bucket ring | n/a | A tokio Timeout is 896 bytes and the driver has a global mutex |
 | Errors | thiserror in libs, anyhow in binary | MIT OR Apache-2.0 | Typed at boundaries, ergonomic at the top |
 | Tests | proptest, nextest, insta, criterion, cargo-fuzz | permissive | Standard set |
 | Audit | cargo-deny, cargo-machete, cargo-bloat | permissive | Enforces the license policy in CI |
@@ -87,6 +87,48 @@ exotic targets where a C compiler is a problem.
 **musl's allocator is pathologically slow** under multithreaded async work,
 with reported slowdowns of 7x and worse. Static musl builds therefore enable
 mimalloc as the global allocator.
+
+**musl's allocator is not merely slow, it is disqualifying.** On a six-core
+machine the same workload takes 0.17s under glibc and 1.18s under musl, with
+system time going from 0.37s to 6.13s and voluntary context switches from
+1,196 to 199,786. The gap widens to roughly 700x on 48 cores. The cause is a
+single global lock in musl's allocator, and a broker allocating per-packet
+buffers across worker threads is the pathological case. mimalloc is chosen
+over jemalloc on build friendliness rather than benchmarks: mimalloc needs
+only a C compiler, so cargo-zigbuild compiles it with zig cc and nothing
+else, while jemalloc runs an autoconf script that needs a shell, make and
+correct host and target plumbing. mimalloc is also 23k lines of C against
+jemalloc's 55k. It is default-on for every non-Windows target, not just
+musl, so that development profiling reflects production. The musl release
+profile adds mimalloc's local dynamic TLS flag, because musl does not
+support initial-exec thread-local storage.
+
+**governor does not solve the memory problem it appears to solve.** Its
+keyed limiters expose retain_recent and shrink_to_fit, but the limiter never
+calls them. A store keyed by IP address grows without bound until a janitor
+task you wrote runs. Since we need that janitor either way, and since the
+per-session publish cap needs no keying at all (the state is one 64-bit
+field in a session struct we already have), governor would add roughly
+fifteen crates including a concurrent map, a clock crate and three futures
+crates to avoid about 130 lines. The per-IP map is a plain mutex-guarded
+hash map swept by the same one-second tick task the keep-alive ring uses.
+
+**Per-connection sleeps do not reach 100k connections.** A tokio Timeout
+future measures 896 bytes against 2 bytes for the bare future, which is
+about 90 MB of futures at 100k connections. The more serious problem is that
+tokio's timer driver sits behind a global mutex and the sharding issue is
+still open upstream, so rescheduling on every inbound packet means a
+contended lock acquisition per packet. The ring avoids this entirely: a
+packet arrival performs one relaxed atomic store of a coarse timestamp and
+touches no timer at all. A single one-second interval task advances a cursor
+over buckets, and when it reaches a connection it either disconnects it or
+lazily re-arms it into a later bucket. That same task publishes a coarse
+clock as an atomic, so neither the keep-alive sweep nor the rate limiters
+ever ask the operating system for the time. Memory is 16 to 24 bytes per
+connection, and a 60-second keep-alive sweeps about 1,100 entries per tick.
+
+**The crate named timer-wheel does not exist.** An earlier draft listed it.
+crates.io returns 404. The similarly named crates are different projects.
 
 ## Deliberate deviations from pure minimalism
 
