@@ -2689,7 +2689,10 @@ ending, so a bug in that acceptance is mirrored by the harness rather than
 caught by it. Three unit tests cover the specific case. This is the same
 circularity that let a transposed property identifier and a swapped flag
 bit pass in the codec, and an unreachable wildcard pass in the routing
-core, so it is worth revisiting when the shell adds state.
+core, so it is worth revisiting when the shell adds state. Note also that
+the three unit tests covering it are all on the send side; the receive
+side's dispatch decision has the same circularity in the end-to-end loop
+and is covered by one mutation rather than by an independent assertion.
 
 ## Done when
 
@@ -2715,6 +2718,30 @@ core, so it is worth revisiting when the shell adds state.
 - **Persistence.** These structures are shaped so a storage trait can
   restore them, which is why the inbound receiver can enumerate what it
   holds and the queue preserves order, but nothing writes to disk yet.
+
+## Obligations the shell inherits
+
+Three things this layer cannot enforce, which the next plan must.
+
+**An acknowledgement owed must be paid.** Receiving a publish reserves a
+receive-maximum slot that only the acknowledgement frees. If the shell
+drops the result on an error path, or a task is cancelled between the two
+calls, that slot never returns and the client is throttled to death with
+nothing reporting it. This is the same shape as the resume defect found in
+review, one level up: a split moved an obligation to the caller and
+nothing enforces it. A guard that acknowledges when dropped is the usual
+answer, though it sits awkwardly with a module that performs no I/O.
+
+**Requeueing bypasses the queue's bounds.** That is deliberate, since a
+message already accepted should not be refused on the way back in, but it
+means a session resumed repeatedly can exceed its byte budget, and a
+requeued message now also pins a packet identifier. The shell should bound
+how often a session may resume, or the budget is advisory.
+
+**A receipt for an unknown identifier is answered but not counted.**
+Answering is correct, but a peer can make the broker emit packets
+indefinitely for identifiers it never held while no counter moves. The
+shell wants a metric there before it wants anything else.
 
 ## Next plan
 
