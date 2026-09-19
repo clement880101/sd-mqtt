@@ -17,6 +17,11 @@ pub fn decode(buf: &[u8]) -> Result<Option<(u32, usize)>, CodecError> {
     for (index, &byte) in buf.iter().take(4).enumerate() {
         value += u32::from(byte & 0x7F) * multiplier;
         if byte & 0x80 == 0 {
+            if byte == 0 && index != 0 {
+                return Err(CodecError::MalformedPacket(
+                    "variable byte integer is not minimally encoded",
+                ));
+            }
             return Ok(Some((value, index + 1)));
         }
         multiplier *= 128;
@@ -122,5 +127,26 @@ mod tests {
         for (value, bytes) in CASES {
             assert_eq!(encoded_len(*value), bytes.len());
         }
+    }
+
+    #[test]
+    fn rejects_non_minimal_encodings() {
+        // 1 spelled in two bytes, 0 spelled in two, and a longer padding.
+        for bytes in [
+            &[0x81u8, 0x00][..],
+            &[0x80, 0x00][..],
+            &[0x81, 0x80, 0x00][..],
+        ] {
+            let err = decode(bytes).expect_err("non-minimal");
+            assert!(
+                matches!(err, crate::error::CodecError::MalformedPacket(_)),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_accepts_a_single_zero_byte() {
+        assert_eq!(decode(&[0x00]).unwrap(), Some((0, 1)));
     }
 }
