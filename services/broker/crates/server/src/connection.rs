@@ -169,6 +169,22 @@ where
         None => usize::from(ABSENT_RECEIVE_MAXIMUM),
     };
 
+    let maximum_packet_size = match connect.properties.maximum_packet_size {
+        // Section 3.1.2.11.4 makes zero a protocol error, exactly as
+        // 3.1.2.11.3 does for the receive maximum above, and for the
+        // same reason: a limit of zero forbids every packet including
+        // the acknowledgement, so honouring it literally and refusing
+        // it come to the same thing. Refused, so the client is told.
+        Some(0) => {
+            refuse(&mut write_half, version, ReasonCode::ProtocolError).await?;
+            return Err(ConnectionError::Protocol(ReasonCode::ProtocolError));
+        }
+        // Absent means unlimited: 3.1.2.11.4 says "If the Maximum
+        // Packet Size is not present, no limit on the packet size is
+        // imposed beyond the limitations in the protocol".
+        other => other,
+    };
+
     // From here the broker knows about this connection and is owed a
     // disconnect.
     //
@@ -227,6 +243,7 @@ where
         subscriber: registration.subscriber,
         epoch: registration.epoch,
         version,
+        maximum_packet_size,
     };
 
     // A takeover addresses two connections by one handle, and the
@@ -407,6 +424,11 @@ struct Attached {
     /// session it no longer owns.
     epoch: u64,
     version: Version,
+    /// The largest packet this client said it will accept, and `None`
+    /// when it said nothing. Per connection, not per session: 3.1.2.11.4
+    /// is a property of the CONNECT, so a resumed session inherits
+    /// nothing from the limit the last connection advertised.
+    maximum_packet_size: Option<u32>,
 }
 
 impl Attached {
@@ -433,8 +455,14 @@ impl Attached {
 
         let (gone, mut writer_gone) = oneshot::channel();
         let version = self.version;
+        let limit = SizeLimit {
+            limit: self.maximum_packet_size,
+            shared: Arc::clone(&self.shared),
+            subscriber: self.subscriber,
+            epoch: self.epoch,
+        };
         tokio::spawn(async move {
-            write_loop(write_half, outbox, version).await;
+            write_loop(write_half, outbox, version, limit).await;
             drop(gone);
         });
 
@@ -539,11 +567,20 @@ async fn write_loop<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut outbox: mpsc::Receiver<Action>,
     version: Version,
+    limit: SizeLimit,
 ) {
     let mut buf = BytesMut::new();
     while let Some(action) = outbox.recv().await {
         buf.clear();
         let last = render(&action, version, &mut buf);
+        if limit.exceeded(buf.len()) {
+            // [MQTT-3.1.2-24]: not one byte of it goes out. The size
+            // is checked here rather than in the broker because this
+            // is where the packet exists and its length is a fact
+            // rather than an estimate.
+            buf.clear();
+            limit.discard(&action);
+        }
         if !buf.is_empty() && writer.write_all(&buf).await.is_err() {
             break;
         }
@@ -553,6 +590,85 @@ async fn write_loop<W: AsyncWrite + Unpin>(
     }
     let _ = writer.flush().await;
     let _ = writer.shutdown().await;
+}
+
+/// The client's Maximum Packet Size, and the way back into the broker
+/// for a packet that exceeds it.
+///
+/// # The lock on the write path
+///
+/// [`SizeLimit::discard`] takes the broker lock, and the write path
+/// otherwise never touches it. That is deliberate, not an oversight:
+/// the benchmark in this crate found the single lock to be this
+/// broker's throughput ceiling, so the next person reading this path
+/// will be counting acquisitions. This one is on the oversize branch
+/// only. A connection that advertised no limit never reaches it, a
+/// connection that advertised one reaches it only for packets it has
+/// refused in advance to read, and in both cases nothing that is
+/// actually written costs a lock.
+///
+/// The alternative was to size the packet in `broker-core` before
+/// building it, under a lock that is already held. That needs either a
+/// second size calculation that would drift from the encoder or a
+/// throwaway encode, and both are paid by every message rather than by
+/// the discarded ones.
+struct SizeLimit {
+    /// What the client advertised, `None` when it advertised nothing.
+    limit: Option<u32>,
+    shared: Arc<Shared>,
+    subscriber: SubscriberId,
+    /// Which claim on the session is ours. A writer can still be
+    /// draining actions it was handed before a newcomer took the
+    /// session over, and settling a delivery that now belongs to the
+    /// newcomer would free an identifier the newcomer is using.
+    epoch: u64,
+}
+
+impl SizeLimit {
+    /// Whether an encoded packet is larger than the client allows.
+    ///
+    /// Strictly larger. 3.1.2.11.4 gives "the Maximum Packet Size the
+    /// Client is willing to accept", so a packet of exactly that size
+    /// is one the client accepts, and refusing it would discard a
+    /// message the protocol says to deliver.
+    fn exceeded(&self, len: usize) -> bool {
+        self.limit
+            .is_some_and(|limit| len as u64 > u64::from(limit))
+    }
+
+    /// Complete the delivery of a packet that was discarded for size.
+    ///
+    /// [MQTT-3.1.2-25]. Only a publish carrying a packet identifier
+    /// has anything to complete: quality of service zero owes no
+    /// acknowledgement, and no other packet holds an inflight slot.
+    fn discard(&self, action: &Action) {
+        let Action::Send(Packet::Publish(publish)) = action else {
+            return;
+        };
+        let Some(packet_id) = publish.packet_id else {
+            return;
+        };
+        tracing::debug!(
+            packet_id,
+            topic = %publish.topic,
+            limit = self.limit,
+            "a publication was larger than the client allows"
+        );
+        // See the type's documentation for why a lock acquisition here
+        // is deliberate.
+        let actions = self.shared.with_broker(|broker| {
+            let ours = broker
+                .session(self.subscriber)
+                .is_some_and(|session| session.epoch() == self.epoch);
+            let mut out = Vec::new();
+            if ours {
+                let now = broker.clock().now();
+                broker.discard_oversize(self.subscriber, packet_id, now, &mut out);
+            }
+            out
+        });
+        self.shared.deliver(actions);
+    }
 }
 
 /// Turn one action into bytes, reporting whether it ends the connection.
@@ -944,6 +1060,336 @@ mod tests {
             shared.with_broker(|broker| assign_identifier(broker, "tenant-b", || "taken".into()));
 
         assert_eq!(assigned.as_deref(), Some("taken"));
+    }
+
+    /// Connect as `client_id` with the given properties, and subscribe
+    /// to `a/+` at `qos`. Leaves the connection ready to receive.
+    async fn attach(
+        client: &mut tokio::io::DuplexStream,
+        client_id: &str,
+        properties: Properties,
+        qos: QoS,
+    ) {
+        let mut packet = connect(client_id, 0);
+        packet.properties = properties;
+        write(client, &Packet::Connect(Box::new(packet)), Version::V5).await;
+        assert!(matches!(
+            read(client, Version::V5).await,
+            Packet::ConnAck(_)
+        ));
+        write(
+            client,
+            &Packet::Subscribe(mqtt_codec::packet::Subscribe {
+                packet_id: 1,
+                filters: vec![mqtt_codec::packet::SubscriptionOptions {
+                    filter: "a/+".into(),
+                    qos,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: mqtt_codec::packet::RetainHandling::DoNotSend,
+                }],
+                properties: Properties::default(),
+            }),
+            Version::V5,
+        )
+        .await;
+        assert!(matches!(read(client, Version::V5).await, Packet::SubAck(_)));
+    }
+
+    /// A publish of `payload` to `a/b`, at `qos`, under `packet_id`.
+    fn publication(payload: &[u8], qos: QoS, packet_id: Option<u16>) -> Packet {
+        Packet::Publish(mqtt_codec::packet::Publish {
+            dup: false,
+            qos,
+            retain: false,
+            topic: "a/b".into(),
+            packet_id,
+            payload: bytes::Bytes::copy_from_slice(payload),
+            properties: Properties::default(),
+        })
+    }
+
+    /// Offer `payload` to a subscriber that advertised `limit`, and
+    /// say whether it arrived.
+    ///
+    /// A four byte publication follows it, so the answer is read off a
+    /// message that arrives either way rather than off a timeout. A
+    /// test that waits for nothing to happen cannot tell a discarded
+    /// packet from a wedged connection, which is convention 5's
+    /// "a test asserting an absence".
+    async fn arrives_under_limit(payload: &[u8], limit: u32, qos: QoS) -> bool {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut subscriber = serve_one(Arc::clone(&shared));
+        let mut publisher = serve_one(Arc::clone(&shared));
+
+        attach(
+            &mut subscriber,
+            "sub",
+            Properties {
+                maximum_packet_size: Some(limit),
+                ..Properties::default()
+            },
+            qos,
+        )
+        .await;
+        attach(
+            &mut publisher,
+            "pub",
+            Properties::default(),
+            QoS::AtMostOnce,
+        )
+        .await;
+
+        let packet_id = (qos != QoS::AtMostOnce).then_some(1);
+        write(
+            &mut publisher,
+            &publication(payload, qos, packet_id),
+            Version::V5,
+        )
+        .await;
+        write(
+            &mut publisher,
+            &publication(b"tiny", QoS::AtMostOnce, None),
+            Version::V5,
+        )
+        .await;
+
+        // Whichever arrives first is the answer: the two were published
+        // in order, so the large one reaching this client at all means
+        // it reaches it before the small one.
+        match read(&mut subscriber, Version::V5).await {
+            Packet::Publish(publish) if publish.payload == b"tiny"[..] => false,
+            Packet::Publish(publish) => {
+                assert_eq!(
+                    &publish.payload[..],
+                    payload,
+                    "one of the two, and no other"
+                );
+                true
+            }
+            other => panic!("expected a publication, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_packet_larger_than_the_client_allows_is_not_sent() {
+        // [MQTT-3.1.2-24]. The publication behind it is what makes this
+        // an assertion rather than the absence of one: the small one
+        // arriving proves the connection is still delivering.
+        assert!(
+            !arrives_under_limit(&[b'x'; 200], 64, QoS::AtMostOnce).await,
+            "a 200 byte publication must not reach a client that allows 64"
+        );
+    }
+
+    /// The encoded size of one packet, as the writer will measure it.
+    fn encoded_size(packet: &Packet) -> usize {
+        let mut buf = BytesMut::new();
+        encode(packet, Version::V5, &mut buf).unwrap();
+        buf.len()
+    }
+
+    #[tokio::test]
+    async fn a_packet_of_exactly_the_advertised_size_is_sent() {
+        // The boundary. 3.1.2.11.4 gives "the Maximum Packet Size the
+        // Client is willing to accept", so a packet of exactly that
+        // size is one the client accepts and refusing it loses a
+        // message the protocol says to deliver.
+        //
+        // Nothing else here is within a byte of a limit, so `>`
+        // degraded to `>=` passes the whole of the rest of the suite.
+        let payload = b"12345678";
+        let exact = encoded_size(&publication(payload, QoS::AtMostOnce, None));
+        // Derived from section 3.3 rather than from the encoder, so
+        // that a drift in either shows up here: one byte of fixed
+        // header and one of remaining length, two of topic length and
+        // three of topic, one property length of zero, eight of
+        // payload.
+        assert_eq!(exact, 1 + 1 + 2 + 3 + 1 + 8, "a v5 publish of 'a/b'");
+
+        assert!(
+            arrives_under_limit(payload, exact as u32, QoS::AtMostOnce).await,
+            "a packet of exactly the advertised size is legal"
+        );
+        assert!(
+            !arrives_under_limit(payload, exact as u32 - 1, QoS::AtMostOnce).await,
+            "and one byte more is not"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_maximum_packet_size_is_a_protocol_error() {
+        // Section 3.1.2.11.4: "It is a Protocol Error to include the
+        // Maximum Packet Size more than once, or for the value to be
+        // set to zero." Refused rather than clamped, for the same
+        // reason a zero receive maximum is.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(shared);
+
+        let mut packet = connect("c", 0);
+        packet.properties.maximum_packet_size = Some(0);
+        write(&mut client, &Packet::Connect(Box::new(packet)), Version::V5).await;
+
+        match read(&mut client, Version::V5).await {
+            Packet::ConnAck(ack) => assert_eq!(ack.reason, ReasonCode::ProtocolError),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The other half of [MQTT-3.1.2-25], at each level that has an
+    /// acknowledgement to owe: after a discard the session must behave
+    /// as though the message had been delivered, which means its
+    /// window slot and its packet identifier come back.
+    ///
+    /// Without that, one oversized publication takes the last slot in
+    /// a window of one and holds it for an acknowledgement that cannot
+    /// arrive, because the packet was never sent. Delivery to this
+    /// client then stops for the life of the session, and a test that
+    /// checks only that the large message is absent still passes.
+    async fn a_discard_does_not_wedge_the_connection(qos: QoS) {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut subscriber = serve_one(Arc::clone(&shared));
+        let mut publisher = serve_one(Arc::clone(&shared));
+
+        attach(
+            &mut subscriber,
+            "sub",
+            Properties {
+                maximum_packet_size: Some(64),
+                // A window of one, so a slot never given back is a
+                // slot never available again.
+                receive_maximum: Some(1),
+                ..Properties::default()
+            },
+            qos,
+        )
+        .await;
+        attach(
+            &mut publisher,
+            "pub",
+            Properties::default(),
+            QoS::AtMostOnce,
+        )
+        .await;
+
+        write(
+            &mut publisher,
+            &publication(&[b'x'; 200], qos, Some(1)),
+            Version::V5,
+        )
+        .await;
+        write(
+            &mut publisher,
+            &publication(b"tiny", qos, Some(2)),
+            Version::V5,
+        )
+        .await;
+
+        match read(&mut subscriber, Version::V5).await {
+            Packet::Publish(publish) => {
+                assert_eq!(
+                    &publish.payload[..],
+                    b"tiny",
+                    "the window slot the discarded message held must come back"
+                );
+                assert_eq!(publish.qos, qos);
+            }
+            other => panic!("expected the publication behind the discard, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_discard_by_a_displaced_writer_leaves_the_newcomer_alone() {
+        // A takeover hands the session to a new connection, but the
+        // displaced writer keeps draining whatever was already in its
+        // outbox, and one of those may be a publish too large to send.
+        // Settling it then frees an identifier the newcomer is using,
+        // so the newcomer's own delivery is stranded: it waits for an
+        // acknowledgement whose entry has gone, and the identifier is
+        // handed to an unrelated message.
+        //
+        // The race cannot be driven through a socket, so the writer's
+        // share is built here directly. Without the epoch check, the
+        // first discard below settles the entry.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let registration = shared.with_broker(|broker| {
+            let mut out = Vec::new();
+            let registration = broker.connect("", &connect("c", 0), &mut out);
+            let session = broker.session_mut(registration.subscriber).unwrap();
+            session.outbound.set_online(true);
+            registration
+        });
+
+        let action = shared.with_broker(|broker| {
+            let mut actions = Vec::new();
+            broker
+                .session_mut(registration.subscriber)
+                .unwrap()
+                .outbound
+                .offer(
+                    broker_core::session::Delivery {
+                        message: broker_core::session::Message::new(
+                            "a/b",
+                            bytes::Bytes::from_static(b"x"),
+                            QoS::AtLeastOnce,
+                            false,
+                        ),
+                        qos: QoS::AtLeastOnce,
+                        retain: false,
+                        dup: false,
+                        subscription_ids: Vec::new(),
+                        packet_id: None,
+                    },
+                    0,
+                    &mut actions,
+                );
+            actions.pop().expect("the publish went out")
+        });
+
+        let outstanding = || {
+            shared.with_broker(|broker| {
+                broker
+                    .session(registration.subscriber)
+                    .unwrap()
+                    .outbound
+                    .inflight_len()
+            })
+        };
+
+        let displaced = SizeLimit {
+            limit: Some(1),
+            shared: Arc::clone(&shared),
+            subscriber: registration.subscriber,
+            epoch: registration.epoch + 1,
+        };
+        displaced.discard(&action);
+        assert_eq!(
+            outstanding(),
+            1,
+            "the session is not this writer's to settle"
+        );
+
+        let ours = SizeLimit {
+            limit: Some(1),
+            shared: Arc::clone(&shared),
+            subscriber: registration.subscriber,
+            epoch: registration.epoch,
+        };
+        ours.discard(&action);
+        assert_eq!(outstanding(), 0, "and the writer that owns it does settle");
+    }
+
+    #[tokio::test]
+    async fn an_at_least_once_discard_does_not_wedge_the_connection() {
+        a_discard_does_not_wedge_the_connection(QoS::AtLeastOnce).await;
+    }
+
+    #[tokio::test]
+    async fn an_exactly_once_discard_does_not_wedge_the_connection() {
+        // The level with no completion path of its own before this
+        // task: `on_puback` ends an at-least-once exchange and nothing
+        // ended one still awaiting its receipt.
+        a_discard_does_not_wedge_the_connection(QoS::ExactlyOnce).await;
     }
 
     #[tokio::test]

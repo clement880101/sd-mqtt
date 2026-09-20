@@ -140,6 +140,46 @@ impl Outbound {
         Ok(())
     }
 
+    /// A publish was discarded on the way out, and no acknowledgement
+    /// for it can ever arrive.
+    ///
+    /// [MQTT-3.1.2-24] forbids sending a packet larger than the peer's
+    /// Maximum Packet Size, and [MQTT-3.1.2-25] says what to do
+    /// instead: "discard the packet and behave as if it had completed
+    /// delivery". Behaving that way is the whole of this method, and
+    /// it is the half that is easy to omit. Dropping only the bytes
+    /// leaves the entry in the window and its identifier reserved,
+    /// waiting on a peer that was never told to answer, so the window
+    /// fills one message at a time and delivery stops for good.
+    ///
+    /// Silent when the identifier names nothing outstanding, or names
+    /// an entry the peer already owns. The caller is a writer draining
+    /// a queue, so the session it addresses may have been resumed or
+    /// taken over since the packet was rendered; an unconditional
+    /// release would then settle an unrelated delivery. An entry in
+    /// [`InflightState::AwaitingComplete`] is likewise not this one:
+    /// what goes out for it is a release, which carries no payload and
+    /// cannot be too large.
+    pub fn on_discarded(&mut self, packet_id: u16, now: u32, out: &mut Vec<Action>) {
+        let state = match self.inflight.get_mut(packet_id) {
+            Some(entry) if entry.state != InflightState::AwaitingComplete => entry.state,
+            _ => return,
+        };
+        let entry = self
+            .complete(packet_id, state)
+            .expect("the entry was just found in that state");
+        // Nothing leaves this module unaccounted for. A message that
+        // vanishes without an action saying so is a support case
+        // nobody can answer, and this one vanishes by design.
+        out.push(Action::Dropped {
+            id: entry.delivery.message.id,
+            reason: DropReason::TooLargeForPeer,
+            qos: entry.delivery.qos,
+            topic: Arc::clone(&entry.delivery.message.topic),
+        });
+        self.pump(now, out);
+    }
+
     /// Handle an exactly-once receipt.
     ///
     /// A failure reason ends the exchange: the peer has refused the
@@ -1066,6 +1106,98 @@ mod tests {
         expected.sort();
         assert_eq!(reported, expected, "every message must be reported");
         assert_eq!(out.queued_len(), 0);
+        assert_eq!(out.inflight_len(), 0);
+    }
+
+    #[test]
+    fn an_exactly_once_message_discarded_for_size_frees_its_slot_and_its_identifier() {
+        // [MQTT-3.1.2-25]: behave as if delivery had completed. The
+        // exactly-once case is the one with no existing completion
+        // path: `on_puback` ends an at-least-once exchange, but a
+        // message still awaiting its receipt has nothing that ends it
+        // short of a refusal. Leaving it outstanding holds a window
+        // slot and an identifier for an acknowledgement that cannot
+        // arrive, because the packet was never sent.
+        let mut out = online(1);
+        let mut actions = Vec::new();
+        let item = delivery(QoS::ExactlyOnce, b"x");
+        let message_id = item.message.id;
+        out.offer(item, 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+
+        actions.clear();
+        out.on_discarded(packet_id, 0, &mut actions);
+
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Dropped { id, reason: DropReason::TooLargeForPeer, .. }
+                    if *id == message_id
+            )),
+            "a message that vanishes without a counter moving is unanswerable"
+        );
+        assert_eq!(out.inflight_len(), 0, "the slot is free");
+        assert!(
+            !out.packet_ids.is_in_use(packet_id),
+            "and so is the identifier"
+        );
+    }
+
+    #[test]
+    fn a_message_behind_one_discarded_for_size_is_sent() {
+        // The consequence of the test above, and the one a test that
+        // only watches the discarded message cannot see. With a window
+        // of one, an uncompleted discard stops this session delivering
+        // anything, ever again.
+        let mut out = online(1);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::ExactlyOnce, b"too big"), 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+        out.offer(delivery(QoS::ExactlyOnce, b"next"), 0, &mut actions);
+        assert_eq!(sent(&actions).len(), 1, "the window holds one");
+
+        actions.clear();
+        out.on_discarded(packet_id, 0, &mut actions);
+
+        let sent = sent(&actions);
+        assert_eq!(sent.len(), 1, "the one behind it goes out");
+        assert_eq!(&sent[0].payload[..], b"next");
+    }
+
+    #[test]
+    fn a_message_the_peer_already_owns_is_not_discarded_for_size() {
+        // A message past its receipt is resumed by resending the
+        // release, which carries no payload and cannot be too large.
+        // So a discard naming that identifier is a writer settling an
+        // exchange that is not its own: the identifier has been reused
+        // by a session that resumed or was taken over since. Freeing
+        // it would strand the exactly-once delivery that now holds it.
+        let mut out = online(4);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::ExactlyOnce, b"x"), 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+        out.on_pubrec(packet_id, ReasonCode::Success, 0, &mut actions)
+            .expect("known");
+
+        actions.clear();
+        out.on_discarded(packet_id, 0, &mut actions);
+
+        assert!(actions.is_empty(), "nothing to settle here");
+        assert_eq!(out.inflight_len(), 1, "the exchange is still the peer's");
+        assert!(out.packet_ids.is_in_use(packet_id));
+    }
+
+    #[test]
+    fn a_discard_naming_nothing_outstanding_does_nothing() {
+        // The writer renders from a queue, so by the time it discards,
+        // the session may have been cleared or resumed out from under
+        // the identifier. That is ordinary, not a fault.
+        let mut out = online(4);
+        let mut actions = Vec::new();
+
+        out.on_discarded(7, 0, &mut actions);
+
+        assert!(actions.is_empty());
         assert_eq!(out.inflight_len(), 0);
     }
 

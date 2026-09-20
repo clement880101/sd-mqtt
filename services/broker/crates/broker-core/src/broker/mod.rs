@@ -620,6 +620,41 @@ impl Broker {
         reached
     }
 
+    /// A packet was too large to send and has been discarded.
+    ///
+    /// [MQTT-3.1.2-24] forbids sending a packet larger than the
+    /// Maximum Packet Size the client advertised, and [MQTT-3.1.2-25]
+    /// says to behave as if delivery had completed. This is that
+    /// second half: releasing the identifier and the inflight slot
+    /// rather than leaving both held for an acknowledgement that
+    /// cannot arrive.
+    ///
+    /// The check belongs to the writer, which is the only place the
+    /// packet's true size is known without either a second size
+    /// calculation that would drift from the encoder or a throwaway
+    /// encode on the hot path. So this is the way back in.
+    ///
+    /// Nothing happens when the identifier names nothing outstanding;
+    /// see [`Outbound::on_discarded`] for why the caller cannot
+    /// promise that it does.
+    ///
+    /// [`Outbound::on_discarded`]: crate::session::Outbound::on_discarded
+    pub fn discard_oversize(
+        &mut self,
+        subscriber: SubscriberId,
+        packet_id: u16,
+        now: u32,
+        out: &mut Vec<Addressed>,
+    ) {
+        let mut actions = Vec::new();
+        if let Some(session) = self.registry.get_mut(subscriber) {
+            session.outbound.on_discarded(packet_id, now, &mut actions);
+        }
+        for action in actions {
+            out.push((subscriber, action));
+        }
+    }
+
     /// A connection went away without a disconnect packet.
     ///
     /// Nothing comes back from this. A will owed by an abrupt departure

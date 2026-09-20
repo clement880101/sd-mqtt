@@ -61,6 +61,11 @@ pub enum DropReason {
     /// the message. The exchange is over by [MQTT-4.4.0-2] and the
     /// message must not be retransmitted.
     RejectedByPeer,
+    /// The encoded packet was larger than the Maximum Packet Size the
+    /// peer advertised. [MQTT-3.1.2-24] forbids sending it and
+    /// [MQTT-3.1.2-25] says to behave as though it had been delivered,
+    /// so this is the only record that it was not.
+    TooLargeForPeer,
 }
 
 /// What to discard when the queue is full.
