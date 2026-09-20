@@ -37,7 +37,7 @@ use broker_core::subscriptions::SubscriberId;
 use broker_core::topic::reference;
 use bytes::Bytes;
 use mqtt_codec::packet::{
-    Ack, Connect, Publish, RetainHandling, Subscribe, SubscriptionOptions, Will,
+    Ack, Connect, Disconnect, Publish, RetainHandling, Subscribe, SubscriptionOptions, Will,
 };
 use mqtt_codec::{Packet, Properties, QoS, ReasonCode, Version};
 use proptest::prelude::*;
@@ -1317,4 +1317,71 @@ fn late_subscriber_sees_the_retained_will(broker: &mut Broker, client: &str) -> 
         .handle(late.subscriber, &Packet::Subscribe(request), &mut out)
         .expect("a valid subscribe");
     copies(&out, "gone/device", late.subscriber) > 0
+}
+
+/// Send a disconnect packet carrying `reason`, then tick `seconds`
+/// times, reporting whether the will went out.
+fn disconnects_with(reason: ReasonCode, version: Version) -> bool {
+    let (mut broker, watcher) = broker_with_a_watcher();
+    let mut out = Vec::new();
+
+    let mut connect = durable_connect("device", 600);
+    connect.version = version;
+    with_will(&mut connect, Some(0));
+    let device = broker.connect("", &connect, &mut out);
+
+    broker
+        .handle(
+            device.subscriber,
+            &Packet::Disconnect(Disconnect {
+                reason,
+                properties: Properties::default(),
+            }),
+            &mut out,
+        )
+        .expect("a disconnect is always accepted");
+
+    for _ in 0..10 {
+        out.clear();
+        broker.tick(&mut out);
+        if copies(&out, "gone/device", watcher) > 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// A normal disconnection discards the will.
+///
+/// [MQTT-3.14.4-3]: "On receipt of DISCONNECT with a Reason Code of
+/// 0x00 (Success) the Server MUST discard any Will Message associated
+/// with the current Connection without publishing it."
+#[test]
+fn a_normal_disconnection_discards_the_will() {
+    assert!(!disconnects_with(ReasonCode::Success, Version::V5));
+}
+
+/// Any other reason leaves it standing, and 0x04 exists to ask for it.
+///
+/// Only 0x00 deletes the will, so a disconnect carrying anything else
+/// is not the receipt that does. Section 3.1.2.5's own example of the
+/// use is a client arranging to announce its own session expiry by
+/// "sending DISCONNECT with Reason Code 0x04".
+#[test]
+fn a_disconnection_asking_for_the_will_publishes_it() {
+    assert!(disconnects_with(
+        ReasonCode::DisconnectWithWillMessage,
+        Version::V5
+    ));
+}
+
+/// MQTT 3.1.1's disconnect carries no reason at all, so its rule is
+/// unconditional: every disconnect packet discards the will.
+#[test]
+fn a_3_1_1_disconnection_always_discards_the_will() {
+    assert!(!disconnects_with(ReasonCode::Success, Version::V311));
+    assert!(
+        !disconnects_with(ReasonCode::DisconnectWithWillMessage, Version::V311),
+        "3.1.1 has no reason code to read, whatever a caller passes"
+    );
 }
