@@ -729,6 +729,58 @@ shippable.
   describes that failure. If a conformance suite ever rejects it, this is
   the line to revisit, and the stricter reading is a one-line change.
 
+- **The single lock above the broker, measured.** The broker's methods take
+  an exclusive reference, so the shell serialises every packet in the
+  process through one mutex. Milestone 1 measured it rather than fixing it.
+  The harness is `services/broker/crates/server/tests/throughput.rs`, three
+  ignored tests run with
+  `cargo test -p sdmqtt-server --release --test throughput -- --ignored
+  --nocapture --test-threads 1`. Machine: Apple M2 Pro, 12 logical cores,
+  32 GB, macOS 26.4.1, arm64, release profile, loopback TCP, MQTT 5,
+  at-most-once, 32-byte payloads, one subscriber per publisher on its own
+  topic, three-second window after a one-second warm-up.
+
+  Closed loop, 512 messages outstanding per pair, nothing discarded:
+
+  | publishers | total msg/s | per publisher |
+  |---:|---:|---:|
+  | 1 | 452,000 | 452,000 |
+  | 2 | 349,000 | 175,000 |
+  | 4 | 241,000 | 60,000 |
+  | 8 | 183,000 | 23,000 |
+  | 16 | 220,000 | 14,000 |
+
+  **Throughput falls rather than flattens.** Sixteen publishers move less
+  in total than one does. A thousand extra idle connections changed no
+  figure by more than noise (447,000 / 354,000 / 245,000 / 183,000 /
+  217,000), so an idle connection costs nothing per message.
+
+  The same load with no sockets at all, one `Shared` for everyone versus
+  one `Shared` per caller, which is the control that says whether the lock
+  or the runtime is responsible:
+
+  | callers | one broker, msg/s | one broker each, msg/s | ratio |
+  |---:|---:|---:|---:|
+  | 1 | 515,000 | 519,000 | 1.01 |
+  | 2 | 400,000 | 901,000 | 2.26 |
+  | 4 | 294,000 | 1,436,000 | 4.89 |
+  | 8 | 289,000 | 1,318,000 | 4.56 |
+  | 16 | 293,000 | 1,195,000 | 4.08 |
+
+  Identical work, identical task counts, identical runtime; the only
+  difference is whether the mutex is contended. Sharded, it scales to
+  about 1.4 M msg/s and saturates on cores. Shared, it peaks at one caller
+  and settles around 290,000.
+
+  One tick with ten thousand sessions: 30 µs median, 27 µs minimum, 108 µs
+  maximum over fifty ticks. `Broker::tick` scans the registry twice per
+  tick, so this is linear in sessions and would be roughly 300 µs at the
+  hundred thousand the design targets — a pause of that length, once a
+  second, for every connection in the process.
+
+  No conclusion is drawn here. The figures exist so that milestone 2
+  decides from a measurement.
+
 - **Contention in the matching layer.** The subscription trie is sharded
   by first topic level, but the retained store is one lock, so every
   retained publish serialises broker-wide and an expiry sweep holds that
