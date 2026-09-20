@@ -976,6 +976,64 @@ mod tests {
         );
     }
 
+    /// The seam between the store and the delivery path, end to end.
+    ///
+    /// A retained message is the worst case for [MQTT-3.3.2-6]: it can
+    /// sit for hours, and the interval it was published with is stale
+    /// the moment it is stored. The store keeps the publisher's figure
+    /// on purpose and the outbound path rewrites it from the deadline,
+    /// so neither half can be checked from inside the other.
+    ///
+    /// This is also the only test that the deadline itself survives
+    /// into the delivery. Dropping `expires_at` on the way out of the
+    /// store passes every other test, because the store applies its
+    /// own deadline on read and the delivery's is never read again.
+    #[test]
+    fn a_retained_delivery_reports_the_expiry_that_is_left_after_the_wait() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+
+        let publisher = broker.connect("", &connect_v5("publisher"), &mut out);
+        let keepsake = Packet::Publish(Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: true,
+            topic: "retain/perishable".to_string(),
+            packet_id: None,
+            payload: Bytes::from_static(b"body"),
+            properties: Properties {
+                message_expiry_interval: Some(600),
+                ..Properties::default()
+            },
+        });
+        broker
+            .handle(publisher.subscriber, &keepsake, &mut out)
+            .expect("the publish is accepted");
+
+        // A hundred seconds pass with nobody subscribed.
+        run_to(&mut broker, 100, &mut out);
+
+        let newcomer = broker.connect("", &connect_v5("newcomer"), &mut out);
+        out.clear();
+        broker
+            .handle(
+                newcomer.subscriber,
+                &subscribe_to("retain/perishable"),
+                &mut out,
+            )
+            .expect("the subscribe is accepted");
+
+        let sent = publishes_to(&out, newcomer.subscriber);
+        let [delivered] = sent.as_slice() else {
+            panic!("one retained delivery, got {}", sent.len());
+        };
+        assert_eq!(
+            delivered.properties.message_expiry_interval,
+            Some(500),
+            "[MQTT-3.3.2-6]: a hundred of the six hundred were spent waiting"
+        );
+    }
+
     /// A subscribe to one filter, asking for retained messages.
     fn subscribe_to(filter: &str) -> Packet {
         Packet::Subscribe(Subscribe {

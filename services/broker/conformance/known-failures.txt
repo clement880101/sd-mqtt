@@ -32,6 +32,5 @@ v5:test_flow_control2        assumption The broker does send DISCONNECT 0x93 aft
 v5:test_subscribe_options    flaky      Waits on aclient's subscribeds after bclient subscribes, so it can publish before bclient's SUBSCRIBE is processed; observed passing three runs in four, and a direct probe shows noLocal routing is correct.
 
 # --- real defects, reported, deliberately not fixed here ---------------
-v5:test_publication_expiry   defect     A queued delivery forwards the original Message Expiry Interval instead of the value minus the time waited ([MQTT-3.3.2-6]).
 v5:test_maximum_packet_size  defect     A client's Maximum Packet Size is not honoured on the way out ([MQTT-3.1.2-24]).
 v5:test_client_topic_alias   defect     A topic alias is never resolved and never stripped, and a protocol error after CONNACK closes the socket with no DISCONNECT.

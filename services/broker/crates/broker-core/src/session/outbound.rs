@@ -71,7 +71,7 @@ impl Outbound {
     /// Put one message on the wire. Returns whether to keep going.
     fn dispatch(&mut self, item: Delivery, now: u32, out: &mut Vec<Action>) -> bool {
         if item.qos == QoS::AtMostOnce {
-            out.push(Action::Send(publish(&item, None)));
+            out.push(Action::Send(publish(&item, None, now)));
             return true;
         }
 
@@ -94,7 +94,7 @@ impl Outbound {
             }
         };
 
-        out.push(Action::Send(publish(&item, Some(packet_id))));
+        out.push(Action::Send(publish(&item, Some(packet_id), now)));
         let state = if item.qos == QoS::AtLeastOnce {
             InflightState::AwaitingAck
         } else {
@@ -392,12 +392,20 @@ impl Outbound {
     }
 }
 
-fn publish(item: &Delivery, packet_id: Option<u16>) -> Packet {
+fn publish(item: &Delivery, packet_id: Option<u16>, now: u32) -> Packet {
     // The property block is cloned per delivery because the subscription
     // identifiers differ per subscriber. That clone is the packet-sizing
     // question recorded in the design spec's open questions.
     let mut properties = (*item.message.properties).clone();
     properties.subscription_identifiers = item.subscription_ids.clone();
+    // [MQTT-3.3.2-6]: what the client is told is what is left, not what
+    // was published. `expires_at` is the subtraction already done, so
+    // the remainder is the distance from now to the deadline. Written
+    // unconditionally rather than only when a deadline exists, so that a
+    // cloned property block cannot carry a stale interval past a message
+    // that has none: the retained store keeps the publisher's interval
+    // whole, and a message with no deadline must carry none.
+    properties.message_expiry_interval = item.message.expires_at.map(|at| at.saturating_sub(now));
 
     Packet::Publish(Publish {
         dup: item.dup,
@@ -419,6 +427,96 @@ mod tests {
     use bytes::Bytes;
     use mqtt_codec::packet::Publish;
     use mqtt_codec::{Packet, QoS, ReasonCode};
+
+    #[test]
+    fn a_delivery_reports_the_expiry_that_is_left_rather_than_the_one_it_arrived_with() {
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        let mut item = delivery(QoS::AtMostOnce, b"body");
+        item.message.expires_at = Some(60);
+        item.message.properties = Arc::new(Properties {
+            message_expiry_interval: Some(60),
+            ..Properties::default()
+        });
+
+        // Sent at tick 20, so forty seconds of the sixty remain.
+        out.offer(item, 20, &mut actions);
+
+        assert_eq!(
+            sent(&actions)[0].properties.message_expiry_interval,
+            Some(40),
+            "[MQTT-3.3.2-6]: the interval sent is the one received less the wait"
+        );
+    }
+
+    /// The boundary itself. A message expires strictly after its
+    /// deadline, so one sent in the very second of that deadline is
+    /// still live and its remainder is zero. Zero and absent are not
+    /// the same answer: 3.3.2.3.3 reads an absent Message Expiry
+    /// Interval as no expiry at all, so reporting nothing here would
+    /// tell the client the opposite of the truth.
+    ///
+    /// The two tests around this one both pick a remainder well clear
+    /// of zero, so dropping a zero remainder passed them both.
+    #[test]
+    fn a_delivery_in_the_second_of_its_deadline_reports_zero_rather_than_nothing() {
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        let mut item = delivery(QoS::AtMostOnce, b"body");
+        item.message.expires_at = Some(60);
+        item.message.properties = Arc::new(Properties {
+            message_expiry_interval: Some(60),
+            ..Properties::default()
+        });
+
+        out.offer(item, 60, &mut actions);
+
+        assert_eq!(sent(&actions).len(), 1, "the deadline itself is not past");
+        assert_eq!(
+            sent(&actions)[0].properties.message_expiry_interval,
+            Some(0),
+            "3.3.2.3.3: an absent interval means no expiry, which is not what is left"
+        );
+    }
+
+    /// The queue is where the waiting actually happens, and a queued
+    /// message goes out through the acknowledged arm of `dispatch`,
+    /// not the fire-and-forget one. `dispatch` calls `publish` twice,
+    /// once per arm, and the test above walks only the first: passing
+    /// a constant instead of the clock on the second arm survived the
+    /// whole suite until this test existed.
+    #[test]
+    fn a_message_that_waited_offline_reports_what_is_left_when_it_finally_goes() {
+        let mut out = Outbound::new(QueueLimits::default(), 10);
+        let mut actions = Vec::new();
+        let mut item = delivery(QoS::AtLeastOnce, b"body");
+        item.message.expires_at = Some(60);
+        item.message.properties = Arc::new(Properties {
+            message_expiry_interval: Some(60),
+            ..Properties::default()
+        });
+
+        out.offer(item, 5, &mut actions);
+        assert!(sent(&actions).is_empty(), "nobody is attached to send to");
+
+        // The client comes back thirty seconds later, with twenty-five
+        // of the sixty already spent waiting.
+        out.on_resume(30, &mut actions);
+
+        assert_eq!(
+            sent(&actions)[0].properties.message_expiry_interval,
+            Some(30),
+            "[MQTT-3.3.2-6]: the wait comes off the interval on this path too"
+        );
+    }
+
+    #[test]
+    fn a_delivery_with_no_deadline_carries_no_expiry() {
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtMostOnce, b"body"), 20, &mut actions);
+        assert_eq!(sent(&actions)[0].properties.message_expiry_interval, None);
+    }
 
     fn delivery(qos: QoS, payload: &'static [u8]) -> Delivery {
         Delivery {
