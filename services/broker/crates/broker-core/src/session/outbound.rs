@@ -6,6 +6,7 @@ use mqtt_codec::packet::{Ack, Publish};
 use mqtt_codec::{Packet, Properties, QoS, ReasonCode};
 
 use crate::session::inflight::{Inflight, InflightEntry, InflightState};
+use crate::session::message::Message;
 use crate::session::packet_ids::PacketIds;
 use crate::session::queue::{Delivery, DropReason, Queue, QueueLimits};
 use crate::session::Action;
@@ -47,18 +48,24 @@ impl Outbound {
         self.inflight.set_limit(limit);
     }
 
-    /// Whether a message of `size` bytes would be refused by the queue.
+    /// Whether this message, delivered at `qos`, would be refused.
     ///
     /// Asked of a shared subscription's members before one of them is
     /// handed the message, which is the only way section 6's "a member
     /// whose queue is full is skipped" can be honoured: an offer that is
     /// refused has already lost the message.
     ///
+    /// The whole message rather than its size, and this session's own
+    /// attachment, because [`Queue::would_refuse`] weighs all three of
+    /// the reasons an offer is refused and two of them — expiry, and a
+    /// fire-and-forget delivery to a session with nobody attached — are
+    /// invisible in a byte count.
+    ///
     /// Only the queue is consulted. A full inflight window is not a
     /// refusal, because the queue exists precisely to hold what the
     /// window has no room for.
-    pub fn would_refuse(&self, size: usize) -> bool {
-        self.queue.would_refuse(size)
+    pub fn would_refuse(&self, message: &Message, qos: QoS, now: u32) -> bool {
+        self.queue.would_refuse(message, qos, now, self.online)
     }
 
     /// Offer a message for delivery.

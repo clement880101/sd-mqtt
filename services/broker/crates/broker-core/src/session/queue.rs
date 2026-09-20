@@ -139,46 +139,34 @@ impl Queue {
         online: bool,
         dropped: &mut Vec<(Delivery, DropReason)>,
     ) -> bool {
-        if item.message.is_expired(now) {
-            dropped.push((item, DropReason::Expired));
-            return false;
-        }
-        if item.qos == QoS::AtMostOnce && !online && !self.limits.queue_qos0_while_offline {
-            dropped.push((item, DropReason::QosZeroWhileOffline));
-            return false;
-        }
-
         let size = item.size_in_queue();
-        // A message larger than the whole budget can never fit, whatever
-        // is evicted, so refuse it rather than emptying the queue trying.
-        if size > self.limits.max_bytes {
-            dropped.push((item, DropReason::ByteBudget));
-            return false;
-        }
+        if let Some(reason) = self.refusal(&item.message, item.qos, now, online) {
+            // Only a bound can be made room for, and only by a queue
+            // that evicts to make it. An expired message, a
+            // fire-and-forget delivery to an offline session and a
+            // message larger than the whole budget are refusals however
+            // much room is cleared.
+            let at_a_bound = matches!(reason, DropReason::QueueFull | DropReason::ByteBudget)
+                && size <= self.limits.max_bytes;
+            if !at_a_bound || self.limits.overflow != Overflow::DropOldest {
+                dropped.push((item, reason));
+                return false;
+            }
 
-        while self.is_over(size) {
-            let reason = if self.entries.len() >= self.limits.max_messages {
-                DropReason::QueueFull
-            } else {
-                DropReason::ByteBudget
-            };
-            match self.limits.overflow {
-                Overflow::DropNewest => {
-                    dropped.push((item, reason));
-                    return false;
-                }
-                Overflow::DropOldest => match self.entries.pop_front() {
+            while self.is_over(size) {
+                let reason = self.bound_reached();
+                match self.entries.pop_front() {
                     Some(evicted) => {
                         self.bytes -= evicted.size_in_queue();
                         dropped.push((evicted, reason));
                     }
-                    // Nothing left to evict, which the size check above
-                    // should already have prevented.
+                    // Nothing left to evict, which the size check in
+                    // `refusal` should already have prevented.
                     None => {
                         dropped.push((item, reason));
                         return false;
                     }
-                },
+                }
             }
         }
 
@@ -187,31 +175,80 @@ impl Queue {
         true
     }
 
+    /// Why this message would not be taken, or `None` if it would.
+    ///
+    /// Every reason a message is refused lives here and nowhere else.
+    /// [`Queue::push`] asks and then acts on the answer;
+    /// [`Queue::would_refuse`] asks and only reports it. Neither
+    /// restates a condition, so a rule added to one is a rule added to
+    /// both.
+    ///
+    /// The three, in the order they are asked: the message has expired,
+    /// it is fire-and-forget for a session with nobody attached, or it
+    /// is over a bound. The first two are the ones a caller asking in
+    /// advance most needs, because they do not depend on how full the
+    /// queue is and so cannot be guessed from its occupancy.
+    fn refusal(&self, message: &Message, qos: QoS, now: u32, online: bool) -> Option<DropReason> {
+        if message.is_expired(now) {
+            return Some(DropReason::Expired);
+        }
+        if qos == QoS::AtMostOnce && !online && !self.limits.queue_qos0_while_offline {
+            return Some(DropReason::QosZeroWhileOffline);
+        }
+        let size = message.size_in_queue();
+        // A message larger than the whole budget can never fit, whatever
+        // is evicted, so refuse it rather than emptying the queue trying.
+        if size > self.limits.max_bytes {
+            return Some(DropReason::ByteBudget);
+        }
+        if self.is_over(size) {
+            return Some(self.bound_reached());
+        }
+        None
+    }
+
+    /// Which bound the queue has reached, for the report.
+    fn bound_reached(&self) -> DropReason {
+        if self.entries.len() >= self.limits.max_messages {
+            DropReason::QueueFull
+        } else {
+            DropReason::ByteBudget
+        }
+    }
+
     /// Whether a message of `size` bytes is over either bound.
     ///
     /// Not a refusal on its own: a queue that evicts to make room is over
-    /// its bound until it has evicted enough. [`Queue::push`] and
-    /// [`Queue::would_refuse`] both ask this, so that the rule deciding
-    /// what fits cannot drift from the rule answering whether it would.
+    /// its bound until it has evicted enough.
     fn is_over(&self, size: usize) -> bool {
         self.entries.len() >= self.limits.max_messages || self.bytes + size > self.limits.max_bytes
     }
 
-    /// Whether offering a message of `size` bytes would be refused.
+    /// Whether offering this message would be refused.
     ///
     /// The question section 6 asks of a shared subscription's members
     /// before it hands one the message: "a member whose queue is full is
-    /// skipped and the next is tried". Answering it needs no message,
-    /// only its size, because a refusal here costs nothing to recover
-    /// from while a refusal after the offer has already lost it.
+    /// skipped and the next is tried". It costs nothing to be refused
+    /// here and the message is already lost by the time an offer is,
+    /// which is why the question is asked at all.
     ///
-    /// Full is full, whatever the queue does about it. An
-    /// [`Overflow::DropOldest`] queue at its bound would accept this
-    /// message by evicting an older one, and is still reported full
-    /// here: a member that need evict nothing is the better place to
-    /// send it, and the group has one or it has not.
-    pub fn would_refuse(&self, size: usize) -> bool {
-        size > self.limits.max_bytes || self.is_over(size)
+    /// It takes the whole message, and the level it would be delivered
+    /// at, because being full is only one of the three reasons
+    /// [`Queue::push`] refuses one. Asking about a size alone answered
+    /// a third of the question and read as the whole of it, which lost
+    /// a fire-and-forget publish to an offline member of a shared group
+    /// while an idle member with an empty queue received nothing.
+    ///
+    /// Both this and `push` get their answer from the same
+    /// [`Queue::refusal`], so they cannot disagree about *whether* a
+    /// message is refused. They differ in one deliberate way, which is
+    /// what they do with the answer: an [`Overflow::DropOldest`] queue
+    /// at its bound accepts the message by evicting an older one, and
+    /// is still reported refused here. A member that need evict nothing
+    /// is the better place to send it, and the group has one or it has
+    /// not.
+    pub fn would_refuse(&self, message: &Message, qos: QoS, now: u32, online: bool) -> bool {
+        self.refusal(message, qos, now, online).is_some()
     }
 
     /// Put a message back at the head, ahead of anything newer.
@@ -336,14 +373,20 @@ mod tests {
         // whole failure this can have.
         let mut queue = Queue::new(limits(2, Overflow::DropNewest));
         let mut dropped = Vec::new();
-        let size = delivery(QoS::AtLeastOnce, b"1").size_in_queue();
+        let probe = delivery(QoS::AtLeastOnce, b"1");
 
         for payload in [b"1", b"2"] {
-            assert!(!queue.would_refuse(size), "room for {payload:?}");
+            assert!(
+                !queue.would_refuse(&probe.message, probe.qos, 0, true),
+                "room for {payload:?}"
+            );
             assert!(queue.push(delivery(QoS::AtLeastOnce, payload), 0, true, &mut dropped));
         }
 
-        assert!(queue.would_refuse(size), "two is the bound, so it is full");
+        assert!(
+            queue.would_refuse(&probe.message, probe.qos, 0, true),
+            "two is the bound, so it is full"
+        );
         assert!(
             !queue.push(delivery(QoS::AtLeastOnce, b"3"), 0, true, &mut dropped),
             "and push agrees"
@@ -355,7 +398,8 @@ mod tests {
         // The other bound, on its own boundary: room for two of this
         // size and not a third, though the message count is nowhere
         // near its own limit.
-        let size = delivery(QoS::AtLeastOnce, b"payload").size_in_queue();
+        let probe = delivery(QoS::AtLeastOnce, b"payload");
+        let size = probe.size_in_queue();
         let mut queue = Queue::new(QueueLimits {
             max_messages: usize::MAX,
             max_bytes: size * 2,
@@ -365,7 +409,7 @@ mod tests {
         let mut dropped = Vec::new();
 
         for _ in 0..2 {
-            assert!(!queue.would_refuse(size));
+            assert!(!queue.would_refuse(&probe.message, probe.qos, 0, true));
             assert!(queue.push(
                 delivery(QoS::AtLeastOnce, b"payload"),
                 0,
@@ -374,7 +418,10 @@ mod tests {
             ));
         }
 
-        assert!(queue.would_refuse(size), "a third would go over the budget");
+        assert!(
+            queue.would_refuse(&probe.message, probe.qos, 0, true),
+            "a third would go over the budget"
+        );
         assert!(!queue.push(
             delivery(QoS::AtLeastOnce, b"payload"),
             0,

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use foldhash::fast::RandomState;
 use mqtt_codec::packet::Connect;
-use mqtt_codec::{Limits, Packet, Properties, ReasonCode, Version};
+use mqtt_codec::{Limits, Packet, Properties, QoS, ReasonCode, Version};
 
 use crate::clock::CoarseClock;
 use crate::keepalive::{Activity, KeepAliveRing};
@@ -638,14 +638,19 @@ impl Broker {
         // Section 6's "a member whose queue is full is skipped". The
         // selector cannot see a session and is not given one; it is
         // asked again instead, and this answers whether the member it
-        // offered could take the message. The size is the same for
-        // every subscriber, so it is measured once.
-        let size = message.size_in_queue();
+        // offered could take the message.
+        //
+        // The whole message and the level this member would be
+        // delivered at, not a byte count: a queue refuses a
+        // fire-and-forget message to a session with nobody attached,
+        // and an expired one, however empty it is. Asking only about
+        // size let an offline member answer "room" for a publish it
+        // then dropped, while an idle member received nothing.
         let registry = &self.registry;
-        let mut has_room = |subscriber: SubscriberId| {
+        let mut has_room = |subscriber: SubscriberId, qos: QoS| {
             registry
                 .get(subscriber)
-                .is_some_and(|session| !session.outbound.would_refuse(size))
+                .is_some_and(|session| !session.outbound.would_refuse(&message, qos, now))
         };
         route::route(
             &self.subscriptions,
@@ -1712,6 +1717,73 @@ mod tests {
         assert!(
             publishes_to(&out, second).is_empty(),
             "and takes it instead of the member that covered for it"
+        );
+    }
+
+    #[test]
+    fn a_shared_member_that_would_drop_a_fire_and_forget_message_is_skipped() {
+        // The other two thirds of what `push` refuses. A queue turns a
+        // message away for three reasons and only one of them is "full",
+        // so a member asked about room alone answers yes to a publish it
+        // is about to discard. Here the first member is offline and the
+        // publish is at-most-once, which the queue drops on arrival: the
+        // rotation hands it to the offline member, the message dies
+        // there, and the online member with an empty queue receives
+        // nothing. That is precisely the loss the skip exists to
+        // prevent, one layer further down.
+        //
+        // Durable sessions, so that disconnecting the first leaves its
+        // subscription in the group rather than removing it: a member
+        // that is gone is not a member that is skipped, and the test
+        // would then pass on a broker with no skip at all.
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+
+        let mut members = Vec::new();
+        for name in ["first", "second"] {
+            let mut connect = connect_v5(name);
+            connect.properties.session_expiry_interval = Some(300);
+            let member = broker.connect("", &connect, &mut out).subscriber;
+            broker
+                .handle(
+                    member,
+                    &subscribe_at("$share/g/a/b", QoS::AtMostOnce),
+                    &mut out,
+                )
+                .expect("the shared subscribe is accepted");
+            members.push(member);
+        }
+        let [first, second] = [members[0], members[1]];
+        broker.disconnect(first, &mut out);
+        out.clear();
+
+        broker.publish(
+            Message::new("a/b", Bytes::from_static(b"x"), QoS::AtMostOnce, false),
+            None,
+            0,
+            &mut out,
+        );
+
+        // Both halves. A broker that delivers to the online member and
+        // *also* drops a copy at the offline one would satisfy the first
+        // assertion alone, and so would one that asks every member in
+        // turn until something sticks.
+        assert_eq!(
+            publishes_to(&out, second).len(),
+            1,
+            "the member that can take it receives it"
+        );
+        assert!(
+            publishes_to(&out, first).is_empty(),
+            "and the offline member is not sent one"
+        );
+        let dropped: Vec<DropReason> = [first, second]
+            .iter()
+            .flat_map(|member| drops_to(&out, *member))
+            .collect();
+        assert!(
+            dropped.is_empty(),
+            "nothing is discarded when a member of the group could take it, got {dropped:?}"
         );
     }
 

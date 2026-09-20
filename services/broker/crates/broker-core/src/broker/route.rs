@@ -36,13 +36,19 @@ pub struct Routed {
 /// `publisher` withholds the message from any subscription that set
 /// no-local, which is about who sent it rather than what it says.
 ///
-/// `has_room` answers whether one subscriber could take this message,
-/// and is asked of a shared group's members alone. Section 6: "A member
-/// whose queue is full is skipped and the next is tried." The selector
-/// cannot see a session, so the asking is done here, and bounded: one
-/// turn of the rotation, no more. A group whose every member is full
-/// still hands the message to one of them, so that the drop is reported
-/// where every other drop is, rather than vanishing here uncounted.
+/// `has_room` answers whether one subscriber could take this message at
+/// the level it would be delivered to *that* subscriber at, and is asked
+/// of a shared group's members alone. Section 6: "A member whose queue
+/// is full is skipped and the next is tried." The selector cannot see a
+/// session, so the asking is done here, and bounded: one turn of the
+/// rotation, no more. A group whose every member is full still hands the
+/// message to one of them, so that the drop is reported where every
+/// other drop is, rather than vanishing here uncounted.
+///
+/// The level is part of the question because a queue refuses a
+/// fire-and-forget message to an offline session whatever room it has,
+/// and a member that will drop the message is exactly the member the
+/// skip exists to pass over.
 ///
 /// An ordinary subscription is not asked. Its subscriber is the only
 /// one there is, so a full queue there is a drop however it is reached.
@@ -51,7 +57,7 @@ pub fn route(
     shared: &SharedSubscriptions,
     message: &Message,
     publisher: Option<SubscriberId>,
-    has_room: &mut dyn FnMut(SubscriberId) -> bool,
+    has_room: &mut dyn FnMut(SubscriberId, QoS) -> bool,
     out: &mut Vec<Routed>,
 ) {
     let mut matched = Vec::new();
@@ -70,7 +76,7 @@ pub fn route(
     let mut groups = Vec::new();
     shared.matching(&message.topic[..], &mut groups);
     for group in groups {
-        if let Some(subscription) = choose(shared, group, publisher, has_room) {
+        if let Some(subscription) = choose(shared, group, message, publisher, has_room) {
             merge(out, &subscription, message);
         }
     }
@@ -91,8 +97,9 @@ pub fn route(
 fn choose(
     shared: &SharedSubscriptions,
     group: GroupId,
+    message: &Message,
     publisher: Option<SubscriberId>,
-    has_room: &mut dyn FnMut(SubscriberId) -> bool,
+    has_room: &mut dyn FnMut(SubscriberId, QoS) -> bool,
 ) -> Option<Subscription> {
     let size = shared.size_of(group);
     let mut turn_holder = None;
@@ -107,7 +114,13 @@ fn choose(
         if is_withheld(&candidate, publisher) {
             continue;
         }
-        if has_room(candidate.subscriber) {
+        // The level this member would be delivered at, which is what
+        // decides whether its queue takes the message. Merging can only
+        // raise it, when the same client also holds an ordinary
+        // subscription matching the topic, so asking at the lower level
+        // can skip a member that had room but never pick one that had
+        // none.
+        if has_room(candidate.subscriber, candidate.qos.min(message.qos)) {
             return Some(candidate);
         }
         turn_holder.get_or_insert(candidate);
@@ -186,7 +199,7 @@ mod tests {
         publisher: Option<SubscriberId>,
         out: &mut Vec<Routed>,
     ) {
-        route(trie, shared, message, publisher, &mut |_| true, out);
+        route(trie, shared, message, publisher, &mut |_, _| true, out);
     }
 
     fn targets(out: &[Routed]) -> Vec<u64> {
@@ -230,7 +243,7 @@ mod tests {
             &shared,
             &message("a/b", QoS::AtLeastOnce),
             None,
-            &mut |subscriber| subscriber == SubscriberId(2),
+            &mut |subscriber, _qos| subscriber == SubscriberId(2),
             &mut out,
         );
         assert_eq!(
@@ -258,7 +271,7 @@ mod tests {
             &shared,
             &message("a/b", QoS::AtLeastOnce),
             None,
-            &mut |subscriber| {
+            &mut |subscriber, _qos| {
                 asked.push(subscriber.0);
                 assert!(
                     asked.len() <= 2,
