@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use broker_core::broker::Broker;
+use broker_core::broker::{Broker, BrokerConfig};
 use broker_core::registry::SessionId;
 use broker_core::session::Action;
 use broker_core::subscriptions::SubscriberId;
@@ -50,6 +50,38 @@ use crate::shared::Shared;
 /// synonym for unlimited, which matters because the window this feeds
 /// reads zero as unbounded.
 const ABSENT_RECEIVE_MAXIMUM: u16 = 65_535;
+
+/// Headroom above the largest burst one session can produce, for the
+/// acknowledgements, closes and drop reports that share an outbox with
+/// a queue drain.
+const OUTBOX_SLACK: usize = 64;
+
+/// How deep a session's outbox must be for the queue and window it
+/// drains, or `None` when those bounds are too large for one to be
+/// sized at all.
+///
+/// The formula, rather than a constant, because both of its inputs are
+/// an operator's to set and a constant beside a configurable value is a
+/// broken invariant waiting to be written in a file.
+///
+/// `Outbound::pump` sends while the window has room and an at-most-once
+/// dispatch consumes no slot, so a single acknowledgement can flush an
+/// entire queue into one batch. A resume puts the window's contents
+/// back at the head of that queue, bypassing its bounds, so the most
+/// one batch can carry is the queue bound plus the window, and the
+/// slack covers what travels beside it.
+///
+/// Undersizing it is not a slow reader: `Shared::deliver` discards
+/// whatever does not fit against a counter, with no reason and no
+/// `Action::Dropped`, which section 6 forbids. Worse, a discarded
+/// publish at an acknowledged level has its inflight entry already
+/// recorded, so the window slot is held for an acknowledgement that
+/// can never arrive.
+pub fn outbox_depth_for(max_queue_messages: usize, max_inflight: u16) -> Option<usize> {
+    max_queue_messages
+        .checked_add(usize::from(max_inflight))?
+        .checked_add(OUTBOX_SLACK)
+}
 
 /// How a connection is configured.
 #[derive(Debug, Clone)]
@@ -83,10 +115,16 @@ impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
             limits: Limits::default(),
-            // A session's queue holds a thousand messages, so a thousand
-            // is what can arrive at a writer at once. Anything smaller
-            // would let a legitimate drain count as a slow reader.
-            outbox_depth: 1024,
+            // Sized for the queue and window a session has by default,
+            // through the same formula `Config::server` uses on the
+            // configured ones. It was a flat 1024 written against a
+            // thousand-message queue, which stopped being a bound the
+            // moment that queue became configurable.
+            outbox_depth: outbox_depth_for(
+                BrokerConfig::default().max_queue_messages,
+                BrokerConfig::default().max_inflight,
+            )
+            .expect("the default bounds size an outbox"),
             connect_timeout: Duration::from_secs(10),
             // Finite, so a client cannot make us hold unbounded
             // exactly-once state, and far above any sensible client's

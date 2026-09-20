@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use broker_core::broker::BrokerConfig;
 use mqtt_codec::Limits;
-use sdmqtt_server::connection::ConnectionConfig;
+use sdmqtt_server::connection::{outbox_depth_for, ConnectionConfig};
 use sdmqtt_server::listener::{ServerConfig, DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT};
 use serde::Deserialize;
 use thiserror::Error;
@@ -307,6 +307,35 @@ impl Config {
                 why: "a queue that holds nothing drops every message an offline session is sent",
             });
         }
+
+        // The relation between the queue and the channel that drains
+        // it. A session's writer reads one outbox, and the broker can
+        // hand the shell a whole queue at once: `Outbound::pump` sends
+        // while the window has room and an at-most-once dispatch
+        // consumes no slot, so one acknowledgement empties the queue
+        // into a single batch. Whatever does not fit is discarded
+        // against a counter, with no reason and no `Action::Dropped`.
+        //
+        // Stated here as well as derived in `server`, because the
+        // derivation is what a later change can quietly undo: a
+        // configuration whose bounds outgrow their outbox is refused at
+        // startup rather than silently lossy in production.
+        let Some(required) =
+            outbox_depth_for(self.broker.max_queue_messages, self.broker.max_inflight)
+        else {
+            return Err(ConfigError::Unusable {
+                key: "broker.max_queue_messages",
+                value: self.broker.max_queue_messages.to_string(),
+                why: "too large for any outbox to hold one drain of the queue",
+            });
+        };
+        if self.server().connection.outbox_depth < required {
+            return Err(ConfigError::Unusable {
+                key: "broker.max_queue_messages",
+                value: self.broker.max_queue_messages.to_string(),
+                why: "the outbox the shell would build cannot hold one drain of a queue this size",
+            });
+        }
         Ok(())
     }
 
@@ -370,6 +399,16 @@ impl Config {
             connection: ConnectionConfig {
                 limits,
                 mountpoint: Arc::from(self.listener.mountpoint.as_str()),
+                // Derived from the bounds it drains rather than left a
+                // constant, so raising the queue raises the channel the
+                // queue empties into. `validate` refuses a configuration
+                // this cannot be sized for, so the fallback is
+                // unreachable on anything `load` returns.
+                outbox_depth: outbox_depth_for(
+                    self.broker.max_queue_messages,
+                    self.broker.max_inflight,
+                )
+                .unwrap_or(usize::MAX),
                 ..ConnectionConfig::default()
             },
             max_connections: self.listener.max_connections,
@@ -633,6 +672,78 @@ mod tests {
     fn a_queue_that_holds_nothing_is_refused() {
         let config = Config::from_toml("[broker]\nmax_queue_messages = 0\n").unwrap();
         let error = config.validate().expect_err("zero cannot be a queue");
+        assert!(
+            error.to_string().contains("broker.max_queue_messages"),
+            "the message names the key at fault: {error}"
+        );
+    }
+
+    #[test]
+    fn the_default_bounds_still_fit_the_outbox_they_had() {
+        // The lower end of the relation, against the numbers rather
+        // than against the formula: the shipped queue holds a thousand
+        // and the window twenty, and the outbox that drains them was a
+        // flat 1024 before it was derived. Derived, it must not have
+        // shrunk below either.
+        let config = Config::default();
+        let depth = config.server().connection.outbox_depth;
+        assert!(
+            depth >= 1000 + 20,
+            "one drain of the default queue and window is {}, the outbox is {depth}",
+            1000 + 20
+        );
+        assert!(
+            depth >= 1024,
+            "the outbox the default bounds had was 1024, now {depth}"
+        );
+    }
+
+    #[test]
+    fn a_raised_queue_bound_raises_the_outbox_that_drains_it() {
+        // The defect. `Outbound::pump` sends while the window has room
+        // and a fire-and-forget dispatch takes no slot, so one
+        // acknowledgement flushes a whole queue into one batch: the
+        // reviewer measured three thousand publishes to one subscriber
+        // from a single acknowledgement with a queue of five thousand.
+        // Against a fixed 1024 the rest is discarded with no reason and
+        // no `Action::Dropped`.
+        let config = Config::from_toml("[broker]\nmax_queue_messages = 5000\n").unwrap();
+        config.validate().expect("five thousand is a usable queue");
+        assert!(
+            config.server().connection.outbox_depth >= 5000 + 20,
+            "a queue of five thousand needs an outbox that can hold one drain of it, got {}",
+            config.server().connection.outbox_depth
+        );
+    }
+
+    #[test]
+    fn a_wider_window_raises_the_outbox_too() {
+        // The other input. A resume puts the window's contents back at
+        // the head of the queue, bypassing its bounds, so the largest
+        // batch is the queue plus the window rather than the queue
+        // alone.
+        let narrow = Config::from_toml("[broker]\nmax_inflight = 1\n").unwrap();
+        let wide = Config::from_toml("[broker]\nmax_inflight = 500\n").unwrap();
+        assert!(
+            wide.server().connection.outbox_depth > narrow.server().connection.outbox_depth,
+            "a window of five hundred needs more room than one of one"
+        );
+        assert!(
+            wide.server().connection.outbox_depth >= wide.broker.max_queue_messages + 500,
+            "and enough for a whole queue behind a whole window"
+        );
+    }
+
+    #[test]
+    fn a_queue_bound_no_outbox_could_drain_is_refused() {
+        // The relation is enforced rather than merely derived, so a
+        // configuration that breaks it is refused at startup instead of
+        // discarding messages in production with nothing to say why.
+        let text = format!("[broker]\nmax_queue_messages = {}\n", usize::MAX);
+        let config = Config::from_toml(&text).unwrap();
+        let error = config
+            .validate()
+            .expect_err("a queue no outbox can hold is refused");
         assert!(
             error.to_string().contains("broker.max_queue_messages"),
             "the message names the key at fault: {error}"
