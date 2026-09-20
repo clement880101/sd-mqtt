@@ -146,7 +146,9 @@ pub struct BrokerSection {
     pub max_client_id_len: u16,
     /// How many shards the subscription trie uses.
     pub trie_shards: usize,
-    /// The largest keep-alive interval the ring is sized for.
+    /// The largest keep-alive interval a client may have. A version 5
+    /// client proposing more is clamped to this and told so in the
+    /// connack. Zero disables the ceiling.
     pub max_keep_alive: u16,
     /// The largest inflight window a session may have. A session's
     /// window is the lesser of this and what the client advertises,

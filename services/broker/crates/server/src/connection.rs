@@ -236,7 +236,35 @@ where
     // same guard, so nothing can claim it in between; the two flow
     // control limits are set there too, so no publish from another
     // connection can overshoot a window not yet narrowed.
+    let proposed_keep_alive = connect.keep_alive;
     let registered = shared.with_broker(|broker| {
+        // Section 5.4 lists server keep-alive as in scope. The interval
+        // we will hold this client to is the lesser of what it proposed
+        // and the configured maximum, and [MQTT-3.2.2-21] makes a
+        // Server Keep Alive in the connack the value the client must
+        // use instead of its own. Clamped here,
+        // before `connect`, so that the ring is armed with the number
+        // the acknowledgement is about to advertise: the whole point of
+        // sending the property is that the two agree, and a clamp
+        // applied anywhere else could drift from it.
+        //
+        // Two cases are deliberately left alone.
+        //
+        // A proposal of zero asks for no keep-alive at all rather than
+        // for a very long one, so there is no maximum for it to exceed.
+        // The standard would permit imposing one, but that is a
+        // different decision from bounding an interval a client did
+        // choose, and only the second is a maximum.
+        //
+        // A 3.1.1 client is left alone because 3.1.1 has no property to
+        // tell it with. Clamping there would produce exactly the defect
+        // this guards against, a client silent for its own interval and
+        // disconnected at ours, with no way to say so.
+        let maximum = broker.config().max_keep_alive;
+        if version == Version::V5 && connect.keep_alive > maximum && maximum > 0 {
+            connect.keep_alive = maximum;
+        }
+
         // [MQTT-3.1.3-6]: a zero length identifier is a special case and
         // the server assigns a unique one, then processes the connect as
         // if the client had sent it [MQTT-3.1.3-7].
@@ -324,7 +352,13 @@ where
     let outbox = shared.register_outbox(attached.subscriber, config.outbox_depth);
     shared.deliver(mine);
 
-    let ack = acknowledgement(&registration, assigned, &config);
+    // [MQTT-3.2.2-22]: an absent Server Keep Alive means the client's
+    // own value stands, so the property is sent when and only when the
+    // clamp above changed it. Sending it unchanged is noise the client
+    // must still parse and act on.
+    let server_keep_alive =
+        (connect.keep_alive != proposed_keep_alive).then_some(connect.keep_alive);
+    let ack = acknowledgement(&registration, assigned, &config, server_keep_alive);
     // The inherited obligation is discharged by dropping `attached`,
     // which happens on every path out of here including a panic. It is
     // deliberately not a call at the end of this function: the mutation
@@ -399,17 +433,22 @@ async fn refuse<W: AsyncWrite + Unpin>(
 ///   in use at once. 3.3.2.3.4 says a client that is told nothing must
 ///   send none at all, which is what this broker used to say and why
 ///   every alias a client did send was lost.
+/// - The server keep-alive is the interval we will hold the client to,
+///   and is present only when it is not the one the client proposed.
+///   [MQTT-3.2.2-21] makes it the value the client must use instead of
+///   its own, and [MQTT-3.2.2-22] makes its absence mean the client's
+///   value stands, so a client within the configured maximum is told
+///   nothing rather than told its own number back. The caller decides,
+///   because only the caller knows what was proposed.
 /// - Everything else is omitted because it equals its default: we
 ///   support retained messages, both higher qualities of service,
 ///   wildcards, subscription identifiers and shared subscriptions, and
-///   we neither shorten the session expiry the client asked for nor
-///   impose a keep-alive of our own. On the last of those,
-///   [MQTT-3.2.2-22] says an absent server keep-alive means the
-///   client's value stands, which is what we want.
+///   we do not shorten the session expiry the client asked for.
 fn acknowledgement(
     registration: &broker_core::registry::Registration,
     assigned: Option<String>,
     config: &ConnectionConfig,
+    server_keep_alive: Option<u16>,
 ) -> ConnAck {
     ConnAck {
         session_present: registration.session_present,
@@ -419,6 +458,7 @@ fn acknowledgement(
             receive_maximum: Some(config.receive_maximum),
             maximum_packet_size: Some(config.limits.max_packet_size),
             topic_alias_maximum: Some(config.topic_alias_maximum),
+            server_keep_alive,
             ..Properties::default()
         },
     }
@@ -2278,5 +2318,181 @@ mod tests {
         // It kept the constructor's 20 before this task only because
         // the assignment that replaced it was guarded on version 5.
         assert_eq!(measured_window(Version::V311, None, 4).await, 4);
+    }
+
+    /// Long enough for a disconnect already written on an in-memory
+    /// socket to arrive, and never the whole of an assertion: each use
+    /// is paired with the neighbouring second, where the opposite must
+    /// be true.
+    const SWEEP_QUIET: Duration = Duration::from_millis(500);
+
+    /// Advance the broker's clock by whole seconds, delivering what the
+    /// sweep produces, exactly as the server's own tick loop does.
+    fn advance(shared: &Arc<Shared>, seconds: u32) {
+        for _ in 0..seconds {
+            let actions = shared.with_broker(|broker| {
+                let mut out = Vec::new();
+                broker.tick(&mut out);
+                out
+            });
+            shared.deliver(actions);
+        }
+    }
+
+    /// What has become of a connection by the end of the quiet period.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Ending {
+        /// Nothing has happened to it.
+        Open,
+        /// It has been closed, carrying a reason where the version has
+        /// one to carry: 3.1.1 has no server sent disconnect, so there
+        /// the close is the whole message.
+        Closed(Option<ReasonCode>),
+    }
+
+    /// How the broker ended this connection, if it has.
+    async fn ending(client: &mut tokio::io::DuplexStream, version: Version) -> Ending {
+        let mut chunk = [0u8; 64];
+        let Ok(read) = tokio::time::timeout(SWEEP_QUIET, client.read(&mut chunk)).await else {
+            return Ending::Open;
+        };
+        let n = read.expect("the socket reads");
+        if n == 0 {
+            return Ending::Closed(None);
+        }
+        let mut buf = BytesMut::from(&chunk[..n]);
+        match decode(&mut buf, version, &Limits::default()).unwrap() {
+            Some(Packet::Disconnect(disconnect)) => Ending::Closed(Some(disconnect.reason)),
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
+    }
+
+    /// Assert that a silent client survives second `limit` and is cut
+    /// off in the one after it.
+    ///
+    /// On the boundary rather than around it, because either half alone
+    /// is satisfied by the wrong interval: the closure alone passes for
+    /// any interval already lapsed, including one shorter than was
+    /// advertised, and the survival alone passes for a broker that
+    /// disconnects nobody. The ring gives up after three halves of the
+    /// negotiated interval, so `limit` is that, and the second after it
+    /// is the first at which the client has been silent for longer.
+    async fn expires_in_the_second_after(
+        shared: &Arc<Shared>,
+        client: &mut tokio::io::DuplexStream,
+        version: Version,
+        limit: u32,
+    ) {
+        advance(shared, limit);
+        assert_eq!(
+            ending(client, version).await,
+            Ending::Open,
+            "at {limit} seconds the interval has not lapsed yet"
+        );
+
+        advance(shared, 1);
+        let expected = match version {
+            Version::V5 => Ending::Closed(Some(ReasonCode::KeepAliveTimeout)),
+            Version::V311 => Ending::Closed(None),
+        };
+        assert_eq!(
+            ending(client, version).await,
+            expected,
+            "at {} seconds the client should have been given up on",
+            limit + 1
+        );
+    }
+
+    /// Connect at `version` proposing `proposed` to a broker configured
+    /// with `maximum`, returning what the acknowledgement said about the
+    /// keep-alive alongside the pieces needed to time the sweep.
+    async fn proposing(
+        version: Version,
+        proposed: u16,
+        maximum: u16,
+    ) -> (Arc<Shared>, tokio::io::DuplexStream, Option<u16>) {
+        let shared = Arc::new(Shared::new(BrokerConfig {
+            max_keep_alive: maximum,
+            ..BrokerConfig::default()
+        }));
+        let mut client = serve_one(Arc::clone(&shared));
+        let mut packet = connect("c", proposed);
+        packet.version = version;
+        write(&mut client, &Packet::Connect(Box::new(packet)), version).await;
+        let advertised = match read(&mut client, version).await {
+            Packet::ConnAck(ack) => ack.properties.server_keep_alive,
+            other => panic!("expected an acknowledgement, got {other:?}"),
+        };
+        (shared, client, advertised)
+    }
+
+    #[tokio::test]
+    async fn a_keep_alive_above_the_maximum_is_clamped_and_the_client_told() {
+        // [MQTT-3.2.2-21]: a Server Keep Alive in the connack is the
+        // value the client must use instead of its own. Without it the
+        // client believes it may be silent for sixty seconds and is cut
+        // off at four.
+        let (shared, mut client, advertised) = proposing(Version::V5, 60, 4).await;
+        assert_eq!(advertised, Some(4), "the client must learn our maximum");
+
+        // The second half, and the one that makes the property truthful
+        // rather than decorative: the interval advertised is the
+        // interval enforced. Four gives up in the seventh second, where
+        // the sixty the client proposed would not until the ninety
+        // first.
+        expires_in_the_second_after(&shared, &mut client, Version::V5, 6).await;
+    }
+
+    #[tokio::test]
+    async fn a_keep_alive_within_the_maximum_is_left_alone_and_unremarked() {
+        // [MQTT-3.2.2-22]: an absent Server Keep Alive means the
+        // client's own value stands, so sending it back unchanged is
+        // noise it must parse and act on for nothing.
+        let (shared, mut client, advertised) = proposing(Version::V5, 10, 60).await;
+        assert_eq!(
+            advertised, None,
+            "nothing was imposed, so there is nothing to say"
+        );
+
+        // And silence in the acknowledgement must mean the client's own
+        // ten, not the configured sixty by another road.
+        expires_in_the_second_after(&shared, &mut client, Version::V5, 15).await;
+    }
+
+    #[tokio::test]
+    async fn a_keep_alive_exactly_at_the_maximum_is_not_remarked_on() {
+        // The boundary itself, because the test above sits well inside
+        // it and passes against a comparison off by one. A client
+        // proposing exactly what we allow has had nothing imposed on
+        // it, so [MQTT-3.2.2-22] says we send nothing.
+        let (shared, mut client, advertised) = proposing(Version::V5, 30, 30).await;
+        assert_eq!(advertised, None, "thirty is not more than thirty");
+        expires_in_the_second_after(&shared, &mut client, Version::V5, 45).await;
+    }
+
+    #[tokio::test]
+    async fn a_maximum_of_zero_is_no_ceiling_rather_than_a_ceiling_of_zero() {
+        // Zero is the one value that cannot mean what the others mean:
+        // read as a ceiling it would force every client's keep-alive
+        // off, which is the opposite of bounding one. Guarded because
+        // dropping the guard changes only this configuration, and
+        // nothing else in the suite sets it.
+        let (shared, mut client, advertised) = proposing(Version::V5, 10, 0).await;
+        assert_eq!(advertised, None, "no ceiling, so nothing imposed");
+        expires_in_the_second_after(&shared, &mut client, Version::V5, 15).await;
+    }
+
+    #[tokio::test]
+    async fn a_three_one_one_client_keeps_the_interval_it_asked_for() {
+        // 3.1.1 has no property to carry a Server Keep Alive, so a
+        // clamp here could not be announced, and an unannounced clamp
+        // is the whole defect: the client believes it may be silent for
+        // its own interval and is disconnected at ours. The ceiling is
+        // therefore a version 5 policy, and this says so in the only
+        // way that cannot be satisfied by an absence: the client is
+        // held to its own sixty, not to the configured four.
+        let (shared, mut client, advertised) = proposing(Version::V311, 60, 4).await;
+        assert_eq!(advertised, None, "3.1.1 has no properties at all");
+        expires_in_the_second_after(&shared, &mut client, Version::V311, 90).await;
     }
 }
