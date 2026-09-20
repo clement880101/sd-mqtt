@@ -14,6 +14,7 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use broker_core::broker::BrokerConfig;
 use tokio::net::TcpListener;
@@ -26,6 +27,16 @@ use crate::ticker::spawn_ticker;
 
 /// The port MQTT over plain TCP is registered on.
 pub const DEFAULT_PORT: u16 = 1883;
+
+/// How long to wait before accepting again after an error that is
+/// about the process rather than about one client.
+///
+/// Long enough that the loop yields and the log stays readable, short
+/// enough that recovery is immediate once descriptors are freed. It is
+/// a flat pause rather than a curve because no curve has been measured
+/// here, and this project has twice been wrong about an optimisation it
+/// guessed at.
+const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 
 /// How many connections one node serves at once by default.
 ///
@@ -159,9 +170,10 @@ impl Running {
 
 /// Accept until told to stop.
 ///
-/// An accept error is logged and the loop continues: one connection the
-/// kernel could not hand over is not a reason to stop serving every
-/// other client on the node.
+/// An accept error never ends the loop: one connection the kernel could
+/// not hand over is not a reason to stop serving every other client on
+/// the node. What it does change is how soon we try again, which
+/// [`affects_one_connection`] decides.
 async fn accept_loop(
     listener: TcpListener,
     shared: Arc<Shared>,
@@ -180,8 +192,25 @@ async fn accept_loop(
 
         let (socket, peer) = match accepted {
             Ok(accepted) => accepted,
+            Err(error) if affects_one_connection(&error) => {
+                tracing::debug!(%error, "a connection was gone before it could be accepted");
+                continue;
+            }
             Err(error) => {
-                tracing::warn!(%error, "a connection could not be accepted");
+                // Warn rather than debug: descriptor exhaustion is a
+                // configuration problem an operator can fix, and one
+                // they will never learn about from a line they do not
+                // see.
+                tracing::warn!(
+                    %error,
+                    pause = ?ACCEPT_PAUSE,
+                    "accepting failed for the whole listener; pausing before trying again"
+                );
+                tokio::select! {
+                    // The pause must not delay a shutdown.
+                    _ = stop.recv() => return,
+                    _ = tokio::time::sleep(ACCEPT_PAUSE) => {}
+                }
                 continue;
             }
         };
@@ -215,10 +244,83 @@ async fn accept_loop(
     }
 }
 
+/// Whether an accept error was about one connection or about the
+/// process.
+///
+/// The listed kinds are all a peer that went away between the kernel's
+/// handshake and our accept: ordinary, costing nothing, and worth
+/// retrying immediately. Everything else pauses.
+///
+/// The classification is a whitelist rather than a list of the failures
+/// worth pausing for, and deliberately so. Descriptor exhaustion, the
+/// case that matters, arrives as `EMFILE` or `ENFILE`, and the standard
+/// library categorises neither, so a blacklist would have to carry a
+/// table of platform errno numbers and would silently miss whatever it
+/// did not list. Erring towards the pause costs a hundred milliseconds
+/// when it is wrong; erring the other way costs a core.
+fn affects_one_connection(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::NotConnected
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// Running out of file descriptors. The standard library gives
+    /// neither a kind of its own on any platform this builds for, which
+    /// is exactly why the classifier cannot key on them.
+    const EMFILE: i32 = 24;
+    const ENFILE: i32 = 23;
+
+    #[test]
+    fn an_error_about_one_connection_is_not_a_reason_to_pause() {
+        // A peer that resets between the kernel's handshake and our
+        // accept costs us nothing. Pausing for it would turn an
+        // ordinary event into a hundred milliseconds of not serving
+        // anybody.
+        for kind in [
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::NotConnected,
+        ] {
+            assert!(
+                affects_one_connection(&io::Error::from(kind)),
+                "{kind:?} concerns one connection"
+            );
+        }
+    }
+
+    #[test]
+    fn running_out_of_file_descriptors_is_a_reason_to_pause() {
+        // The failure this prevents: every accept fails instantly, the
+        // loop spins on one core refusing every client, and the log
+        // fills fast enough that nobody reads the reason.
+        for errno in [EMFILE, ENFILE] {
+            let error = io::Error::from_raw_os_error(errno);
+            assert!(
+                !affects_one_connection(&error),
+                "errno {errno} is the process in trouble, not one client"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_error_is_treated_as_the_process_being_in_trouble() {
+        // The safe direction. Pausing for something ordinary costs a
+        // hundred milliseconds; not pausing for something systemic
+        // costs a core for as long as it lasts.
+        assert!(!affects_one_connection(&io::Error::other("something new")));
+    }
 
     #[tokio::test]
     async fn binds_to_an_ephemeral_port_and_reports_it() {
