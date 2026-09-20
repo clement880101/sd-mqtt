@@ -2061,6 +2061,7 @@ mod tests {
                         dup: false,
                         subscription_ids: Vec::new(),
                         packet_id: None,
+                        sequence: 0,
                     },
                     0,
                     &mut actions,

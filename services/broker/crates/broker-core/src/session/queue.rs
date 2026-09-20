@@ -32,6 +32,18 @@ pub struct Delivery {
     /// waiting on that identifier, and a new one makes the message look
     /// unrelated.
     pub packet_id: Option<u16>,
+    /// The per-session sequence number this was enqueued under.
+    ///
+    /// Section 7.4: assigned on enqueue, monotonic within the session,
+    /// never reused, and the key the stored queue is read back in. It is
+    /// **[`Outbound::offer`]'s to assign**, not a caller's: whatever is
+    /// here when a delivery is offered is overwritten, because the
+    /// counter that must never go backwards lives there and nowhere
+    /// else. A caller putting a message back — [`Queue::requeue`], or
+    /// restore — keeps the number the delivery already carries.
+    ///
+    /// [`Outbound::offer`]: crate::session::Outbound::offer
+    pub sequence: u64,
 }
 
 impl Delivery {
@@ -296,6 +308,16 @@ impl Queue {
         self.entries.iter()
     }
 
+    /// The message most recently accepted, which is the one a successful
+    /// [`Queue::push`] just took.
+    ///
+    /// There for the journal: a push consumes the delivery, and the
+    /// record that says what was queued is worth building only once the
+    /// queue has said it took it.
+    pub fn back(&self) -> Option<&Delivery> {
+        self.entries.back()
+    }
+
     /// How many messages are waiting.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -332,6 +354,7 @@ mod tests {
             subscription_ids: Vec::new(),
             dup: false,
             packet_id: None,
+            sequence: 0,
         }
     }
 

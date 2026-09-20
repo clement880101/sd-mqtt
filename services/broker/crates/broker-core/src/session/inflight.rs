@@ -123,6 +123,7 @@ mod tests {
                 subscription_ids: Vec::new(),
                 dup: false,
                 packet_id: None,
+                sequence: 0,
             },
             state: InflightState::AwaitingAck,
             sent_at: 0,

@@ -182,6 +182,11 @@ impl Registry {
         self.sessions.iter_mut()
     }
 
+    /// Every session, for a report.
+    pub fn iter(&self) -> impl Iterator<Item = (&SubscriberId, &Session)> {
+        self.sessions.iter()
+    }
+
     /// How many sessions exist, connected or not.
     pub fn len(&self) -> usize {
         self.sessions.len()

@@ -161,19 +161,34 @@ impl RetainedNode {
         }
     }
 
-    fn sweep(&mut self, now: u32) -> usize {
-        let mut removed = 0;
+    /// Collect every message held, expired or not, with its topic.
+    fn collect_all(&self, prefix: &mut Vec<String>, out: &mut Vec<(String, RetainedMessage)>) {
+        if let Some(message) = &self.message {
+            out.push((prefix.join("/"), message.clone()));
+        }
+        for (level, child) in &self.children {
+            prefix.push(level.to_string());
+            child.collect_all(prefix, out);
+            prefix.pop();
+        }
+    }
+
+    fn sweep(&mut self, now: u32, prefix: &mut Vec<String>, removed: &mut Vec<String>) {
         if let Some(message) = &self.message {
             if is_expired(message, now) {
                 self.message = None;
-                removed += 1;
+                removed.push(prefix.join("/"));
             }
         }
-        self.children.retain(|_, child| {
-            removed += child.sweep(now);
-            !child.is_empty()
-        });
-        removed
+        // `retain` cannot borrow `prefix` mutably from inside the
+        // closure while the loop needs it, so the levels are walked and
+        // the empty branches pruned in two passes rather than one.
+        for (level, child) in self.children.iter_mut() {
+            prefix.push(level.to_string());
+            child.sweep(now, prefix, removed);
+            prefix.pop();
+        }
+        self.children.retain(|_, child| !child.is_empty());
     }
 }
 
@@ -236,10 +251,31 @@ impl RetainedStore {
             .matching(&levels, now, &mut prefix, true, out);
     }
 
-    /// Discard every message whose deadline has passed. Returns how many
-    /// went. A message expires strictly after its deadline.
-    pub fn sweep_expired(&self, now: u32) -> usize {
-        self.root.write().sweep(now)
+    /// Discard every message whose deadline has passed, appending each
+    /// one's topic to `removed`. Returns how many went. A message
+    /// expires strictly after its deadline.
+    ///
+    /// The topics are reported rather than counted because a retained
+    /// message reclaimed here is a durable change: the store holds it
+    /// until something says it has gone, and nothing else ever will.
+    /// Counting alone would leave every expired message on disk for the
+    /// life of the file, invisible because every reader skips it.
+    pub fn sweep_expired(&self, now: u32, removed: &mut Vec<String>) -> usize {
+        let before = removed.len();
+        let mut prefix = Vec::new();
+        self.root.write().sweep(now, &mut prefix, removed);
+        removed.len() - before
+    }
+
+    /// Every message held, with its topic, expired or not.
+    ///
+    /// Deliberately including the expired: this reports what is
+    /// *stored*, which is the question a comparison against a restored
+    /// broker asks. [`Self::matching`] answers the other question, what
+    /// a reader may see, and skips them.
+    pub fn entries(&self, out: &mut Vec<(String, RetainedMessage)>) {
+        let mut prefix = Vec::new();
+        self.root.read().collect_all(&mut prefix, out);
     }
 
     /// How many messages are retained.
@@ -428,7 +464,7 @@ mod tests {
 
         assert!(topics(&store, "a/+").contains(&"a/b".to_string()));
 
-        assert_eq!(store.sweep_expired(101), 1);
+        assert_eq!(store.sweep_expired(101, &mut Vec::new()), 1);
         assert_eq!(topics(&store, "a/+"), vec!["a/c".to_string()]);
         assert_eq!(store.len(), 1);
     }
@@ -444,7 +480,7 @@ mod tests {
             },
         );
         assert_eq!(
-            store.sweep_expired(100),
+            store.sweep_expired(100, &mut Vec::new()),
             0,
             "the deadline itself is not past"
         );

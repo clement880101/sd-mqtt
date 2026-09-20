@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use mqtt_codec::{Properties, QoS, ReasonCode, Version};
+use storage::record::{ProtocolVersion, Record, SessionRecord, SubscriptionRecord, WillRecord};
 
+use crate::journal::{self, Journal};
 use crate::registry::SessionId;
 use crate::session::inbound::Inbound;
 use crate::session::outbound::Outbound;
@@ -50,14 +52,21 @@ pub struct Session {
     pub outbound: Outbound,
     /// The inbound path.
     pub inbound: Inbound,
-    /// Filters this session holds, so teardown can undo them.
-    filters: Vec<String>,
+    /// Filters this session holds, with the options each was taken
+    /// under: teardown needs the names, and a restart needs everything
+    /// else, because a subscription rebuilt with default options is a
+    /// subscription that silently changed.
+    subscriptions: Vec<SubscriptionRecord>,
     will: Option<StoredWill>,
     /// When the will becomes due, if it is owed.
     will_at: Option<u32>,
     expiry_interval: u32,
     /// When the session may be destroyed, once disconnected.
     expires_at: Option<u32>,
+    /// What changed durably about the session itself and has not been
+    /// handed over. The queue, the window and the inbound identifiers
+    /// keep their own; this one is for the fields above.
+    journal: Journal,
 }
 
 impl Session {
@@ -85,23 +94,85 @@ impl Session {
         // does too. Leaving it offline would make `is_connected` lie and
         // silently discard every at-most-once delivery, which such a path
         // does not queue for an absent client.
-        let mut outbound = Outbound::new(queue, max_inflight);
+        let key = journal::key_of(&id);
+        let mut outbound = Outbound::new(key.clone(), queue, max_inflight);
         outbound.set_online(true);
 
-        Self {
+        let mut session = Self {
             id,
             subscriber,
             version,
             epoch,
             connected: true,
             outbound,
-            inbound: Inbound::new(0),
-            filters: Vec::new(),
+            inbound: Inbound::new(key, 0),
+            subscriptions: Vec::new(),
             will: None,
             will_at: None,
             expiry_interval: 0,
             expires_at: None,
+            journal: Journal::new(),
+        };
+        // A session exists the moment it is made, and nothing else will
+        // say so: every record that follows names it, and the store
+        // refuses one that names a session it does not hold.
+        session.journal_state();
+        session
+    }
+
+    /// Say what this session's durable fields are now.
+    ///
+    /// One record covers all of them, because [`Record::SessionPut`] is
+    /// an update rather than a reset. Every setter below calls it rather
+    /// than leaving the decision to a caller: a durable field changed by
+    /// a path that forgot to say so is a field that silently does not
+    /// survive a restart, and there is no ordinary test that looks for
+    /// the absence of a record.
+    pub fn journal_state(&mut self) {
+        let record = self.record();
+        self.journal.push(Record::SessionPut(record));
+    }
+
+    /// This session's durable fields, as they are stored.
+    pub fn record(&self) -> SessionRecord {
+        SessionRecord {
+            key: journal::key_of(&self.id),
+            version: match self.version {
+                Version::V311 => ProtocolVersion::V311,
+                Version::V5 => ProtocolVersion::V5,
+            },
+            expiry_interval: self.expiry_interval,
+            expires_at: self.expires_at,
+            will: self.will.as_ref().map(|will| WillRecord {
+                topic: will.topic.clone(),
+                payload: will.payload.clone(),
+                qos: journal::stored_qos(will.qos),
+                retain: will.retain,
+                delay: will.delay,
+                properties: journal::stored_properties(&will.properties),
+            }),
+            will_at: self.will_at,
         }
+    }
+
+    /// Move everything this session has said onto the end of `out`.
+    ///
+    /// Its own fields first, then what arrived and then what is leaving,
+    /// because a record naming a session the store does not hold is
+    /// refused and the session's own record is what makes it hold one.
+    pub fn take_journal(&mut self, out: &mut Vec<Record>) {
+        self.journal.drain_into(out);
+        self.inbound.take_journal(out);
+        self.outbound.take_journal(out);
+    }
+
+    /// Whether anything said has not been handed over.
+    ///
+    /// For the test that proves every path drains what it changed. A
+    /// record left here is one the shell has not committed, and section
+    /// 7.3 has the shell committing before it acknowledges.
+    pub fn has_unsaid(&self) -> bool {
+        !self.journal.is_empty() || self.inbound.has_unsaid() || self.outbound.has_unsaid()
     }
 
     /// Reclaim an existing session for a new connection.
@@ -120,6 +191,7 @@ impl Session {
         // rather than the only guard. It stops being so the moment a
         // shell defers an acknowledgement across a reconnect.
         self.inbound.on_disconnect();
+        self.journal_state();
     }
 
     /// The connection went away.
@@ -144,6 +216,7 @@ impl Session {
         }
 
         self.expires_at = Some(deadline(now, self.expiry_interval));
+        self.journal_state();
     }
 
     /// A disconnect packet arrived, which may leave the will standing
@@ -174,7 +247,12 @@ impl Session {
         match self.will_at {
             Some(due) if now >= due => {
                 self.will_at = None;
-                self.will.take()
+                let will = self.will.take();
+                // A will that has been published is no longer owed, and
+                // a restart that resurrected it would announce a client
+                // gone twice.
+                self.journal_state();
+                will
             }
             _ => None,
         }
@@ -183,11 +261,45 @@ impl Session {
     /// Set or clear the will.
     pub fn set_will(&mut self, will: Option<StoredWill>) {
         self.will = will;
+        self.journal_state();
+    }
+
+    /// When the will falls due, for a path rebuilding this from storage.
+    pub fn set_will_at(&mut self, will_at: Option<u32>) {
+        self.will_at = will_at;
+        self.journal_state();
+    }
+
+    /// When the will falls due, if it is owed.
+    pub fn will_at(&self) -> Option<u32> {
+        self.will_at
+    }
+
+    /// The will, if one is still owed.
+    pub fn will(&self) -> Option<&StoredWill> {
+        self.will.as_ref()
+    }
+
+    /// When the session may be destroyed, once disconnected.
+    pub fn expires_at(&self) -> Option<u32> {
+        self.expires_at
+    }
+
+    /// When the session may be destroyed, for a path rebuilding this
+    /// from storage.
+    ///
+    /// Section 7.5: a session whose expiry passed while the broker was
+    /// down is not restored, so the deadline that survives is an
+    /// absolute one and is judged against a clock read before restore.
+    pub fn set_expires_at(&mut self, expires_at: Option<u32>) {
+        self.expires_at = expires_at;
+        self.journal_state();
     }
 
     /// How long the session outlives its connection.
     pub fn set_expiry_interval(&mut self, seconds: u32) {
         self.expiry_interval = seconds;
+        self.journal_state();
     }
 
     /// How long the session outlives its connection.
@@ -200,23 +312,49 @@ impl Session {
         !self.connected && self.expires_at.is_some_and(|at| now >= at)
     }
 
-    /// Record a filter this session holds.
-    pub fn add_filter(&mut self, filter: &str) {
-        if !self.filters.iter().any(|f| f == filter) {
-            self.filters.push(filter.to_string());
+    /// Record a subscription this session holds, replacing the options
+    /// on a filter it already had.
+    ///
+    /// The filter is what identifies one, which is the protocol's rule
+    /// and the store's: a second subscribe to the same filter changes
+    /// the options rather than adding a subscription.
+    pub fn add_subscription(&mut self, subscription: SubscriptionRecord) {
+        self.journal.push(Record::SubscriptionAdded {
+            session: journal::key_of(&self.id),
+            subscription: subscription.clone(),
+        });
+        match self
+            .subscriptions
+            .iter_mut()
+            .find(|held| held.filter == subscription.filter)
+        {
+            Some(held) => *held = subscription,
+            None => self.subscriptions.push(subscription),
         }
     }
 
     /// Forget a filter.
     pub fn remove_filter(&mut self, filter: &str) -> bool {
-        let before = self.filters.len();
-        self.filters.retain(|f| f != filter);
-        self.filters.len() != before
+        let before = self.subscriptions.len();
+        self.subscriptions.retain(|held| held.filter != filter);
+        let removed = self.subscriptions.len() != before;
+        if removed {
+            self.journal.push(Record::SubscriptionRemoved {
+                session: journal::key_of(&self.id),
+                filter: filter.to_string(),
+            });
+        }
+        removed
     }
 
     /// Every filter this session holds.
     pub fn filters(&self) -> impl Iterator<Item = &str> {
-        self.filters.iter().map(String::as_str)
+        self.subscriptions.iter().map(|held| held.filter.as_str())
+    }
+
+    /// Every subscription this session holds, with its options.
+    pub fn subscriptions(&self) -> &[SubscriptionRecord] {
+        &self.subscriptions
     }
 
     /// Whether a connection is attached.
@@ -232,6 +370,7 @@ impl Session {
     /// Record the version once the connect has been decoded.
     pub fn set_version(&mut self, version: Version) {
         self.version = version;
+        self.journal_state();
     }
 
     /// The claim's generation.
@@ -316,6 +455,37 @@ mod tests {
     }
 
     #[test]
+    fn a_session_records_the_version_it_speaks() {
+        // Convention 5 again: the stored discriminants are 0 and 1 and
+        // the protocol level bytes are 4 and 5, so a mapping written
+        // from the wrong pair would round trip inside this build and
+        // misread every session a released build had stored.
+        let mut five = session(Version::V5);
+        five.set_version(Version::V5);
+        assert_eq!(five.record().version, ProtocolVersion::V5);
+
+        let mut three = session(Version::V5);
+        three.set_version(Version::V311);
+        assert_eq!(three.record().version, ProtocolVersion::V311);
+    }
+
+    #[test]
+    fn a_session_records_the_will_it_is_holding_and_stops_when_it_is_not() {
+        let mut session = session(Version::V5);
+        assert_eq!(session.record().will, None, "no will, nothing recorded");
+
+        session.set_will(Some(will()));
+        let recorded = session.record().will.expect("a will was set");
+        assert_eq!(recorded.topic, "gone/c");
+        assert_eq!(recorded.qos, storage::record::Qos::AtLeastOnce);
+
+        // A graceful departure discards it, and the record must say so
+        // or a restart announces a client gone that said goodbye.
+        session.on_disconnected(true, 10);
+        assert_eq!(session.record().will, None);
+    }
+
+    #[test]
     fn a_new_session_is_connected_and_has_no_deadline() {
         let session = session(Version::V5);
         assert!(session.is_connected());
@@ -339,6 +509,7 @@ mod tests {
                 subscription_ids: Vec::new(),
                 dup: false,
                 packet_id: None,
+                sequence: 0,
             },
             0,
             &mut out,
