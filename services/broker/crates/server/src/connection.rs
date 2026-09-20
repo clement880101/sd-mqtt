@@ -64,6 +64,15 @@ pub struct ConnectionConfig {
     /// How many quality-of-service 1 and 2 publications we are willing
     /// to process concurrently from one client.
     pub receive_maximum: u16,
+    /// How many topic aliases one client may have in use at once.
+    ///
+    /// Sixteen is a default and not a discovery: nothing was measured.
+    /// It is enough for the handful of topics a device publishes to,
+    /// and small enough that the table costs nothing per connection.
+    /// Zero would tell a client to send none at all, which 3.3.2.3.4
+    /// permits and which is what this broker did before it had a
+    /// table.
+    pub topic_alias_maximum: u16,
     /// The namespace this listener's clients live in, empty for the
     /// default. Two clients with the same identifier on two mountpoints
     /// are two sessions.
@@ -83,6 +92,7 @@ impl Default for ConnectionConfig {
             // exactly-once state, and far above any sensible client's
             // pipelining depth, so it never throttles one.
             receive_maximum: 1024,
+            topic_alias_maximum: 16,
             mountpoint: Arc::from(""),
         }
     }
@@ -244,6 +254,7 @@ where
         epoch: registration.epoch,
         version,
         maximum_packet_size,
+        topic_alias_maximum: config.topic_alias_maximum,
     };
 
     // A takeover addresses two connections by one handle, and the
@@ -341,13 +352,17 @@ async fn refuse<W: AsyncWrite + Unpin>(
 /// - The maximum packet size is sent because ours is not the protocol's
 ///   default of unlimited. A client told nothing would learn our limit
 ///   only by being disconnected for exceeding it.
+/// - The topic alias maximum is how many aliases this client may have
+///   in use at once. 3.3.2.3.4 says a client that is told nothing must
+///   send none at all, which is what this broker used to say and why
+///   every alias a client did send was lost.
 /// - Everything else is omitted because it equals its default: we
 ///   support retained messages, both higher qualities of service,
-///   wildcards, subscription identifiers and shared subscriptions, we
-///   accept no topic aliases, and we neither shorten the session expiry
-///   the client asked for nor impose a keep-alive of our own. On the
-///   last of those, [MQTT-3.2.2-22] says an absent server keep-alive
-///   means the client's value stands, which is what we want.
+///   wildcards, subscription identifiers and shared subscriptions, and
+///   we neither shorten the session expiry the client asked for nor
+///   impose a keep-alive of our own. On the last of those,
+///   [MQTT-3.2.2-22] says an absent server keep-alive means the
+///   client's value stands, which is what we want.
 fn acknowledgement(
     registration: &broker_core::registry::Registration,
     assigned: Option<String>,
@@ -360,6 +375,7 @@ fn acknowledgement(
             assigned_client_identifier: assigned,
             receive_maximum: Some(config.receive_maximum),
             maximum_packet_size: Some(config.limits.max_packet_size),
+            topic_alias_maximum: Some(config.topic_alias_maximum),
             ..Properties::default()
         },
     }
@@ -415,6 +431,85 @@ fn candidate_identifier() -> String {
     format!("auto-{started:016x}-{serial:x}")
 }
 
+/// The topic aliases one client has set on this connection.
+///
+/// 3.3.2.3.4: "Topic Alias mappings exist only within a Network
+/// Connection and last only for the lifetime of that Network
+/// Connection." So this belongs to the connection and not to the
+/// session: it is rebuilt on every reconnect without anyone having to
+/// remember to clear it, and a resumed session inherits nothing.
+///
+/// A vector rather than a map, because the maximum is small, known at
+/// connect time, and bounded by us rather than by the client. Its
+/// length is the whole of the bounds check: an alias is legal exactly
+/// when it indexes a slot, so there is no second limit that could
+/// disagree with the first. It is allocated on the first alias rather
+/// than on every connection, because most clients send none and this
+/// broker is sized for a great many connections.
+struct TopicAliases {
+    /// What the acknowledgement advertised, and therefore how many
+    /// slots there are once there are any.
+    maximum: u16,
+    /// Indexed by alias minus one. Empty until the first alias.
+    table: Vec<Option<Arc<str>>>,
+}
+
+impl TopicAliases {
+    /// An empty table for a client told it may use `maximum` aliases.
+    fn new(maximum: u16) -> Self {
+        Self {
+            maximum,
+            table: Vec::new(),
+        }
+    }
+
+    /// The slot `alias` names, or `None` when it names none.
+    fn slot(&mut self, alias: u16) -> Option<&mut Option<Arc<str>>> {
+        if self.table.is_empty() {
+            self.table = vec![None; usize::from(self.maximum)];
+        }
+        // Alias one is the first slot. Alias zero names none, which
+        // the codec refuses before this is reached; `checked_sub`
+        // makes that a refusal here too rather than a wrap.
+        self.table.get_mut(usize::from(alias).checked_sub(1)?)
+    }
+
+    /// Resolve an inbound publish's alias, and strip it.
+    ///
+    /// The strip is what makes the retained store and every subscriber
+    /// correct without any of them knowing that aliases exist. An
+    /// alias means nothing to a connection that did not set it, and
+    /// 3.1.2.11.5 forbids sending one to a client that advertised no
+    /// maximum of its own; every subscriber is a different connection
+    /// from the publisher, so the only safe place to do this is here,
+    /// once, on ingress.
+    fn apply(&mut self, packet: &mut Packet) -> Result<(), ReasonCode> {
+        let Packet::Publish(publish) = packet else {
+            return Ok(());
+        };
+        let Some(alias) = publish.properties.topic_alias.take() else {
+            return Ok(());
+        };
+        let Some(slot) = self.slot(alias) else {
+            return Err(ReasonCode::TopicAliasInvalid);
+        };
+        if publish.topic.is_empty() {
+            // An alias standing in for a topic name. One nothing has
+            // mapped names no topic at all; reading it as the empty
+            // topic would publish to one.
+            let Some(topic) = slot.as_deref() else {
+                return Err(ReasonCode::TopicAliasInvalid);
+            };
+            publish.topic = topic.to_owned();
+        } else {
+            // A topic and an alias: the mapping is set, replacing
+            // whatever this alias meant before.
+            *slot = Some(Arc::from(publish.topic.as_str()));
+        }
+        Ok(())
+    }
+}
+
 /// A connection the broker knows about, and therefore owes a disconnect.
 struct Attached {
     shared: Arc<Shared>,
@@ -429,6 +524,10 @@ struct Attached {
     /// is a property of the CONNECT, so a resumed session inherits
     /// nothing from the limit the last connection advertised.
     maximum_packet_size: Option<u32>,
+    /// How many topic aliases this client was told it may use. Per
+    /// connection for the same reason: 3.3.2.3.4 ends a mapping with
+    /// the network connection that made it.
+    topic_alias_maximum: u16,
 }
 
 impl Attached {
@@ -476,8 +575,9 @@ impl Attached {
         reader: &mut FrameReader<R>,
         writer_gone: &mut oneshot::Receiver<()>,
     ) -> Result<(), ConnectionError> {
+        let mut aliases = TopicAliases::new(self.topic_alias_maximum);
         loop {
-            let packet = tokio::select! {
+            let mut packet = tokio::select! {
                 // The writer stops when its outbox closes, which is how
                 // a displaced connection learns it has been replaced, or
                 // when it has written a close. Either way there is
@@ -506,6 +606,14 @@ impl Attached {
                 // now, so it is told why before the socket closes.
                 self.close_with(ReasonCode::ProtocolError);
                 return Err(ConnectionError::Protocol(ReasonCode::ProtocolError));
+            }
+            // Before the broker sees it, so that nothing below this
+            // shell ever meets an alias. Refused by the same
+            // `close_with` path as the second connect above, so the
+            // client is told rather than dropped.
+            if let Err(reason) = aliases.apply(&mut packet) {
+                self.close_with(reason);
+                return Err(ConnectionError::Protocol(reason));
             }
             let said_goodbye = matches!(packet, Packet::Disconnect(_));
 
@@ -787,8 +895,23 @@ mod tests {
 
     async fn read(client: &mut tokio::io::DuplexStream, version: Version) -> Packet {
         let mut buf = BytesMut::new();
+        read_buffered(client, &mut buf, version).await
+    }
+
+    /// The next reply, decoded from a buffer that outlives the call.
+    ///
+    /// Two packets can arrive in one read, and [`read`] starts from an
+    /// empty buffer every time, so it decodes the first and discards
+    /// whatever followed it in the same chunk. That is invisible to a
+    /// test that reads one reply per request, and it makes a test that
+    /// waits for two consecutive publications hang on the second.
+    async fn read_buffered(
+        client: &mut tokio::io::DuplexStream,
+        buf: &mut BytesMut,
+        version: Version,
+    ) -> Packet {
         loop {
-            if let Some(packet) = decode(&mut buf, version, &Limits::default()).unwrap() {
+            if let Some(packet) = decode(buf, version, &Limits::default()).unwrap() {
                 return packet;
             }
             let mut chunk = [0u8; 1024];
@@ -1504,6 +1627,319 @@ mod tests {
         // task: `on_puback` ends an at-least-once exchange and nothing
         // ended one still awaiting its receipt.
         a_discard_does_not_wedge_the_connection(QoS::ExactlyOnce).await;
+    }
+
+    /// A publish to `topic` carrying `alias`, at quality of service
+    /// zero. An empty topic means "use the alias".
+    fn aliased(topic: &str, alias: u16, payload: &[u8]) -> Packet {
+        Packet::Publish(mqtt_codec::packet::Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: topic.into(),
+            packet_id: None,
+            payload: bytes::Bytes::copy_from_slice(payload),
+            properties: Properties {
+                topic_alias: Some(alias),
+                ..Properties::default()
+            },
+        })
+    }
+
+    /// Connect as version 5 and return the acknowledgement.
+    async fn connect_v5(client: &mut tokio::io::DuplexStream, client_id: &str) -> ConnAck {
+        write(
+            client,
+            &Packet::Connect(Box::new(connect(client_id, 0))),
+            Version::V5,
+        )
+        .await;
+        match read(client, Version::V5).await {
+            Packet::ConnAck(ack) => ack,
+            other => panic!("expected an acknowledgement, got {other:?}"),
+        }
+    }
+
+    /// Read the next publish, failing on anything else.
+    ///
+    /// Takes the buffer rather than allocating one, because the tests
+    /// below wait for two publications in a row; see [`read_buffered`].
+    async fn next_publish(
+        client: &mut tokio::io::DuplexStream,
+        buf: &mut BytesMut,
+    ) -> mqtt_codec::packet::Publish {
+        match read_buffered(client, buf, Version::V5).await {
+            Packet::Publish(publish) => publish,
+            other => panic!("expected a publication, got {other:?}"),
+        }
+    }
+
+    /// Read the next disconnect, failing on anything else.
+    async fn next_disconnect(client: &mut tokio::io::DuplexStream) -> Disconnect {
+        match read(client, Version::V5).await {
+            Packet::Disconnect(disconnect) => disconnect,
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_acknowledgement_advertises_a_topic_alias_maximum() {
+        // 3.3.2.3.4: without one, a client must send no aliases at all,
+        // which is why nothing crashed before this task and why every
+        // alias it did send was lost.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(shared);
+
+        let ack = connect_v5(&mut client, "c").await;
+        assert_eq!(
+            ack.properties.topic_alias_maximum,
+            Some(ConnectionConfig::default().topic_alias_maximum)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_publish_with_only_an_alias_is_routed_to_the_topic_it_named() {
+        // The message-loss defect. Both publications are asserted, not
+        // just the second: a broker that routed the aliased one and
+        // lost the one that named the topic would pass an assertion
+        // about the second alone.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut subscriber = serve_one(Arc::clone(&shared));
+        let mut publisher = serve_one(Arc::clone(&shared));
+
+        attach(
+            &mut subscriber,
+            "sub",
+            Properties::default(),
+            QoS::AtMostOnce,
+        )
+        .await;
+        connect_v5(&mut publisher, "pub").await;
+
+        write(&mut publisher, &aliased("a/b", 1, b"first"), Version::V5).await;
+        write(&mut publisher, &aliased("", 1, b"second"), Version::V5).await;
+
+        let mut buf = BytesMut::new();
+        let first = next_publish(&mut subscriber, &mut buf).await;
+        assert_eq!(first.topic, "a/b");
+        assert_eq!(&first.payload[..], b"first");
+
+        let second = next_publish(&mut subscriber, &mut buf).await;
+        assert_eq!(
+            second.topic, "a/b",
+            "the alias stands in for the topic it was mapped to"
+        );
+        assert_eq!(&second.payload[..], b"second");
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_never_sees_the_publishers_topic_alias() {
+        // 3.1.2.11.5: an alias means nothing to a connection that did
+        // not set it, and this subscriber advertised no maximum, so it
+        // may be sent none at all.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut subscriber = serve_one(Arc::clone(&shared));
+        let mut publisher = serve_one(Arc::clone(&shared));
+
+        attach(
+            &mut subscriber,
+            "sub",
+            Properties::default(),
+            QoS::AtMostOnce,
+        )
+        .await;
+        connect_v5(&mut publisher, "pub").await;
+
+        write(&mut publisher, &aliased("a/b", 1, b"first"), Version::V5).await;
+
+        let delivered = next_publish(&mut subscriber, &mut BytesMut::new()).await;
+        assert_eq!(delivered.topic, "a/b");
+        assert_eq!(
+            delivered.properties.topic_alias, None,
+            "the alias is stripped on ingress, so nothing below the shell sees one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retained_message_is_delivered_without_the_alias_it_was_published_with() {
+        // The retained store keeps a message's properties verbatim and
+        // was deliberately left alone by the task that fixed it, on the
+        // grounds that the strip here is the only one. If it is wrong,
+        // the store holds an alias and hands it to every later
+        // subscriber, on connections that never set it.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut publisher = serve_one(Arc::clone(&shared));
+        connect_v5(&mut publisher, "pub").await;
+
+        let mut retained = aliased("a/b", 1, b"kept");
+        let Packet::Publish(publish) = &mut retained else {
+            unreachable!()
+        };
+        publish.retain = true;
+        write(&mut publisher, &retained, Version::V5).await;
+
+        let mut subscriber = serve_one(Arc::clone(&shared));
+        connect_v5(&mut subscriber, "sub").await;
+        write(
+            &mut subscriber,
+            &Packet::Subscribe(mqtt_codec::packet::Subscribe {
+                packet_id: 1,
+                filters: vec![mqtt_codec::packet::SubscriptionOptions {
+                    filter: "a/+".into(),
+                    qos: QoS::AtMostOnce,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: mqtt_codec::packet::RetainHandling::SendAlways,
+                }],
+                properties: Properties::default(),
+            }),
+            Version::V5,
+        )
+        .await;
+        // Section 3.8.4 permits the server to start sending matching
+        // publications before the acknowledgement, and this one does,
+        // so both are waited for rather than one then the other.
+        let mut buf = BytesMut::new();
+        let mut acknowledged = false;
+        let mut delivered = None;
+        for _ in 0..2 {
+            match read_buffered(&mut subscriber, &mut buf, Version::V5).await {
+                Packet::SubAck(_) => acknowledged = true,
+                Packet::Publish(publish) => delivered = Some(publish),
+                other => panic!("expected the subscription's replies, got {other:?}"),
+            }
+        }
+        assert!(acknowledged, "the subscription is acknowledged too");
+        let delivered = delivered.expect("the retained message is sent");
+        assert_eq!(&delivered.payload[..], b"kept", "the retained message");
+        assert_eq!(delivered.topic, "a/b");
+        assert_eq!(
+            delivered.properties.topic_alias, None,
+            "a retained delivery carries no alias either"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alias_of_exactly_the_maximum_is_accepted() {
+        // The boundary. Nothing else here is within one of it, so a
+        // bound one too tight passes the whole of the rest of the
+        // suite while silently refusing the last alias a client may
+        // legally use.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut subscriber = serve_one(Arc::clone(&shared));
+        let mut publisher = serve_one(Arc::clone(&shared));
+
+        attach(
+            &mut subscriber,
+            "sub",
+            Properties::default(),
+            QoS::AtMostOnce,
+        )
+        .await;
+        let maximum = connect_v5(&mut publisher, "pub")
+            .await
+            .properties
+            .topic_alias_maximum
+            .expect("a maximum is advertised");
+
+        write(
+            &mut publisher,
+            &aliased("a/b", maximum, b"at the limit"),
+            Version::V5,
+        )
+        .await;
+
+        let delivered = next_publish(&mut subscriber, &mut BytesMut::new()).await;
+        assert_eq!(&delivered.payload[..], b"at the limit");
+    }
+
+    #[tokio::test]
+    async fn an_alias_above_the_maximum_is_a_protocol_error() {
+        // 3.3.2.3.4: "It is a Protocol Error if the Topic Alias value
+        // is [...] greater than the Topic Alias Maximum".
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(shared);
+
+        let maximum = connect_v5(&mut client, "c")
+            .await
+            .properties
+            .topic_alias_maximum
+            .expect("a maximum is advertised");
+
+        write(
+            &mut client,
+            &aliased("a/b", maximum + 1, b"one too many"),
+            Version::V5,
+        )
+        .await;
+
+        assert_eq!(
+            next_disconnect(&mut client).await.reason,
+            ReasonCode::TopicAliasInvalid
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmapped_alias_is_a_protocol_error() {
+        // An empty topic and an alias nothing was ever mapped to names
+        // no topic at all. Treating it as an empty topic would publish
+        // to one, silently.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(shared);
+        connect_v5(&mut client, "c").await;
+
+        write(&mut client, &aliased("", 1, b"nowhere"), Version::V5).await;
+
+        assert_eq!(
+            next_disconnect(&mut client).await.reason,
+            ReasonCode::TopicAliasInvalid
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alias_does_not_survive_the_connection_that_set_it() {
+        // 3.3.2.3.4: "Topic Alias mappings exist only within a Network
+        // Connection and last only for the lifetime of that Network
+        // Connection." The session is resumed here and the mapping is
+        // still gone, which is why the table lives in the shell rather
+        // than in the session.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut first = serve_one(Arc::clone(&shared));
+
+        let mut durable = connect("durable", 0);
+        durable.clean_start = false;
+        write(&mut first, &Packet::Connect(Box::new(durable)), Version::V5).await;
+        assert!(matches!(
+            read(&mut first, Version::V5).await,
+            Packet::ConnAck(_)
+        ));
+        write(&mut first, &aliased("a/b", 1, b"maps it"), Version::V5).await;
+        write(&mut first, &Packet::PingReq, Version::V5).await;
+        assert_eq!(read(&mut first, Version::V5).await, Packet::PingResp);
+        drop(first);
+
+        // The takeover the second connect performs is what ends the
+        // first, so no wait for the socket to close is needed.
+        let mut second = serve_one(Arc::clone(&shared));
+        let mut durable = connect("durable", 0);
+        durable.clean_start = false;
+        write(
+            &mut second,
+            &Packet::Connect(Box::new(durable)),
+            Version::V5,
+        )
+        .await;
+        assert!(matches!(
+            read(&mut second, Version::V5).await,
+            Packet::ConnAck(_)
+        ));
+
+        write(&mut second, &aliased("", 1, b"stale"), Version::V5).await;
+
+        assert_eq!(
+            next_disconnect(&mut second).await.reason,
+            ReasonCode::TopicAliasInvalid
+        );
     }
 
     #[tokio::test]
