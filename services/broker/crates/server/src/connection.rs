@@ -139,6 +139,28 @@ pub async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    serve_with_candidates(socket, shared, config, candidate_identifier).await
+}
+
+/// The same, with the source of assigned client identifiers as a
+/// parameter.
+///
+/// A seam, and it exists for one reason: a clash between a nanosecond
+/// timestamp and a process-wide counter cannot be waited for, so the
+/// refusal that follows every candidate being taken is unreachable
+/// from a test that goes through [`serve`]. [`assign_identifier`] takes
+/// the same parameter for the same reason and is tested on its own; the
+/// refusal is a separate piece of code and this is what lets a test
+/// walk it.
+async fn serve_with_candidates<S>(
+    socket: S,
+    shared: Arc<Shared>,
+    config: ConnectionConfig,
+    mut candidates: impl FnMut() -> String + Send,
+) -> Result<(), ConnectionError>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     let (read_half, write_half) = tokio::io::split(socket);
     let mut reader = FrameReader::new(read_half, config.limits);
     let mut write_half = write_half;
@@ -269,7 +291,7 @@ where
         // the server assigns a unique one, then processes the connect as
         // if the client had sent it [MQTT-3.1.3-7].
         let assigned = if connect.client_id.is_empty() {
-            let assigned = assign_identifier(broker, &config.mountpoint, candidate_identifier)?;
+            let assigned = assign_identifier(broker, &config.mountpoint, &mut candidates)?;
             connect.client_id.clone_from(&assigned);
             Some(assigned)
         } else {
@@ -1516,6 +1538,201 @@ mod tests {
             shared.with_broker(|broker| assign_identifier(broker, "tenant-b", || "taken".into()));
 
         assert_eq!(assigned.as_deref(), Some("taken"));
+    }
+
+    /// The reason a CONNECT was answered with, whatever it was.
+    async fn connack_reason(client: &mut tokio::io::DuplexStream, version: Version) -> ReasonCode {
+        match read(client, version).await {
+            Packet::ConnAck(ack) => ack.reason,
+            other => panic!("expected an acknowledgement, got {other:?}"),
+        }
+    }
+
+    /// Connect over a fresh connection and report how it was answered.
+    async fn answered(shared: &Arc<Shared>, packet: Connect) -> ReasonCode {
+        let version = packet.version;
+        let mut client = serve_one(Arc::clone(shared));
+        write(&mut client, &Packet::Connect(Box::new(packet)), version).await;
+        connack_reason(&mut client, version).await
+    }
+
+    /// A 3.1.1 connect with no client identifier, keeping or
+    /// discarding whatever session it names.
+    fn anonymous_v311(clean_session: bool) -> Connect {
+        let mut packet = connect("", 0);
+        packet.version = Version::V311;
+        packet.clean_start = clean_session;
+        packet
+    }
+
+    #[tokio::test]
+    async fn a_three_one_one_connect_with_no_identifier_and_clean_session_clear_is_refused() {
+        // [MQTT-3.1.3-8]: "If the Client supplies a zero-byte
+        // ClientId with CleanSession set to 0, the Server MUST respond
+        // to the CONNECT Packet with a CONNACK return code 0x02
+        // (Identifier rejected) and then close the Network
+        // Connection." 3.1.1 has no Assigned Client Identifier
+        // property, so a client given one could never name the
+        // session it is asking to keep.
+        //
+        // Nothing else in this module sends a 3.1.1 CONNECT at all,
+        // which is how the whole refusal went unguarded.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        assert_eq!(
+            answered(&shared, anonymous_v311(false)).await,
+            ReasonCode::ClientIdentifierNotValid,
+            "return code 2 over 3.1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_three_one_one_connect_with_no_identifier_and_clean_session_set_is_accepted() {
+        // The other side of the same condition, and the half that
+        // keeps the refusal from becoming a ban. 3.1.1's
+        // [MQTT-3.1.3-7] is the rule the refusal enforces, "If the
+        // Client supplies a zero-byte ClientId, the Client MUST also
+        // set CleanSession to 1", and a client that obeys it is served
+        // with an identifier the server assigns [MQTT-3.1.3-6].
+        // Dropping the `!clean_start` term refuses every anonymous
+        // 3.1.1 client and passes the test above.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        assert_eq!(
+            answered(&shared, anonymous_v311(true)).await,
+            ReasonCode::Success,
+            "an anonymous 3.1.1 client that keeps nothing is served"
+        );
+    }
+
+    /// A version 5 connect advertising `receive_maximum`.
+    fn advertising(receive_maximum: u16) -> Connect {
+        let mut packet = connect("c", 0);
+        packet.properties.receive_maximum = Some(receive_maximum);
+        packet
+    }
+
+    #[tokio::test]
+    async fn a_zero_receive_maximum_is_a_protocol_error() {
+        // 3.1.2.11.3: "It is a Protocol Error to include the Receive
+        // Maximum value more than once or for it to have the value 0."
+        //
+        // Refused rather than clamped, and that is the whole point:
+        // the window it feeds reads zero as no limit at all, so a
+        // silent clamp would turn the strictest limit a client can ask
+        // for into the loosest. Its sibling, a Maximum Packet Size of
+        // zero, has a test; this one had none, and a clamp here passed
+        // the suite.
+        //
+        // On the boundary: one is the smallest legal value and must
+        // still be served, so a check widened to `<= 1` fails here.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        assert_eq!(
+            answered(&shared, advertising(0)).await,
+            ReasonCode::ProtocolError,
+            "zero is refused, not read as unbounded"
+        );
+        assert_eq!(
+            answered(&shared, advertising(1)).await,
+            ReasonCode::Success,
+            "one is the strictest legal window, not an error"
+        );
+    }
+
+    /// Drive one connection whose assigned identifiers come from
+    /// `candidates` rather than from the real generator.
+    fn serve_one_with_candidates(
+        shared: Arc<Shared>,
+        candidates: impl FnMut() -> String + Send + 'static,
+    ) -> tokio::io::DuplexStream {
+        let (client, server) = tokio::io::duplex(8192);
+        tokio::spawn(async move {
+            let _ = serve_with_candidates(server, shared, ConnectionConfig::default(), candidates)
+                .await;
+        });
+        client
+    }
+
+    #[tokio::test]
+    async fn a_connect_is_refused_when_every_candidate_identifier_is_taken() {
+        // [MQTT-3.2.2-16] wants an identifier "not used by any other
+        // Session currently in the Server", and the search for one is
+        // bounded because it runs under the broker's lock. This is
+        // what happens when it comes back empty: the client is told,
+        // rather than dropped or handed a name that would take an
+        // unrelated session over.
+        //
+        // Seeded through the candidate seam, because a clash between a
+        // nanosecond timestamp and a counter cannot be waited for.
+        // `assign_identifier` returning `None` is tested directly; the
+        // refusal is a different piece of code and this is the only
+        // way to reach it.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        shared.with_broker(|broker| {
+            let mut out = Vec::new();
+            broker.connect("", &connect("taken", 0), &mut out);
+        });
+
+        let mut client = serve_one_with_candidates(Arc::clone(&shared), || "taken".into());
+        write(
+            &mut client,
+            &Packet::Connect(Box::new(connect("", 0))),
+            Version::V5,
+        )
+        .await;
+        assert_eq!(
+            connack_reason(&mut client, Version::V5).await,
+            ReasonCode::ClientIdentifierNotValid,
+            "the client is told, not dropped"
+        );
+
+        // And the session that owned the name is untouched: the
+        // refusal must not have taken it over on the way past. This is
+        // the consequence the whole search exists to prevent, so
+        // asserting only the reason code would leave it unguarded.
+        assert_eq!(
+            shared.with_broker(|broker| broker.session_count()),
+            1,
+            "nothing was registered for the refused connection"
+        );
+        assert!(
+            shared
+                .with_broker(|broker| broker
+                    .subscriber_of(&broker_core::registry::SessionId::new("", "taken")))
+                .is_some(),
+            "the session holding the name is still there"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connect_is_served_when_a_candidate_identifier_is_free() {
+        // The boundary of the search, over a real connection: the
+        // second candidate is free and the client is given it. Without
+        // this, refusing every anonymous client passes the test above.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        shared.with_broker(|broker| {
+            let mut out = Vec::new();
+            broker.connect("", &connect("taken", 0), &mut out);
+        });
+
+        let mut offered = ["taken", "free"].into_iter();
+        let mut client =
+            serve_one_with_candidates(Arc::clone(&shared), move || offered.next().unwrap().into());
+        write(
+            &mut client,
+            &Packet::Connect(Box::new(connect("", 0))),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::ConnAck(ack) => {
+                assert_eq!(ack.reason, ReasonCode::Success);
+                assert_eq!(
+                    ack.properties.assigned_client_identifier.as_deref(),
+                    Some("free"),
+                    "the name that was free, and the client is told which"
+                );
+            }
+            other => panic!("expected an acknowledgement, got {other:?}"),
+        }
     }
 
     /// Connect as `client_id` with the given properties, and subscribe

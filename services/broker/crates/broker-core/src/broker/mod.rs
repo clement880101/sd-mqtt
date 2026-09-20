@@ -825,6 +825,20 @@ impl Broker {
     pub fn subscription_count(&self) -> usize {
         self.subscriptions.len() + self.shared.member_count()
     }
+
+    /// How many messages the retained store holds, expired or not.
+    ///
+    /// It exists so that the expiry sweep in [`Broker::tick`] can be
+    /// asserted, and there is no other way to see it. Every route into
+    /// the store applies the deadline on read, so an expired message
+    /// that no sweep has reclaimed is already invisible: deleting the
+    /// sweep from the tick changes no answer the protocol can observe
+    /// and leaks the memory instead. Counting what is stored rather
+    /// than what is live is the one view that tells those two apart,
+    /// which is also why this must not skip expired messages.
+    pub fn retained_count(&self) -> usize {
+        self.retained.len()
+    }
 }
 
 /// How long a session outlives its connection, in seconds.
@@ -1127,6 +1141,226 @@ mod tests {
             delivered.properties.message_expiry_interval,
             Some(500),
             "[MQTT-3.3.2-6]: a hundred of the six hundred were spent waiting"
+        );
+    }
+
+    /// One quality-of-service zero publication, with no properties.
+    fn publication(topic: &str, payload: &'static [u8], retain: bool) -> Packet {
+        Packet::Publish(Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain,
+            topic: topic.to_string(),
+            packet_id: None,
+            payload: Bytes::from_static(payload),
+            properties: Properties::default(),
+        })
+    }
+
+    /// The same, carrying properties.
+    fn publication_with(
+        topic: &str,
+        payload: &'static [u8],
+        retain: bool,
+        properties: Properties,
+    ) -> Packet {
+        let Packet::Publish(mut publish) = publication(topic, payload, retain) else {
+            unreachable!("publication builds a publish");
+        };
+        publish.properties = properties;
+        Packet::Publish(publish)
+    }
+
+    /// The topic of every publication addressed to one subscriber.
+    fn topics_to(out: &[Addressed], subscriber: SubscriberId) -> Vec<&str> {
+        publishes_to(out, subscriber)
+            .into_iter()
+            .map(|publish| publish.topic.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_empty_retained_publish_still_reaches_the_subscribers_matching_at_the_time() {
+        // 3.3.1.3: "If the Payload contains zero bytes it is processed
+        // normally by the Server but any retained message with the same
+        // topic name MUST be removed and any future subscribers for the
+        // topic will not receive a retained message" [MQTT-3.3.1-6],
+        // and it "MUST NOT be stored as a retained message"
+        // [MQTT-3.3.1-7]. 3.1.1 spells out what "processed normally"
+        // covers: "sent to Clients with a subscription matching the
+        // topic name" [MQTT-3.3.1-10].
+        //
+        // The removal half is guarded inside `retained.rs`, which
+        // cannot see a delivery; before this test nothing in the
+        // workspace published an empty payload through a broker at
+        // all, so the live half was guarded by nothing and discarding
+        // the message outright looked identical.
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+
+        let publisher = broker.connect("", &connect_v5("publisher"), &mut out);
+        broker
+            .handle(
+                publisher.subscriber,
+                &publication("retain/cleared", b"body", true),
+                &mut out,
+            )
+            .expect("the publish is accepted");
+
+        let sub = broker.connect("", &connect_v5("sub"), &mut out);
+        broker
+            .handle(sub.subscriber, &subscribe_to("retain/+"), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            topics_to(&out, sub.subscriber),
+            vec!["retain/cleared"],
+            "the subscriber is caught up before the clear, or the next \
+             assertion is about the wrong message"
+        );
+        out.clear();
+
+        broker
+            .handle(
+                publisher.subscriber,
+                &publication("retain/cleared", b"", true),
+                &mut out,
+            )
+            .expect("the empty publish is accepted");
+
+        let sent = publishes_to(&out, sub.subscriber);
+        let [delivered] = sent.as_slice() else {
+            panic!("one live delivery, got {}", sent.len());
+        };
+        assert_eq!(delivered.topic, "retain/cleared");
+        assert!(
+            delivered.payload.is_empty(),
+            "the message delivered is the empty one that was published"
+        );
+
+        // The other half, and a positive assertion rather than an
+        // absence: a newcomer is sent the sibling topic that still
+        // holds a message and not the one that was cleared, so a
+        // delivery path that had simply stopped working would fail
+        // here too.
+        broker
+            .handle(
+                publisher.subscriber,
+                &publication("retain/kept", b"body", true),
+                &mut out,
+            )
+            .expect("the publish is accepted");
+        let newcomer = broker.connect("", &connect_v5("newcomer"), &mut out);
+        out.clear();
+        broker
+            .handle(newcomer.subscriber, &subscribe_to("retain/+"), &mut out)
+            .expect("the subscribe is accepted");
+
+        assert_eq!(
+            topics_to(&out, newcomer.subscriber),
+            vec!["retain/kept"],
+            "the cleared topic is not stored and reaches no future subscriber"
+        );
+    }
+
+    #[test]
+    fn the_retained_sweep_reclaims_an_expired_message_nobody_has_read() {
+        // `tick` calls the sweep, and deleting that call changes no
+        // other test: the deadline is enforced on read as well, so an
+        // unswept message is already absent from every answer and only
+        // the memory stays. That makes the store's size the one
+        // observation that can tell a sweep that ran from one that did
+        // not, and it is why `retained_count` exists.
+        //
+        // On the boundary, not around it: a message expires strictly
+        // after its deadline, so second ten still holds it.
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let publisher = broker.connect("", &connect_v5("publisher"), &mut out);
+
+        broker
+            .handle(
+                publisher.subscriber,
+                &publication_with(
+                    "retain/perishable",
+                    b"body",
+                    true,
+                    Properties {
+                        message_expiry_interval: Some(10),
+                        ..Properties::default()
+                    },
+                ),
+                &mut out,
+            )
+            .expect("the publish is accepted");
+        assert_eq!(broker.retained_count(), 1, "it is retained to begin with");
+
+        run_to(&mut broker, 10, &mut out);
+        assert_eq!(
+            broker.retained_count(),
+            1,
+            "the deadline itself is not past"
+        );
+
+        run_to(&mut broker, 11, &mut out);
+        assert_eq!(
+            broker.retained_count(),
+            0,
+            "the second after it, the sweep gives the memory back"
+        );
+    }
+
+    #[test]
+    fn a_publication_carries_its_response_topic_and_correlation_data() {
+        // 4.10: the pair is how a responder learns where to reply and
+        // how the requester matches the reply to its request, and
+        // [MQTT-3.3.2-15] and [MQTT-3.3.2-16] make both the receiver's
+        // to be sent unaltered. Guarded today only on the will path,
+        // where a different piece of code assembles the message, so a
+        // fan-out that dropped either one passed the whole suite.
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+
+        let sub = broker.connect("", &connect_v5("sub"), &mut out);
+        broker
+            .handle(
+                sub.subscriber,
+                &subscribe_to("request/temperature"),
+                &mut out,
+            )
+            .expect("the subscribe is accepted");
+        let publisher = broker.connect("", &connect_v5("publisher"), &mut out);
+        out.clear();
+
+        broker
+            .handle(
+                publisher.subscriber,
+                &publication_with(
+                    "request/temperature",
+                    b"now?",
+                    false,
+                    Properties {
+                        response_topic: Some("reply/17".to_string()),
+                        correlation_data: Some(Bytes::from_static(b"\x00\xffcid")),
+                        ..Properties::default()
+                    },
+                ),
+                &mut out,
+            )
+            .expect("the publish is accepted");
+
+        let sent = publishes_to(&out, sub.subscriber);
+        let [delivered] = sent.as_slice() else {
+            panic!("one delivery, got {}", sent.len());
+        };
+        assert_eq!(
+            delivered.properties.response_topic.as_deref(),
+            Some("reply/17"),
+            "[MQTT-3.3.2-15]: the response topic reaches the receiver"
+        );
+        assert_eq!(
+            delivered.properties.correlation_data,
+            Some(Bytes::from_static(b"\x00\xffcid")),
+            "[MQTT-3.3.2-16]: correlation data is binary and travels unaltered"
         );
     }
 
