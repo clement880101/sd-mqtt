@@ -63,6 +63,20 @@ pub enum ConfigError {
         /// What it should have been.
         expected: &'static str,
     },
+    /// A key parsed as its own type but cannot mean what it says.
+    ///
+    /// Separate from `Invalid` because the parser is content: the
+    /// number is a number and the file is well formed. What is wrong is
+    /// the meaning, and only the broker knows that.
+    #[error("{key} cannot be {value}: {why}")]
+    Unusable {
+        /// The key at fault, written as it appears in the file.
+        key: &'static str,
+        /// What it was set to.
+        value: String,
+        /// Why that cannot work.
+        why: &'static str,
+    },
 }
 
 /// How much to log.
@@ -259,7 +273,41 @@ impl Config {
 
         config.apply_env(|variable| std::env::var(variable).ok())?;
         config.apply(overrides);
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Refuse a configuration that parses but cannot mean what it says.
+    ///
+    /// Run after the environment and the command line, so that a value
+    /// from any of the three sources is held to the same rule.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // Zero is the sentinel the inflight window uses internally for
+        // "unbounded", so an operator who writes it gets the opposite of
+        // what the word suggests: not a window of nothing, but no window
+        // at all, overriding even a client that asked for a strict one.
+        // The shell takes the lesser of this and the client's Receive
+        // Maximum, and the lesser of zero and anything is zero.
+        //
+        // Refused rather than reinterpreted. The sibling `max_keep_alive`
+        // documents zero as "no ceiling", and either meaning is arguable
+        // here, which is the argument for making the operator say which
+        // they meant instead of guessing.
+        if self.broker.max_inflight == 0 {
+            return Err(ConfigError::Unusable {
+                key: "broker.max_inflight",
+                value: "0".to_string(),
+                why: "a window of zero would send nothing; write 1 for strict ordering",
+            });
+        }
+        if self.broker.max_queue_messages == 0 {
+            return Err(ConfigError::Unusable {
+                key: "broker.max_queue_messages",
+                value: "0".to_string(),
+                why: "a queue that holds nothing drops every message an offline session is sent",
+            });
+        }
+        Ok(())
     }
 
     /// Let the environment override what the file said.
@@ -554,5 +602,71 @@ mod tests {
         let mut config = Config::from_toml("[listener]\nmax_connections = 5\n").unwrap();
         config.apply(&Overrides::default());
         assert_eq!(config.listener.max_connections, 5);
+    }
+
+    #[test]
+    fn an_inflight_window_of_zero_is_refused_rather_than_read_as_unbounded() {
+        // Zero is the sentinel the inflight window uses for unbounded,
+        // so accepting it here would give an operator asking for the
+        // narrowest window the widest one, overriding even a client
+        // that advertised a Receive Maximum of its own.
+        let config = Config::from_toml("[broker]\nmax_inflight = 0\n").unwrap();
+        let error = config.validate().expect_err("zero cannot be a window");
+        assert!(
+            error.to_string().contains("broker.max_inflight"),
+            "the message names the key at fault: {error}"
+        );
+    }
+
+    #[test]
+    fn an_inflight_window_of_one_is_accepted() {
+        // The other side of the boundary. One is the narrowest usable
+        // window and is how strict ordering is asked for, so a guard
+        // that refused it would be worse than no guard.
+        let config = Config::from_toml("[broker]\nmax_inflight = 1\n").unwrap();
+        config
+            .validate()
+            .expect("one is strict ordering, not an error");
+    }
+
+    #[test]
+    fn a_queue_that_holds_nothing_is_refused() {
+        let config = Config::from_toml("[broker]\nmax_queue_messages = 0\n").unwrap();
+        let error = config.validate().expect_err("zero cannot be a queue");
+        assert!(
+            error.to_string().contains("broker.max_queue_messages"),
+            "the message names the key at fault: {error}"
+        );
+    }
+
+    #[test]
+    fn loading_a_file_runs_the_guard() {
+        // The three tests above call `validate` directly, so all of
+        // them pass against a `load` that never calls it. This one is
+        // the wiring: without it, deleting that one line from `load`
+        // costs nothing and the guard guards nothing.
+        let path = std::env::temp_dir().join(format!(
+            "sdmqtt-validate-{}-{}.toml",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, "[broker]\nmax_inflight = 0\n").expect("write the file");
+        let result = Config::load(Some(&path), &Overrides::default());
+        std::fs::remove_file(&path).ok();
+
+        let error = result.expect_err("loading a refused file fails");
+        assert!(
+            error.to_string().contains("broker.max_inflight"),
+            "the message names the key at fault: {error}"
+        );
+    }
+
+    #[test]
+    fn the_shipped_defaults_are_usable() {
+        // The guard runs on every start, so a default it refuses would
+        // stop the broker from booting with no configuration at all.
+        Config::default()
+            .validate()
+            .expect("the defaults must pass the guard they ship with");
     }
 }
