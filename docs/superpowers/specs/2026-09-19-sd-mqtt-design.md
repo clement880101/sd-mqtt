@@ -86,8 +86,11 @@ depends on all of them. `sdmqtt` wires them together.
 `mqtt-codec` is pure: bytes in, typed frames out, no I/O and no allocation
 beyond what a frame owns. It exposes:
 
-- `Frame`, an enum over the fourteen MQTT packet types, version-agnostic in
-  shape, with v5 properties in an `Option<Properties>` field.
+- `Frame`, an enum over the fifteen MQTT packet types, version-agnostic in
+  shape, carrying v5 properties by value. An earlier draft said an
+  `Option<Properties>`, which would shrink the common case where a packet
+  has none; section 17 records why that was not done and what would decide
+  it.
 - `decode(buf: &mut BytesMut, version: Version, limits: &Limits) -> Result<Option<Frame>, CodecError>`,
   returning `Ok(None)` when more bytes are needed.
 - `encode(frame: &Frame, version: Version, buf: &mut BytesMut) -> Result<(), CodecError>`.
@@ -111,16 +114,18 @@ into their own topic tree. This gives multi-tenancy at no structural cost.
 
 Session state:
 
-- subscriptions, each with QoS, no-local, retain-as-published, retain
-  handling and an optional subscription identifier
+- subscriptions, each with QoS, no-local, retain-as-published and an
+  optional subscription identifier. Retain handling is **not** kept: it
+  says what to do with retained messages at the instant of subscribing,
+  and once that instant has passed it has no further meaning.
 - outbound inflight map, keyed by packet identifier
 - outbound queue
 - inbound QoS 2 packet identifiers awaiting release
 - session expiry interval, will message and will delay
 - an `epoch`, a monotonically increasing counter used for takeover
 
-CONNECT is validated in this order: protocol version accepted for this
-listener, client identifier length and empty-identifier rules, authentication,
+CONNECT is validated in this order: protocol version served by this build,
+client identifier length and empty-identifier rules, authentication,
 will topic authorized as an ordinary publish, then registration. Registration
 is the point at which takeover happens.
 
@@ -140,8 +145,12 @@ mechanism is a ring of one-second buckets, described in section 10.2.
 Topic levels are interned into a `LevelId` on first use, so comparisons are
 integer comparisons and nodes store fixed-size keys.
 
-The subscription structure is a per-level trie. Matching walks literal, then
-single-level wildcard, then multi-level wildcard children. A filter whose
+The subscription structure is a per-level trie. Matching visits literal,
+single-level wildcard and multi-level wildcard children, in whatever order
+the node finds cheapest. The order is deliberately unspecified: the result
+is a set, the merge that consumes it is order-insensitive, and pinning an
+order in prose invites a reader to treat an implementation detail as a
+promise. A filter whose
 first level is a wildcard never matches a topic whose first level begins with
 a dollar sign, and a dollar-prefixed filter matches only dollar-prefixed
 topics. Depth is bounded by configuration and checked during validation, so
@@ -160,9 +169,19 @@ Session expiry, message expiry, will delay, user properties, request and
 response topics with correlation data, subscription identifiers, a
 client's topic aliases, shared subscriptions, no-local,
 retain-as-published, all three retain-handling values, server keep-alive,
-receive maximum in both directions, maximum packet size, maximum QoS,
-retain availability, assigned client identifier, and reason codes with
-optional reason strings on every acknowledgement.
+receive maximum in both directions, maximum packet size, assigned client
+identifier, and reason codes on every acknowledgement.
+
+**Maximum QoS and Retain Availability move to milestone 7.** The broker
+always supports quality of service 2 and always accepts a retained
+message, advertising neither property, which is conformant. Capping either
+is an operator policy and belongs with authorization rather than on its
+own.
+
+**Reason strings are not sent in v1.** The codec carries them and nothing
+produces one. The reason code is the contract; a string is a convenience
+for a human reading a packet capture, and it costs bytes on every
+acknowledgement.
 
 **The server does not itself use topic aliases outbound.** An earlier
 draft of this section promised aliases "in both directions". 3.3.2.3.4
@@ -185,9 +204,12 @@ the lesser of the configured maximum and the peer's receive maximum. Default
 is 20. Setting it to 1 gives strict ordering.
 
 **Queue** holds messages waiting for an inflight slot, bounded by both a
-message count and a byte total, configured separately for the online and
-offline cases. The online bound protects memory, the offline bound protects
-disk.
+message count and a byte total, both configurable. An earlier draft
+specified separate bounds for the online and offline cases; one set is
+built, because nobody stated the problem two sets solve and a bound an
+operator cannot reason about is worse than a bound that is the same
+everywhere. Revisit it when persistence makes the offline case cost disk
+rather than memory.
 
 **No retransmission on a live connection.** MQTT 5 forbids it and TCP makes
 it pointless. On session resume, inflight messages are requeued with the
@@ -206,9 +228,11 @@ Resume is also not uniform. A message whose receipt has already arrived is
 resumed by resending the release, not the publish, because the peer has
 taken ownership of it.
 
-**Overflow** is configurable per queue, `drop_newest` by default and
-`drop_oldest` available. Every drop increments a counter labelled with a
-reason and fires the message-drop hook. Nothing is discarded silently.
+**Overflow** is `drop_newest` for every queue in v1. Both policies are
+implemented and tested, and nothing selects between them yet; making it
+configurable waits for someone to want the other one. Every drop carries a
+reason, and from milestone 3 increments a counter labelled with it and
+fires the message-drop hook. Nothing is discarded silently.
 
 **Packet identifiers** are allocated per session from a monotonic counter
 wrapping through 1 to 65535, skipping identifiers currently inflight.
@@ -720,7 +744,8 @@ shippable.
    mode, and the replication lag metric bounds the loss in asynchronous mode.
    The UI shows replica health and re-replication progress.
 7. **Hardening.** TLS with certificate hot reload, WebSocket, SCRAM-SHA-256,
-   the authentication and access control UI, rate limits, the container image,
+   the authentication and access control UI, rate limits, a configurable
+   maximum quality of service and retain availability, the container image,
    cross-compiled release artifacts and documentation. Exit criteria: all
    budgets met, the full conformance suite green including TLS and WebSocket,
    a SCRAM client authenticates and re-authenticates, and a release is
