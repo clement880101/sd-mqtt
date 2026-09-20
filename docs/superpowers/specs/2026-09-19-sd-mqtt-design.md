@@ -296,6 +296,88 @@ Restore runs as the first startup phase, before any listener binds.
 Reference counts are persisted alongside the bodies they protect, not
 rebuilt by scanning at startup.
 
+### 7.3 How the broker says what changed
+
+`broker-core` does no I/O, holds no locks and takes time as a parameter.
+Persistence must not change that, so the broker does not write: it
+**says what happened** and the shell writes.
+
+`Broker` keeps a journal buffer beside the action buffer it already
+fills. Every method that changes durable state appends a `Record` to it,
+and the shell drains it under the same lock that produced it, so a
+record and the actions it belongs with are always taken together and in
+order. A buffer is state, not I/O, so the purity that makes the broker
+testable survives.
+
+The alternative, having the shell infer what to persist from the packet
+it just handed in, was rejected: it would put a second copy of the
+broker's rules in the shell, and the two would drift the first time one
+of them was corrected.
+
+**Ordering is the point, and it is not an optimisation.** For an
+at-least-once or exactly-once publication, the acknowledgement says the
+broker has taken responsibility for the message. Sending it before the
+message is durable means a restart can lose a message the publisher was
+told was safe. So the shell commits the journal, waits for the commit to
+be durable, and only then delivers the actions. The wait is what the
+batching writer exists to make cheap: many connections commit into one
+flush and are woken together.
+
+At-most-once publications are journalled where they touch durable state
+and are never waited on, because nothing was promised.
+
+### 7.4 Sequence numbers
+
+Every queue entry carries a per-session sequence number, assigned when
+the message is enqueued and monotonic within the session. It is the
+queue's key, so reading in key order is reading in the order the
+messages arrived, and the highest applied number is a single value
+rather than a scan.
+
+They exist from this milestone even though nothing reads them yet.
+Replication in milestone 6 is a matter of shipping operations a replica
+applies in order, and retrofitting an ordering onto a queue that never
+had one would mean rewriting every stored queue in the field.
+
+Gapless is a property of the assignment, not of what survives: a
+delivered and deleted entry leaves a hole in the stored keys, and that
+is expected. What must never happen is two entries sharing a number, or
+a number going backwards.
+
+### 7.5 Restore
+
+Restore is the first startup phase and completes before any listener
+binds, so no client can observe a half-restored broker.
+
+It rebuilds, in order: sessions with their expiry and will; their
+subscriptions, which re-enter the matching trie; inbound exactly-once
+identifiers awaiting release; outbound inflight entries with the
+identifiers they were sent under; and queues, read in sequence order.
+The seams for the last three exist already and were written for this:
+`Inbound::reserve`, `Outbound::restore` and `Queue::requeue`.
+
+A session whose expiry has passed while the broker was down is not
+restored. The clock the broker starts with is therefore read before
+restore, not after.
+
+### 7.6 What this milestone does not store
+
+The trait in 7.1 lists what it will eventually cover. Milestone 2
+implements sessions, subscriptions, inbound state, queues, message
+bodies and retained messages. Replica queues wait for milestone 6,
+cluster metadata for milestone 5, and users, access control rules,
+rules and API keys for milestones 4 and 7. The trait may name them; the
+backend need not answer them yet.
+
+**Only the fjall backend is built.** Section 7.1 says a redb backend is
+maintained as a supported alternative and that its existence keeps the
+trait honest. A second backend built alongside the first keeps the trait
+honest at the cost of doubling the work before anything is proven, so
+what keeps it honest in this milestone is an in-memory backend used by
+the tests, which is cheap and catches the same class of mistake. Whether
+redb follows is a decision for after the trait has survived contact with
+one real engine.
+
 ## 8. Clustering
 
 ### 8.1 Membership
