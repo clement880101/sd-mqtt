@@ -152,6 +152,12 @@ pub struct BrokerSection {
     /// window is the lesser of this and what the client advertises,
     /// and one gives strict ordering.
     pub max_inflight: u16,
+    /// How many messages a session's queue may hold waiting for a
+    /// window slot.
+    pub max_queue_messages: usize,
+    /// How many bytes those messages may occupy in total. The one knob
+    /// that bounds per-session memory.
+    pub max_queue_bytes: usize,
 }
 
 impl Default for BrokerSection {
@@ -165,6 +171,8 @@ impl Default for BrokerSection {
             trie_shards: broker.trie_shards,
             max_keep_alive: broker.max_keep_alive,
             max_inflight: broker.max_inflight,
+            max_queue_messages: broker.max_queue_messages,
+            max_queue_bytes: broker.max_queue_bytes,
         }
     }
 }
@@ -306,6 +314,8 @@ impl Config {
                 trie_shards: self.broker.trie_shards,
                 max_keep_alive: self.broker.max_keep_alive,
                 max_inflight: self.broker.max_inflight,
+                max_queue_messages: self.broker.max_queue_messages,
+                max_queue_bytes: self.broker.max_queue_bytes,
             },
             connection: ConnectionConfig {
                 limits,
@@ -365,6 +375,8 @@ mod tests {
             trie_shards = 2
             max_keep_alive = 60
             max_inflight = 3
+            max_queue_messages = 5
+            max_queue_bytes = 8192
 
             [log]
             level = "debug"
@@ -380,6 +392,8 @@ mod tests {
         assert_eq!(config.broker.trie_shards, 2);
         assert_eq!(config.broker.max_keep_alive, 60);
         assert_eq!(config.broker.max_inflight, 3);
+        assert_eq!(config.broker.max_queue_messages, 5);
+        assert_eq!(config.broker.max_queue_bytes, 8192);
         assert_eq!(config.log.level, LogLevel::Debug);
 
         // Parsed is not the same as applied. A field read into this
@@ -395,6 +409,8 @@ mod tests {
         assert_eq!(server.broker.trie_shards, 2);
         assert_eq!(server.broker.max_keep_alive, 60);
         assert_eq!(server.broker.max_inflight, 3);
+        assert_eq!(server.broker.max_queue_messages, 5);
+        assert_eq!(server.broker.max_queue_bytes, 8192);
         assert_eq!(server.connection.limits, server.broker.limits);
     }
 
@@ -411,11 +427,23 @@ mod tests {
             "section 6: the inflight window defaults to 20"
         );
 
+        assert_eq!(
+            config.broker.max_queue_messages, 1000,
+            "section 6: a session queues a thousand messages"
+        );
+        assert_eq!(
+            config.broker.max_queue_bytes,
+            64 * 1024 * 1024,
+            "and 64 MiB of them"
+        );
+
         let server = config.server();
         assert_eq!(
             server.broker.max_inflight, 20,
             "and the default reaches the broker"
         );
+        assert_eq!(server.broker.max_queue_messages, 1000);
+        assert_eq!(server.broker.max_queue_bytes, 64 * 1024 * 1024);
     }
 
     #[test]

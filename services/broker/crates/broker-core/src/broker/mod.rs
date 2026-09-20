@@ -15,7 +15,7 @@ use crate::keepalive::{Activity, KeepAliveRing};
 use crate::registry::{Registration, Registry, SessionId};
 use crate::retained::{RetainedMessage, RetainedStore};
 use crate::session::message::Message;
-use crate::session::queue::{Delivery, DropReason};
+use crate::session::queue::{Delivery, DropReason, QueueLimits};
 use crate::session::state::{will_message, Session, StoredWill};
 use crate::session::Action;
 use crate::subscriptions::{SharedSubscriptions, SubscriberId, SubscriptionTrie};
@@ -39,6 +39,15 @@ pub struct BrokerConfig {
     /// peer's receive maximum. One gives strict ordering, and is the
     /// only way to ask for it that does not depend on the client.
     pub max_inflight: u16,
+    /// How many messages a session's queue may hold waiting for a
+    /// window slot.
+    pub max_queue_messages: usize,
+    /// How many bytes those messages may occupy in total.
+    ///
+    /// Separate from the count because either bound alone is
+    /// escapable: a count permits a thousand enormous payloads, a byte
+    /// total permits a million empty ones.
+    pub max_queue_bytes: usize,
 }
 
 impl Default for BrokerConfig {
@@ -48,6 +57,11 @@ impl Default for BrokerConfig {
             trie_shards: 32,
             max_keep_alive: 3600,
             max_inflight: DEFAULT_MAX_INFLIGHT,
+            // Taken from the queue's own defaults rather than restated,
+            // so that the two cannot drift apart while both claim to be
+            // the documented number.
+            max_queue_messages: QueueLimits::default().max_messages,
+            max_queue_bytes: QueueLimits::default().max_bytes,
         }
     }
 }
@@ -87,7 +101,14 @@ impl Broker {
             subscriptions: SubscriptionTrie::new(config.trie_shards),
             shared: SharedSubscriptions::new(config.trie_shards),
             retained: RetainedStore::new(),
-            registry: Registry::new(usize::from(config.max_inflight)),
+            registry: Registry::new(
+                usize::from(config.max_inflight),
+                QueueLimits {
+                    max_messages: config.max_queue_messages,
+                    max_bytes: config.max_queue_bytes,
+                    ..QueueLimits::default()
+                },
+            ),
             keepalive: KeepAliveRing::new(config.max_keep_alive),
             activities: HashMap::with_hasher(RandomState::default()),
             config,
@@ -1155,6 +1176,103 @@ mod tests {
                 "a configured window of {max_inflight} sends that many and queues the rest"
             );
         }
+    }
+
+    /// Every message dropped on the way to one subscriber, with why.
+    fn drops_to(out: &[Addressed], subscriber: SubscriberId) -> Vec<DropReason> {
+        out.iter()
+            .filter_map(|(target, action)| match action {
+                Action::Dropped { reason, .. } if *target == subscriber => Some(*reason),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A subscriber with a window of one, so that everything after the
+    /// first message it is offered is in the queue rather than in
+    /// flight, and the queue's bounds are what decide its fate.
+    fn subscriber_with_a_full_window(
+        broker: &mut Broker,
+        out: &mut Vec<Addressed>,
+    ) -> SubscriberId {
+        let sub = broker.connect("", &connect_v5("sub"), out).subscriber;
+        broker
+            .handle(sub, &subscribe_at("a/b", QoS::AtLeastOnce), out)
+            .expect("the subscribe is accepted");
+        out.clear();
+        sub
+    }
+
+    /// One message of the size the tests below budget for.
+    fn queued_message(payload: &[u8]) -> Message {
+        Message::new(
+            "a/b",
+            Bytes::copy_from_slice(payload),
+            QoS::AtLeastOnce,
+            false,
+        )
+    }
+
+    #[test]
+    fn the_configured_message_bound_bounds_a_sessions_queue() {
+        // Section 6 calls the queue bounds configured. They were two
+        // literals in `QueueLimits::default`, and a test that only
+        // read the number back out of the configuration would not have
+        // noticed that nothing carried it to a session.
+        //
+        // On the boundary, not around it: with room for two, the
+        // second is queued and the third is not.
+        let mut broker = Broker::new(BrokerConfig {
+            max_inflight: 1,
+            max_queue_messages: 2,
+            ..BrokerConfig::default()
+        });
+        let mut out = Vec::new();
+        let sub = subscriber_with_a_full_window(&mut broker, &mut out);
+
+        // One fills the window, two fill the queue, the fourth has
+        // nowhere to go.
+        for _ in 0..4 {
+            broker.publish(queued_message(b"x"), None, 0, &mut out);
+        }
+
+        assert_eq!(publishes_to(&out, sub).len(), 1, "the window holds one");
+        assert_eq!(
+            drops_to(&out, sub),
+            vec![DropReason::QueueFull],
+            "two queued and exactly one refused"
+        );
+    }
+
+    #[test]
+    fn the_configured_byte_bound_bounds_a_sessions_queue() {
+        // The other half of the pair. A count alone permits a thousand
+        // enormous payloads, so this bound is the one that makes the
+        // memory budget a budget, and it is the knob an operator
+        // reaches for.
+        let payload = [b'x'; 256];
+        let size = queued_message(&payload).size_in_queue();
+        let mut broker = Broker::new(BrokerConfig {
+            max_inflight: 1,
+            // Room for exactly two, measured rather than guessed: the
+            // queue refuses a message that would take it past the
+            // budget, so two of this size fit and a third does not.
+            max_queue_bytes: size * 2,
+            ..BrokerConfig::default()
+        });
+        let mut out = Vec::new();
+        let sub = subscriber_with_a_full_window(&mut broker, &mut out);
+
+        for _ in 0..4 {
+            broker.publish(queued_message(&payload), None, 0, &mut out);
+        }
+
+        assert_eq!(publishes_to(&out, sub).len(), 1, "the window holds one");
+        assert_eq!(
+            drops_to(&out, sub),
+            vec![DropReason::ByteBudget],
+            "two of that size fit the budget and a third does not"
+        );
     }
 
     /// Every publish addressed to one subscriber, in order.

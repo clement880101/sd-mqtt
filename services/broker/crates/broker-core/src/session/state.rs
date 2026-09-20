@@ -68,6 +68,10 @@ impl Session {
     /// receive maximum, which the shell narrows this to once it has
     /// read the connect packet; it is not known here, and a session
     /// exists before any connection has advertised anything.
+    ///
+    /// `queue` bounds what waits for one of those slots. Section 6
+    /// calls both bounds configured, and this is the only path a
+    /// configured value can reach a session by.
     pub fn new(
         id: SessionId,
         subscriber: SubscriberId,
@@ -75,12 +79,13 @@ impl Session {
         epoch: u64,
         _now: u32,
         max_inflight: usize,
+        queue: QueueLimits,
     ) -> Self {
         // A fresh session has a connection attached, so its outbound path
         // does too. Leaving it offline would make `is_connected` lie and
         // silently discard every at-most-once delivery, which such a path
         // does not queue for an absent client.
-        let mut outbound = Outbound::new(QueueLimits::default(), max_inflight);
+        let mut outbound = Outbound::new(queue, max_inflight);
         outbound.set_online(true);
 
         Self {
@@ -288,7 +293,15 @@ mod tests {
     use mqtt_codec::{Packet, QoS, ReasonCode, Version};
 
     fn session(version: Version) -> Session {
-        Session::new(SessionId::new("", "c"), SubscriberId(1), version, 1, 0, 20)
+        Session::new(
+            SessionId::new("", "c"),
+            SubscriberId(1),
+            version,
+            1,
+            0,
+            20,
+            QueueLimits::default(),
+        )
     }
 
     fn will() -> StoredWill {

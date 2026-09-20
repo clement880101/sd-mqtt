@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use foldhash::fast::RandomState;
 
+use crate::session::queue::QueueLimits;
 use crate::session::state::Session;
 use crate::subscriptions::SubscriberId;
 
@@ -65,17 +66,21 @@ pub struct Registry {
     /// with. Held rather than passed per call because a session is
     /// also built by a clean start, which has nothing to hand it.
     max_inflight: usize,
+    /// The configured queue bounds, held for the same reason.
+    queue: QueueLimits,
 }
 
 impl Registry {
-    /// An empty registry whose sessions start with `max_inflight`.
-    pub fn new(max_inflight: usize) -> Self {
+    /// An empty registry whose sessions start with `max_inflight` and
+    /// the given queue bounds.
+    pub fn new(max_inflight: usize, queue: QueueLimits) -> Self {
         Self {
             by_identity: HashMap::default(),
             sessions: HashMap::default(),
             next_subscriber: 0,
             next_epoch: 0,
             max_inflight,
+            queue,
         }
     }
 
@@ -98,7 +103,15 @@ impl Registry {
 
             if clean_start {
                 let version = existing.version();
-                *existing = Session::new(id, subscriber, version, epoch, now, self.max_inflight);
+                *existing = Session::new(
+                    id,
+                    subscriber,
+                    version,
+                    epoch,
+                    now,
+                    self.max_inflight,
+                    self.queue,
+                );
                 return Registration {
                     subscriber,
                     session_present: false,
@@ -130,6 +143,7 @@ impl Registry {
                 epoch,
                 now,
                 self.max_inflight,
+                self.queue,
             ),
         );
 
@@ -201,7 +215,7 @@ mod tests {
 
     #[test]
     fn a_first_connect_creates_a_session() {
-        let mut registry = Registry::new(20);
+        let mut registry = Registry::new(20, QueueLimits::default());
         let first = registry.register(id("a"), true, 0);
         assert!(!first.session_present);
         assert!(!first.took_over);
@@ -211,7 +225,7 @@ mod tests {
 
     #[test]
     fn distinct_clients_get_distinct_subscribers() {
-        let mut registry = Registry::new(20);
+        let mut registry = Registry::new(20, QueueLimits::default());
         let a = registry.register(id("a"), true, 0);
         let b = registry.register(id("b"), true, 0);
         assert_ne!(a.subscriber, b.subscriber);
@@ -222,7 +236,7 @@ mod tests {
     fn the_same_client_on_a_different_mountpoint_is_a_different_session() {
         // A mountpoint namespaces a listener's clients, so the same
         // identifier on two listeners must not collide.
-        let mut registry = Registry::new(20);
+        let mut registry = Registry::new(20, QueueLimits::default());
         let a = registry.register(SessionId::new("tenant-a", "device"), true, 0);
         let b = registry.register(SessionId::new("tenant-b", "device"), true, 0);
         assert_ne!(a.subscriber, b.subscriber);
@@ -230,7 +244,7 @@ mod tests {
 
     #[test]
     fn reconnecting_without_a_clean_start_resumes_the_session() {
-        let mut registry = Registry::new(20);
+        let mut registry = Registry::new(20, QueueLimits::default());
         let first = registry.register(id("a"), false, 0);
         depart(&mut registry, first.subscriber);
 
@@ -244,7 +258,7 @@ mod tests {
 
     #[test]
     fn a_clean_start_discards_whatever_was_there() {
-        let mut registry = Registry::new(20);
+        let mut registry = Registry::new(20, QueueLimits::default());
         let first = registry.register(id("a"), false, 0);
         depart(&mut registry, first.subscriber);
 
@@ -255,7 +269,7 @@ mod tests {
 
     #[test]
     fn connecting_while_already_connected_takes_the_session_over() {
-        let mut registry = Registry::new(20);
+        let mut registry = Registry::new(20, QueueLimits::default());
         let first = registry.register(id("a"), false, 0);
 
         let second = registry.register(id("a"), false, 5);
@@ -270,7 +284,7 @@ mod tests {
     fn the_epoch_never_goes_backwards() {
         // Two nodes may both accept a client during a partition. The
         // higher epoch wins when they meet, so it must only increase.
-        let mut registry = Registry::new(20);
+        let mut registry = Registry::new(20, QueueLimits::default());
         let mut last = 0;
         for n in 0..10 {
             let reg = registry.register(id("a"), false, n);
@@ -281,7 +295,7 @@ mod tests {
 
     #[test]
     fn a_session_can_be_looked_up_and_removed() {
-        let mut registry = Registry::new(20);
+        let mut registry = Registry::new(20, QueueLimits::default());
         let reg = registry.register(id("a"), true, 0);
         assert!(registry.get(reg.subscriber).is_some());
         assert_eq!(registry.subscriber_of(&id("a")), Some(reg.subscriber));
@@ -296,7 +310,7 @@ mod tests {
     fn a_subscriber_identifier_is_never_reused() {
         // The subscription trie is keyed by it, so reuse would hand one
         // session another's subscriptions.
-        let mut registry = Registry::new(20);
+        let mut registry = Registry::new(20, QueueLimits::default());
         let first = registry.register(id("a"), true, 0);
         registry.remove(first.subscriber);
         let second = registry.register(id("b"), true, 0);

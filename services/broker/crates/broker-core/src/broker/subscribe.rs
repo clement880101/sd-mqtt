@@ -208,6 +208,7 @@ mod tests {
                 1,
                 0,
                 20,
+                crate::session::queue::QueueLimits::default(),
             ),
         }
     }
