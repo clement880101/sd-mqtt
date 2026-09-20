@@ -29,6 +29,15 @@
 //! one's connection state and is right not to, so a comparison including
 //! it would fail for correct reasons.
 //!
+//! One durable field follows from that and is therefore expected to
+//! differ. A connected session has no expiry deadline, because a
+//! connected session cannot expire; a restored one is not connected,
+//! because whatever stopped the broker disconnected it, so restore
+//! gives it one counted from the restore. [`check`] states the value it
+//! must be given rather than skipping the field — a session left
+//! without a deadline is a session that can never expire, which is the
+//! bug this accounts for and must not hide.
+//!
 //! # What this test can produce
 //!
 //! Counted by name in [`the_generator_produces_every_case_the_property_needs`],
@@ -113,7 +122,7 @@ use mqtt_codec::{Packet, Properties, QoS, ReasonCode, Version};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{TestCaseResult, TestRunner};
-use storage::record::{InflightState, Record};
+use storage::record::{InflightState, Record, SessionKey};
 use storage::{MemoryStorage, Restored, Storage};
 
 // ---- the universe the generator draws from ------------------------------
@@ -1136,8 +1145,31 @@ fn check(history: &[Op]) -> TestCaseResult {
 
     bodies_are_exactly_what_is_referenced(&restored).map_err(TestCaseError::fail)?;
 
-    let rebuilt = rebuild(&restored, run.broker.clock().now());
-    let live = run.broker.durable_state();
+    let now = run.broker.clock().now();
+    let rebuilt = rebuild(&restored, now);
+    let mut live = run.broker.durable_state();
+    // The one durable difference the two brokers are meant to have; see
+    // the note at the top of this file. The expected deadline is
+    // restated from the rule rather than read back from the broker,
+    // because a comparison that asked the implementation what it does
+    // could not see it do the wrong thing.
+    for (client, name) in CLIENTS.iter().enumerate() {
+        if run.attached(client).is_none() {
+            continue;
+        }
+        let Some(session) = live.sessions.get_mut(&SessionKey::new("", name)) else {
+            continue;
+        };
+        let interval = session.session.expiry_interval;
+        session.session.expires_at = Some(if interval == 0 {
+            // At once. A deadline of zero seconds is not rounded.
+            now
+        } else {
+            // Rounded up, because the clock is whole seconds and only
+            // erring early is wrong.
+            now.saturating_add(interval).saturating_add(1)
+        });
+    }
     let restored_state = rebuilt.durable_state();
 
     if live != restored_state {

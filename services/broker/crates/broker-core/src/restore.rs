@@ -26,6 +26,12 @@
 //! stored expiry and will, the identifiers already outstanding, the
 //! queue, and the sequence number to carry on from.
 //!
+//! One of those is not simply put back. A session that was connected
+//! when the broker stopped has no stored expiry deadline, because a
+//! connected session cannot expire and so never had one written, and
+//! the restored session is not connected. It is given one, counted
+//! from the restore.
+//!
 //! # Two orderings that are not tidiness
 //!
 //! **Retained messages go in last, after every session.** Establishing
@@ -57,7 +63,7 @@ use storage::{Restored, RestoredSession};
 
 use crate::broker::Broker;
 use crate::journal;
-use crate::session::state::StoredWill;
+use crate::session::state::{deadline, StoredWill};
 use crate::subscriptions::SubscriberId;
 
 /// What a restore found, for the log line the shell writes.
@@ -151,7 +157,7 @@ pub fn restore(broker: &mut Broker, restored: &Restored, now: u32) -> Restoratio
             report.expired.push(held.session.key.clone());
             continue;
         }
-        restore_session(broker, held, restored, &mut actions, &mut report);
+        restore_session(broker, held, restored, now, &mut actions, &mut report);
         report.sessions += 1;
     }
 
@@ -171,6 +177,7 @@ fn restore_session(
     broker: &mut Broker,
     held: &RestoredSession,
     restored: &Restored,
+    now: u32,
     actions: &mut Vec<(SubscriberId, crate::session::Action)>,
     report: &mut Restoration,
 ) {
@@ -251,7 +258,38 @@ fn restore_session(
         properties: journal::live_properties(&will.properties),
     }));
     session.set_will_at(record.will_at);
-    session.set_expires_at(record.expires_at);
+    // A stored deadline is kept exactly, and a session that has none
+    // is given one counted from the restore.
+    //
+    // Only a *disconnected* session has a stored deadline, because
+    // only a disconnected session can expire; one that was connected
+    // when the broker died never had one written. Restoring that
+    // verbatim leaves it offline with no deadline, and
+    // [`Session::is_expired`] never expires a session without one, so
+    // the crash makes it immortal — it and its queue and its share of
+    // every body it references stay in the file forever. A clean-start
+    // client with an interval of zero, which asked to outlive nothing,
+    // outlives everything.
+    //
+    // The crash disconnected it, so the deadline counts from a
+    // disconnection whose time is not knowable. The restore's is, and
+    // it is later, which is the direction [`deadline`] already argues
+    // for: every other deadline in this broker errs late, which is
+    // harmless, and only erring early is wrong. An interval of zero
+    // lands on the restore itself and the session goes on the first
+    // tick, which is what a running broker does with it too.
+    //
+    // A session that already had one keeps it. Time spent dead is time
+    // the client was away, and extending those by the length of the
+    // outage would be a second bug wearing the first one's clothes. It
+    // is also what keeps this composing with section 7.5 above: a
+    // stored deadline already past is dropped before reaching here,
+    // and a fresh one would have resurrected it.
+    session.set_expires_at(Some(
+        record
+            .expires_at
+            .unwrap_or_else(|| deadline(now, record.expiry_interval)),
+    ));
 
     for packet_id in &held.inbound {
         session.inbound.reserve(*packet_id);
@@ -751,6 +789,149 @@ mod tests {
     }
 
     #[test]
+    fn a_session_connected_when_the_broker_died_is_given_a_deadline() {
+        // A connected session has no stored deadline, because a
+        // connected session cannot expire and so never had one set.
+        // Restored verbatim it comes back offline with none, and
+        // `Session::is_expired` refuses to expire a session that has
+        // no deadline, so the crash makes it immortal: it holds its
+        // queue and its share of every body it references for the
+        // life of the file. The crash disconnected it, so it needs
+        // one.
+        let mut node = Node::new();
+        let handle = node.connect_with("crashed", None, 5);
+        node.subscribe(handle, "a/+", QoS::AtLeastOnce);
+        // No `vanish`. The broker died with this session attached.
+        let now = node.broker.clock().now();
+
+        let held = node.store.restore().expect("the store restores");
+        assert_eq!(
+            held.sessions[0].session.expires_at, None,
+            "nothing wrote a deadline for a session that was connected, \
+             which is what leaves restore with nothing to put back"
+        );
+
+        let (mut rebuilt, report) = node.rebuild();
+        assert_eq!(report.sessions, 1);
+        let restored = handle_of(&rebuilt, "crashed").expect("it came back");
+        assert_eq!(
+            rebuilt
+                .session(restored)
+                .expect("it came back")
+                .expires_at(),
+            // Not merely "some deadline": the value, restated from the
+            // rule. Five seconds from the restore, and the extra
+            // second because the clock is whole seconds and a deadline
+            // that errs late is harmless where one that errs early is
+            // wrong.
+            Some(now + 5 + 1),
+            "a restored session is not connected, so its interval runs \
+             from the restore"
+        );
+
+        let mut actions = Vec::new();
+        for _ in 0..7 {
+            rebuilt.tick(&mut actions);
+        }
+        assert_eq!(
+            rebuilt.session_count(),
+            0,
+            "its interval counts from the restore, and the restore is when \
+             it became a session nobody is attached to"
+        );
+        assert_eq!(
+            rebuilt.subscription_count(),
+            0,
+            "and it took its subscription with it"
+        );
+    }
+
+    #[test]
+    fn a_session_that_asked_to_outlive_nothing_goes_on_the_first_tick() {
+        // The interval the defect is worst for. Zero means the session
+        // ends with its connection, so a restore that leaves it
+        // deadlineless turns the one session that should never have
+        // outlived its socket into the one that outlives the file.
+        //
+        // A deadline of the restore itself is not a reprieve: it is
+        // the same boundary a running broker keeps, where the sweep
+        // advances the clock before it looks.
+        let mut node = Node::new();
+        let handle = node.connect_with("clean", None, 0);
+        node.subscribe(handle, "a/+", QoS::AtLeastOnce);
+        let now = node.broker.clock().now();
+
+        let (mut rebuilt, report) = node.rebuild();
+        assert_eq!(
+            report.sessions, 1,
+            "its deadline is the restore, and the restore has not passed"
+        );
+        let restored = handle_of(&rebuilt, "clean").expect("it came back");
+        assert_eq!(
+            rebuilt
+                .session(restored)
+                .expect("it came back")
+                .expires_at(),
+            Some(now),
+            "at once, which is not rounded up"
+        );
+
+        let mut actions = Vec::new();
+        rebuilt.tick(&mut actions);
+        assert_eq!(rebuilt.session_count(), 0, "one tick, and it is gone");
+        assert_eq!(rebuilt.subscription_count(), 0);
+    }
+
+    #[test]
+    fn a_stored_deadline_survives_restore_unchanged() {
+        // The other half of the rule above, and the bug it must not
+        // become: a session that was already disconnected when the
+        // broker died has a deadline, and time spent dead is time the
+        // client was away. Granting it a fresh one would extend every
+        // abandoned session by the length of the outage.
+        let mut node = Node::new();
+        let handle = node.connect_with("away", None, 600);
+        node.vanish(handle);
+        let stored = node.store.restore().expect("the store restores").sessions[0]
+            .session
+            .expires_at
+            .expect("a disconnected session has one");
+
+        // The outage, on the clock restore is judged against.
+        node.tick(5);
+
+        let (rebuilt, _) = node.rebuild();
+        let restored = handle_of(&rebuilt, "away").expect("it came back");
+        assert_eq!(
+            rebuilt
+                .session(restored)
+                .expect("it came back")
+                .expires_at(),
+            Some(stored),
+            "the deadline it left with is the deadline it keeps"
+        );
+    }
+
+    #[test]
+    fn a_stored_deadline_already_past_is_still_not_restored() {
+        // The two rules composing. Section 7.5 drops a session whose
+        // expiry passed while the broker was down, and the rule above
+        // hands a deadline to one that has none; a fix that gave every
+        // session a fresh deadline would resurrect the dropped ones.
+        let mut node = Node::new();
+        let handle = node.connect_with("short", None, 5);
+        node.vanish(handle);
+
+        let held = node.store.restore().expect("the store restores");
+        let mut rebuilt = Broker::new(config());
+        let report = restore(&mut rebuilt, &held, node.broker.clock().now() + 60);
+
+        assert_eq!(report.sessions, 0);
+        assert_eq!(report.expired, vec![SessionKey::new("", "short")]);
+        assert_eq!(rebuilt.session_count(), 0);
+    }
+
+    #[test]
     fn a_restored_inflight_entry_keeps_the_identifier_it_was_sent_under() {
         // Section 7.5, and section 6 behind it: the peer is waiting on
         // that identifier. A restored window under fresh identifiers
@@ -1092,6 +1273,20 @@ mod tests {
         node.tick(3);
 
         let (rebuilt, _) = node.rebuild();
-        assert_eq!(rebuilt.durable_state(), node.broker.durable_state());
+        let mut live = node.broker.durable_state();
+        // One field is expected to differ, and stating it is the point.
+        // The publisher is still connected, and a connected session has
+        // no deadline because it cannot expire; the rebuilt one is not,
+        // because nothing is attached to a session read off a disk, so
+        // restore gives it one counted from the restore. Its interval is
+        // `u32::MAX`, which saturates there whatever the clock reads.
+        // `tests/journal.rs` states the same rule over generated
+        // histories.
+        live.sessions
+            .get_mut(&SessionKey::new("", "pub"))
+            .expect("the publisher is held")
+            .session
+            .expires_at = Some(u32::MAX);
+        assert_eq!(rebuilt.durable_state(), live);
     }
 }

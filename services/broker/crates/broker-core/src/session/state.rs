@@ -397,7 +397,10 @@ impl Session {
 /// 3.1.3.2.2 and [MQTT-3.1.2-11] both say a period elapses before the
 /// thing happens, so the extra tick is the difference between late and
 /// wrong. A delay of zero means at once and is not rounded.
-fn deadline(now: u32, delay: u32) -> u32 {
+///
+/// Restore reaches this too, for a session that was connected when the
+/// broker died and so has no stored deadline to put back.
+pub(crate) fn deadline(now: u32, delay: u32) -> u32 {
     if delay == 0 {
         now
     } else {
