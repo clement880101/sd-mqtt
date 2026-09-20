@@ -150,8 +150,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_full_outbox_does_not_block_the_sender() {
-        // The lock is held while delivering, so blocking here would stall
-        // every other connection behind one slow reader.
+        // Not the broker's mutex: it is released before anything is
+        // delivered and this path never takes it. What waiting here
+        // would hold is the read half of the outboxes lock, which
+        // every connect and every teardown needs the write half of,
+        // and the caller itself — another connection with its own
+        // client to serve, or the one ticker task that drives every
+        // deadline in the process.
         let shared = Shared::new(Default::default());
         let _inbox = shared.register_outbox(SubscriberId(1), 1);
 
