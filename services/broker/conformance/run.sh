@@ -54,9 +54,18 @@ fail() { echo "conformance: $*" >&2; exit 1; }
 
 command -v python3 >/dev/null || fail "python3 is required"
 
-# A broker already on 1883 would be the one under test, and the run
-# would pass or fail for the wrong reasons. Checked where `lsof` exists;
-# where it does not, the first test fails loudly anyway.
+# What this catches is a broker already listening when the run starts:
+# the suites cannot be pointed elsewhere, so that broker would be the
+# one under test and the run would pass or fail for the wrong reasons.
+#
+# It is one look at one moment and not a claim on the port. Every test
+# below starts a broker and kills it, so the port is free between
+# tests, and a second runner started mid-run passes this check and then
+# fights this one for it. Harmless with one runner, which is the only
+# way this is run.
+#
+# Checked where `lsof` exists; where it does not, the first test fails
+# loudly anyway.
 if command -v lsof >/dev/null && lsof -iTCP:"$PORT" -sTCP:LISTEN -n -P >/dev/null 2>&1; then
   fail "port $PORT is already in use; the suites cannot be pointed elsewhere"
 fi
