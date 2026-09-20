@@ -4,3 +4,5 @@
 //! section 7.6 of the design builds one real backend and keeps the trait
 //! honest with an in-memory one, and both are proved on their own before
 //! anything depends on them.
+
+pub mod record;
