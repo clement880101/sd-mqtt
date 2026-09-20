@@ -416,7 +416,7 @@ pub fn will_message(will: &StoredWill) -> crate::session::message::Message {
         will.qos,
         will.retain,
     );
-    message.properties = Arc::new(will.properties.clone());
+    message.properties = Arc::new(will.properties.clone().into());
     message
 }
 

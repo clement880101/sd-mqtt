@@ -14,8 +14,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use foldhash::fast::RandomState;
-use mqtt_codec::{Properties, QoS};
+use mqtt_codec::QoS;
 use parking_lot::RwLock;
+
+use crate::properties::SharedProperties;
 
 /// A message held for future subscribers to a topic.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +47,7 @@ pub struct RetainedMessage {
     ///
     /// [`Message`]: crate::session::message::Message
     /// [`outbound::publish`]: crate::session::outbound
-    pub properties: Arc<Properties>,
+    pub properties: Arc<SharedProperties>,
 }
 
 /// Retained messages, stored by topic and queried by filter.
@@ -347,7 +349,7 @@ mod tests {
             payload: Bytes::from_static(body.as_bytes()),
             qos: QoS::AtMostOnce,
             expires_at: None,
-            properties: Arc::new(Properties::default()),
+            properties: Arc::new(Properties::default().into()),
         }
     }
 
@@ -544,7 +546,7 @@ mod tests {
     /// other test keeps saying "no properties" by construction.
     fn retained_with(body: &'static str, properties: &Properties) -> RetainedMessage {
         RetainedMessage {
-            properties: Arc::new(properties.clone()),
+            properties: Arc::new(properties.clone().into()),
             ..message(body)
         }
     }

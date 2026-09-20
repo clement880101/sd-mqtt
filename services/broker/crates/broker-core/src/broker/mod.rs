@@ -731,7 +731,7 @@ impl Broker {
                 publish.qos,
                 publish.retain,
             );
-            message.properties = Arc::new(publish.properties.clone());
+            message.properties = Arc::new(publish.properties.clone().into());
             message.expires_at = self.deadline(&publish.properties);
 
             Some(self.publish(message, Some(from), now, out))
@@ -806,7 +806,7 @@ impl Broker {
                         payload: message.payload.clone(),
                         qos: journal::stored_qos(message.qos),
                         expires_at: message.expires_at,
-                        properties: journal::stored_properties(&message.properties),
+                        properties: message.properties.encoded(),
                     },
                 });
             }

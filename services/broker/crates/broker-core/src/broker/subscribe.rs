@@ -208,7 +208,7 @@ mod tests {
                 payload: Bytes::from_static(b"kept"),
                 qos: QoS::AtMostOnce,
                 expires_at: None,
-                properties: Arc::new(Properties::default()),
+                properties: Arc::new(Properties::default().into()),
             },
         );
         Fixture {
@@ -548,7 +548,7 @@ mod tests {
                 payload: Bytes::from_static(b"stale"),
                 qos: QoS::AtMostOnce,
                 expires_at: Some(5),
-                properties: Arc::new(Properties::default()),
+                properties: Arc::new(Properties::default().into()),
             },
         );
         let mut out = Vec::new();

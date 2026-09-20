@@ -40,6 +40,7 @@ use storage::record::{
     SubscriptionRecord,
 };
 
+use crate::properties::SharedProperties;
 use crate::registry::SessionId;
 use crate::retained::RetainedMessage;
 use crate::session::inflight::{InflightEntry, InflightState};
@@ -195,7 +196,11 @@ pub fn body_record(message: &Message) -> BodyRecord {
         qos: stored_qos(message.qos),
         retain: message.retain,
         expires_at: message.expires_at,
-        properties: stored_properties(&message.properties),
+        // Encoded once for the whole fan-out: a thousand sessions
+        // holding one message journal a thousand of these records and
+        // the store keeps one body, so a thousand encodes of one block
+        // would produce one row. See [`SharedProperties`].
+        properties: message.properties.encoded(),
     }
 }
 
@@ -207,7 +212,12 @@ pub fn live_message(id: StoredMessageId, body: &BodyRecord) -> Message {
         payload: body.payload.clone(),
         qos: live_qos(body.qos),
         retain: body.retain,
-        properties: Arc::new(live_properties(&body.properties)),
+        // Both halves are already in hand, so the block is not
+        // encoded again to get back the bytes it was decoded from.
+        properties: Arc::new(SharedProperties::from_encoded(
+            live_properties(&body.properties),
+            body.properties.clone(),
+        )),
         expires_at: body.expires_at,
     }
 }
@@ -282,7 +292,7 @@ pub fn retained_record(message: &RetainedMessage) -> RetainedRecord {
         payload: message.payload.clone(),
         qos: stored_qos(message.qos),
         expires_at: message.expires_at,
-        properties: stored_properties(&message.properties),
+        properties: message.properties.encoded(),
     }
 }
 
@@ -292,7 +302,10 @@ pub fn live_retained(record: &RetainedRecord) -> RetainedMessage {
         payload: record.payload.clone(),
         qos: live_qos(record.qos),
         expires_at: record.expires_at,
-        properties: Arc::new(live_properties(&record.properties)),
+        properties: Arc::new(SharedProperties::from_encoded(
+            live_properties(&record.properties),
+            record.properties.clone(),
+        )),
     }
 }
 

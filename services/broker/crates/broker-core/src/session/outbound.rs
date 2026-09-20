@@ -788,7 +788,7 @@ fn publish(item: &Delivery, packet_id: Option<u16>, now: u32) -> Packet {
     // The property block is cloned per delivery because the subscription
     // identifiers differ per subscriber. That clone is the packet-sizing
     // question recorded in the design spec's open questions.
-    let mut properties = (*item.message.properties).clone();
+    let mut properties = item.message.properties.live().clone();
     properties.subscription_identifiers = item.subscription_ids.clone();
     // [MQTT-3.3.2-6]: what the client is told is what is left, not what
     // was published. `expires_at` is the subtraction already done, so
@@ -817,7 +817,13 @@ mod tests {
         SessionKey::new("", "c")
     }
 
+    /// A property block as a message carries one.
+    fn shared(properties: Properties) -> Arc<SharedProperties> {
+        Arc::new(SharedProperties::new(properties))
+    }
+
     use super::*;
+    use crate::properties::SharedProperties;
     use crate::session::message::Message;
     use crate::session::queue::{Delivery, DropReason, QueueLimits};
     use crate::session::Action;
@@ -831,7 +837,7 @@ mod tests {
         let mut actions = Vec::new();
         let mut item = delivery(QoS::AtMostOnce, b"body");
         item.message.expires_at = Some(60);
-        item.message.properties = Arc::new(Properties {
+        item.message.properties = shared(Properties {
             message_expiry_interval: Some(60),
             ..Properties::default()
         });
@@ -861,7 +867,7 @@ mod tests {
         let mut actions = Vec::new();
         let mut item = delivery(QoS::AtMostOnce, b"body");
         item.message.expires_at = Some(60);
-        item.message.properties = Arc::new(Properties {
+        item.message.properties = shared(Properties {
             message_expiry_interval: Some(60),
             ..Properties::default()
         });
@@ -888,7 +894,7 @@ mod tests {
         let mut actions = Vec::new();
         let mut item = delivery(QoS::AtLeastOnce, b"body");
         item.message.expires_at = Some(60);
-        item.message.properties = Arc::new(Properties {
+        item.message.properties = shared(Properties {
             message_expiry_interval: Some(60),
             ..Properties::default()
         });
@@ -1783,7 +1789,7 @@ mod tests {
         let mut out = online(10);
         let mut actions = Vec::new();
         let mut item = delivery(QoS::AtLeastOnce, b"x");
-        item.message.properties = Arc::new(Properties {
+        item.message.properties = shared(Properties {
             subscription_identifiers: vec![3],
             ..Properties::default()
         });

@@ -11,6 +11,7 @@ pub mod broker;
 pub mod clock;
 pub mod journal;
 pub mod keepalive;
+pub mod properties;
 pub mod registry;
 pub mod restore;
 pub mod retained;

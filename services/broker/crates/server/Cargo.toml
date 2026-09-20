@@ -31,6 +31,16 @@ tokio = { version = "1", default-features = false, features = [
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# The redb backend, for `tests/throughput.rs` alone. What a store costs
+# the broker is a question about a real device, and the in-memory
+# backend this crate's other tests use answers it with a number from a
+# machine with no disk in it. A dev-dependency rather than a feature:
+# nothing this crate ships gains redb, and `cargo tree -p sdmqtt-server
+# -e normal` is still free of it.
+storage = { path = "../storage", version = "0.1.0", features = ["redb"] }
+# For the throughput harness's temporary store directory, thrown away
+# with the measurement.
+tempfile.workspace = true
 # test-util is what `#[tokio::test(start_paused = true)]` needs. Without
 # it the ticker tests wait on real seconds instead of asserting a
 # schedule, which is slow and flaky and proves less.

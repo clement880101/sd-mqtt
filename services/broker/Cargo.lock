@@ -714,6 +714,7 @@ dependencies = [
  "mqtt-codec",
  "parking_lot",
  "storage",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

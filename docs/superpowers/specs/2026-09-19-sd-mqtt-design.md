@@ -1128,6 +1128,125 @@ needs it, and the resolution is recorded as an architecture decision record.
   the same 64 KiB bodies measured over 8 MiB read 3.89, which is redb's
   file growth granularity rather than anything about the payload.
 
+- **What a store costs the broker, measured.** The two questions above
+  measured the lock with no store and the store with no broker. This is
+  the two together, on the same harness as the lock figures —
+  `services/broker/crates/server/tests/throughput.rs`, now four ignored
+  tests — run with
+  `cargo test -p sdmqtt-server --release --test throughput -- --ignored
+  --nocapture --test-threads 1`. Machine: Apple M2 Pro, 12 logical
+  cores, 32 GB, macOS 26.4.1, arm64, release profile, internal APFS
+  SSD, loopback TCP, MQTT 5, 32-byte payloads, one subscriber per
+  publisher on its own topic, three-second window after a one-second
+  warm-up. Both rows of each table were measured in the same run, so
+  the comparison is not against a figure recorded on another day.
+
+  At most once, paced at 512 outstanding per pair, nothing discarded:
+
+  | publishers | no store, msg/s | redb, msg/s |
+  |---:|---:|---:|
+  | 1 | 429,000 | 428,000 |
+  | 2 | 345,000 | 354,000 |
+  | 4 | 230,000 | 231,000 |
+  | 8 | 173,000 | 174,000 |
+  | 16 | 214,000 | 217,000 |
+
+  **A store costs at-most-once delivery nothing, and the reason is that
+  nothing is written.** Section 7.3 journals such a publication only
+  where it touches durable state, and one delivered straight to an
+  attached subscriber touches none: `Outbound::offer` dispatches it
+  without pushing it on to a queue, so the whole exchange produces no
+  record. The column is here to show that rather than to find a cost.
+  The no-store column also reproduces milestone one's curve on the same
+  machine, 429,000 against 452,000 at one publisher, which is the check
+  that nothing else moved underneath it.
+
+  At least once, each publisher keeping exactly one publication
+  outstanding, so the publisher count is the concurrent-waiter count
+  the storage measurement is in:
+
+  | publishers | no store, ack/s | redb, ack/s | per waiter | storage crate predicted |
+  |---:|---:|---:|---:|---:|
+  | 1 | 30,000 | 340 | 340 | 334 |
+  | 2 | 41,500 | 365 | 182 | ~670 |
+  | 4 | 53,200 | 1,125 | 281 | ~1,340 |
+  | 8 | 58,700 | 2,630 | 329 | ~2,680 |
+  | 16 | 62,500 | 4,900 | 306 | ~5,350 |
+  | 100 | 66,000 | 11,100 | 111 | 25,100 |
+
+  Every figure is the mean of two runs that agreed to within 5%.
+
+  **The prediction holds at one waiter exactly and is optimistic
+  everywhere above it.** One publisher awaiting an acknowledgement gets
+  340 a second where the store alone gave 334, so the broker adds
+  nothing measurable to a message that is waiting for a disk. Coalescing
+  then works, but not as well through the broker as through the store:
+  a hundred waiters get 11,100 rather than 25,100, which is 45% of the
+  store's own ceiling and 33 times the single-waiter rate rather than
+  75.
+
+  **The shape differs, and the reason is that a message is not a
+  record.** The storage measurement wrote one small record per durable
+  write. An acknowledged publication through the broker journals a body,
+  a queue push, a queue pop and an inflight entry before the
+  acknowledgement is owed, and the body carries the payload; the
+  subscriber's own acknowledgement then adds two more records to the
+  next flush. So a hundred waiters are not a hundred records per flush
+  but closer to six hundred, and the flush is correspondingly longer.
+  The store's figure is the ceiling on durable **commits**, not on
+  acknowledged messages, and the difference between the two is how much
+  the broker writes per message.
+
+  **Two waiters get no more between them than one gets alone** — 365 a
+  second against 340, so 182 each. It is reproducible across runs and it
+  is not noise. The writer flushes what has accumulated since the last
+  flush, and a batch that arrives while a flush is in progress waits for
+  the next one; two publishers in a strict round trip arrive almost
+  exactly in each other's flush windows, so each pays a whole flush of
+  its own. At four and above enough waiters accumulate behind each flush
+  for the coalescing to pay. Nothing is broken here, but a deployment
+  with two acknowledged publishers should not expect twice one.
+
+  Beside the at-most-once row: the same broker moves 428,000 unpromised
+  messages a second and 11,100 promised ones. **That factor of forty is
+  the price of the promise**, and it is paid to the device rather than
+  to the lock.
+
+- **Encoding a property block once per subscriber, found and fixed.**
+  `journal::body_record` built each subscriber's body record by
+  encoding the message's property block again, though the store keeps
+  one body per message however many sessions hold it. On the same
+  machine, a publish to a fan-out of a thousand offline durable
+  sessions cost 654 ns per subscriber with a realistic 95-byte block
+  against 435 ns with an empty one, and a fan-out of a hundred cost 465
+  against 248: a third to a half of the work of a fan-out was producing
+  copies of one answer. The block itself encodes in 284 ns, which is
+  the check that the difference is the encode and not something else
+  that grew with the fan-out.
+
+  `broker_core::properties::SharedProperties` now carries the block and
+  its encoding together, filling the encoding on the first ask and
+  sharing the buffer with every asker after it. Lazily, because an
+  at-most-once publication to an attached client is journalled nowhere
+  and encoding eagerly would charge the hot path for bytes no record
+  wants; and with no way to change a block in place, because a cache is
+  only honest while what it was taken from cannot change.
+
+  | fan-out | before, ns/subscriber | after, ns/subscriber |
+  |---:|---:|---:|
+  | 1 | 1,730 / 1,950 | 1,740 / 2,030 |
+  | 10 | 369 / 570 | 310 / 328 |
+  | 100 | 248 / 465 | 193 / 185 |
+  | 1,000 | 435 / 654 | 393 / 366 |
+
+  Empty block first, realistic block second, each the mean of three
+  runs. The two columns meet afterwards, and at a fan-out of one
+  nothing changed — one encode is still one encode, and the 4% between
+  1,950 and 2,030 is inside the spread of the runs it is the mean of. The measurement is
+  `what_a_property_block_costs_a_fan_out` in the same harness, kept so
+  that a build which re-encoded per subscriber would pull the two
+  columns apart again.
+
 - **Two fjall behaviours worth remembering if this is ever revisited.**
   Its length call counts deleted entries, so it cannot answer queue
   depth; and its keyspaces cost roughly thirty milliseconds each to
