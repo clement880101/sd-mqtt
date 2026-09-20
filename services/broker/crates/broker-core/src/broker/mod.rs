@@ -923,6 +923,42 @@ mod tests {
     }
 
     #[test]
+    fn a_three_one_one_session_with_clean_session_set_does_not_outlive_its_connection() {
+        // The other half of the test above, and the half that was
+        // unguarded: that one was added when reading the clear flag as
+        // "ends with the connection" was the bug, so only the clear
+        // case has ever been asserted. Deleting the arm that reads the
+        // set flag leaves every 3.1.1 session living for the maximum
+        // interval, which is [MQTT-3.1.2-6] broken in the direction
+        // nothing complains about: a peer-driven leak of sessions that
+        // never expire, one per identifier it cares to invent.
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+
+        let mut connect = connect_v311("ephemeral");
+        connect.clean_start = true;
+        let first = broker.connect("", &connect, &mut out);
+        broker.disconnect(first.subscriber, &mut out);
+        broker.tick(&mut out);
+
+        assert_eq!(
+            broker.session_count(),
+            0,
+            "[MQTT-3.1.2-6]: the session must not outlast its connection"
+        );
+
+        // And asked for by name rather than inferred from the count: a
+        // resuming connect is what would find it if it were still there.
+        let mut resuming = connect_v311("ephemeral");
+        resuming.clean_start = false;
+        let second = broker.connect("", &resuming, &mut out);
+        assert!(
+            !second.session_present,
+            "[MQTT-3.1.2-6]: there is nothing left to resume"
+        );
+    }
+
+    #[test]
     fn a_version_five_session_with_no_expiry_property_does_not_outlive_its_connection() {
         // The mirror of the test above, and the half no other test
         // reached: every existing session-expiry test names an interval
