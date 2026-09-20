@@ -145,9 +145,42 @@ where
 
     // Nothing below this point is owed to the broker: it does not know
     // this connection exists yet, so these returns are free.
-    let mut connect = match first_packet(&mut reader, config.connect_timeout).await? {
-        Some(connect) => connect,
-        None => return Ok(()),
+    let mut connect = match first_packet(&mut reader, config.connect_timeout).await {
+        Ok(Some(connect)) => connect,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            if let ConnectionError::Frame(FrameError::Protocol(CodecError::UnsupportedVersion(_))) =
+                &error
+            {
+                // Section 2, and both standards: a protocol level we do
+                // not serve is answered rather than dropped. MQTT 5
+                // wants 0x84 and 3.1.1 return code 1, and [MQTT-3.1.4-5]
+                // requires the acknowledgement even though the server
+                // then closes the connection.
+                //
+                // Answered in 3.1.1 form because the version is
+                // precisely what could not be parsed, so there is none
+                // to encode in. A refusing CONNACK is the same four
+                // bytes in 3.1, 3.1.1 and 5, and the return code for
+                // this refusal is 1 in both of the older versions, so
+                // whichever level the client named it can read the
+                // answer. A 5 client would rather have 0x84, but a
+                // client that reached this path did not claim to be
+                // one. Bytes we could not parse at all still get
+                // nothing, which is all there is to give them.
+                //
+                // A failure to write is discarded rather than returned:
+                // the socket is ending either way, and the version is
+                // the ending worth reporting.
+                let _ = refuse(
+                    &mut write_half,
+                    Version::V311,
+                    ReasonCode::UnsupportedProtocolVersion,
+                )
+                .await;
+            }
+            return Err(error);
+        }
     };
     let version = connect.version;
 
@@ -989,6 +1022,99 @@ mod tests {
             .expect("the server reacts")
             .unwrap();
         assert_eq!(n, 0, "the connection is closed, not answered");
+    }
+
+    /// A CONNECT naming a protocol level, built by hand.
+    ///
+    /// By hand because the encoder will not produce one: it writes the
+    /// level from a `Version`, and there is no `Version` for a level we
+    /// do not serve. That is the same absence the refusal has to work
+    /// around, seen from the writing side.
+    fn connect_at_level(level: u8) -> Vec<u8> {
+        let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T'];
+        body.push(level);
+        // Clean session, no will, no credentials.
+        body.push(0x02);
+        // Keep alive.
+        body.extend_from_slice(&[0x00, 0x00]);
+        // Client identifier "c".
+        body.extend_from_slice(&[0x00, 0x01, b'c']);
+        let mut out = vec![0x10, u8::try_from(body.len()).expect("a short packet")];
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[tokio::test]
+    async fn an_unserved_protocol_version_is_refused_out_loud() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(shared);
+
+        // Level 3 is MQTT 3.1, which section 2 says is "rejected with an
+        // unacceptable protocol version response".
+        client.write_all(&connect_at_level(3)).await.unwrap();
+
+        // Asserted as bytes rather than as a decoded reason, because the
+        // code is the whole content of the answer. That a packet arrived
+        // is the easy half and proves nothing: a CONNACK carrying
+        // Success would satisfy it while telling the client it had been
+        // accepted. 0x20 0x02 is the header of a two byte CONNACK, 0x00
+        // the session present flag that a failure must carry
+        // [MQTT-3.2.2-6], and 0x01 the 3.1.1 return code for an
+        // unacceptable protocol version.
+        let mut reply = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut reply))
+            .await
+            .expect("the refusal arrives")
+            .expect("the socket carries it rather than closing");
+        assert_eq!(
+            reply,
+            [0x20, 0x02, 0x00, 0x01],
+            "a connack refusing the version, not silence and not an acceptance"
+        );
+
+        // [MQTT-3.1.4-5]: the acknowledgement is required even though
+        // the server then closes the connection.
+        let mut rest = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut rest))
+            .await
+            .expect("the socket closes")
+            .unwrap();
+        assert_eq!(n, 0, "nothing follows the refusal");
+    }
+
+    #[tokio::test]
+    async fn a_connect_that_is_merely_malformed_is_not_blamed_on_its_version() {
+        // The other side of the boundary, and the reason it is here: a
+        // mutation widening the refusal to every protocol error the
+        // decoder can raise survived the whole suite. A client whose
+        // CONNECT is garbled would then be told the one thing that was
+        // not wrong with it, and 3.1.4 lets a server close without a
+        // CONNACK when it cannot validate the packet at all.
+        //
+        // [MQTT-3.1.2-1] is why the protocol name is the case chosen:
+        // an incorrect one may be disconnected, and it is the nearest
+        // neighbour of the refusal above.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(shared);
+
+        let mut bytes = connect_at_level(4);
+        // "MQTT" becomes "MQTX", leaving every other field valid. The
+        // name is the two length bytes and four characters that follow
+        // the two byte fixed header, so its last character is here.
+        bytes[7] = b'X';
+        client.write_all(&bytes).await.unwrap();
+
+        let mut chunk = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut chunk))
+            .await
+            .expect("the server reacts")
+            .unwrap();
+        assert_eq!(
+            n,
+            0,
+            "closed in silence, not answered with a version refusal: got {:?}",
+            &chunk[..n]
+        );
     }
 
     #[tokio::test]
