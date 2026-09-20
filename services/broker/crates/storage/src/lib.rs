@@ -14,8 +14,11 @@
 
 use std::path::PathBuf;
 
+pub mod memory;
 pub mod record;
 pub mod restore;
+
+pub use memory::MemoryStorage;
 
 pub use record::{
     BodyRecord, DeliveryRecord, FormatError, FormatMarker, InflightRecord, InflightState,
@@ -83,9 +86,75 @@ pub enum StorageError {
         /// Where the store is.
         path: PathBuf,
     },
+    /// A record contradicted what the store already holds, and the batch
+    /// carrying it was applied in full or not at all, which means not at
+    /// all.
+    #[error("the store refused a record: {0}")]
+    Rejected(#[from] Rejection),
     /// The underlying device or file system failed.
     #[error("storage I/O failed: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Why a store refused a record.
+///
+/// Separate from the rest of [`StorageError`] because these are the
+/// caller's mistakes rather than the disk's, and separate from each other
+/// because convention 2 says a test asserting a category is not guarding
+/// the check it is named after: `Rejected(_)` would pass for any of the
+/// three.
+///
+/// Each of these is a fact the store cannot record without losing
+/// something it already holds, so refusing is the only honest answer.
+/// Everything a caller might plausibly repeat — reserving an inbound
+/// identifier twice, popping a sequence already popped, removing a session
+/// that is gone, unsubscribing from a filter it does not hold — is a
+/// no-op instead, because for those the postcondition the record asks for
+/// already holds.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Rejection {
+    /// A record named a session the store does not hold.
+    ///
+    /// Accepting it would put a queue, a subscription or an inflight entry
+    /// somewhere [`Storage::restore`] does not look, because restore walks
+    /// sessions. The state would be neither stored nor reported missing,
+    /// which is the one outcome worse than an error.
+    #[error("no session is held for client {:?} at mountpoint {:?}", .session.client_id, .session.mountpoint)]
+    NoSuchSession {
+        /// Which session was named.
+        session: SessionKey,
+    },
+    /// A queue push reused a sequence number.
+    ///
+    /// Section 7.4: two entries sharing a number, or a number going
+    /// backwards, is what must never happen. The store holds the
+    /// high-water mark precisely so it can say no.
+    #[error(
+        "sequence {sequence} was already assigned to client {:?} at mountpoint {:?}, whose highest is {highest}",
+        .session.client_id,
+        .session.mountpoint
+    )]
+    SequenceReused {
+        /// Whose queue.
+        session: SessionKey,
+        /// The number the push asked for.
+        sequence: u64,
+        /// The highest ever assigned to that session.
+        highest: u64,
+    },
+    /// A body was released more often than it was stored.
+    ///
+    /// The reference count is the only thing standing between a shared
+    /// body and a queue entry that names nothing, so a release with no
+    /// matching put is refused rather than clamped at zero. Clamping would
+    /// turn a caller's double release into a body deleted underneath a
+    /// live reference, which is a message lost and a restore that cannot
+    /// complete.
+    #[error("body {:?} was released more often than it was stored", .id.0)]
+    BodyNotHeld {
+        /// Which body.
+        id: MessageId,
+    },
 }
 
 impl From<FormatError> for StorageError {
@@ -120,6 +189,30 @@ pub trait Storage: Send + Sync + 'static {
     /// the broker has taken responsibility for a message, so sending one
     /// before the flush returns means a restart can lose a message the
     /// publisher was told was safe.
+    ///
+    /// Records take effect in order, so a batch may create a session and
+    /// then fill it. A batch that returns an error has changed nothing,
+    /// including the records before the one that failed. [`Rejection`]
+    /// lists what is refused and what is a no-op instead.
+    ///
+    /// # References to a body are taken and released explicitly
+    ///
+    /// [`Record::BodyPut`] takes one reference and
+    /// [`Record::BodyReleased`] drops one; **no other record changes the
+    /// count.** In particular a [`Record::QueuePopped`] does not release
+    /// the body its entry named, because the usual reason to pop is to
+    /// send the message, and for anything above at-most-once the
+    /// [`Record::InflightPut`] that follows names the same body. A store
+    /// that released on pop would delete it between the two. By the same
+    /// argument a [`Record::SessionRemoved`] does not release the bodies
+    /// of the entries it discards: a caller that already emits the
+    /// releases would then release twice, and the store cannot tell the
+    /// two callers apart.
+    ///
+    /// The cost of that choice is that a caller which drops a queue entry
+    /// without releasing its body leaks the body, and nothing reclaims it.
+    /// That is a leak rather than a loss, and it is the direction to err
+    /// in.
     fn apply(&self, records: &[Record]) -> Result<(), StorageError>;
 
     /// Make everything applied so far durable, as hard as the configured
@@ -166,6 +259,12 @@ pub trait Storage: Send + Sync + 'static {
     /// assignment and not of what survives, so this is the high-water mark
     /// rather than the largest key present. Zero for a session that has
     /// never been pushed to, which makes the first assigned number one.
+    ///
+    /// Zero again once the session is removed. The mark belongs to the
+    /// session, not to the key, so a client that reconnects under the same
+    /// identifier after its session was destroyed inherits nothing from
+    /// it. A store that kept the mark would be the same bug as a store
+    /// that kept the queue, only quieter.
     fn highest_sequence(&self, session: &SessionKey) -> Result<u64, StorageError>;
 }
 
