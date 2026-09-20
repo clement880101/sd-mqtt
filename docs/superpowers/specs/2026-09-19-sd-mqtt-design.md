@@ -915,6 +915,31 @@ needs it, and the resolution is recorded as an architecture decision record.
   always accepts a retained message is a legal server whatever it
   advertises. They are recorded in the milestone 1.5 plan.
 
+- **What the final review found, after all of that.** Two defects worth
+  naming. `Queue::would_refuse`, which the shared-subscription skip asks
+  before choosing a member, modelled one of the three reasons
+  `Queue::push` refuses, so an offline durable member answered "I have
+  room" to a fire-and-forget message and then dropped it while an online
+  member sat idle. And the writer's outbox stayed a hard 1024 after the
+  queue bounds it drains became configurable, so a large configured
+  queue could overflow it, discarding acknowledged deliveries whose
+  window slots were already held. Both are fixed; the outbox is now
+  derived from the bounds and a configuration that breaks the relation
+  is refused at startup.
+
+  Six further rules had no test that could fail, **including the
+  takeover guard**, on which every takeover depends: deleting it lets a
+  displaced connection tear down the session a newcomer has just taken
+  over, and the whole suite stayed green. Its sibling rule was tested,
+  but only by constructing the type by hand, so no test ever walked the
+  connection. That is the lesson recorded in convention 5.
+
+  The running total for milestone one is twenty-two defects found after
+  the feature work was complete, by three methods in order of yield:
+  an independent conformance suite, a walk of the spec against the code,
+  and mutation testing during review. None of the three found what
+  either of the others did.
+
 - **Eight conformance defects, found by the suite and since fixed.**
   Kept here rather than deleted, because the finding is worth more than
   the fixes and a reader who meets the defect list in the history should

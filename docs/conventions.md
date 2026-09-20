@@ -85,6 +85,14 @@ was not, which is the failure mode that survives review by looking green.
   fifty thousand armed. The accessor added to assert bounded work
   measured only the half that already was.
 
+- **A test that constructs the type instead of walking the path.** The
+  rule that stops a displaced connection tearing down the session a
+  newcomer took over was guarded by a test that built the struct by
+  hand. Deleting the guard from the connection changed nothing the suite
+  could see, because no test ever reached it through a socket. A unit
+  test of a helper is not a test of the caller that was supposed to use
+  it.
+
 The question to ask of any new test: what would have to be true for this
 to fail, and can the inputs actually make it true? If the answer is "the
 feature would have to be absent", the test is not guarding it.
