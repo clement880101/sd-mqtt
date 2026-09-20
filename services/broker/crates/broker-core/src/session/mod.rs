@@ -15,6 +15,7 @@ pub mod message;
 pub mod outbound;
 pub mod packet_ids;
 pub mod queue;
+pub mod state;
 
 /// Something the caller must do as a result of an input.
 ///
@@ -58,3 +59,4 @@ pub use message::{Message, MessageId};
 pub use outbound::Outbound;
 pub use packet_ids::PacketIds;
 pub use queue::{Delivery, DropReason, Overflow, Queue, QueueLimits};
+pub use state::{Session, StoredWill};

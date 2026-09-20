@@ -9,6 +9,7 @@
 
 pub mod clock;
 pub mod keepalive;
+pub mod registry;
 pub mod retained;
 pub mod session;
 pub mod subscriptions;
