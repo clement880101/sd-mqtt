@@ -178,6 +178,11 @@ impl Session {
         self.expiry_interval = seconds;
     }
 
+    /// How long the session outlives its connection.
+    pub fn expiry_interval(&self) -> u32 {
+        self.expiry_interval
+    }
+
     /// Whether the session may be destroyed. A connected one never may.
     pub fn is_expired(&self, now: u32) -> bool {
         !self.connected && self.expires_at.is_some_and(|at| now >= at)

@@ -410,6 +410,24 @@ impl Broker {
                 Ok(())
             }
             Packet::Disconnect(disconnect) => {
+                // 3.14.2.2.2 lets a client change how long its session
+                // outlives this connection. [MQTT-3.14.4-3] bars it from
+                // raising an interval of zero: a session that asked to
+                // end with its connection cannot be kept alive on the
+                // way out.
+                //
+                // This runs before `detach`, because `on_disconnected`
+                // computes `expires_at` from the interval.
+                if let Some(requested) = disconnect.properties.session_expiry_interval {
+                    let session = self
+                        .registry
+                        .get_mut(subscriber)
+                        .ok_or(ReasonCode::ProtocolError)?;
+                    if requested != 0 && session.expiry_interval() == 0 {
+                        return Err(ReasonCode::ProtocolError);
+                    }
+                    session.set_expiry_interval(requested);
+                }
                 // Whether a disconnect packet leaves the will standing
                 // depends on the reason code and the protocol version,
                 // and the session already holds that rule.
@@ -727,7 +745,7 @@ fn expiry_interval(connect: &Connect) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mqtt_codec::packet::Connect;
+    use mqtt_codec::packet::{Connect, Disconnect};
 
     /// A minimal MQTT 5 connect for the given client, resuming rather
     /// than discarding whatever session it already has.
@@ -797,6 +815,102 @@ mod tests {
         assert!(
             !second.session_present,
             "3.1.2.11.2: an absent Session Expiry Interval is zero, not forever"
+        );
+    }
+
+    /// Advance the broker's clock to `seconds`, running every tick on
+    /// the way so that nothing due is stepped over.
+    fn run_to(broker: &mut Broker, seconds: u32, out: &mut Vec<Addressed>) {
+        while broker.clock().now() < seconds {
+            broker.tick(out);
+        }
+    }
+
+    #[test]
+    fn a_disconnect_may_extend_the_session() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let mut connect = connect_v5("mover");
+        connect.properties.session_expiry_interval = Some(1);
+        let first = broker.connect("", &connect, &mut out);
+
+        let goodbye = Packet::Disconnect(Disconnect {
+            reason: ReasonCode::Success,
+            properties: Properties {
+                session_expiry_interval: Some(300),
+                ..Properties::default()
+            },
+        });
+        broker.handle(first.subscriber, &goodbye, &mut out).unwrap();
+
+        // Past the interval the CONNECT asked for, inside the one the
+        // DISCONNECT asked for.
+        run_to(&mut broker, 60, &mut out);
+        let second = broker.connect("", &connect, &mut out);
+        assert!(
+            second.session_present,
+            "3.14.2.2.2: the DISCONNECT's interval stands"
+        );
+    }
+
+    #[test]
+    fn a_disconnect_must_not_resurrect_a_session_that_asked_to_end() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let mut connect = connect_v5("liar");
+        connect.properties.session_expiry_interval = Some(0);
+        let first = broker.connect("", &connect, &mut out);
+
+        let goodbye = Packet::Disconnect(Disconnect {
+            reason: ReasonCode::Success,
+            properties: Properties {
+                session_expiry_interval: Some(300),
+                ..Properties::default()
+            },
+        });
+        assert_eq!(
+            broker.handle(first.subscriber, &goodbye, &mut out),
+            Err(ReasonCode::ProtocolError),
+            "[MQTT-3.14.4-3]: zero on CONNECT cannot become non-zero on DISCONNECT"
+        );
+    }
+
+    #[test]
+    fn a_disconnect_repeating_an_interval_of_zero_is_not_an_error() {
+        // [MQTT-3.14.4-3] forbids raising an interval of zero, not
+        // restating it. An explicit `Some(0)` on a session already at
+        // zero asks for nothing it did not have, and a client that
+        // spells out its default is common; refusing it would close a
+        // conforming connection with a protocol error.
+        //
+        // This is the half the two tests above cannot reach: both send
+        // a non-zero interval, so a check that dropped the
+        // `requested != 0` term and rejected every zero passed them.
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let mut connect = connect_v5("plainspoken");
+        connect.properties.session_expiry_interval = Some(0);
+        let first = broker.connect("", &connect, &mut out);
+
+        let goodbye = Packet::Disconnect(Disconnect {
+            reason: ReasonCode::Success,
+            properties: Properties {
+                session_expiry_interval: Some(0),
+                ..Properties::default()
+            },
+        });
+        assert_eq!(
+            broker.handle(first.subscriber, &goodbye, &mut out),
+            Ok(()),
+            "3.14.2.2.2: restating an interval of zero is legal"
+        );
+
+        // And it meant it: the session still ends with the connection.
+        broker.tick(&mut out);
+        let second = broker.connect("", &connect, &mut out);
+        assert!(
+            !second.session_present,
+            "zero still means the session ends with its connection"
         );
     }
 }
