@@ -6,6 +6,7 @@ use mqtt_codec::packet::{Ack, Publish};
 use mqtt_codec::{Packet, Properties, QoS, ReasonCode};
 
 use crate::session::inflight::{Inflight, InflightEntry, InflightState};
+use crate::session::message::Message;
 use crate::session::packet_ids::PacketIds;
 use crate::session::queue::{Delivery, DropReason, Queue, QueueLimits};
 use crate::session::Action;
@@ -47,6 +48,26 @@ impl Outbound {
         self.inflight.set_limit(limit);
     }
 
+    /// Whether this message, delivered at `qos`, would be refused.
+    ///
+    /// Asked of a shared subscription's members before one of them is
+    /// handed the message, which is the only way section 6's "a member
+    /// whose queue is full is skipped" can be honoured: an offer that is
+    /// refused has already lost the message.
+    ///
+    /// The whole message rather than its size, and this session's own
+    /// attachment, because [`Queue::would_refuse`] weighs all three of
+    /// the reasons an offer is refused and two of them — expiry, and a
+    /// fire-and-forget delivery to a session with nobody attached — are
+    /// invisible in a byte count.
+    ///
+    /// Only the queue is consulted. A full inflight window is not a
+    /// refusal, because the queue exists precisely to hold what the
+    /// window has no room for.
+    pub fn would_refuse(&self, message: &Message, qos: QoS, now: u32) -> bool {
+        self.queue.would_refuse(message, qos, now, self.online)
+    }
+
     /// Offer a message for delivery.
     pub fn offer(&mut self, item: Delivery, now: u32, out: &mut Vec<Action>) {
         self.scratch.clear();
@@ -71,7 +92,7 @@ impl Outbound {
     /// Put one message on the wire. Returns whether to keep going.
     fn dispatch(&mut self, item: Delivery, now: u32, out: &mut Vec<Action>) -> bool {
         if item.qos == QoS::AtMostOnce {
-            out.push(Action::Send(publish(&item, None)));
+            out.push(Action::Send(publish(&item, None, now)));
             return true;
         }
 
@@ -94,7 +115,7 @@ impl Outbound {
             }
         };
 
-        out.push(Action::Send(publish(&item, Some(packet_id))));
+        out.push(Action::Send(publish(&item, Some(packet_id), now)));
         let state = if item.qos == QoS::AtLeastOnce {
             InflightState::AwaitingAck
         } else {
@@ -138,6 +159,46 @@ impl Outbound {
         }
         self.pump(now, out);
         Ok(())
+    }
+
+    /// A publish was discarded on the way out, and no acknowledgement
+    /// for it can ever arrive.
+    ///
+    /// [MQTT-3.1.2-24] forbids sending a packet larger than the peer's
+    /// Maximum Packet Size, and [MQTT-3.1.2-25] says what to do
+    /// instead: "discard the packet and behave as if it had completed
+    /// delivery". Behaving that way is the whole of this method, and
+    /// it is the half that is easy to omit. Dropping only the bytes
+    /// leaves the entry in the window and its identifier reserved,
+    /// waiting on a peer that was never told to answer, so the window
+    /// fills one message at a time and delivery stops for good.
+    ///
+    /// Silent when the identifier names nothing outstanding, or names
+    /// an entry the peer already owns. The caller is a writer draining
+    /// a queue, so the session it addresses may have been resumed or
+    /// taken over since the packet was rendered; an unconditional
+    /// release would then settle an unrelated delivery. An entry in
+    /// [`InflightState::AwaitingComplete`] is likewise not this one:
+    /// what goes out for it is a release, which carries no payload and
+    /// cannot be too large.
+    pub fn on_discarded(&mut self, packet_id: u16, now: u32, out: &mut Vec<Action>) {
+        let state = match self.inflight.get_mut(packet_id) {
+            Some(entry) if entry.state != InflightState::AwaitingComplete => entry.state,
+            _ => return,
+        };
+        let entry = self
+            .complete(packet_id, state)
+            .expect("the entry was just found in that state");
+        // Nothing leaves this module unaccounted for. A message that
+        // vanishes without an action saying so is a support case
+        // nobody can answer, and this one vanishes by design.
+        out.push(Action::Dropped {
+            id: entry.delivery.message.id,
+            reason: DropReason::TooLargeForPeer,
+            qos: entry.delivery.qos,
+            topic: Arc::clone(&entry.delivery.message.topic),
+        });
+        self.pump(now, out);
     }
 
     /// Handle an exactly-once receipt.
@@ -392,12 +453,20 @@ impl Outbound {
     }
 }
 
-fn publish(item: &Delivery, packet_id: Option<u16>) -> Packet {
+fn publish(item: &Delivery, packet_id: Option<u16>, now: u32) -> Packet {
     // The property block is cloned per delivery because the subscription
     // identifiers differ per subscriber. That clone is the packet-sizing
     // question recorded in the design spec's open questions.
     let mut properties = (*item.message.properties).clone();
     properties.subscription_identifiers = item.subscription_ids.clone();
+    // [MQTT-3.3.2-6]: what the client is told is what is left, not what
+    // was published. `expires_at` is the subtraction already done, so
+    // the remainder is the distance from now to the deadline. Written
+    // unconditionally rather than only when a deadline exists, so that a
+    // cloned property block cannot carry a stale interval past a message
+    // that has none: the retained store keeps the publisher's interval
+    // whole, and a message with no deadline must carry none.
+    properties.message_expiry_interval = item.message.expires_at.map(|at| at.saturating_sub(now));
 
     Packet::Publish(Publish {
         dup: item.dup,
@@ -419,6 +488,96 @@ mod tests {
     use bytes::Bytes;
     use mqtt_codec::packet::Publish;
     use mqtt_codec::{Packet, QoS, ReasonCode};
+
+    #[test]
+    fn a_delivery_reports_the_expiry_that_is_left_rather_than_the_one_it_arrived_with() {
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        let mut item = delivery(QoS::AtMostOnce, b"body");
+        item.message.expires_at = Some(60);
+        item.message.properties = Arc::new(Properties {
+            message_expiry_interval: Some(60),
+            ..Properties::default()
+        });
+
+        // Sent at tick 20, so forty seconds of the sixty remain.
+        out.offer(item, 20, &mut actions);
+
+        assert_eq!(
+            sent(&actions)[0].properties.message_expiry_interval,
+            Some(40),
+            "[MQTT-3.3.2-6]: the interval sent is the one received less the wait"
+        );
+    }
+
+    /// The boundary itself. A message expires strictly after its
+    /// deadline, so one sent in the very second of that deadline is
+    /// still live and its remainder is zero. Zero and absent are not
+    /// the same answer: 3.3.2.3.3 reads an absent Message Expiry
+    /// Interval as no expiry at all, so reporting nothing here would
+    /// tell the client the opposite of the truth.
+    ///
+    /// The two tests around this one both pick a remainder well clear
+    /// of zero, so dropping a zero remainder passed them both.
+    #[test]
+    fn a_delivery_in_the_second_of_its_deadline_reports_zero_rather_than_nothing() {
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        let mut item = delivery(QoS::AtMostOnce, b"body");
+        item.message.expires_at = Some(60);
+        item.message.properties = Arc::new(Properties {
+            message_expiry_interval: Some(60),
+            ..Properties::default()
+        });
+
+        out.offer(item, 60, &mut actions);
+
+        assert_eq!(sent(&actions).len(), 1, "the deadline itself is not past");
+        assert_eq!(
+            sent(&actions)[0].properties.message_expiry_interval,
+            Some(0),
+            "3.3.2.3.3: an absent interval means no expiry, which is not what is left"
+        );
+    }
+
+    /// The queue is where the waiting actually happens, and a queued
+    /// message goes out through the acknowledged arm of `dispatch`,
+    /// not the fire-and-forget one. `dispatch` calls `publish` twice,
+    /// once per arm, and the test above walks only the first: passing
+    /// a constant instead of the clock on the second arm survived the
+    /// whole suite until this test existed.
+    #[test]
+    fn a_message_that_waited_offline_reports_what_is_left_when_it_finally_goes() {
+        let mut out = Outbound::new(QueueLimits::default(), 10);
+        let mut actions = Vec::new();
+        let mut item = delivery(QoS::AtLeastOnce, b"body");
+        item.message.expires_at = Some(60);
+        item.message.properties = Arc::new(Properties {
+            message_expiry_interval: Some(60),
+            ..Properties::default()
+        });
+
+        out.offer(item, 5, &mut actions);
+        assert!(sent(&actions).is_empty(), "nobody is attached to send to");
+
+        // The client comes back thirty seconds later, with twenty-five
+        // of the sixty already spent waiting.
+        out.on_resume(30, &mut actions);
+
+        assert_eq!(
+            sent(&actions)[0].properties.message_expiry_interval,
+            Some(30),
+            "[MQTT-3.3.2-6]: the wait comes off the interval on this path too"
+        );
+    }
+
+    #[test]
+    fn a_delivery_with_no_deadline_carries_no_expiry() {
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtMostOnce, b"body"), 20, &mut actions);
+        assert_eq!(sent(&actions)[0].properties.message_expiry_interval, None);
+    }
 
     fn delivery(qos: QoS, payload: &'static [u8]) -> Delivery {
         Delivery {
@@ -972,6 +1131,98 @@ mod tests {
     }
 
     #[test]
+    fn an_exactly_once_message_discarded_for_size_frees_its_slot_and_its_identifier() {
+        // [MQTT-3.1.2-25]: behave as if delivery had completed. The
+        // exactly-once case is the one with no existing completion
+        // path: `on_puback` ends an at-least-once exchange, but a
+        // message still awaiting its receipt has nothing that ends it
+        // short of a refusal. Leaving it outstanding holds a window
+        // slot and an identifier for an acknowledgement that cannot
+        // arrive, because the packet was never sent.
+        let mut out = online(1);
+        let mut actions = Vec::new();
+        let item = delivery(QoS::ExactlyOnce, b"x");
+        let message_id = item.message.id;
+        out.offer(item, 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+
+        actions.clear();
+        out.on_discarded(packet_id, 0, &mut actions);
+
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Dropped { id, reason: DropReason::TooLargeForPeer, .. }
+                    if *id == message_id
+            )),
+            "a message that vanishes without a counter moving is unanswerable"
+        );
+        assert_eq!(out.inflight_len(), 0, "the slot is free");
+        assert!(
+            !out.packet_ids.is_in_use(packet_id),
+            "and so is the identifier"
+        );
+    }
+
+    #[test]
+    fn a_message_behind_one_discarded_for_size_is_sent() {
+        // The consequence of the test above, and the one a test that
+        // only watches the discarded message cannot see. With a window
+        // of one, an uncompleted discard stops this session delivering
+        // anything, ever again.
+        let mut out = online(1);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::ExactlyOnce, b"too big"), 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+        out.offer(delivery(QoS::ExactlyOnce, b"next"), 0, &mut actions);
+        assert_eq!(sent(&actions).len(), 1, "the window holds one");
+
+        actions.clear();
+        out.on_discarded(packet_id, 0, &mut actions);
+
+        let sent = sent(&actions);
+        assert_eq!(sent.len(), 1, "the one behind it goes out");
+        assert_eq!(&sent[0].payload[..], b"next");
+    }
+
+    #[test]
+    fn a_message_the_peer_already_owns_is_not_discarded_for_size() {
+        // A message past its receipt is resumed by resending the
+        // release, which carries no payload and cannot be too large.
+        // So a discard naming that identifier is a writer settling an
+        // exchange that is not its own: the identifier has been reused
+        // by a session that resumed or was taken over since. Freeing
+        // it would strand the exactly-once delivery that now holds it.
+        let mut out = online(4);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::ExactlyOnce, b"x"), 0, &mut actions);
+        let packet_id = sent(&actions)[0].packet_id.unwrap();
+        out.on_pubrec(packet_id, ReasonCode::Success, 0, &mut actions)
+            .expect("known");
+
+        actions.clear();
+        out.on_discarded(packet_id, 0, &mut actions);
+
+        assert!(actions.is_empty(), "nothing to settle here");
+        assert_eq!(out.inflight_len(), 1, "the exchange is still the peer's");
+        assert!(out.packet_ids.is_in_use(packet_id));
+    }
+
+    #[test]
+    fn a_discard_naming_nothing_outstanding_does_nothing() {
+        // The writer renders from a queue, so by the time it discards,
+        // the session may have been cleared or resumed out from under
+        // the identifier. That is ordinary, not a fault.
+        let mut out = online(4);
+        let mut actions = Vec::new();
+
+        out.on_discarded(7, 0, &mut actions);
+
+        assert!(actions.is_empty());
+        assert_eq!(out.inflight_len(), 0);
+    }
+
+    #[test]
     fn a_refused_message_is_reported_as_discarded() {
         // It leaves the window and will never be retransmitted, so it is
         // as discarded as one the queue evicted. This module's rule is
@@ -1106,6 +1357,38 @@ mod tests {
             published[0].properties.subscription_identifiers,
             vec![7, 9],
             "both identifiers, in order"
+        );
+    }
+
+    #[test]
+    fn a_subscription_identifier_on_the_message_never_reaches_a_subscriber_that_has_none() {
+        // A Subscription Identifier belongs to the subscriber, not to
+        // the message: [MQTT-3.3.4-6] forbids a Client from putting one
+        // on a PUBLISH, and nothing upstream strips it, so a message's
+        // property block may carry one. It also reaches here through
+        // the retained store, which keeps the publisher's properties
+        // whole. The overwrite below is what keeps either from leaking,
+        // and it is unconditional for exactly that reason.
+        //
+        // The existing echo test cannot see this: it gives the delivery
+        // identifiers of its own, so an overwrite guarded by
+        // `if !subscription_ids.is_empty()` passes it and the whole
+        // suite besides.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        let mut item = delivery(QoS::AtLeastOnce, b"x");
+        item.message.properties = Arc::new(Properties {
+            subscription_identifiers: vec![3],
+            ..Properties::default()
+        });
+        assert!(item.subscription_ids.is_empty(), "this subscriber has none");
+        out.offer(item, 0, &mut actions);
+
+        let published = sent(&actions);
+        assert_eq!(published.len(), 1);
+        assert!(
+            published[0].properties.subscription_identifiers.is_empty(),
+            "an identifier the subscriber did not earn must not go out"
         );
     }
 

@@ -3,6 +3,7 @@
 use mqtt_codec::QoS;
 
 use crate::session::message::Message;
+use crate::subscriptions::shared::GroupId;
 use crate::subscriptions::{SharedSubscriptions, SubscriberId, Subscription, SubscriptionTrie};
 
 /// One message addressed to one subscriber.
@@ -34,11 +35,29 @@ pub struct Routed {
 ///
 /// `publisher` withholds the message from any subscription that set
 /// no-local, which is about who sent it rather than what it says.
+///
+/// `has_room` answers whether one subscriber could take this message at
+/// the level it would be delivered to *that* subscriber at, and is asked
+/// of a shared group's members alone. Section 6: "A member whose queue
+/// is full is skipped and the next is tried." The selector cannot see a
+/// session, so the asking is done here, and bounded: one turn of the
+/// rotation, no more. A group whose every member is full still hands the
+/// message to one of them, so that the drop is reported where every
+/// other drop is, rather than vanishing here uncounted.
+///
+/// The level is part of the question because a queue refuses a
+/// fire-and-forget message to an offline session whatever room it has,
+/// and a member that will drop the message is exactly the member the
+/// skip exists to pass over.
+///
+/// An ordinary subscription is not asked. Its subscriber is the only
+/// one there is, so a full queue there is a drop however it is reached.
 pub fn route(
     trie: &SubscriptionTrie,
     shared: &SharedSubscriptions,
     message: &Message,
     publisher: Option<SubscriberId>,
+    has_room: &mut dyn FnMut(SubscriberId, QoS) -> bool,
     out: &mut Vec<Routed>,
 ) {
     let mut matched = Vec::new();
@@ -54,14 +73,60 @@ pub fn route(
     // A shared group contributes one member, and that member is merged
     // like any other: a client holding both an ordinary and a shared
     // subscription to the same topic still receives one message.
-    let mut chosen = Vec::new();
-    shared.select(&message.topic[..], &mut chosen);
-    for subscription in chosen {
-        if is_withheld(&subscription, publisher) {
+    let mut groups = Vec::new();
+    shared.matching(&message.topic[..], &mut groups);
+    for group in groups {
+        if let Some(subscription) = choose(shared, group, message, publisher, has_room) {
+            merge(out, &subscription, message);
+        }
+    }
+}
+
+/// Pick the member of `group` that will carry this message.
+///
+/// Asks for a member, tries it, and asks again if it cannot take the
+/// message, up to the size of the group. The bound is what keeps a
+/// saturated group from becoming a search: every member having refused
+/// is an answer, not a reason to go round again.
+///
+/// When nobody can take it, the member whose turn it was carries it
+/// anyway and its queue refuses it. That is deliberate: a dropped
+/// message must be reported, and the session's own drop is the only
+/// thing that reports one. Returning `None` here would lose it in
+/// silence.
+fn choose(
+    shared: &SharedSubscriptions,
+    group: GroupId,
+    message: &Message,
+    publisher: Option<SubscriberId>,
+    has_room: &mut dyn FnMut(SubscriberId, QoS) -> bool,
+) -> Option<Subscription> {
+    let size = shared.size_of(group);
+    let mut turn_holder = None;
+
+    for _ in 0..size {
+        let candidate = shared.next_member(group)?;
+        // Unreachable in practice: [MQTT-3.8.3-4] forbids no-local on a
+        // shared subscription and the codec refuses to decode one. Kept
+        // because the rule belongs to whoever reads a subscription's
+        // options, and a withheld member is not a candidate for the
+        // drop either.
+        if is_withheld(&candidate, publisher) {
             continue;
         }
-        merge(out, &subscription, message);
+        // The level this member would be delivered at, which is what
+        // decides whether its queue takes the message. Merging can only
+        // raise it, when the same client also holds an ordinary
+        // subscription matching the topic, so asking at the lower level
+        // can skip a member that had room but never pick one that had
+        // none.
+        if has_room(candidate.subscriber, candidate.qos.min(message.qos)) {
+            return Some(candidate);
+        }
+        turn_holder.get_or_insert(candidate);
     }
+
+    turn_holder
 }
 
 fn is_withheld(subscription: &Subscription, publisher: Option<SubscriberId>) -> bool {
@@ -122,10 +187,107 @@ mod tests {
         Message::new(topic, Bytes::from_static(b"x"), qos, false)
     }
 
+    /// Route with every subscriber able to take the message.
+    ///
+    /// These tests are about matching and merging rather than about a
+    /// queue's capacity, and a subscriber with room is the ordinary
+    /// case. The tests that are about capacity pass their own answer.
+    fn route_all(
+        trie: &SubscriptionTrie,
+        shared: &SharedSubscriptions,
+        message: &Message,
+        publisher: Option<SubscriberId>,
+        out: &mut Vec<Routed>,
+    ) {
+        route(trie, shared, message, publisher, &mut |_, _| true, out);
+    }
+
     fn targets(out: &[Routed]) -> Vec<u64> {
         let mut ids: Vec<u64> = out.iter().map(|r| r.subscriber.0).collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// The group this topic matches, which every shared test wants.
+    fn group_of(shared: &SharedSubscriptions, topic: &str) -> crate::subscriptions::GroupId {
+        let mut groups = Vec::new();
+        shared.matching(topic, &mut groups);
+        let [group] = groups[..] else {
+            panic!("one group matches {topic}, got {}", groups.len());
+        };
+        group
+    }
+
+    #[test]
+    fn a_shared_member_that_cannot_take_the_message_is_skipped_for_the_next() {
+        // Section 6: "A member whose queue is full is skipped and the
+        // next is tried." Subscriber 3 holds an ordinary subscription
+        // and refuses too, to pin the other half of the rule: an
+        // ordinary subscriber is the only one there is, so it is never
+        // asked and never skipped. Skipping it would lose the message
+        // with nothing reporting the loss.
+        let trie = SubscriptionTrie::new(4);
+        let shared = SharedSubscriptions::new(4);
+        trie.insert("a/b", sub(3, QoS::AtLeastOnce));
+        shared.insert("g", "a/b", sub(1, QoS::AtLeastOnce));
+        shared.insert("g", "a/b", sub(2, QoS::AtLeastOnce));
+        assert_eq!(
+            group_of(&shared, "a/b"),
+            group_of(&shared, "a/b"),
+            "the two are one group, so the rotation is one rotation"
+        );
+
+        let mut out = Vec::new();
+        route(
+            &trie,
+            &shared,
+            &message("a/b", QoS::AtLeastOnce),
+            None,
+            &mut |subscriber, _qos| subscriber == SubscriberId(2),
+            &mut out,
+        );
+        assert_eq!(
+            targets(&out),
+            vec![2, 3],
+            "the member with room takes it, and the ordinary subscriber is not asked"
+        );
+    }
+
+    #[test]
+    fn a_shared_group_is_asked_once_per_member_and_no_more() {
+        // The bound, which is what keeps the skip from becoming a
+        // spin. Without it the rotation goes round for ever on a group
+        // where nobody can take the message; the panic inside the
+        // answer turns that hang into a failure.
+        let trie = SubscriptionTrie::new(4);
+        let shared = SharedSubscriptions::new(4);
+        shared.insert("g", "a/b", sub(1, QoS::AtLeastOnce));
+        shared.insert("g", "a/b", sub(2, QoS::AtLeastOnce));
+
+        let mut asked: Vec<u64> = Vec::new();
+        let mut out = Vec::new();
+        route(
+            &trie,
+            &shared,
+            &message("a/b", QoS::AtLeastOnce),
+            None,
+            &mut |subscriber, _qos| {
+                asked.push(subscriber.0);
+                assert!(
+                    asked.len() <= 2,
+                    "a group of two is asked twice at most, and was asked {asked:?}"
+                );
+                false
+            },
+            &mut out,
+        );
+
+        assert_eq!(asked, vec![1, 2], "each member once, in rotation order");
+        assert_eq!(
+            targets(&out),
+            vec![1],
+            "the member whose turn it was carries it, so its queue reports the drop"
+        );
     }
 
     #[test]
@@ -137,7 +299,7 @@ mod tests {
         trie.insert("z/#", sub(3, QoS::AtLeastOnce));
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("a/b", QoS::AtLeastOnce),
@@ -155,7 +317,7 @@ mod tests {
         trie.insert("a/b", sub(1, QoS::ExactlyOnce));
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("a/b", QoS::ExactlyOnce),
@@ -186,7 +348,7 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("a/b", QoS::AtMostOnce),
@@ -226,7 +388,7 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("a/b", QoS::AtMostOnce),
@@ -251,7 +413,7 @@ mod tests {
         trie.insert("a/b", sub(1, QoS::AtMostOnce));
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("a/b", QoS::AtMostOnce),
@@ -269,7 +431,7 @@ mod tests {
         trie.insert("a", sub(2, QoS::ExactlyOnce));
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("a", QoS::AtLeastOnce),
@@ -296,7 +458,7 @@ mod tests {
         trie.insert("a/b", sub(1, QoS::ExactlyOnce));
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("a/b", QoS::AtLeastOnce),
@@ -321,7 +483,7 @@ mod tests {
         trie.insert("a", sub(2, QoS::AtMostOnce));
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("a", QoS::AtMostOnce),
@@ -344,7 +506,7 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("a", QoS::AtMostOnce),
@@ -371,7 +533,7 @@ mod tests {
         trie.insert("a/b", sub(1, QoS::AtMostOnce));
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("a/b", QoS::AtMostOnce),
@@ -398,7 +560,7 @@ mod tests {
         retained.retain = true;
 
         let mut out = Vec::new();
-        route(&trie, &shared, &retained, None, &mut out);
+        route_all(&trie, &shared, &retained, None, &mut out);
         let mut flags: Vec<(u64, bool)> = out.iter().map(|r| (r.subscriber.0, r.retain)).collect();
         flags.sort_by_key(|(id, _)| *id);
         assert_eq!(flags, vec![(1, true), (2, false)]);
@@ -420,7 +582,7 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("a", QoS::AtMostOnce),
@@ -438,7 +600,7 @@ mod tests {
         shared.insert("g", "a", sub(2, QoS::AtMostOnce));
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("a", QoS::AtMostOnce),
@@ -457,7 +619,7 @@ mod tests {
         shared.insert("g", "a", sub(2, QoS::AtMostOnce));
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("a", QoS::AtMostOnce),
@@ -477,7 +639,7 @@ mod tests {
         shared.insert("g", "a", sub(1, QoS::ExactlyOnce));
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("a", QoS::ExactlyOnce),
@@ -495,7 +657,7 @@ mod tests {
         trie.insert("a/b", sub(1, QoS::AtMostOnce));
 
         let mut out = Vec::new();
-        route(
+        route_all(
             &trie,
             &shared,
             &message("c/d", QoS::AtMostOnce),

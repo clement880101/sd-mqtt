@@ -1,0 +1,41 @@
+[package]
+name = "sdmqtt-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The listener and connection handling for sd-mqtt"
+
+[dependencies]
+broker-core = { path = "../broker-core", version = "0.1.0" }
+mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
+bytes.workspace = true
+thiserror.workspace = true
+foldhash = "0.2"
+parking_lot = "0.12"
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+    "sync",
+    "macros",
+    "io-util",
+] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# test-util is what `#[tokio::test(start_paused = true)]` needs. Without
+# it the ticker tests wait on real seconds instead of asserting a
+# schedule, which is slow and flaky and proves less.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "net",
+    "io-util",
+    "test-util",
+] }
+
+[lints]
+workspace = true

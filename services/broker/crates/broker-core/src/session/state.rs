@@ -62,18 +62,30 @@ pub struct Session {
 
 impl Session {
     /// A fresh session, connected.
+    ///
+    /// `max_inflight` is the configured window, which section 6 makes
+    /// one half of the lesser-of pair. The other half is the peer's
+    /// receive maximum, which the shell narrows this to once it has
+    /// read the connect packet; it is not known here, and a session
+    /// exists before any connection has advertised anything.
+    ///
+    /// `queue` bounds what waits for one of those slots. Section 6
+    /// calls both bounds configured, and this is the only path a
+    /// configured value can reach a session by.
     pub fn new(
         id: SessionId,
         subscriber: SubscriberId,
         version: Version,
         epoch: u64,
         _now: u32,
+        max_inflight: usize,
+        queue: QueueLimits,
     ) -> Self {
         // A fresh session has a connection attached, so its outbound path
         // does too. Leaving it offline would make `is_connected` lie and
         // silently discard every at-most-once delivery, which such a path
         // does not queue for an absent client.
-        let mut outbound = Outbound::new(QueueLimits::default(), 20);
+        let mut outbound = Outbound::new(queue, max_inflight);
         outbound.set_online(true);
 
         Self {
@@ -128,10 +140,10 @@ impl Session {
             } else {
                 0
             };
-            self.will_at = Some(now.saturating_add(delay));
+            self.will_at = Some(deadline(now, delay));
         }
 
-        self.expires_at = Some(now.saturating_add(self.expiry_interval));
+        self.expires_at = Some(deadline(now, self.expiry_interval));
     }
 
     /// A disconnect packet arrived, which may leave the will standing
@@ -176,6 +188,11 @@ impl Session {
     /// How long the session outlives its connection.
     pub fn set_expiry_interval(&mut self, seconds: u32) {
         self.expiry_interval = seconds;
+    }
+
+    /// How long the session outlives its connection.
+    pub fn expiry_interval(&self) -> u32 {
+        self.expiry_interval
     }
 
     /// Whether the session may be destroyed. A connected one never may.
@@ -233,6 +250,22 @@ impl Session {
     }
 }
 
+/// A deadline that errs late.
+///
+/// `now` is a whole-second clock, so a disconnect part-way through a tick
+/// reads as the tick that has already begun. A deadline of `now + delay`
+/// would then fall due after as little as `delay - 1` real seconds:
+/// 3.1.3.2.2 and [MQTT-3.1.2-11] both say a period elapses before the
+/// thing happens, so the extra tick is the difference between late and
+/// wrong. A delay of zero means at once and is not rounded.
+fn deadline(now: u32, delay: u32) -> u32 {
+    if delay == 0 {
+        now
+    } else {
+        now.saturating_add(delay).saturating_add(1)
+    }
+}
+
 /// Turn a stored will into a message to publish.
 ///
 /// The expiry deadline is left for the caller, because it is the only
@@ -260,7 +293,15 @@ mod tests {
     use mqtt_codec::{Packet, QoS, ReasonCode, Version};
 
     fn session(version: Version) -> Session {
-        Session::new(SessionId::new("", "c"), SubscriberId(1), version, 1, 0)
+        Session::new(
+            SessionId::new("", "c"),
+            SubscriberId(1),
+            version,
+            1,
+            0,
+            20,
+            QueueLimits::default(),
+        )
     }
 
     fn will() -> StoredWill {
@@ -314,6 +355,41 @@ mod tests {
         );
     }
 
+    /// A session with a will that waits `delay` seconds.
+    fn a_session_with_a_will(delay: u32) -> Session {
+        let mut session = session(Version::V5);
+        session.set_will(Some(StoredWill {
+            delay,
+            properties: Properties::default(),
+            ..will()
+        }));
+        session
+    }
+
+    #[test]
+    fn a_will_delay_is_never_cut_short_by_the_coarse_clock() {
+        // The disconnect lands part-way through a tick, so `now` reads one
+        // less than the true elapsed time. A deadline of `now + delay` would
+        // then fall due before `delay` seconds had actually passed.
+        let mut session = a_session_with_a_will(3);
+        session.set_expiry_interval(300);
+
+        session.on_disconnected(false, 10);
+
+        assert!(
+            session.take_due_will(12).is_none(),
+            "two ticks after a three second delay, the will is not yet owed"
+        );
+        assert!(
+            session.take_due_will(13).is_none(),
+            "3.1.3.2.2: at the tick the delay lands on, up to a second of it may remain"
+        );
+        assert!(
+            session.take_due_will(14).is_some(),
+            "the tick after, the delay has certainly passed"
+        );
+    }
+
     #[test]
     fn an_ungraceful_disconnect_owes_a_will_at_once_without_a_delay() {
         let mut session = session(Version::V5);
@@ -348,8 +424,15 @@ mod tests {
         }));
         session.on_disconnected(false, 100);
 
-        assert!(session.take_due_will(129).is_none(), "not yet");
-        assert!(session.take_due_will(130).is_some(), "at the deadline");
+        // The disconnect was seen at coarse tick 100, so the true time
+        // was somewhere in [100, 101). At tick 130 as little as 29
+        // seconds may have passed, which is short of the delay; at 131
+        // at least 30 have.
+        assert!(session.take_due_will(130).is_none(), "not yet");
+        assert!(
+            session.take_due_will(131).is_some(),
+            "the delay has certainly passed"
+        );
     }
 
     #[test]
@@ -367,8 +450,11 @@ mod tests {
         }));
         session.on_disconnected(false, 100);
 
-        assert!(session.take_due_will(109).is_none(), "the session lives");
-        assert!(session.take_due_will(110).is_some(), "the session ended");
+        // Ten seconds from a disconnect seen at tick 100 is not
+        // certainly past until tick 111, for the same reason the
+        // uncapped delay is not: see `deadline`.
+        assert!(session.take_due_will(110).is_none(), "the session lives");
+        assert!(session.take_due_will(111).is_some(), "the session ended");
     }
 
     #[test]
@@ -426,8 +512,15 @@ mod tests {
         session.set_expiry_interval(60);
         session.on_disconnected(true, 100);
 
-        assert!(!session.is_expired(159));
-        assert!(session.is_expired(161));
+        // The boundary exactly, not a gap either side of it. A
+        // disconnect seen at tick 100 happened somewhere in [100, 101),
+        // so sixty seconds are not certainly gone until tick 161:
+        // [MQTT-3.1.2-11] ends the session after the interval has
+        // passed, not up to a second before. Read loosely, this test
+        // could not tell 160 from 161, which is the very error the
+        // interval had.
+        assert!(!session.is_expired(160), "up to a second of it may remain");
+        assert!(session.is_expired(161), "and now it has certainly gone");
     }
 
     #[test]

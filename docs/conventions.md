@@ -108,3 +108,21 @@ message that was mine and wrong.
 The reverse also holds: when a property fails, check whether it asserts
 something the protocol actually promises before assuming a defect. Once it
 did not, and the harness was wrong.
+
+## 8. A spec section is not a task list
+
+Six features that section 5.4 of the design listed as in scope for v1 had
+no task in any of the five milestone-one plans, and every one of them
+shipped missing. An independent conformance suite found them; nothing in
+our own process would have. Plans are written from the spec and then read
+on their own, so a line of the spec that no task picked up leaves no trace
+anywhere to notice.
+
+Before a milestone closes, walk its spec sections and name the task that
+implements each line. Where there is none, say out loud whether it is
+deferred or forgotten. The two look identical in a codebase and opposite
+in a review.
+
+The corollary is that the exit criterion should be a suite we did not
+write. One we wrote shares our misunderstandings, and would have been
+silent on all six.

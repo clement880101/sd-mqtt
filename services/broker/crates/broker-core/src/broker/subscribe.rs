@@ -106,6 +106,10 @@ fn deliver_retained(
         let qos = options.qos.min(kept.qos);
         let mut message = Message::new(&topic, kept.payload, kept.qos, true);
         message.expires_at = kept.expires_at;
+        // What was published is what is delivered. The Message Expiry
+        // Interval inside is the publisher's and is stale; the outbound
+        // path rewrites it from `expires_at` on the way out.
+        message.properties = kept.properties;
 
         session.outbound.offer(
             Delivery {
@@ -173,6 +177,7 @@ mod tests {
     use bytes::Bytes;
     use mqtt_codec::packet::{RetainHandling, Subscribe, SubscriptionOptions};
     use mqtt_codec::{Limits, Packet, Properties, QoS, ReasonCode, Version};
+    use std::sync::Arc;
 
     struct Fixture {
         trie: SubscriptionTrie,
@@ -189,13 +194,22 @@ mod tests {
                 payload: Bytes::from_static(b"kept"),
                 qos: QoS::AtMostOnce,
                 expires_at: None,
+                properties: Arc::new(Properties::default()),
             },
         );
         Fixture {
             trie: SubscriptionTrie::new(4),
             shared: SharedSubscriptions::new(4),
             retained,
-            session: Session::new(SessionId::new("", "c"), SubscriberId(1), Version::V5, 1, 0),
+            session: Session::new(
+                SessionId::new("", "c"),
+                SubscriberId(1),
+                Version::V5,
+                1,
+                0,
+                20,
+                crate::session::queue::QueueLimits::default(),
+            ),
         }
     }
 
@@ -520,6 +534,7 @@ mod tests {
                 payload: Bytes::from_static(b"stale"),
                 qos: QoS::AtMostOnce,
                 expires_at: Some(5),
+                properties: Arc::new(Properties::default()),
             },
         );
         let mut out = Vec::new();

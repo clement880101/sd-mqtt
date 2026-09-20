@@ -19,7 +19,13 @@ use crate::subscriptions::trie::SubscriptionTrie;
 /// Selection is round-robin within a group. The specification's fuller
 /// policy, preferring a local online member and then the least loaded
 /// remote node, needs session and cluster state that does not exist yet;
-/// [`SharedSubscriptions::select`] is the seam where that policy will go.
+/// [`SharedSubscriptions::next_member`] is the seam where that policy
+/// will go.
+///
+/// Nothing here can see a session, deliberately. The one clause of the
+/// policy that is implemented, skipping a member whose queue is full,
+/// lives in the caller for that reason: it asks for a member, tries it,
+/// and asks again if that member cannot take the message.
 pub struct SharedSubscriptions {
     /// Keyed by a synthetic subscriber identifier standing for a group.
     trie: SubscriptionTrie,
@@ -38,6 +44,11 @@ struct Group {
     members: Vec<Subscription>,
     cursor: usize,
 }
+
+/// One shared group, as the caller refers to it between asking which
+/// groups matched and asking them for a member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GroupId(pub u64);
 
 impl SharedSubscriptions {
     /// An empty set of groups, over a trie with `shards` shards.
@@ -80,8 +91,8 @@ impl SharedSubscriptions {
                     },
                 );
                 // One synthetic entry stands for the whole group. Only
-                // its subscriber identifier is ever read, by `select`,
-                // to learn which groups matched; the options come from
+                // its subscriber identifier is ever read, by
+                // `matching`, to learn which groups matched; the options come from
                 // the chosen member, never from here. They are spelled
                 // out as defaults rather than copied from whichever
                 // member happened to create the group, which made them
@@ -167,30 +178,59 @@ impl SharedSubscriptions {
         removed
     }
 
-    /// Append one chosen member of each group matching `topic` to `out`.
+    /// Append every group whose filter matches `topic` to `out`.
     ///
-    /// This is the seam for delivery policy. Today it is round-robin within
-    /// each group; it will later prefer a local online member and then the
-    /// least loaded remote node.
-    pub fn select(&self, topic: &str, out: &mut Vec<Subscription>) {
+    /// One entry per group, never per member: choosing among the members
+    /// is [`SharedSubscriptions::next_member`]'s job, and the caller's to
+    /// repeat.
+    pub fn matching(&self, topic: &str, out: &mut Vec<GroupId>) {
         let mut matched = Vec::new();
         self.trie.matching(topic, &mut matched);
-        if matched.is_empty() {
-            return;
-        }
+        out.extend(matched.into_iter().map(|s| GroupId(s.subscriber.0)));
+    }
 
+    /// How many members `group` has, or zero if it no longer exists.
+    ///
+    /// The bound on how many times a caller may ask for a member before
+    /// giving up: one full turn of the rotation and no more.
+    pub fn size_of(&self, group: GroupId) -> usize {
+        self.groups
+            .read()
+            .by_id
+            .get(&group.0)
+            .map_or(0, |entry| entry.members.len())
+    }
+
+    /// Take the next member of `group` in the rotation.
+    ///
+    /// This is the seam for delivery policy. Today it is round-robin
+    /// within the group; it will later prefer a local online member and
+    /// then the least loaded remote node.
+    ///
+    /// **Every call is a turn.** The cursor advances whether or not the
+    /// caller goes on to use the member it was given, so a member the
+    /// caller refuses because its queue is full has spent its turn on
+    /// the message it could not have taken anyway. It is neither moved
+    /// to the back of the rotation nor held at the front of it: it keeps
+    /// its place, and the next message that reaches it is the next one
+    /// its turn comes round for, as soon as it has drained. The
+    /// alternative, holding the cursor still on a refusal, would ask the
+    /// same full member first on every message until it drained, paying
+    /// a wasted ask each time to gain nothing: the member was never
+    /// going to receive those messages either way.
+    ///
+    /// Returns `None` only when the group has gone, which a caller
+    /// holding a [`GroupId`] from [`SharedSubscriptions::matching`] can
+    /// still see if it was emptied in between.
+    pub fn next_member(&self, group: GroupId) -> Option<Subscription> {
         let mut groups = self.groups.write();
-        for synthetic in matched {
-            let Some(entry) = groups.by_id.get_mut(&synthetic.subscriber.0) else {
-                continue;
-            };
-            if entry.members.is_empty() {
-                continue;
-            }
-            let index = entry.cursor % entry.members.len();
-            entry.cursor = entry.cursor.wrapping_add(1);
-            out.push(entry.members[index].clone());
+        let entry = groups.by_id.get_mut(&group.0)?;
+        if entry.members.is_empty() {
+            return None;
         }
+        let index = entry.cursor % entry.members.len();
+        entry.cursor = entry.cursor.wrapping_add(1);
+        Some(entry.members[index].clone())
     }
 
     /// How many groups exist.
@@ -215,14 +255,15 @@ impl SharedSubscriptions {
     /// scanning every group that exists. That invariant holds by
     /// construction, and a violation of it leaks quietly rather than
     /// returning a wrong answer: a stale entry names a group that
-    /// [`select`] will simply skip. Exposed so the invariant can be
+    /// [`next_member`] will simply decline to answer for. Exposed so
+    /// the invariant can be
     /// asserted rather than assumed, for the same reason
     /// [`SubscriptionTrie::node_count`] and [`RetainedStore::node_count`]
     /// are.
     ///
     /// This should equal [`group_count`] after every operation.
     ///
-    /// [`select`]: Self::select
+    /// [`next_member`]: Self::next_member
     /// [`group_count`]: Self::group_count
     /// [`RetainedStore::node_count`]: crate::retained::RetainedStore::node_count
     pub fn synthetic_count(&self) -> usize {
@@ -250,10 +291,16 @@ mod tests {
         }
     }
 
+    /// One member from each group matching `topic`, the way a caller
+    /// with room everywhere would take them.
     fn picked(shared: &SharedSubscriptions, topic: &str) -> Vec<u64> {
-        let mut out = Vec::new();
-        shared.select(topic, &mut out);
-        let mut ids: Vec<u64> = out.into_iter().map(|s| s.subscriber.0).collect();
+        let mut groups = Vec::new();
+        shared.matching(topic, &mut groups);
+        let mut ids: Vec<u64> = groups
+            .iter()
+            .filter_map(|group| shared.next_member(*group))
+            .map(|s| s.subscriber.0)
+            .collect();
         ids.sort_unstable();
         ids
     }
@@ -282,6 +329,56 @@ mod tests {
             seen.extend(picked(&shared, "a/b"));
         }
         assert_eq!(seen.len(), 3, "every member should be picked eventually");
+    }
+
+    #[test]
+    fn every_ask_is_a_turn_whether_or_not_the_caller_uses_the_answer() {
+        // The rotation's answer to starvation. A caller that refuses a
+        // member because its queue is full spends that member's turn,
+        // and the cursor moves on: the member keeps its place rather
+        // than being held at the front or pushed to the back, so it is
+        // picked again on its next turn as soon as it drains.
+        //
+        // Asserted by asking four times and using none of the answers,
+        // which is exactly what a caller refusing every member does.
+        let shared = SharedSubscriptions::new(4);
+        shared.insert("g", "a/b", sub(1));
+        shared.insert("g", "a/b", sub(2));
+
+        let mut groups = Vec::new();
+        shared.matching("a/b", &mut groups);
+        let asked: Vec<u64> = (0..4)
+            .filter_map(|_| shared.next_member(groups[0]))
+            .map(|member| member.subscriber.0)
+            .collect();
+        assert_eq!(asked, vec![1, 2, 1, 2]);
+    }
+
+    #[test]
+    fn a_groups_size_is_how_many_members_it_holds() {
+        // The bound a caller retries within. One short and a member is
+        // never asked; one long and a full group is asked twice about
+        // somebody.
+        let shared = SharedSubscriptions::new(4);
+        shared.insert("g", "a/b", sub(1));
+        let mut groups = Vec::new();
+        shared.matching("a/b", &mut groups);
+        let group = groups[0];
+        assert_eq!(shared.size_of(group), 1);
+
+        shared.insert("g", "a/b", sub(2));
+        assert_eq!(shared.size_of(group), 2);
+
+        shared.remove("g", "a/b", SubscriberId(1));
+        assert_eq!(shared.size_of(group), 1);
+
+        shared.remove("g", "a/b", SubscriberId(2));
+        assert_eq!(
+            shared.size_of(group),
+            0,
+            "a group that is gone has no members to ask"
+        );
+        assert!(shared.next_member(group).is_none());
     }
 
     #[test]
@@ -350,8 +447,11 @@ mod tests {
         );
         assert_eq!(shared.member_count(), 1);
 
-        let mut out = Vec::new();
-        shared.select("a/b", &mut out);
-        assert_eq!(out[0].qos, QoS::ExactlyOnce);
+        let mut groups = Vec::new();
+        shared.matching("a/b", &mut groups);
+        let member = shared
+            .next_member(groups[0])
+            .expect("the group still has its one member");
+        assert_eq!(member.qos, QoS::ExactlyOnce);
     }
 }

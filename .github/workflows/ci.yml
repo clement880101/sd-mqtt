@@ -64,6 +64,38 @@ jobs:
               cargo deny --manifest-path Cargo.toml --config ../../deny.toml check
             '
 
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/broker
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the broker under test
+        working-directory: services/broker
+        run: cargo build --release -p sdmqtt
+      # Eclipse Paho's interoperability suite, pinned in run.sh. A test
+      # tool run here is not distributed, so its licence needs only to
+      # permit use; that is a weaker rule than deny.toml, which governs
+      # what ships. The suite's known failures are classified in
+      # conformance/known-failures.txt and the runner fails the build on
+      # any difference from that set, in either direction.
+      - name: Independent conformance suite
+        env:
+          SDMQTT: ${{ github.workspace }}/services/broker/target/release/sdmqtt
+        run: services/broker/conformance/run.sh
+      - name: Upload the suite's output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-output
+          path: services/broker/conformance/.work/*.out
+          if-no-files-found: ignore
+
   fuzz:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'

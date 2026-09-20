@@ -86,8 +86,11 @@ depends on all of them. `sdmqtt` wires them together.
 `mqtt-codec` is pure: bytes in, typed frames out, no I/O and no allocation
 beyond what a frame owns. It exposes:
 
-- `Frame`, an enum over the fourteen MQTT packet types, version-agnostic in
-  shape, with v5 properties in an `Option<Properties>` field.
+- `Frame`, an enum over the fifteen MQTT packet types, version-agnostic in
+  shape, carrying v5 properties by value. An earlier draft said an
+  `Option<Properties>`, which would shrink the common case where a packet
+  has none; section 17 records why that was not done and what would decide
+  it.
 - `decode(buf: &mut BytesMut, version: Version, limits: &Limits) -> Result<Option<Frame>, CodecError>`,
   returning `Ok(None)` when more bytes are needed.
 - `encode(frame: &Frame, version: Version, buf: &mut BytesMut) -> Result<(), CodecError>`.
@@ -111,16 +114,18 @@ into their own topic tree. This gives multi-tenancy at no structural cost.
 
 Session state:
 
-- subscriptions, each with QoS, no-local, retain-as-published, retain
-  handling and an optional subscription identifier
+- subscriptions, each with QoS, no-local, retain-as-published and an
+  optional subscription identifier. Retain handling is **not** kept: it
+  says what to do with retained messages at the instant of subscribing,
+  and once that instant has passed it has no further meaning.
 - outbound inflight map, keyed by packet identifier
 - outbound queue
 - inbound QoS 2 packet identifiers awaiting release
 - session expiry interval, will message and will delay
 - an `epoch`, a monotonically increasing counter used for takeover
 
-CONNECT is validated in this order: protocol version accepted for this
-listener, client identifier length and empty-identifier rules, authentication,
+CONNECT is validated in this order: protocol version served by this build,
+client identifier length and empty-identifier rules, authentication,
 will topic authorized as an ordinary publish, then registration. Registration
 is the point at which takeover happens.
 
@@ -140,8 +145,12 @@ mechanism is a ring of one-second buckets, described in section 10.2.
 Topic levels are interned into a `LevelId` on first use, so comparisons are
 integer comparisons and nodes store fixed-size keys.
 
-The subscription structure is a per-level trie. Matching walks literal, then
-single-level wildcard, then multi-level wildcard children. A filter whose
+The subscription structure is a per-level trie. Matching visits literal,
+single-level wildcard and multi-level wildcard children, in whatever order
+the node finds cheapest. The order is deliberately unspecified: the result
+is a set, the merge that consumes it is order-insensitive, and pinning an
+order in prose invites a reader to treat an implementation detail as a
+promise. A filter whose
 first level is a wildcard never matches a topic whose first level begins with
 a dollar sign, and a dollar-prefixed filter matches only dollar-prefixed
 topics. Depth is bounded by configuration and checked during validation, so
@@ -157,12 +166,31 @@ a periodic expiry sweep.
 ### 5.4 MQTT 5 features in scope for v1
 
 Session expiry, message expiry, will delay, user properties, request and
-response topics with correlation data, subscription identifiers, topic
-aliases in both directions, shared subscriptions, no-local,
+response topics with correlation data, subscription identifiers, a
+client's topic aliases, shared subscriptions, no-local,
 retain-as-published, all three retain-handling values, server keep-alive,
-receive maximum in both directions, maximum packet size, maximum QoS,
-retain availability, assigned client identifier, and reason codes with
-optional reason strings on every acknowledgement.
+receive maximum in both directions, maximum packet size, assigned client
+identifier, and reason codes on every acknowledgement.
+
+**Maximum QoS and Retain Availability move to milestone 7.** The broker
+always supports quality of service 2 and always accepts a retained
+message, advertising neither property, which is conformant. Capping either
+is an operator policy and belongs with authorization rather than on its
+own.
+
+**Reason strings are not sent in v1.** The codec carries them and nothing
+produces one. The reason code is the contract; a string is a convenience
+for a human reading a packet capture, and it costs bytes on every
+acknowledgement.
+
+**The server does not itself use topic aliases outbound.** An earlier
+draft of this section promised aliases "in both directions". 3.3.2.3.4
+permits a server to use them and requires nothing, while the inbound half
+is the one whose absence loses messages, so the inbound half is built and
+the outbound half is not. A client that advertises a Topic Alias Maximum
+is simply never sent an alias, which is conformant. Revisit it with the
+packet-sizing question in section 17, since the two trade against each
+other: an alias shortens every publish after the first on a topic.
 
 Enhanced authentication (the AUTH exchange) is in scope, with SCRAM-SHA-256
 as the shipped mechanism. See section 12.2.
@@ -176,9 +204,12 @@ the lesser of the configured maximum and the peer's receive maximum. Default
 is 20. Setting it to 1 gives strict ordering.
 
 **Queue** holds messages waiting for an inflight slot, bounded by both a
-message count and a byte total, configured separately for the online and
-offline cases. The online bound protects memory, the offline bound protects
-disk.
+message count and a byte total, both configurable. An earlier draft
+specified separate bounds for the online and offline cases; one set is
+built, because nobody stated the problem two sets solve and a bound an
+operator cannot reason about is worse than a bound that is the same
+everywhere. Revisit it when persistence makes the offline case cost disk
+rather than memory.
 
 **No retransmission on a live connection.** MQTT 5 forbids it and TCP makes
 it pointless. On session resume, inflight messages are requeued with the
@@ -197,9 +228,11 @@ Resume is also not uniform. A message whose receipt has already arrived is
 resumed by resending the release, not the publish, because the peer has
 taken ownership of it.
 
-**Overflow** is configurable per queue, `drop_newest` by default and
-`drop_oldest` available. Every drop increments a counter labelled with a
-reason and fires the message-drop hook. Nothing is discarded silently.
+**Overflow** is `drop_newest` for every queue in v1. Both policies are
+implemented and tested, and nothing selects between them yet; making it
+configurable waits for someone to want the other one. Every drop carries a
+reason, and from milestone 3 increments a counter labelled with it and
+fires the message-drop hook. Nothing is discarded silently.
 
 **Packet identifiers** are allocated per session from a monotonic counter
 wrapping through 1 to 65535, skipping identifiers currently inflight.
@@ -711,7 +744,8 @@ shippable.
    mode, and the replication lag metric bounds the loss in asynchronous mode.
    The UI shows replica health and re-replication progress.
 7. **Hardening.** TLS with certificate hot reload, WebSocket, SCRAM-SHA-256,
-   the authentication and access control UI, rate limits, the container image,
+   the authentication and access control UI, rate limits, a configurable
+   maximum quality of service and retain availability, the container image,
    cross-compiled release artifacts and documentation. Exit criteria: all
    budgets met, the full conformance suite green including TLS and WebSocket,
    a SCRAM client authenticates and re-authenticates, and a release is
@@ -728,6 +762,58 @@ shippable.
   disconnect with an appropriate reason code and this is the only code that
   describes that failure. If a conformance suite ever rejects it, this is
   the line to revisit, and the stricter reading is a one-line change.
+
+- **The single lock above the broker, measured.** The broker's methods take
+  an exclusive reference, so the shell serialises every packet in the
+  process through one mutex. Milestone 1 measured it rather than fixing it.
+  The harness is `services/broker/crates/server/tests/throughput.rs`, three
+  ignored tests run with
+  `cargo test -p sdmqtt-server --release --test throughput -- --ignored
+  --nocapture --test-threads 1`. Machine: Apple M2 Pro, 12 logical cores,
+  32 GB, macOS 26.4.1, arm64, release profile, loopback TCP, MQTT 5,
+  at-most-once, 32-byte payloads, one subscriber per publisher on its own
+  topic, three-second window after a one-second warm-up.
+
+  Closed loop, 512 messages outstanding per pair, nothing discarded:
+
+  | publishers | total msg/s | per publisher |
+  |---:|---:|---:|
+  | 1 | 452,000 | 452,000 |
+  | 2 | 349,000 | 175,000 |
+  | 4 | 241,000 | 60,000 |
+  | 8 | 183,000 | 23,000 |
+  | 16 | 220,000 | 14,000 |
+
+  **Throughput falls rather than flattens.** Sixteen publishers move less
+  in total than one does. A thousand extra idle connections changed no
+  figure by more than noise (447,000 / 354,000 / 245,000 / 183,000 /
+  217,000), so an idle connection costs nothing per message.
+
+  The same load with no sockets at all, one `Shared` for everyone versus
+  one `Shared` per caller, which is the control that says whether the lock
+  or the runtime is responsible:
+
+  | callers | one broker, msg/s | one broker each, msg/s | ratio |
+  |---:|---:|---:|---:|
+  | 1 | 515,000 | 519,000 | 1.01 |
+  | 2 | 400,000 | 901,000 | 2.26 |
+  | 4 | 294,000 | 1,436,000 | 4.89 |
+  | 8 | 289,000 | 1,318,000 | 4.56 |
+  | 16 | 293,000 | 1,195,000 | 4.08 |
+
+  Identical work, identical task counts, identical runtime; the only
+  difference is whether the mutex is contended. Sharded, it scales to
+  about 1.4 M msg/s and saturates on cores. Shared, it peaks at one caller
+  and settles around 290,000.
+
+  One tick with ten thousand sessions: 30 µs median, 27 µs minimum, 108 µs
+  maximum over fifty ticks. `Broker::tick` scans the registry twice per
+  tick, so this is linear in sessions and would be roughly 300 µs at the
+  hundred thousand the design targets — a pause of that length, once a
+  second, for every connection in the process.
+
+  No conclusion is drawn here. The figures exist so that milestone 2
+  decides from a measurement.
 
 - **Contention in the matching layer.** The subscription trie is sharded
   by first topic level, but the retained store is one lock, so every
@@ -782,6 +868,106 @@ needs it, and the resolution is recorded as an architecture decision record.
 - **Channel binding.** SCRAM-SHA-256-PLUS defends against an attacker who
   terminates TLS in the middle. Whether that threat model applies depends on
   whether deployments terminate TLS at a proxy. Milestone 7 decides.
-- **Conformance suite choice.** Milestone 1 selects and pins one. The
-  criteria are that it is independent of any broker implementation, that it
-  covers both protocol versions, and that its license permits use in CI.
+- **Conformance suite choice — settled.** Eclipse Paho's interoperability
+  tests, `eclipse-paho/paho.mqtt.testing`, pinned at commit
+  `9d7bb80bb8b9d9cfc0b52f8cb4c1916401281103`. It is maintained by the Paho
+  project rather than by any broker, tests a broker purely over the wire,
+  covers both protocol versions (27 tests for MQTT 5, 10 for 3.1.1), and
+  needs nothing but Python 3 to run. Its licence is `EPL-2.0 OR
+  BSD-3-Clause`.
+
+  **The licence rule here is the weaker one.** A test tool run in CI is
+  never linked into the shipped binary and never distributed, so what its
+  licence must do is permit use. That is weaker than the dependency policy
+  in `deny.toml`, which governs code that ships and is why EPL-2.0 is not
+  on that allow list. The distinction happens not to change the answer,
+  because the suite's BSD-3-Clause option is already allowed, but the rule
+  being applied is the weaker one and `deny.toml` is unchanged.
+
+  The runner is `services/broker/conformance/run.sh` and the CI job is
+  `conformance`. The suite has no expected-failure mechanism, so the runner
+  supplies one: it runs **every test on its own against a broker started
+  for it**, and compares the failing set against
+  `conformance/known-failures.txt`, failing the build on a new failure and
+  equally on a listed test that has started passing. Per-test isolation is
+  not tidiness: run whole, `test_subscribe_identifiers` and
+  `test_will_message` fail only because of state an earlier test left
+  behind, and a baseline taken from a whole-suite run would encode the
+  running order as conformance.
+
+  The first run found **12 failures of 37 tests**: two deferred, three
+  suite assumptions, seven real defects and one test that races with
+  itself. None was fixed at the time, because a conformance failure is
+  worth looking at before it is patched and each fix belonged in a layer
+  below the shell.
+
+  All eight defects behind those seven tests have since been fixed. **Of
+  37 tests, five now fail and 32 pass**, one of those 32 being the test
+  whose result is ignored either way because it races with itself. The
+  five are the two deferred and the three assumptions. No known defect
+  remains on the list.
+
+  The suite is not the whole story. A walk of sections 5 and 6 against
+  the code, done because convention 8 demands it before a milestone
+  closes, found five more promises with no implementation and five with
+  no test that could fail. None of them is visible to a conformance
+  suite, because a server that always supports quality of service 2 and
+  always accepts a retained message is a legal server whatever it
+  advertises. They are recorded in the milestone 1.5 plan.
+
+- **Eight conformance defects, found by the suite and since fixed.**
+  Kept here rather than deleted, because the finding is worth more than
+  the fixes and a reader who meets the defect list in the history should
+  meet its resolution in the same place.
+
+  What was wrong: a client's topic aliases were neither resolved nor
+  stripped, so a publish carrying only an alias was silently lost and the
+  alias was forwarded to subscribers that never asked for one; a protocol
+  error the decoder caught closed the socket with no DISCONNECT; a 3.1.1
+  session with `CleanSession` clear was given an expiry of zero and
+  discarded at disconnect; a DISCONNECT's Session Expiry Interval was
+  ignored; the retained store held payload, quality of service and expiry
+  and dropped the rest; a delivery reported the Message Expiry Interval it
+  was published with rather than what remained; a client's Maximum Packet
+  Size was not honoured outbound; and a will could fire up to a second
+  early, because a deadline of `now + delay` on a whole-second clock
+  rounds the wrong way.
+
+  **Six of the eight were features this document lists in section 5.4 as
+  in scope for v1, and no task in any of the five milestone-one plans
+  built them.** Nothing in the process read the specification back. That
+  is the finding, and it is recorded as convention 8.
+
+  Sixteen mutations were made by hand against the fixes and **eight
+  survived**, each one a test that could not fail. Two shapes recurred.
+  Tests that assert around a boundary rather than on it: this plan
+  predicted that a 200-byte publish would catch a size limit doubled from
+  64, and it does not, because 200 exceeds both. And tests that reach the
+  easy half of a rule: a discarded oversize publish must also complete its
+  delivery, and every test that only checked the packet was absent passed
+  against a broker that leaked the inflight slot forever.
+
+  Two findings came from mutations no plan named. A publish carrying a
+  Subscription Identifier from the client, which [MQTT-3.3.4-6] forbids,
+  reached subscribers through the retained store; only the unconditional
+  overwrite in the outgoing publish stops it, and `broker-core` still does
+  not reject it on ingress. And a displaced connection's writer, draining
+  actions handed to it before a takeover, could complete a delivery whose
+  packet identifier the newcomer now owns; the discard path checks the
+  session epoch as the detach path does.
+
+  **Still open, deliberately.** The CONNACK is written before the write
+  loop exists and is therefore not size-checked, so a client advertising a
+  Maximum Packet Size below roughly thirteen bytes receives an oversize
+  CONNACK. Suppressing it would leave that client with no reply at all,
+  which is worse. Left as it is and recorded here.
+
+  The three suite assumptions, recorded so they are not re-investigated:
+  `test_server_keep_alive` asserts a CONNACK property 3.2.2.3.14 says the
+  server MAY send; `test_server_topic_alias` asserts the server uses
+  aliases, which 3.3.2.3.4 permits rather than requires and which section
+  5.4 now says this broker does not do; and `test_flow_control2` is the
+  suite's own client raising `BrokenPipeError` while writing another
+  PUBREL, a raw probe confirming the broker sends exactly the DISCONNECT
+  with reason 0x93 the test is looking for, after the 1024th
+  unacknowledged QoS 2 publication.
