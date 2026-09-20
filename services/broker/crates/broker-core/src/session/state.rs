@@ -58,13 +58,20 @@ impl Session {
         epoch: u64,
         _now: u32,
     ) -> Self {
+        // A fresh session has a connection attached, so its outbound path
+        // does too. Leaving it offline would make `is_connected` lie and
+        // silently discard every at-most-once delivery, which such a path
+        // does not queue for an absent client.
+        let mut outbound = Outbound::new(QueueLimits::default(), 20);
+        outbound.set_online(true);
+
         Self {
             id,
             subscriber,
             version,
             epoch,
             connected: true,
-            outbound: Outbound::new(QueueLimits::default(), 20),
+            outbound,
             inbound: Inbound::new(0),
             filters: Vec::new(),
             will: None,
@@ -217,9 +224,12 @@ pub fn will_message(will: &StoredWill) -> crate::session::message::Message {
 mod tests {
     use super::*;
     use crate::registry::SessionId;
+    use crate::session::message::Message;
+    use crate::session::queue::Delivery;
+    use crate::session::Action;
     use crate::subscriptions::SubscriberId;
     use bytes::Bytes;
-    use mqtt_codec::{QoS, ReasonCode, Version};
+    use mqtt_codec::{Packet, QoS, ReasonCode, Version};
 
     fn session(version: Version) -> Session {
         Session::new(SessionId::new("", "c"), SubscriberId(1), version, 1, 0)
@@ -240,6 +250,39 @@ mod tests {
         let session = session(Version::V5);
         assert!(session.is_connected());
         assert!(!session.is_expired(1_000_000));
+    }
+
+    #[test]
+    fn a_new_session_delivers_a_fire_and_forget_message_rather_than_dropping_it() {
+        // `is_connected` and the outbound path must agree. A session that
+        // reports itself connected while its outbound path is offline
+        // discards every at-most-once delivery, because such a message is
+        // not queued for an absent client by default. The symptom is a
+        // retained message that silently never arrives.
+        let mut session = session(Version::V5);
+        let mut out = Vec::new();
+        session.outbound.offer(
+            Delivery {
+                message: Message::new("a/b", Bytes::from_static(b"x"), QoS::AtMostOnce, false),
+                qos: QoS::AtMostOnce,
+                retain: false,
+                subscription_ids: Vec::new(),
+                dup: false,
+                packet_id: None,
+            },
+            0,
+            &mut out,
+        );
+
+        assert!(
+            !out.iter().any(|a| matches!(a, Action::Dropped { .. })),
+            "a connected session does not discard what it is offered"
+        );
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::Send(Packet::Publish(p)) if p.topic == "a/b")),
+            "it goes out"
+        );
     }
 
     #[test]

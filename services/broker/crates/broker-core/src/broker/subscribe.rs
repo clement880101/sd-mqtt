@@ -191,17 +191,11 @@ mod tests {
                 expires_at: None,
             },
         );
-        let mut session = Session::new(SessionId::new("", "c"), SubscriberId(1), Version::V5, 1, 0);
-        // `Session::new` leaves the outbound path offline, and a
-        // fire-and-forget delivery to an offline session is discarded
-        // rather than queued. A retained message therefore never reaches
-        // the wire unless a connection is attached.
-        session.outbound.set_online(true);
         Fixture {
             trie: SubscriptionTrie::new(4),
             shared: SharedSubscriptions::new(4),
             retained,
-            session,
+            session: Session::new(SessionId::new("", "c"), SubscriberId(1), Version::V5, 1, 0),
         }
     }
 
