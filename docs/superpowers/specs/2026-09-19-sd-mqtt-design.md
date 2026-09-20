@@ -157,12 +157,21 @@ a periodic expiry sweep.
 ### 5.4 MQTT 5 features in scope for v1
 
 Session expiry, message expiry, will delay, user properties, request and
-response topics with correlation data, subscription identifiers, topic
-aliases in both directions, shared subscriptions, no-local,
+response topics with correlation data, subscription identifiers, a
+client's topic aliases, shared subscriptions, no-local,
 retain-as-published, all three retain-handling values, server keep-alive,
 receive maximum in both directions, maximum packet size, maximum QoS,
 retain availability, assigned client identifier, and reason codes with
 optional reason strings on every acknowledgement.
+
+**The server does not itself use topic aliases outbound.** An earlier
+draft of this section promised aliases "in both directions". 3.3.2.3.4
+permits a server to use them and requires nothing, while the inbound half
+is the one whose absence loses messages, so the inbound half is built and
+the outbound half is not. A client that advertises a Topic Alias Maximum
+is simply never sent an alias, which is conformant. Revisit it with the
+packet-sizing question in section 17, since the two trade against each
+other: an alias shortens every publish after the first on a topic.
 
 Enhanced authentication (the AUTH exchange) is in scope, with SCRAM-SHA-256
 as the shipped mechanism. See section 12.2.
@@ -861,69 +870,79 @@ needs it, and the resolution is recorded as an architecture decision record.
   behind, and a baseline taken from a whole-suite run would encode the
   running order as conformance.
 
-  As of the milestone 1 run, of 37 tests **12 fail, one is ignored as
-  flaky and the remaining 24 pass.** The twelve classify as two deferred
-  (both `test_subscribe_failure`, which needs a filter the broker is
-  configured to refuse — authorization is milestone 7), three suite
-  assumptions, and seven that are real defects. None has been fixed: each
-  one's fix belongs in a layer below the shell, and patching the shell
-  would hide it.
+  The first run found **12 failures of 37 tests**: two deferred, three
+  suite assumptions, seven real defects and one test that races with
+  itself. None was fixed at the time, because a conformance failure is
+  worth looking at before it is patched and each fix belonged in a layer
+  below the shell.
 
-- **Eight conformance defects behind seven failing tests.** In rough
-  order of seriousness (`test_client_topic_alias` exposes the first two):
+  All eight defects behind those seven tests have since been fixed. **Of
+  37 tests, five now fail and 32 pass**, one of those 32 being the test
+  whose result is ignored either way because it races with itself. The
+  five are the two deferred and the three assumptions. No known defect
+  remains on the list.
 
-  1. **Topic aliases are neither resolved nor stripped.** A PUBLISH
-     carrying a Topic Alias is accepted, the alias is never mapped, and a
-     later PUBLISH with an empty topic name and only the alias is dropped
-     rather than routed — a silent message loss. The alias property is
-     then forwarded verbatim to subscribers that advertised no Topic Alias
-     Maximum, which 3.1.2.11.5 forbids. The codec already refuses alias
-     zero; nothing above it implements the mapping. `broker-core`, plus a
-     per-connection alias table in the shell.
-  2. **A protocol error after CONNACK closes the socket silently.** Alias
-     zero is caught by the codec and the connection is dropped with no
-     DISCONNECT, so an MQTT 5 client never learns the reason. The shell,
-     `server/src/connection.rs`, which has the version and the reason code
-     and already has a `refuse` path for the pre-CONNACK case.
-  3. **A 3.1.1 `CleanSession=0` session is not stored.** It is given a
-     session expiry interval of zero, so it is discarded the moment the
-     client disconnects. [MQTT-3.1.2-4] requires it to be kept. The 3.1.1
-     flag needs mapping to an interval that does not expire.
-     `broker-core/src/broker/mod.rs`.
-  4. **A DISCONNECT's Session Expiry Interval is ignored.** 3.14.2.2.2
-     lets a client change the interval on the way out; the handler passes
-     only the reason code to `detach`. Note that a fix must also make a
-     non-zero interval on DISCONNECT a protocol error when CONNECT said
-     zero, [MQTT-3.14.4-3]. `broker-core/src/broker/mod.rs`.
-  5. **A retained message loses its properties.** `RetainedMessage` holds
-     payload, QoS and expiry, so User Properties and Content Type are
-     dropped; [MQTT-3.3.2-17] requires User Properties to be forwarded
-     unaltered, and they are part of the stored Application Message.
-     Live forwarding is correct, so this is the retained store only.
-     `broker-core/src/retained.rs`.
-  6. **Message Expiry Interval is not decremented.** A delivery that
-     waited in a session queue forwards the interval it arrived with;
-     [MQTT-3.3.2-6] requires the received value minus the time waited.
-     Expiry itself works — the expired messages are dropped — so only the
-     rewrite on delivery is missing. `broker-core`.
-  7. **A client's Maximum Packet Size is not honoured outbound.**
-     [MQTT-3.1.2-24] forbids sending a packet larger than the client
-     advertised. Like Receive Maximum, this is per connection and not
-     session state, so it belongs beside `set_inflight_limit` in the
-     shell.
-  8. **A will can fire up to a second early.** The deadline is
-     `tick + delay` on a clock that advances in whole seconds, so a
-     disconnect part-way through a tick shortens the delay by the
-     remainder: a three-second Will Delay Interval was observed firing at
-     2.8s. Every other deadline in the broker errs late, which is
-     harmless; this one errs early, which 3.1.3.2.2 does not allow.
-     `broker-core/src/session/state.rs`.
+  The suite is not the whole story. A walk of sections 5 and 6 against
+  the code, done because convention 8 demands it before a milestone
+  closes, found five more promises with no implementation and five with
+  no test that could fail. None of them is visible to a conformance
+  suite, because a server that always supports quality of service 2 and
+  always accepts a retained message is a legal server whatever it
+  advertises. They are recorded in the milestone 1.5 plan.
+
+- **Eight conformance defects, found by the suite and since fixed.**
+  Kept here rather than deleted, because the finding is worth more than
+  the fixes and a reader who meets the defect list in the history should
+  meet its resolution in the same place.
+
+  What was wrong: a client's topic aliases were neither resolved nor
+  stripped, so a publish carrying only an alias was silently lost and the
+  alias was forwarded to subscribers that never asked for one; a protocol
+  error the decoder caught closed the socket with no DISCONNECT; a 3.1.1
+  session with `CleanSession` clear was given an expiry of zero and
+  discarded at disconnect; a DISCONNECT's Session Expiry Interval was
+  ignored; the retained store held payload, quality of service and expiry
+  and dropped the rest; a delivery reported the Message Expiry Interval it
+  was published with rather than what remained; a client's Maximum Packet
+  Size was not honoured outbound; and a will could fire up to a second
+  early, because a deadline of `now + delay` on a whole-second clock
+  rounds the wrong way.
+
+  **Six of the eight were features this document lists in section 5.4 as
+  in scope for v1, and no task in any of the five milestone-one plans
+  built them.** Nothing in the process read the specification back. That
+  is the finding, and it is recorded as convention 8.
+
+  Sixteen mutations were made by hand against the fixes and **eight
+  survived**, each one a test that could not fail. Two shapes recurred.
+  Tests that assert around a boundary rather than on it: this plan
+  predicted that a 200-byte publish would catch a size limit doubled from
+  64, and it does not, because 200 exceeds both. And tests that reach the
+  easy half of a rule: a discarded oversize publish must also complete its
+  delivery, and every test that only checked the packet was absent passed
+  against a broker that leaked the inflight slot forever.
+
+  Two findings came from mutations no plan named. A publish carrying a
+  Subscription Identifier from the client, which [MQTT-3.3.4-6] forbids,
+  reached subscribers through the retained store; only the unconditional
+  overwrite in the outgoing publish stops it, and `broker-core` still does
+  not reject it on ingress. And a displaced connection's writer, draining
+  actions handed to it before a takeover, could complete a delivery whose
+  packet identifier the newcomer now owns; the discard path checks the
+  session epoch as the detach path does.
+
+  **Still open, deliberately.** The CONNACK is written before the write
+  loop exists and is therefore not size-checked, so a client advertising a
+  Maximum Packet Size below roughly thirteen bytes receives an oversize
+  CONNACK. Suppressing it would leave that client with no reply at all,
+  which is worse. Left as it is and recorded here.
 
   The three suite assumptions, recorded so they are not re-investigated:
   `test_server_keep_alive` asserts a CONNACK property 3.2.2.3.14 says the
   server MAY send; `test_server_topic_alias` asserts the server uses
-  aliases, which 3.3.2.3.4 permits rather than requires; and
-  `test_flow_control2` is the suite's own client raising `BrokenPipeError`
-  while writing another PUBREL — a raw probe confirms the broker sends
-  exactly the DISCONNECT with reason 0x93 the test is looking for, after
-  the 1024th unacknowledged QoS 2 publication.
+  aliases, which 3.3.2.3.4 permits rather than requires and which section
+  5.4 now says this broker does not do; and `test_flow_control2` is the
+  suite's own client raising `BrokenPipeError` while writing another
+  PUBREL, a raw probe confirming the broker sends exactly the DISCONNECT
+  with reason 0x93 the test is looking for, after the 1024th
+  unacknowledged QoS 2 publication.
