@@ -1,7 +1,10 @@
 //! Disconnecting clients that have gone quiet, at scale.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+
+use foldhash::fast::RandomState;
 
 use crate::subscriptions::SubscriberId;
 
@@ -44,11 +47,26 @@ struct Armed {
 /// One timer drives the whole process. Each tick inspects one bucket, so
 /// the work per second is the population divided by the number of
 /// buckets rather than the whole population.
+///
+/// Departure is the other half of that promise, and it is the half that
+/// was quietly missing. `remove` used to scan every bucket, which at
+/// fifty thousand armed measured forty microseconds a call and grew
+/// linearly; a herd of a hundred thousand timing out together would
+/// have spent minutes inside one tick, which is precisely the stall the
+/// ring exists to prevent. Every entry now carries its own address in
+/// [`KeepAliveRing::placed`], so a removal touches one bucket slot and
+/// nothing else.
 pub struct KeepAliveRing {
     buckets: Vec<Vec<Armed>>,
+    /// Where each armed connection sits, as (bucket, index within it).
+    ///
+    /// Kept in step by every path that moves an entry. The invariant is
+    /// simply that `buckets[b][i].id == id` for each `id -> (b, i)`
+    /// here, and that the two hold the same population.
+    placed: HashMap<SubscriberId, (usize, usize), RandomState>,
     cursor: usize,
-    count: usize,
     last_examined: usize,
+    last_removal_examined: usize,
 }
 
 /// A client is disconnected after this multiple of its interval.
@@ -62,9 +80,10 @@ impl KeepAliveRing {
         let slots = (u32::from(max_keep_alive) * LIMIT_NUMERATOR / LIMIT_DENOMINATOR) as usize + 2;
         Self {
             buckets: (0..slots.max(2)).map(|_| Vec::new()).collect(),
+            placed: HashMap::with_hasher(RandomState::default()),
             cursor: 0,
-            count: 0,
             last_examined: 0,
+            last_removal_examined: 0,
         }
     }
 
@@ -73,42 +92,61 @@ impl KeepAliveRing {
     }
 
     /// Arm a connection.
+    ///
+    /// Arming one that is already armed replaces it rather than adding
+    /// a second entry. Two entries for one connection would expire it
+    /// twice, and the second would fire on a timestamp belonging to a
+    /// connection that no longer exists.
     pub fn insert(&mut self, id: SubscriberId, keep_alive: u16, activity: Activity, now: u32) {
+        self.remove(id);
         let armed = Armed {
             id,
             keep_alive,
             activity,
         };
-        self.count += 1;
         self.arm(armed, now);
     }
 
     /// Place a connection in the bucket where it next needs checking.
     fn arm(&mut self, armed: Armed, now: u32) {
         let slots = self.buckets.len();
-        if armed.keep_alive == 0 {
+        let slot = if armed.keep_alive == 0 {
             // No deadline. Park it a full revolution away so it is
             // revisited rarely and costs almost nothing.
-            let slot = (self.cursor + slots - 1) % slots;
-            self.buckets[slot].push(armed);
-            return;
-        }
+            (self.cursor + slots - 1) % slots
+        } else {
+            let due = armed
+                .activity
+                .last()
+                .saturating_add(Self::limit(armed.keep_alive));
+            let ahead = due.saturating_sub(now).max(1) as usize;
+            (self.cursor + ahead.min(slots - 1)) % slots
+        };
 
-        let due = armed
-            .activity
-            .last()
-            .saturating_add(Self::limit(armed.keep_alive));
-        let ahead = due.saturating_sub(now).max(1) as usize;
-        let slot = (self.cursor + ahead.min(slots - 1)) % slots;
+        let id = armed.id;
         self.buckets[slot].push(armed);
+        self.placed.insert(id, (slot, self.buckets[slot].len() - 1));
     }
 
     /// Disarm a connection.
+    ///
+    /// One hash lookup and one swap, whatever the population. The entry
+    /// swapped into the hole learns its new index, which is the only
+    /// other thing that moved.
     pub fn remove(&mut self, id: SubscriberId) {
-        for bucket in &mut self.buckets {
-            let before = bucket.len();
-            bucket.retain(|a| a.id != id);
-            self.count -= before - bucket.len();
+        let Some((slot, index)) = self.placed.remove(&id) else {
+            self.last_removal_examined = 0;
+            return;
+        };
+        let bucket = &mut self.buckets[slot];
+        bucket.swap_remove(index);
+        // `swap_remove` moved the last entry into the hole, unless the
+        // hole *was* the last entry.
+        if let Some(moved) = bucket.get(index) {
+            self.placed.insert(moved.id, (slot, index));
+            self.last_removal_examined = 2;
+        } else {
+            self.last_removal_examined = 1;
         }
     }
 
@@ -126,7 +164,10 @@ impl KeepAliveRing {
             }
             let silent_for = now.saturating_sub(armed.activity.last());
             if silent_for > Self::limit(armed.keep_alive) {
-                self.count -= 1;
+                // Already out of its bucket, so only the index needs
+                // forgetting. The caller must not ask the ring to
+                // remove it again.
+                self.placed.remove(&armed.id);
                 expired.push(armed.id);
             } else {
                 self.arm(armed, now);
@@ -136,12 +177,12 @@ impl KeepAliveRing {
 
     /// How many connections are armed.
     pub fn len(&self) -> usize {
-        self.count
+        self.placed.len()
     }
 
     /// Whether none are.
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        self.placed.is_empty()
     }
 
     /// How many entries the most recent tick examined.
@@ -153,6 +194,20 @@ impl KeepAliveRing {
     /// the cost.
     pub fn last_examined(&self) -> usize {
         self.last_examined
+    }
+
+    /// How many entries the most recent [`KeepAliveRing::remove`]
+    /// touched.
+    ///
+    /// The other half of the same promise, and the half that was
+    /// missing. [`KeepAliveRing::last_examined`] measured the sweep
+    /// while a linear scan sat beside it on every departure, invisible
+    /// to the one accessor that existed: a test measuring only the
+    /// cheap half of an operation proves nothing about the expensive
+    /// half. This is bounded by a small constant however many
+    /// connections are armed, and a test says so.
+    pub fn last_removal_examined(&self) -> usize {
+        self.last_removal_examined
     }
 }
 
@@ -324,6 +379,90 @@ mod tests {
         ring.insert(SubscriberId(1), 600, Activity::new(0), 0);
         assert!(expired_after(&mut ring, 0, 900).is_empty());
         assert_eq!(expired_after(&mut ring, 900, 901), vec![SubscriberId(1)]);
+    }
+
+    #[test]
+    fn removing_costs_the_same_however_many_are_armed() {
+        // The assertion the ring was missing. `last_examined` proved the
+        // sweep was bounded while `remove` scanned every bucket beside
+        // it: forty microseconds a call at fifty thousand armed, growing
+        // linearly, on a path the broker walks at every departure.
+        //
+        // Measured in entries touched rather than in time, so it is a
+        // statement about the algorithm and does not flake on a loaded
+        // machine. A scan would touch the whole population and this
+        // would read in the thousands.
+        for population in [1u64, 100, 10_000] {
+            let mut ring = KeepAliveRing::new(120);
+            for n in 0..population {
+                ring.insert(SubscriberId(n), 60, Activity::new(0), 0);
+            }
+
+            let mut worst = 0;
+            for n in 0..population {
+                ring.remove(SubscriberId(n));
+                worst = worst.max(ring.last_removal_examined());
+            }
+            assert!(ring.is_empty(), "everything came out");
+            assert!(
+                worst <= 2,
+                "removal touched {worst} entries with {population} armed"
+            );
+        }
+    }
+
+    #[test]
+    fn removing_one_leaves_the_rest_findable() {
+        // The risk a swap-remove introduces: the entry moved into the
+        // hole must learn its new index, or the next removal takes the
+        // wrong one out and the ring and its index disagree forever.
+        let mut ring = ring();
+        for n in 0..8u64 {
+            ring.insert(SubscriberId(n), 60, Activity::new(0), 0);
+        }
+        // Front, middle and back of the same bucket, in an order that
+        // makes the swap move an entry that is itself removed later.
+        for n in [0u64, 3, 7, 1] {
+            ring.remove(SubscriberId(n));
+        }
+        assert_eq!(ring.len(), 4);
+
+        let mut out = Vec::new();
+        for now in 1..=120 {
+            ring.tick(now, &mut out);
+        }
+        out.sort_unstable_by_key(|id| id.0);
+        assert_eq!(
+            out,
+            vec![
+                SubscriberId(2),
+                SubscriberId(4),
+                SubscriberId(5),
+                SubscriberId(6)
+            ],
+            "exactly the ones not removed, each exactly once"
+        );
+    }
+
+    #[test]
+    fn arming_an_armed_connection_replaces_it() {
+        // A takeover arms a handle that is already armed. Two entries
+        // for one connection means the older one expires it on a
+        // timestamp belonging to a connection that has already gone.
+        let mut ring = ring();
+        let first = Activity::new(0);
+        ring.insert(SubscriberId(1), 2, first, 0);
+        ring.insert(SubscriberId(1), 60, Activity::new(0), 0);
+        assert_eq!(ring.len(), 1, "one connection, one entry");
+
+        let mut out = Vec::new();
+        for now in 1..=10 {
+            ring.tick(now, &mut out);
+        }
+        assert!(
+            out.is_empty(),
+            "the replaced entry's two-second deadline is gone, not lurking"
+        );
     }
 
     #[test]

@@ -539,6 +539,16 @@ impl Broker {
     /// two owes a will is the session's rule, not this layer's.
     fn detach(&mut self, subscriber: SubscriberId, packet: Option<ReasonCode>, now: u32) {
         self.keepalive.remove(subscriber);
+        self.release(subscriber, packet, now);
+    }
+
+    /// The part of a detach that a connection already out of the ring
+    /// still needs: forget its activity cell and tell the session.
+    ///
+    /// Split out for the keep-alive path alone. The sweep takes an
+    /// expired entry out of its bucket as it finds it, so asking the
+    /// ring to remove it again is the one call there that buys nothing.
+    fn release(&mut self, subscriber: SubscriberId, packet: Option<ReasonCode>, now: u32) {
         self.activities.remove(&subscriber);
         if let Some(session) = self.registry.get_mut(subscriber) {
             match packet {
@@ -578,8 +588,9 @@ impl Broker {
         for subscriber in expired {
             out.push((subscriber, Action::Close(ReasonCode::KeepAliveTimeout)));
             // A connection that stopped talking never said goodbye, so
-            // its will is owed.
-            self.detach(subscriber, None, now);
+            // its will is owed. The sweep above already took it out of
+            // the ring, so this does not ask again.
+            self.release(subscriber, None, now);
         }
 
         // Wills first: a session that expires this tick may also owe one.
