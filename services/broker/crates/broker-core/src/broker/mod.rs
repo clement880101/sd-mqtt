@@ -576,6 +576,12 @@ impl Broker {
                     payload: message.payload.clone(),
                     qos: message.qos,
                     expires_at: message.expires_at,
+                    // The stored Application Message is the whole of it,
+                    // properties included: [MQTT-3.3.2-17] requires User
+                    // Properties to be forwarded unaltered, and a
+                    // retained delivery is a forward. Shared rather than
+                    // cloned, as the live fan-out below shares them.
+                    properties: Arc::clone(&message.properties),
                 },
             );
         }
@@ -745,7 +751,11 @@ fn expiry_interval(connect: &Connect) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mqtt_codec::packet::{Connect, Disconnect};
+    use bytes::Bytes;
+    use mqtt_codec::packet::{
+        Connect, Disconnect, Publish, RetainHandling, Subscribe, SubscriptionOptions,
+    };
+    use mqtt_codec::QoS;
 
     /// A minimal MQTT 5 connect for the given client, resuming rather
     /// than discarding whatever session it already has.
@@ -912,5 +922,82 @@ mod tests {
             !second.session_present,
             "zero still means the session ends with its connection"
         );
+    }
+
+    /// Retain a message carrying properties, then subscribe from a
+    /// second client and read what it was sent.
+    ///
+    /// The store keeping the properties is half the fix; this is the
+    /// other half. A store that keeps them and a delivery path that
+    /// drops them look identical from inside `retained.rs`, so the
+    /// store's own test cannot tell the two apart.
+    #[test]
+    fn a_retained_delivery_carries_the_properties_it_was_published_with() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+
+        let publisher = broker.connect("", &connect_v5("publisher"), &mut out);
+        let keepsake = Packet::Publish(Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: true,
+            topic: "retain/probe".to_string(),
+            packet_id: None,
+            payload: Bytes::from_static(b"body"),
+            properties: Properties {
+                content_type: Some("text/plain".to_string()),
+                user_properties: vec![("a".to_string(), "2".to_string())],
+                ..Properties::default()
+            },
+        });
+        broker
+            .handle(publisher.subscriber, &keepsake, &mut out)
+            .expect("the publish is accepted");
+
+        let newcomer = broker.connect("", &connect_v5("newcomer"), &mut out);
+        out.clear();
+        broker
+            .handle(newcomer.subscriber, &subscribe_to("retain/probe"), &mut out)
+            .expect("the subscribe is accepted");
+
+        let sent = publishes_to(&out, newcomer.subscriber);
+        let [delivered] = sent.as_slice() else {
+            panic!("one retained delivery, got {}", sent.len());
+        };
+        assert_eq!(
+            delivered.properties.user_properties,
+            vec![("a".to_string(), "2".to_string())],
+            "[MQTT-3.3.2-17]: user properties are forwarded unaltered"
+        );
+        assert_eq!(
+            delivered.properties.content_type.as_deref(),
+            Some("text/plain"),
+            "the content type is part of the stored application message"
+        );
+    }
+
+    /// A subscribe to one filter, asking for retained messages.
+    fn subscribe_to(filter: &str) -> Packet {
+        Packet::Subscribe(Subscribe {
+            packet_id: 1,
+            filters: vec![SubscriptionOptions {
+                filter: filter.to_string(),
+                qos: QoS::AtMostOnce,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: RetainHandling::SendAlways,
+            }],
+            properties: Properties::default(),
+        })
+    }
+
+    /// Every publish addressed to one subscriber, in order.
+    fn publishes_to(out: &[Addressed], subscriber: SubscriberId) -> Vec<&Publish> {
+        out.iter()
+            .filter_map(|(target, action)| match action {
+                Action::Send(Packet::Publish(p)) if *target == subscriber => Some(p),
+                _ => None,
+            })
+            .collect()
     }
 }

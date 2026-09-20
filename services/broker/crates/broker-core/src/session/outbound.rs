@@ -1110,6 +1110,38 @@ mod tests {
     }
 
     #[test]
+    fn a_subscription_identifier_on_the_message_never_reaches_a_subscriber_that_has_none() {
+        // A Subscription Identifier belongs to the subscriber, not to
+        // the message: [MQTT-3.3.4-6] forbids a Client from putting one
+        // on a PUBLISH, and nothing upstream strips it, so a message's
+        // property block may carry one. It also reaches here through
+        // the retained store, which keeps the publisher's properties
+        // whole. The overwrite below is what keeps either from leaking,
+        // and it is unconditional for exactly that reason.
+        //
+        // The existing echo test cannot see this: it gives the delivery
+        // identifiers of its own, so an overwrite guarded by
+        // `if !subscription_ids.is_empty()` passes it and the whole
+        // suite besides.
+        let mut out = online(10);
+        let mut actions = Vec::new();
+        let mut item = delivery(QoS::AtLeastOnce, b"x");
+        item.message.properties = Arc::new(Properties {
+            subscription_identifiers: vec![3],
+            ..Properties::default()
+        });
+        assert!(item.subscription_ids.is_empty(), "this subscriber has none");
+        out.offer(item, 0, &mut actions);
+
+        let published = sent(&actions);
+        assert_eq!(published.len(), 1);
+        assert!(
+            published[0].properties.subscription_identifiers.is_empty(),
+            "an identifier the subscriber did not earn must not go out"
+        );
+    }
+
+    #[test]
     fn a_message_that_expired_while_waiting_is_dropped_rather_than_sent() {
         let mut out = Outbound::new(QueueLimits::default(), 10);
         let mut actions = Vec::new();

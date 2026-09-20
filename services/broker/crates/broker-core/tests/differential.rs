@@ -261,6 +261,7 @@ proptest! {
                     payload: Bytes::from_static(b"v"),
                     qos: QoS::AtMostOnce,
                     expires_at: None,
+                    properties: Default::default(),
                 },
             );
         }

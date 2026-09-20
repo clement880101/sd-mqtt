@@ -10,10 +10,11 @@
 //! returning an error.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use foldhash::fast::RandomState;
-use mqtt_codec::QoS;
+use mqtt_codec::{Properties, QoS};
 use parking_lot::RwLock;
 
 /// A message held for future subscribers to a topic.
@@ -25,6 +26,26 @@ pub struct RetainedMessage {
     pub qos: QoS,
     /// A coarse deadline in seconds, past which it is discarded.
     pub expires_at: Option<u32>,
+    /// The properties the message was published with, part of the stored
+    /// Application Message: [MQTT-3.3.2-17] requires User Properties to be
+    /// forwarded unaltered, and the Content Type and the rest travel with
+    /// them. Shared rather than owned for the same reason [`Message`]
+    /// shares its own, because fan-out clones one retained message per
+    /// matching subscriber.
+    ///
+    /// Two of them are not this store's to hold. Subscription Identifiers
+    /// are per subscriber and [`outbound::publish`] overwrites them on
+    /// every delivery, so one stored here cannot reach a client. A Topic
+    /// Alias is stripped on ingress, which is the single place that rule
+    /// lives.
+    ///
+    /// The Message Expiry Interval stored here is the one the publisher
+    /// sent, which is stale the moment it is stored. [`outbound::publish`]
+    /// rewrites it from [`Self::expires_at`] on the way out.
+    ///
+    /// [`Message`]: crate::session::message::Message
+    /// [`outbound::publish`]: crate::session::outbound
+    pub properties: Arc<Properties>,
 }
 
 /// Retained messages, stored by topic and queried by filter.
@@ -282,13 +303,15 @@ fn remove_at(node: &mut RetainedNode, levels: &[&str]) -> bool {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use mqtt_codec::QoS;
+    use mqtt_codec::{Properties, QoS};
+    use std::sync::Arc;
 
     fn message(body: &'static str) -> RetainedMessage {
         RetainedMessage {
             payload: Bytes::from_static(body.as_bytes()),
             qos: QoS::AtMostOnce,
             expires_at: None,
+            properties: Arc::new(Properties::default()),
         }
     }
 
@@ -479,5 +502,39 @@ mod tests {
         assert!(topics_at(&store, "+", 101).is_empty());
         assert!(topics_at(&store, "a/b", 101).is_empty());
         assert!(topics_at(&store, "a/+", 101).is_empty());
+    }
+
+    /// A helper beside the test rather than in `message`, so that every
+    /// other test keeps saying "no properties" by construction.
+    fn retained_with(body: &'static str, properties: &Properties) -> RetainedMessage {
+        RetainedMessage {
+            properties: Arc::new(properties.clone()),
+            ..message(body)
+        }
+    }
+
+    #[test]
+    fn a_retained_message_keeps_its_properties() {
+        let store = RetainedStore::new();
+        let properties = Properties {
+            content_type: Some("text/plain".to_string()),
+            user_properties: vec![("a".to_string(), "2".to_string())],
+            ..Properties::default()
+        };
+        store.set("retain/probe", retained_with("body", &properties));
+
+        let mut found = Vec::new();
+        store.matching("retain/probe", 0, &mut found);
+
+        let (_, message) = found.pop().expect("the message is there");
+        assert_eq!(
+            message.properties.user_properties,
+            vec![("a".to_string(), "2".to_string())],
+            "[MQTT-3.3.2-17]: user properties are forwarded unaltered"
+        );
+        assert_eq!(
+            message.properties.content_type.as_deref(),
+            Some("text/plain")
+        );
     }
 }
