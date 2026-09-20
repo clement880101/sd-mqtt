@@ -156,9 +156,7 @@ impl Queue {
             return false;
         }
 
-        while self.entries.len() >= self.limits.max_messages
-            || self.bytes + size > self.limits.max_bytes
-        {
+        while self.is_over(size) {
             let reason = if self.entries.len() >= self.limits.max_messages {
                 DropReason::QueueFull
             } else {
@@ -187,6 +185,33 @@ impl Queue {
         self.bytes += size;
         self.entries.push_back(item);
         true
+    }
+
+    /// Whether a message of `size` bytes is over either bound.
+    ///
+    /// Not a refusal on its own: a queue that evicts to make room is over
+    /// its bound until it has evicted enough. [`Queue::push`] and
+    /// [`Queue::would_refuse`] both ask this, so that the rule deciding
+    /// what fits cannot drift from the rule answering whether it would.
+    fn is_over(&self, size: usize) -> bool {
+        self.entries.len() >= self.limits.max_messages || self.bytes + size > self.limits.max_bytes
+    }
+
+    /// Whether offering a message of `size` bytes would be refused.
+    ///
+    /// The question section 6 asks of a shared subscription's members
+    /// before it hands one the message: "a member whose queue is full is
+    /// skipped and the next is tried". Answering it needs no message,
+    /// only its size, because a refusal here costs nothing to recover
+    /// from while a refusal after the offer has already lost it.
+    ///
+    /// Full is full, whatever the queue does about it. An
+    /// [`Overflow::DropOldest`] queue at its bound would accept this
+    /// message by evicting an older one, and is still reported full
+    /// here: a member that need evict nothing is the better place to
+    /// send it, and the group has one or it has not.
+    pub fn would_refuse(&self, size: usize) -> bool {
+        size > self.limits.max_bytes || self.is_over(size)
     }
 
     /// Put a message back at the head, ahead of anything newer.
@@ -299,6 +324,63 @@ mod tests {
             assert_eq!(&item.message.payload[..], &[n]);
         }
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn a_full_queue_says_so_before_it_is_offered_anything() {
+        // What section 6's skip asks of a shared group's members, and
+        // it has to be answerable in advance: an offer that is refused
+        // has already lost the message. On the boundary in both
+        // directions, and against `push` rather than against a
+        // restatement of its rule, because the two disagreeing is the
+        // whole failure this can have.
+        let mut queue = Queue::new(limits(2, Overflow::DropNewest));
+        let mut dropped = Vec::new();
+        let size = delivery(QoS::AtLeastOnce, b"1").size_in_queue();
+
+        for payload in [b"1", b"2"] {
+            assert!(!queue.would_refuse(size), "room for {payload:?}");
+            assert!(queue.push(delivery(QoS::AtLeastOnce, payload), 0, true, &mut dropped));
+        }
+
+        assert!(queue.would_refuse(size), "two is the bound, so it is full");
+        assert!(
+            !queue.push(delivery(QoS::AtLeastOnce, b"3"), 0, true, &mut dropped),
+            "and push agrees"
+        );
+    }
+
+    #[test]
+    fn a_queue_out_of_bytes_says_so_before_it_is_offered_anything() {
+        // The other bound, on its own boundary: room for two of this
+        // size and not a third, though the message count is nowhere
+        // near its own limit.
+        let size = delivery(QoS::AtLeastOnce, b"payload").size_in_queue();
+        let mut queue = Queue::new(QueueLimits {
+            max_messages: usize::MAX,
+            max_bytes: size * 2,
+            overflow: Overflow::DropNewest,
+            queue_qos0_while_offline: false,
+        });
+        let mut dropped = Vec::new();
+
+        for _ in 0..2 {
+            assert!(!queue.would_refuse(size));
+            assert!(queue.push(
+                delivery(QoS::AtLeastOnce, b"payload"),
+                0,
+                true,
+                &mut dropped
+            ));
+        }
+
+        assert!(queue.would_refuse(size), "a third would go over the budget");
+        assert!(!queue.push(
+            delivery(QoS::AtLeastOnce, b"payload"),
+            0,
+            true,
+            &mut dropped
+        ));
     }
 
     #[test]

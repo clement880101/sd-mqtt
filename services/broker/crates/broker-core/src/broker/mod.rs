@@ -635,11 +635,24 @@ impl Broker {
         }
 
         let mut routed = Vec::new();
+        // Section 6's "a member whose queue is full is skipped". The
+        // selector cannot see a session and is not given one; it is
+        // asked again instead, and this answers whether the member it
+        // offered could take the message. The size is the same for
+        // every subscriber, so it is measured once.
+        let size = message.size_in_queue();
+        let registry = &self.registry;
+        let mut has_room = |subscriber: SubscriberId| {
+            registry
+                .get(subscriber)
+                .is_some_and(|session| !session.outbound.would_refuse(size))
+        };
         route::route(
             &self.subscriptions,
             &self.shared,
             &message,
             publisher,
+            &mut has_room,
             &mut routed,
         );
         let reached = routed.len();
@@ -1279,6 +1292,192 @@ mod tests {
             drops_to(&out, sub),
             vec![DropReason::ByteBudget],
             "two of that size fit the budget and a third does not"
+        );
+    }
+
+    /// Two sessions sharing a group on `a/b`, each also holding an
+    /// ordinary subscription to a private filling topic so that its
+    /// queue can be filled alone, without spending any of the group's
+    /// rotation and without touching the other member.
+    ///
+    /// Returns them in the order they joined the group, which is the
+    /// order the rotation asks them in.
+    fn a_group_of_two(broker: &mut Broker, out: &mut Vec<Addressed>) -> [SubscriberId; 2] {
+        let mut members = Vec::new();
+        for name in ["first", "second"] {
+            let member = broker.connect("", &connect_v5(name), out).subscriber;
+            broker
+                .handle(
+                    member,
+                    &subscribe_at(&fill_topic(name), QoS::AtLeastOnce),
+                    out,
+                )
+                .expect("the subscribe is accepted");
+            broker
+                .handle(member, &subscribe_at("$share/g/a/b", QoS::AtLeastOnce), out)
+                .expect("the shared subscribe is accepted");
+            members.push(member);
+        }
+        out.clear();
+        [members[0], members[1]]
+    }
+
+    /// The private topic one group member's queue is filled through.
+    fn fill_topic(name: &str) -> String {
+        format!("fill/{name}")
+    }
+
+    /// Fill one member's window and queue, so that the next message
+    /// offered to it is refused.
+    ///
+    /// The broker here is configured with a window of one and a queue of
+    /// one, so two messages are exactly full: one in flight, one waiting.
+    fn fill(broker: &mut Broker, member: SubscriberId, name: &str, out: &mut Vec<Addressed>) {
+        for _ in 0..2 {
+            broker.publish(
+                Message::new(
+                    &fill_topic(name),
+                    Bytes::from_static(b"x"),
+                    QoS::AtLeastOnce,
+                    false,
+                ),
+                None,
+                0,
+                out,
+            );
+        }
+        assert!(
+            drops_to(out, member).is_empty(),
+            "the filling itself must not overflow, or the test is measuring that instead"
+        );
+        out.clear();
+    }
+
+    /// A broker whose sessions hold one message in flight and one queued.
+    fn brimful() -> Broker {
+        Broker::new(BrokerConfig {
+            max_inflight: 1,
+            max_queue_messages: 1,
+            ..BrokerConfig::default()
+        })
+    }
+
+    #[test]
+    fn a_shared_member_whose_queue_is_full_is_skipped_for_one_with_room() {
+        // Section 6: "A member whose queue is full is skipped and the
+        // next is tried." The rotation asks `first` because it joined
+        // first, so without the skip the message dies in its full queue
+        // while `second` sits idle.
+        let mut broker = brimful();
+        let mut out = Vec::new();
+        let [first, second] = a_group_of_two(&mut broker, &mut out);
+        fill(&mut broker, first, "first", &mut out);
+
+        broker.publish(
+            Message::new("a/b", Bytes::from_static(b"x"), QoS::AtLeastOnce, false),
+            None,
+            0,
+            &mut out,
+        );
+
+        assert_eq!(
+            publishes_to(&out, second).len(),
+            1,
+            "the member with room receives it"
+        );
+        assert!(
+            drops_to(&out, first).is_empty() && drops_to(&out, second).is_empty(),
+            "nothing is dropped when a member of the group could take it"
+        );
+    }
+
+    #[test]
+    fn a_shared_group_with_every_member_full_drops_the_message_once() {
+        // The other end of the same rule, and the one that keeps the
+        // skip from becoming a search: when nobody can take it the
+        // message is dropped, once, and reported. A retry that wrapped
+        // past the group would either deliver it twice or drop it twice.
+        let mut broker = brimful();
+        let mut out = Vec::new();
+        let [first, second] = a_group_of_two(&mut broker, &mut out);
+        fill(&mut broker, first, "first", &mut out);
+        fill(&mut broker, second, "second", &mut out);
+
+        broker.publish(
+            Message::new("a/b", Bytes::from_static(b"x"), QoS::AtLeastOnce, false),
+            None,
+            0,
+            &mut out,
+        );
+
+        let dropped: Vec<DropReason> = [first, second]
+            .iter()
+            .flat_map(|member| drops_to(&out, *member))
+            .collect();
+        assert_eq!(
+            dropped,
+            vec![DropReason::QueueFull],
+            "one member's queue reports it, and only one"
+        );
+        assert!(
+            publishes_to(&out, first).is_empty() && publishes_to(&out, second).is_empty(),
+            "nobody could take it, so nobody received it"
+        );
+    }
+
+    #[test]
+    fn a_shared_member_skipped_while_full_is_picked_again_once_it_drains() {
+        // Starvation, which the skip is the obvious way to cause: a
+        // member passed over must keep its place in the rotation rather
+        // than lose it. `first` is asked first, refuses, and `second`
+        // takes the message; once `first` drains it must be picked
+        // again, and on its very next turn.
+        let mut broker = brimful();
+        let mut out = Vec::new();
+        let [first, second] = a_group_of_two(&mut broker, &mut out);
+        fill(&mut broker, first, "first", &mut out);
+
+        broker.publish(
+            Message::new("a/b", Bytes::from_static(b"x"), QoS::AtLeastOnce, false),
+            None,
+            0,
+            &mut out,
+        );
+        assert_eq!(publishes_to(&out, second).len(), 1, "skipped while full");
+
+        // `first` drains: the in-flight message is acknowledged, the
+        // queued one goes out in its place, and that is acknowledged
+        // too. Both the window and the queue are empty again.
+        out.clear();
+        for packet_id in [1, 2] {
+            broker
+                .handle(
+                    first,
+                    &Packet::PubAck(mqtt_codec::packet::Ack {
+                        packet_id,
+                        reason: ReasonCode::Success,
+                        properties: Properties::default(),
+                    }),
+                    &mut out,
+                )
+                .expect("the acknowledgement is accepted");
+        }
+        out.clear();
+
+        broker.publish(
+            Message::new("a/b", Bytes::from_static(b"y"), QoS::AtLeastOnce, false),
+            None,
+            0,
+            &mut out,
+        );
+        assert_eq!(
+            publishes_to(&out, first).len(),
+            1,
+            "a member that has drained takes its next turn"
+        );
+        assert!(
+            publishes_to(&out, second).is_empty(),
+            "and takes it instead of the member that covered for it"
         );
     }
 

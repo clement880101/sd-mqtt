@@ -47,6 +47,20 @@ impl Outbound {
         self.inflight.set_limit(limit);
     }
 
+    /// Whether a message of `size` bytes would be refused by the queue.
+    ///
+    /// Asked of a shared subscription's members before one of them is
+    /// handed the message, which is the only way section 6's "a member
+    /// whose queue is full is skipped" can be honoured: an offer that is
+    /// refused has already lost the message.
+    ///
+    /// Only the queue is consulted. A full inflight window is not a
+    /// refusal, because the queue exists precisely to hold what the
+    /// window has no room for.
+    pub fn would_refuse(&self, size: usize) -> bool {
+        self.queue.would_refuse(size)
+    }
+
     /// Offer a message for delivery.
     pub fn offer(&mut self, item: Delivery, now: u32, out: &mut Vec<Action>) {
         self.scratch.clear();

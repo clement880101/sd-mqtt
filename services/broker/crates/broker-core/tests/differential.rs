@@ -350,8 +350,9 @@ proptest! {
 
             // One synthetic trie entry per live group, always. This is
             // what makes matching yield groups directly, and a stale
-            // entry is invisible to every other assertion here: `select`
-            // skips a synthetic whose group is gone, so the leak shows
+            // entry is invisible to every other assertion here:
+            // `next_member` answers nothing for a synthetic whose
+            // group is gone, so the leak shows
             // up in nothing but the count itself.
             prop_assert_eq!(
                 shared.synthetic_count(),
@@ -366,9 +367,15 @@ proptest! {
                 .filter(|(_, filter)| reference::matches(filter, topic))
                 .collect();
 
-            let mut out = Vec::new();
-            shared.select(topic, &mut out);
-            let picked: Vec<u64> = out.into_iter().map(|s| s.subscriber.0).collect();
+            // One member from each matching group, the way a caller
+            // with room for the message everywhere would take them.
+            let mut groups = Vec::new();
+            shared.matching(topic, &mut groups);
+            let picked: Vec<u64> = groups
+                .iter()
+                .filter_map(|group| shared.next_member(*group))
+                .map(|s| s.subscriber.0)
+                .collect();
 
             // Exactly one member per matching group, no more and no less.
             prop_assert_eq!(picked.len(), wanted.len(), "topic {:?}", topic);
