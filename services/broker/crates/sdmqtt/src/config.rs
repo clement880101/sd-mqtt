@@ -314,6 +314,16 @@ impl Config {
                 why: "a queue that holds nothing drops every message an offline session is sent",
             });
         }
+        // The same failure through the other bound. A message's size in
+        // the queue is never zero, so a byte budget of zero refuses
+        // every one of them, exactly as a message count of zero does.
+        if self.broker.max_queue_bytes == 0 {
+            return Err(ConfigError::Unusable {
+                key: "broker.max_queue_bytes",
+                value: "0".to_string(),
+                why: "a queue that holds nothing drops every message an offline session is sent",
+            });
+        }
 
         // The relation between the queue and the channel that drains
         // it. A session's writer reads one outbox, and the broker can
@@ -681,6 +691,20 @@ mod tests {
         let error = config.validate().expect_err("zero cannot be a queue");
         assert!(
             error.to_string().contains("broker.max_queue_messages"),
+            "the message names the key at fault: {error}"
+        );
+    }
+
+    #[test]
+    fn a_queue_with_no_byte_budget_is_refused() {
+        // The sibling of `max_queue_messages = 0`, and the same
+        // failure: a message occupies a non-zero number of bytes in the
+        // queue, so a budget of zero refuses every message rather than
+        // bounding anything.
+        let config = Config::from_toml("[broker]\nmax_queue_bytes = 0\n").unwrap();
+        let error = config.validate().expect_err("zero cannot be a budget");
+        assert!(
+            error.to_string().contains("broker.max_queue_bytes"),
             "the message names the key at fault: {error}"
         );
     }
