@@ -15,6 +15,7 @@ pub mod message;
 pub mod outbound;
 pub mod packet_ids;
 pub mod queue;
+pub mod state;
 
 /// Something the caller must do as a result of an input.
 ///
@@ -46,8 +47,6 @@ pub enum Action {
         /// Where it was published, for the log line.
         topic: Arc<str>,
     },
-    /// The session ended ungracefully; publish this will.
-    PublishWill(message::Message),
     /// Close the connection with this reason.
     Close(ReasonCode),
 }
@@ -58,3 +57,4 @@ pub use message::{Message, MessageId};
 pub use outbound::Outbound;
 pub use packet_ids::PacketIds;
 pub use queue::{Delivery, DropReason, Overflow, Queue, QueueLimits};
+pub use state::{Session, StoredWill};

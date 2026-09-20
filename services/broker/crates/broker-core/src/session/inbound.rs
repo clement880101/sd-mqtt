@@ -208,7 +208,7 @@ impl Inbound {
     ///
     /// At-least-once publishes left unanswered stop counting: section
     /// 4.9 says the quota "is not preserved across Network Connections,
-    /// and [is] re-initialized with each new Network Connection", and
+    /// and \[is\] re-initialized with each new Network Connection", and
     /// a client that gets no acknowledgement resends the publish on the
     /// next one. Exactly-once exchanges are session state and are kept,
     /// because a redelivery must still be recognised as one.
