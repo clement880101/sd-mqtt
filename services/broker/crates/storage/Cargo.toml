@@ -1,0 +1,21 @@
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Durable storage for sd-mqtt sessions, queues, bodies and retained messages"
+
+[dependencies]
+redb = "4.3"
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+thiserror.workspace = true
+bytes = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
