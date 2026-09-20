@@ -33,7 +33,6 @@ v5:test_subscribe_options    flaky      Waits on aclient's subscribeds after bcl
 
 # --- real defects, reported, deliberately not fixed here ---------------
 v5:test_session_expiry       defect     A DISCONNECT's Session Expiry Interval is ignored, so it cannot extend the session (3.14.2.2.2).
-v311:test_offline_message_queueing defect A 3.1.1 CleanSession=0 session gets expiry 0 and is discarded at disconnect; [MQTT-3.1.2-4] requires it to be stored.
 v5:test_retained_message     defect     The retained store keeps payload, QoS and expiry only, so a retained delivery loses its User Properties and Content Type ([MQTT-3.3.2-17]).
 v5:test_publication_expiry   defect     A queued delivery forwards the original Message Expiry Interval instead of the value minus the time waited ([MQTT-3.3.2-6]).
 v5:test_maximum_packet_size  defect     A client's Maximum Packet Size is not honoured on the way out ([MQTT-3.1.2-24]).

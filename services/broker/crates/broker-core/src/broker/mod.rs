@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use foldhash::fast::RandomState;
 use mqtt_codec::packet::Connect;
-use mqtt_codec::{Limits, Packet, Properties, ReasonCode};
+use mqtt_codec::{Limits, Packet, Properties, ReasonCode, Version};
 
 use crate::clock::CoarseClock;
 use crate::keepalive::{Activity, KeepAliveRing};
@@ -181,12 +181,7 @@ impl Broker {
             .get_mut(registration.subscriber)
             .expect("just registered");
         session.set_version(connect.version);
-        session.set_expiry_interval(
-            connect
-                .properties
-                .session_expiry_interval
-                .unwrap_or_default(),
-        );
+        session.set_expiry_interval(expiry_interval(connect));
         session.set_will(connect.will.as_ref().map(|will| {
             // Section 3.1.3.2 splits the will properties in two: the
             // application message's own, which travel with it, and the
@@ -709,5 +704,99 @@ impl Broker {
     /// How many subscriptions are held, for a metric and for tests.
     pub fn subscription_count(&self) -> usize {
         self.subscriptions.len() + self.shared.member_count()
+    }
+}
+
+/// How long a session outlives its connection, in seconds.
+///
+/// MQTT 5 states it as a property and defaults it to zero, 3.1.2.11.2.
+/// MQTT 3.1.1 has only the clean flag, and [MQTT-3.1.2-4] requires a
+/// session with it clear to be stored: there is no interval to read, so
+/// the equivalent is one that does not elapse.
+fn expiry_interval(connect: &Connect) -> u32 {
+    match connect.version {
+        Version::V5 => connect
+            .properties
+            .session_expiry_interval
+            .unwrap_or_default(),
+        _ if connect.clean_start => 0,
+        _ => u32::MAX,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mqtt_codec::packet::Connect;
+
+    /// A minimal MQTT 5 connect for the given client, resuming rather
+    /// than discarding whatever session it already has.
+    fn connect_v5(client: &str) -> Connect {
+        Connect {
+            version: Version::V5,
+            client_id: client.to_string(),
+            clean_start: false,
+            keep_alive: 0,
+            username: None,
+            password: None,
+            will: None,
+            properties: Properties::default(),
+        }
+    }
+
+    /// The same over 3.1.1, which has no properties to speak of.
+    fn connect_v311(client: &str) -> Connect {
+        Connect {
+            version: Version::V311,
+            ..connect_v5(client)
+        }
+    }
+
+    #[test]
+    fn a_three_one_one_session_with_clean_session_clear_outlives_its_connection() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+
+        let mut connect = connect_v311("durable");
+        connect.clean_start = false;
+        let first = broker.connect("", &connect, &mut out);
+        broker.disconnect(first.subscriber, &mut out);
+
+        // Far past any plausible deadline.
+        broker.clock().advance(1_000_000);
+        broker.tick(&mut out);
+
+        let second = broker.connect("", &connect, &mut out);
+        assert!(
+            second.session_present,
+            "[MQTT-3.1.2-4]: a 3.1.1 session with CleanSession clear is stored"
+        );
+    }
+
+    #[test]
+    fn a_version_five_session_with_no_expiry_property_does_not_outlive_its_connection() {
+        // The mirror of the test above, and the half no other test
+        // reached: every existing session-expiry test names an interval
+        // explicitly, so the default was unguarded and reading the
+        // absent property as "never expires" survived the whole suite.
+        // 3.1.2.11.2 says the absent Session Expiry Interval is zero,
+        // and zero ends the session with the network connection.
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+
+        let connect = connect_v5("ephemeral");
+        assert!(
+            connect.properties.session_expiry_interval.is_none(),
+            "the point of this test is the absent property"
+        );
+        let first = broker.connect("", &connect, &mut out);
+        broker.disconnect(first.subscriber, &mut out);
+        broker.tick(&mut out);
+
+        let second = broker.connect("", &connect, &mut out);
+        assert!(
+            !second.session_present,
+            "3.1.2.11.2: an absent Session Expiry Interval is zero, not forever"
+        );
     }
 }
