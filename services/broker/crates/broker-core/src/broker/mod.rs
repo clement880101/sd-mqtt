@@ -15,7 +15,7 @@ use crate::keepalive::{Activity, KeepAliveRing};
 use crate::registry::{Registration, Registry, SessionId};
 use crate::retained::{RetainedMessage, RetainedStore};
 use crate::session::message::Message;
-use crate::session::queue::Delivery;
+use crate::session::queue::{Delivery, DropReason};
 use crate::session::state::{will_message, Session, StoredWill};
 use crate::session::Action;
 use crate::subscriptions::{SharedSubscriptions, SubscriberId, SubscriptionTrie};
@@ -110,6 +110,16 @@ impl Broker {
         let identity = SessionId::new(mountpoint, &connect.client_id);
 
         let displaced = self.displace_incumbent(&identity, connect.clean_start, now, out);
+        if connect.clean_start {
+            // The registry is about to replace this session wholesale,
+            // taking its queue and its window with it. What it was
+            // holding is reported before it goes.
+            if let Some(existing) = self.registry.subscriber_of(&identity) {
+                if let Some(session) = self.registry.get_mut(existing) {
+                    Self::discard_held(session, existing, out);
+                }
+            }
+        }
         let mut registration = self.registry.register(identity, connect.clean_start, now);
         // The registry judges takeover by whether the session was still
         // connected, and this layer disconnected it a moment ago on
@@ -538,6 +548,27 @@ impl Broker {
         }
     }
 
+    /// Report and discard everything a session still held.
+    ///
+    /// A session that is destroyed takes its queue and its window with
+    /// it, and discarding them is correct: nothing will ever deliver
+    /// them now. Discarding them *unreported* is not. The session layer
+    /// keeps the rule that nothing disappears without an action saying
+    /// so, because a message that vanishes with no counter moving is a
+    /// support case nobody can answer, and [`Outbound::clear`] exists
+    /// for exactly this moment. Only the assembly knows when it arrives.
+    ///
+    /// [`Outbound::clear`]: crate::session::Outbound::clear
+    fn discard_held(session: &mut Session, subscriber: SubscriberId, out: &mut Vec<Addressed>) {
+        let mut actions = Vec::new();
+        session
+            .outbound
+            .clear(DropReason::SessionEnded, &mut actions);
+        for action in actions {
+            out.push((subscriber, action));
+        }
+    }
+
     /// Advance one second and do everything that falls due.
     pub fn tick(&mut self, out: &mut Vec<Addressed>) {
         let now = self.clock.advance(1);
@@ -571,6 +602,7 @@ impl Broker {
         for subscriber in gone {
             if let Some(mut session) = self.registry.remove(subscriber) {
                 subscribe::remove_all(&self.subscriptions, &self.shared, &mut session);
+                Self::discard_held(&mut session, subscriber, out);
             }
             self.keepalive.remove(subscriber);
             self.activities.remove(&subscriber);

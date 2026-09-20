@@ -32,7 +32,7 @@
 
 use broker_core::broker::{Broker, BrokerConfig};
 use broker_core::session::message::Message;
-use broker_core::session::Action;
+use broker_core::session::{Action, DropReason};
 use broker_core::subscriptions::SubscriberId;
 use broker_core::topic::reference;
 use bytes::Bytes;
@@ -42,6 +42,7 @@ use mqtt_codec::packet::{
 use mqtt_codec::{Packet, Properties, QoS, ReasonCode, Version};
 use proptest::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A small vocabulary, so collisions and overlaps are common.
 fn any_topic() -> impl Strategy<Value = String> {
@@ -1083,5 +1084,111 @@ fn a_takeover_does_not_publish_the_newcomers_will() {
         payloads,
         vec![Bytes::from_static(b"the first")],
         "the will that went out is the one being displaced"
+    );
+}
+
+/// Queue `count` at-least-once messages for a session that is not
+/// there, returning its handle. The session is durable so the messages
+/// wait rather than being refused.
+fn a_session_holding(broker: &mut Broker, expiry: u32, count: usize) -> SubscriberId {
+    let mut out = Vec::new();
+    let subscriber = broker.connect("", &durable_connect("holder", expiry), &mut out);
+    broker
+        .handle(
+            subscriber.subscriber,
+            &Packet::Subscribe(subscribe_packet("a/b", QoS::AtLeastOnce)),
+            &mut out,
+        )
+        .expect("a valid subscribe");
+    broker.disconnect(subscriber.subscriber, &mut out);
+
+    let author = broker.connect("", &connect_packet("author", 0), &mut out);
+    for attempt in 0..count {
+        let packet_id = u16::try_from(attempt).expect("a small count") + 1;
+        broker
+            .handle(
+                author.subscriber,
+                &Packet::Publish(publish_packet(
+                    "a/b",
+                    QoS::AtLeastOnce,
+                    Some(packet_id),
+                    false,
+                    false,
+                )),
+                &mut out,
+            )
+            .expect("a valid publish");
+    }
+    subscriber.subscriber
+}
+
+/// Every message discarded because a session ended, in order.
+fn session_ended_drops(out: &[(SubscriberId, Action)], subscriber: SubscriberId) -> Vec<Arc<str>> {
+    out.iter()
+        .filter(|(to, _)| *to == subscriber)
+        .filter_map(|(_, action)| match action {
+            Action::Dropped {
+                reason: DropReason::SessionEnded,
+                topic,
+                ..
+            } => Some(Arc::clone(topic)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A session destroyed by expiry says what it was still holding.
+///
+/// Three messages went into its queue and no client will ever see them.
+/// That is correct. Letting them vanish with no action, so that nothing
+/// counts them and no operator can answer where they went, is not.
+#[test]
+fn an_expiring_session_reports_what_it_discards() {
+    let mut broker = Broker::new(BrokerConfig::default());
+    let holder = a_session_holding(&mut broker, 5, 3);
+
+    let mut out = Vec::new();
+    let mut drops = Vec::new();
+    for _ in 0..10 {
+        out.clear();
+        broker.tick(&mut out);
+        drops.extend(session_ended_drops(&out, holder));
+    }
+
+    assert_eq!(
+        drops.len(),
+        3,
+        "one report per message the destroyed session was holding"
+    );
+    assert!(
+        drops.iter().all(|topic| &**topic == "a/b"),
+        "and each says which message went"
+    );
+    assert_eq!(broker.session_count(), 1, "only the author is left");
+}
+
+/// A session replaced by a clean start says the same.
+///
+/// The registry swaps the session out from under the handle, which is
+/// the same destruction by another route and just as silent.
+#[test]
+fn a_clean_start_reports_what_it_discards() {
+    let mut broker = Broker::new(BrokerConfig::default());
+    let holder = a_session_holding(&mut broker, 600, 3);
+
+    let mut out = Vec::new();
+    let mut fresh = durable_connect("holder", 600);
+    fresh.clean_start = true;
+    broker.connect("", &fresh, &mut out);
+
+    assert_eq!(
+        session_ended_drops(&out, holder).len(),
+        3,
+        "a clean start discards the old session's queue, and says so"
+    );
+    assert_eq!(
+        copies(&out, "a/b", holder),
+        0,
+        "and certainly does not deliver it to the new session"
     );
 }
