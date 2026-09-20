@@ -30,7 +30,10 @@ tempfile.workspace = true
 # exercising the path the shell takes. `time` is what bounds the waits
 # that cannot be made deterministic, so a broken writer fails rather than
 # hangs.
-tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+# `rt-multi-thread` is only for `tests/throughput.rs`: a hundred
+# waiters woken by one flush on a single-threaded runtime would
+# measure the runtime's wakeups rather than the device's `fsync`.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 
 [lints]
 workspace = true

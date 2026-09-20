@@ -300,8 +300,11 @@ The deciding facts:
 What is given up is key-value separation: redb stores values in the tree,
 so a multi-megabyte payload costs write amplification that fjall's separate
 blob storage would avoid. Message bodies are stored once and referenced, so
-the cost is paid once per message rather than once per subscriber. It is
-recorded in section 17 as a thing to measure rather than a thing to assume.
+the cost is paid once per message rather than once per subscriber. It was
+recorded in section 17 as a thing to measure rather than a thing to assume,
+and section 17 now carries the measurement: a body at the configured
+maximum packet size costs less per byte than a small one, and nothing
+follows from it.
 
 Writes serialize on a single write transaction, which is what a single
 batching writer does in any case. Freed pages are reused, so the file is
@@ -1053,15 +1056,77 @@ needs it, and the resolution is recorded as an architecture decision record.
   and mutation testing during review. None of the three found what
   either of the others did.
 
-- **What a multi-megabyte payload costs the store.** redb keeps values in
-  the tree rather than apart from it, so a large payload is rewritten as
-  pages split and merge, where an engine with key-value separation would
-  write it once. Bodies are stored once and referenced by every queue
-  entry, so the amplification is paid per message rather than per
-  subscriber, and the maximum packet size bounds it. Measure it during
-  milestone 2 against payloads at the configured maximum, and record the
-  figure here. If it is bad, the answer is to keep large bodies in files
-  beside the store rather than to change engine.
+- **The ceiling on acknowledged delivery, measured.** Section 7.3 sends an
+  acknowledgement only after the commit is durable, so whatever the rest
+  of the broker can do, an acknowledged message costs a share of a flush.
+  Nothing had measured it. The harness is
+  `services/broker/crates/storage/tests/throughput.rs`, two ignored tests
+  run with
+  `cargo test -p storage --release --test throughput -- --ignored
+  --nocapture --test-threads 1`. Machine: Apple M2 Pro, 12 logical cores,
+  32 GB, macOS 26.4.1, arm64, release profile, internal APFS SSD, redb
+  with `SyncMode::Immediate`, one small record per write, each waiter
+  holding one write outstanding at a time, three-second window after a
+  one-second warm-up.
+
+  | concurrent waiters | durable writes/s | per waiter | coalescing off |
+  |---:|---:|---:|---:|
+  | 1 | 334 | 334 | 335 |
+  | 10 | 3,343 | 334 | 339 |
+  | 100 | 25,100 | 251 | 337 |
+
+  The last column is the control: the same load with the writer's count
+  trigger at zero, so every batch is flushed on its own. It is flat at
+  about 337 a second however many waiters there are, because that is one
+  `fsync` on this device and nothing is amortising it. With coalescing,
+  a hundred waiters get 25,100, and each of them still completes about
+  250 a second — roughly one flush per round trip, shared.
+
+  **So the ceiling is set by how many publishers are waiting at once, not
+  by the device.** A broker with one publisher awaiting an
+  acknowledgement is held to about 340 messages a second whatever else it
+  can do; a hundred of them get 75 times that between them, which is 75%
+  of what a perfectly linear scaling would give. Beside
+  the lock measurement above — around 290,000 at-most-once messages a
+  second through one `Shared` — this says that for acknowledged traffic
+  at these concurrencies the disk is the limit and the lock is not.
+
+- **What a multi-megabyte payload costs the store, measured.** redb keeps
+  values in the tree rather than apart from it, so a large payload is
+  rewritten as pages split and merge, where an engine with key-value
+  separation would write it once. The same harness, same machine. Each
+  row stores about 32 MiB of payload as bodies of one size, one batch per
+  body, with identifiers scattered across the key space as a real UUID
+  would be, and compares the file size before and after with the file
+  closed both times.
+
+  | body | bodies | payload bytes | file grew by | bytes/byte | MiB/s |
+  |---:|---:|---:|---:|---:|---:|
+  | 1 KiB | 32,768 | 33,554,432 | 66,351,104 | 1.98 | 46 |
+  | 64 KiB | 512 | 33,554,432 | 66,318,336 | 1.98 | 395 |
+  | 1 MiB | 32 | 33,554,432 | 68,153,344 | 2.03 | 562 |
+  | 2,000,000 B | 16 | 32,000,000 | 34,598,912 | 1.08 | 952 |
+
+  **Large bodies are not disproportionately expensive, and no design
+  change follows.** The store costs about twice its payload in file space
+  at every body size up to a megabyte, and 1.08 at the configured maximum
+  packet size, where it is also written twenty times faster per byte than
+  a kilobyte body is. The answer this question reserved — keeping large
+  bodies in files beside the store — is not needed, and bodies stay in
+  the store.
+
+  What the figure is and is not: bytes the file grew per byte of payload,
+  which is **space** amplification. Write amplification, the bytes a
+  copy-on-write engine spends rewriting pages, is necessarily larger and
+  is not measured here, because counting device writes needs a tool the
+  test cannot call. The throughput column is the check on it: a body
+  rewritten many times over would show there, and the rate rises with
+  body size rather than falling.
+
+  One caveat for anyone reproducing it. The ratio is only stable once the
+  store is tens of megabytes, which is why every row stores about 32 MiB:
+  the same 64 KiB bodies measured over 8 MiB read 3.89, which is redb's
+  file growth granularity rather than anything about the payload.
 
 - **Two fjall behaviours worth remembering if this is ever revisited.**
   Its length call counts deleted entries, so it cannot answer queue
