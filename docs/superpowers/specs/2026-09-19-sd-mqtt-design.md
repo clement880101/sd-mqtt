@@ -60,7 +60,7 @@ sd-mqtt/
       crates/
         mqtt-codec/          packet types, encode, decode. No I/O.
         broker-core/         sessions, routing, retained, queues, hooks
-        storage/             Storage trait, fjall backend, redb backend
+        storage/             Storage trait, redb backend, in-memory backend
         cluster/             membership, metadata replication, node link
         connectors/          rule engine and the four connector types
         api/                 HTTP API, SSE, metrics, health, UI serving
@@ -276,11 +276,38 @@ miss because the codec correctly treats an empty payload as ordinary.
 - users with both an argon2 password hash and a SCRAM verifier, access
   control rules, rules, API keys, node identity
 
-The default backend is fjall, chosen because the queue workload is appends
-with deletion from the head and values up to megabytes, which is the shape a
-log-structured merge tree is built for. A redb backend is maintained as a
-supported alternative for anyone who wants the smaller dependency tree, and
-its existence keeps the trait honest.
+**The backend is redb.** An earlier draft named fjall, reasoning that a
+queue of appends with deletion from the head is the shape a log-structured
+merge tree is built for. Measuring both before writing against either
+reversed that.
+
+The deciding facts:
+
+- redb has a native remove-and-return-head. It measured 1.47M operations a
+  second and stayed flat across a hundred thousand of them. fjall has no
+  such primitive, and its obvious head read is a forward scan over every
+  accumulated deletion marker: it collapsed from 1,357 a second to 197 as a
+  queue drained, and a hundred thousand deletions never finished. A
+  persisted head cursor recovers most of that, but the engine that needs no
+  workaround is the better one to build on.
+- redb has one dependency, `libc`. fjall has forty-two, two of which fall
+  outside this project's licence allow list and would require amending it.
+  redb passes `cargo deny` with no change at all.
+- redb spawns no background threads. fjall runs a worker pool whose write
+  path contains unbounded loops of `std::thread::sleep`, which must never
+  run on an async runtime's thread.
+
+What is given up is key-value separation: redb stores values in the tree,
+so a multi-megabyte payload costs write amplification that fjall's separate
+blob storage would avoid. Message bodies are stored once and referenced, so
+the cost is paid once per message rather than once per subscriber. It is
+recorded in section 17 as a thing to measure rather than a thing to assume.
+
+Writes serialize on a single write transaction, which is what a single
+batching writer does in any case. Freed pages are reused, so the file is
+bounded by its high-water mark rather than growing without end; reclaiming
+space needs an explicit compaction that excludes all transactions, which is
+a maintenance operation rather than a background one.
 
 ### 7.2 Durability
 
@@ -369,14 +396,18 @@ cluster metadata for milestone 5, and users, access control rules,
 rules and API keys for milestones 4 and 7. The trait may name them; the
 backend need not answer them yet.
 
-**Only the fjall backend is built.** Section 7.1 says a redb backend is
-maintained as a supported alternative and that its existence keeps the
-trait honest. A second backend built alongside the first keeps the trait
-honest at the cost of doubling the work before anything is proven, so
-what keeps it honest in this milestone is an in-memory backend used by
-the tests, which is cheap and catches the same class of mistake. Whether
-redb follows is a decision for after the trait has survived contact with
-one real engine.
+**One real backend is built.** What keeps the trait honest in this
+milestone is an in-memory backend used by the tests, which is cheap and
+catches the same class of mistake as a second engine would.
+
+The trait is nonetheless written as though a second backend existed,
+because comparing two engines is what found the head-read problem in the
+first place. Concretely: no backend's types appear in a signature; the
+head read is expressed as "read at or after this cursor" rather than as
+"read the first key", so an engine without a head primitive can still
+answer it; and queue depth is an explicit stored counter rather than a
+call to the engine's own length, because at least one engine's answer
+counts deleted entries.
 
 ## 8. Clustering
 
@@ -803,7 +834,7 @@ shippable.
    ring. Exit criteria: a single node passes the conformance suite over plain
    TCP, with the suite's TLS and WebSocket sections deferred to milestone 7.
    The suite is chosen and pinned during this milestone.
-2. **Persistence.** The storage trait, the fjall backend, durable sessions and
+2. **Persistence.** The storage trait, the redb backend, durable sessions and
    queues with per-session sequence numbers, restore on start. Exit criteria:
    a broker restart preserves durable sessions, their subscriptions and their
    queued messages, and queue operations carry gapless sequence numbers.
@@ -1021,6 +1052,23 @@ needs it, and the resolution is recorded as an architecture decision record.
   an independent conformance suite, a walk of the spec against the code,
   and mutation testing during review. None of the three found what
   either of the others did.
+
+- **What a multi-megabyte payload costs the store.** redb keeps values in
+  the tree rather than apart from it, so a large payload is rewritten as
+  pages split and merge, where an engine with key-value separation would
+  write it once. Bodies are stored once and referenced by every queue
+  entry, so the amplification is paid per message rather than per
+  subscriber, and the maximum packet size bounds it. Measure it during
+  milestone 2 against payloads at the configured maximum, and record the
+  figure here. If it is bad, the answer is to keep large bodies in files
+  beside the store rather than to change engine.
+
+- **Two fjall behaviours worth remembering if this is ever revisited.**
+  Its length call counts deleted entries, so it cannot answer queue
+  depth; and its keyspaces cost roughly thirty milliseconds each to
+  create, so a design with one per session would take minutes to start.
+  Both shaped the trait even though the engine was not chosen: depth is a
+  stored counter and queues share one table with composite keys.
 
 - **Eight conformance defects, found by the suite and since fixed.**
   Kept here rather than deleted, because the finding is worth more than
