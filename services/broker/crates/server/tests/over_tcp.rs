@@ -166,6 +166,79 @@ async fn a_packet_split_across_two_writes_is_reassembled() {
     running.shutdown().await;
 }
 
+/// Wait for a connection that has just been displaced to finish
+/// unwinding, and therefore to have run the detach it owes the broker.
+///
+/// There is nothing the correct path leaves behind to wait for: the
+/// guard under test fires by doing nothing at all. So the wait is
+/// bounded by the damage instead. It ends the moment the session's
+/// outbox disappears, which is what a detach by the displaced
+/// connection does and what closes the newcomer's socket, and
+/// otherwise spends the whole budget — three orders of magnitude
+/// longer than the scheduler hops between the displaced socket closing
+/// and the task that owned it dropping its attachment.
+async fn displaced_connection_unwound(running: &Running) {
+    for _ in 0..50 {
+        if running.shared().outbox_count() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_displaced_connection_does_not_disconnect_the_session_it_lost() {
+    // An ordinary takeover, which is the most common event on this
+    // path, and one deleted condition away from killing the newcomer:
+    // the displaced connection unwinds a moment after the newcomer has
+    // claimed the handle, and without the epoch check its detach
+    // disconnects a live client and arms a will nobody is owed.
+    //
+    // It needs two real connections and the race between them, so it
+    // cannot be driven from a unit test that builds the pieces by
+    // hand. The assertion is on the newcomer's own socket, because
+    // what the defect does is close it.
+    let running = Server::bind(ServerConfig::ephemeral())
+        .await
+        .expect("the server binds");
+
+    let (mut displaced, mut displaced_buf) = handshake(&running, "contested", 0).await;
+    let (mut newcomer, mut newcomer_buf) = handshake(&running, "contested", 0).await;
+
+    // Both halves of the incumbent's ending are waited for. The
+    // disconnect says the takeover happened; the close says its writer
+    // has finished, which is the last thing before the connection task
+    // unwinds into the detach under test.
+    match next(&mut displaced, &mut displaced_buf).await {
+        Some(Packet::Disconnect(disconnect)) => {
+            assert_eq!(disconnect.reason, ReasonCode::SessionTakenOver);
+        }
+        other => panic!("expected the takeover disconnect, got {other:?}"),
+    }
+    assert!(
+        next(&mut displaced, &mut displaced_buf).await.is_none(),
+        "the displaced connection is closed, not left open"
+    );
+    drop(displaced);
+    displaced_connection_unwound(&running).await;
+
+    // The positive check, so this is not an assertion that nothing
+    // happened: the newcomer is still being served by the session it
+    // took over.
+    let ping = bytes_of(&Packet::PingReq);
+    assert!(
+        newcomer.write_all(&ping).await.is_ok(),
+        "the newcomer's socket was closed by the connection it displaced"
+    );
+    match next(&mut newcomer, &mut newcomer_buf).await {
+        Some(Packet::PingResp) => {}
+        None => panic!("the newcomer's socket was closed by the connection it displaced"),
+        other => panic!("expected a ping response, got {other:?}"),
+    }
+
+    running.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_disconnect_closes_the_socket_at_the_other_end() {
     // The other difference. A duplex stream's close is visible the
