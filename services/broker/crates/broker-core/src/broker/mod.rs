@@ -88,6 +88,17 @@ impl Broker {
         &self.clock
     }
 
+    /// One session, mutably.
+    ///
+    /// For the two settings a connection owns and a session does not:
+    /// the send window narrowed to the peer's receive maximum, and the
+    /// receive maximum imposed on the peer. Section 4.9 says both are
+    /// "not preserved across Network Connections", so neither can be
+    /// decided here, where no connection is visible.
+    pub fn session_mut(&mut self, subscriber: SubscriberId) -> Option<&mut Session> {
+        self.registry.get_mut(subscriber)
+    }
+
     /// One session, for a metric or an assertion.
     pub fn session(&self, subscriber: SubscriberId) -> Option<&Session> {
         self.registry.get(subscriber)

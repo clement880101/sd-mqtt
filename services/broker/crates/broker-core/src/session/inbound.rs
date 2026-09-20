@@ -81,6 +81,20 @@ impl Inbound {
         }
     }
 
+    /// Change the limit, as [`Outbound::set_inflight_limit`] does for
+    /// the other direction. Zero means unbounded.
+    ///
+    /// A connection announces this in its acknowledgement, and section
+    /// 4.9 says the quota is re-initialised on each network connection,
+    /// so it is set per connection rather than when the session is
+    /// created. Nothing already held is discarded: lowering it stops
+    /// new publishes being accepted, and the exchanges in flight finish.
+    ///
+    /// [`Outbound::set_inflight_limit`]: crate::session::Outbound::set_inflight_limit
+    pub fn set_receive_maximum(&mut self, receive_maximum: usize) {
+        self.receive_maximum = receive_maximum;
+    }
+
     /// Decide what to do with a publish from the client.
     ///
     /// This emits nothing. The acknowledgement is owed rather than sent,
