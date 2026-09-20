@@ -10,6 +10,12 @@ description = "The listener and connection handling for sd-mqtt"
 [dependencies]
 broker-core = { path = "../broker-core", version = "0.1.0" }
 mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
+# Default features off, and not for `broker-core`'s reason. This crate is
+# allowed a disk; it simply has no use for one. It needs the record
+# vocabulary and the batching writer, both of which are backend
+# independent, and which store the writer is given is `sdmqtt`'s choice
+# to make and nothing this crate can see.
+storage = { path = "../storage", version = "0.1.0", default-features = false }
 bytes.workspace = true
 thiserror.workspace = true
 foldhash = "0.2"

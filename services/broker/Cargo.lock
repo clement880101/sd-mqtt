@@ -711,6 +711,7 @@ dependencies = [
  "foldhash",
  "mqtt-codec",
  "parking_lot",
+ "storage",
  "thiserror",
  "tokio",
  "tracing",

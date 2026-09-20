@@ -29,12 +29,23 @@ pub fn spawn_ticker(shared: Arc<Shared>, mut shutdown: broadcast::Receiver<()>) 
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    // Expiries, wills and reclaimed retained messages
+                    // are durable changes, and `with_broker` commits
+                    // them. **Nothing here is waited on.** Section
+                    // 7.3: the wait is for an acknowledgement, and a
+                    // tick was promised to nobody. Waiting would put
+                    // the one task that drives every deadline in the
+                    // process behind a disk flush once a second.
                     let actions = shared.with_broker(|broker| {
                         let mut out = Vec::new();
                         broker.tick(&mut out);
                         out
                     });
                     shared.deliver(actions);
+                    // Once a second, from the one task that runs
+                    // whether or not anybody is connected. See
+                    // `Shared::report_rejections`.
+                    shared.report_rejections();
                 }
                 _ = shutdown.recv() => return,
             }
