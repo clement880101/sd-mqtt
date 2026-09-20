@@ -621,3 +621,161 @@ fn a_drained_queue_restores_its_mark_and_not_its_length() {
         3
     );
 }
+
+// ---- a body's reference count is stored, not remembered -----------------
+
+/// The count of references to a body survives a restart.
+///
+/// Section 7.2 says the count is persisted beside the body rather than
+/// rebuilt by scanning at startup, and a broker with a large store cannot
+/// afford that scan. Without this test the count could live only in
+/// memory: both of the contract suite's body tests would still pass,
+/// because neither of them closes the store.
+///
+/// The restart is placed between the two releases on purpose. A count that
+/// came back as one would delete the body on the first release, under a
+/// queue entry that still names it.
+#[test]
+fn a_body_reference_count_survives_a_restart() {
+    let workspace = workspace();
+    let path = store_path(&workspace);
+    {
+        let store = open(&path);
+        apply(
+            &store,
+            &[
+                Record::SessionPut(session("one")),
+                Record::SessionPut(session("two")),
+                Record::BodyPut {
+                    id: body_id(1),
+                    body: body(1),
+                },
+                Record::BodyPut {
+                    id: body_id(1),
+                    body: body(1),
+                },
+                Record::QueuePushed {
+                    session: key("one"),
+                    entry: queue_entry(1, body_id(1)),
+                },
+                Record::QueuePushed {
+                    session: key("two"),
+                    entry: queue_entry(1, body_id(1)),
+                },
+            ],
+        );
+        store.flush().expect("a flush must succeed");
+    }
+
+    // One of the two sessions takes its copy and releases its reference.
+    {
+        let store = open(&path);
+        apply(
+            &store,
+            &[
+                Record::QueuePopped {
+                    session: key("one"),
+                    sequence: 1,
+                },
+                Record::BodyReleased { id: body_id(1) },
+            ],
+        );
+        assert_eq!(
+            store.restore().expect("restoring").bodies.get(&body_id(1)),
+            Some(&body(1)),
+            "the body went on the first of two releases, and session two's queue entry now \
+             names nothing"
+        );
+        store.flush().expect("a flush must succeed");
+    }
+
+    // And the second, after another restart.
+    {
+        let store = open(&path);
+        assert_eq!(
+            store.restore().expect("restoring").bodies.get(&body_id(1)),
+            Some(&body(1)),
+            "the body did not survive the restart"
+        );
+        apply(
+            &store,
+            &[
+                Record::QueuePopped {
+                    session: key("two"),
+                    sequence: 1,
+                },
+                Record::BodyReleased { id: body_id(1) },
+            ],
+        );
+        assert!(
+            store.restore().expect("restoring").bodies.is_empty(),
+            "the body outlived its last reference, and nothing will ever release it again"
+        );
+        store.flush().expect("a flush must succeed");
+    }
+
+    // A release past the last one is still refused after a restart, which
+    // a count that came back too high would accept.
+    let store = open(&path);
+    assert!(
+        matches!(
+            store.apply(&[Record::BodyReleased { id: body_id(1) }]),
+            Err(StorageError::Rejected(
+                storage::Rejection::BodyNotHeld { .. }
+            ))
+        ),
+        "the body is still held after its last reference was released"
+    );
+}
+
+/// A body stored once and referenced many times is stored once on disk.
+///
+/// The count is what makes that safe, so it is worth asserting that the
+/// saving is real rather than assumed: a thousand references to a
+/// megabyte body must not be a gigabyte of file.
+#[test]
+fn a_body_referenced_many_times_is_written_once() {
+    let workspace = workspace();
+    let path = store_path(&workspace);
+    let payload = vec![7u8; 64 * 1024];
+    {
+        let store = open(&path);
+        apply(&store, &[Record::SessionPut(session("sensor"))]);
+        for sequence in 1..=64u64 {
+            apply(
+                &store,
+                &[
+                    Record::BodyPut {
+                        id: body_id(1),
+                        body: BodyRecord {
+                            topic: "sensor/1".to_owned(),
+                            payload: payload.clone().into(),
+                            qos: Qos::AtLeastOnce,
+                            retain: false,
+                            expires_at: None,
+                            properties: bytes::Bytes::new(),
+                        },
+                    },
+                    Record::QueuePushed {
+                        session: key("sensor"),
+                        entry: queue_entry(sequence, body_id(1)),
+                    },
+                ],
+            );
+        }
+        store.flush().expect("a flush must succeed");
+    }
+
+    let written = std::fs::metadata(&path)
+        .expect("the store file must exist")
+        .len();
+    let sixty_four_copies = 64 * payload.len() as u64;
+    assert!(
+        written < sixty_four_copies / 2,
+        "the store is {written} bytes, which is the size of storing the body more than once \
+         ({sixty_four_copies} bytes would be all sixty-four)"
+    );
+
+    let store = open(&path);
+    assert_eq!(store.restore().expect("restoring").bodies.len(), 1);
+}
