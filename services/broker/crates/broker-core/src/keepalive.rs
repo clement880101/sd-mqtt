@@ -48,6 +48,7 @@ pub struct KeepAliveRing {
     buckets: Vec<Vec<Armed>>,
     cursor: usize,
     count: usize,
+    last_examined: usize,
 }
 
 /// A client is disconnected after this multiple of its interval.
@@ -63,6 +64,7 @@ impl KeepAliveRing {
             buckets: (0..slots.max(2)).map(|_| Vec::new()).collect(),
             cursor: 0,
             count: 0,
+            last_examined: 0,
         }
     }
 
@@ -115,6 +117,7 @@ impl KeepAliveRing {
     pub fn tick(&mut self, now: u32, expired: &mut Vec<SubscriberId>) {
         self.cursor = (self.cursor + 1) % self.buckets.len();
         let due = std::mem::take(&mut self.buckets[self.cursor]);
+        self.last_examined = due.len();
 
         for armed in due {
             if armed.keep_alive == 0 {
@@ -139,6 +142,17 @@ impl KeepAliveRing {
     /// Whether none are.
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// How many entries the most recent tick examined.
+    ///
+    /// Exposed so a test can assert the ring does bounded work per tick
+    /// rather than assume it. That is the whole reason this is a ring
+    /// rather than a list, and nothing else observes it: a mutation that
+    /// degrades the sweep to the full population changes no outcome, only
+    /// the cost.
+    pub fn last_examined(&self) -> usize {
+        self.last_examined
     }
 }
 
@@ -223,27 +237,59 @@ mod tests {
     fn connections_arriving_over_time_are_swept_across_buckets() {
         // Clients connect over time, and the ring places each one by when
         // it is next due, so the work spreads without any scheduling.
+        //
+        // "Over time" is ticked here, not merely labelled: arm() places a
+        // connection relative to the ring's own cursor, which only tracks
+        // the passage of time because tick() is called once per second. A
+        // batch of inserts with no ticks between them leaves the cursor
+        // stuck at second zero regardless of the `now` each one claims to
+        // arrive at, which collapses every one of them onto the same
+        // bucket instead of spreading them. Advancing the clock between
+        // arrivals is what makes this a simulation of the real driver
+        // (one ticker, once a second, independent of connection traffic)
+        // rather than of a false instant where everyone arrives at once.
         let mut ring = ring();
         let mut activities = Vec::new();
-        for n in 0..1000u64 {
-            let arrived = n as u32 % 100;
-            let activity = Activity::new(arrived);
-            ring.insert(SubscriberId(n), 60, activity.clone(), arrived);
-            activities.push(activity);
-        }
-        assert_eq!(ring.len(), 1000);
-
         let mut out = Vec::new();
         let mut worst = 0;
-        for now in 1..=200 {
-            let before = out.len();
+        let mut now = 0u32;
+        for arrived in 0u32..100 {
+            if arrived > 0 {
+                now += 1;
+                ring.tick(now, &mut out);
+                worst = worst.max(ring.last_examined());
+            }
+            for _ in 0..10u64 {
+                let activity = Activity::new(arrived);
+                ring.insert(
+                    SubscriberId(activities.len() as u64),
+                    60,
+                    activity.clone(),
+                    arrived,
+                );
+                activities.push(activity);
+            }
+        }
+
+        // The earliest arrivals' sixty-second keep-alive can lapse before
+        // the hundredth second of arrivals has even finished ticking by,
+        // so some are already expired here, folded into `out` above
+        // rather than dropped: that is real work the ring did while
+        // still accepting new connections, not a separate phase.
+        for _ in 0..200 {
+            now += 1;
             ring.tick(now, &mut out);
-            worst = worst.max(out.len() - before);
+            worst = worst.max(ring.last_examined());
         }
         assert_eq!(out.len(), 1000, "all of them eventually");
+        assert!(ring.is_empty());
+        // The bound is about the shape of the sweep, not a precise budget:
+        // a thousand connections spread across a hundred arrival seconds
+        // and a hundred and eighty-two buckets should never need a tick
+        // to examine more than a small fraction of the population.
         assert!(
             worst <= 100,
-            "no tick should carry the whole population, worst was {worst}"
+            "no tick should examine the whole population, worst was {worst}"
         );
     }
 
@@ -263,12 +309,11 @@ mod tests {
         let mut out = Vec::new();
         let mut worst = 0;
         for now in 1..=30 {
-            let before = out.len();
             ring.tick(now, &mut out);
-            worst = worst.max(out.len() - before);
+            worst = worst.max(ring.last_examined());
         }
         assert_eq!(out.len(), 500);
-        assert_eq!(worst, 500, "the herd is swept in one tick");
+        assert_eq!(worst, 500, "the herd is examined in one tick");
     }
 
     #[test]
