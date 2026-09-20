@@ -320,19 +320,11 @@ pub(crate) fn check_reason(kind: PacketKind, reason: ReasonCode) -> Result<(), C
 }
 
 impl From<CodecError> for ReasonCode {
+    /// One mapping, held by the error itself. See
+    /// [`CodecError::reason_code`], which this exists only to spell
+    /// `into()`: a copy of the table here would drift from it.
     fn from(error: CodecError) -> Self {
-        match error {
-            CodecError::MalformedPacket(_) | CodecError::InvalidUtf8 => ReasonCode::MalformedPacket,
-            CodecError::ProtocolError(_) => ReasonCode::ProtocolError,
-            CodecError::PacketTooLarge => ReasonCode::PacketTooLarge,
-            CodecError::UnsupportedVersion(_) => ReasonCode::UnsupportedProtocolVersion,
-            CodecError::InvalidTopicName | CodecError::TopicNameTooDeep => {
-                ReasonCode::TopicNameInvalid
-            }
-            CodecError::InvalidTopicFilter | CodecError::TopicFilterTooDeep => {
-                ReasonCode::TopicFilterInvalid
-            }
-        }
+        error.reason_code()
     }
 }
 

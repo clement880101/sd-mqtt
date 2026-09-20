@@ -483,9 +483,20 @@ impl Attached {
                 // when it has written a close. Either way there is
                 // nothing left to read for.
                 _ = &mut *writer_gone => return Ok(()),
-                next = reader.next(self.version) => match next? {
-                    Some(packet) => packet,
-                    None => return Ok(()),
+                next = reader.next(self.version) => match next {
+                    Ok(Some(packet)) => packet,
+                    Ok(None) => return Ok(()),
+                    // A malformed packet is the client's fault and it
+                    // is owed the reason: the decoder found it, so
+                    // nothing above has had the chance to report it.
+                    // An I/O failure is not reportable, because the
+                    // socket is what failed.
+                    Err(FrameError::Protocol(error)) => {
+                        let reason = reportable(error.reason_code());
+                        self.close_with(reason);
+                        return Err(ConnectionError::Frame(FrameError::Protocol(error)));
+                    }
+                    Err(other) => return Err(other.into()),
                 },
             };
 
@@ -671,6 +682,29 @@ impl SizeLimit {
     }
 }
 
+/// Narrow a reason to one a DISCONNECT may carry.
+///
+/// Every code the codec reports is in Table 3-10 under 3.14.2.1 except
+/// unsupported protocol version, which 2.4 lists for CONNACK alone. It
+/// is reachable here: a client that has already been acknowledged and
+/// then sends a second CONNECT naming a level we do not serve is
+/// refused by the decoder with exactly that error. Sent as it stands,
+/// the encoder would refuse the disconnect, the writer would log and
+/// write nothing, and the client would learn no more than it did
+/// before this path existed. It is a protocol error like any other
+/// second CONNECT, so that is what it is told.
+///
+/// Which codes a DISCONNECT may carry is the shell's business rather
+/// than the error's, which is why this is here and not in the codec:
+/// the same error answers a CONNECT with a CONNACK, where 0x84 is the
+/// right and only answer.
+fn reportable(reason: ReasonCode) -> ReasonCode {
+    match reason {
+        ReasonCode::UnsupportedProtocolVersion => ReasonCode::ProtocolError,
+        other => other,
+    }
+}
+
 /// Turn one action into bytes, reporting whether it ends the connection.
 fn render(action: &Action, version: Version, buf: &mut BytesMut) -> bool {
     match action {
@@ -849,6 +883,86 @@ mod tests {
             .expect("the server reacts")
             .unwrap();
         assert_ne!(n, 0, "a reason is given before closing");
+    }
+
+    /// A publish whose topic alias is zero, written as bytes because
+    /// the encoder refuses to produce one (convention 1), so a test
+    /// cannot reach the decoder's check through `encode`.
+    ///
+    /// Section 3.3: 0x30 is a publish at quality of service zero, then
+    /// a remaining length of nine, a two byte topic length and "a/b",
+    /// a property length of three, and property 0x23 (topic alias)
+    /// carrying the two byte value zero. 3.3.2.3.4 makes that a
+    /// protocol error.
+    const PUBLISH_WITH_A_ZERO_ALIAS: &[u8] = &[
+        0x30, 0x09, 0x00, 0x03, b'a', b'/', b'b', 0x03, 0x23, 0x00, 0x00,
+    ];
+
+    /// A connect naming protocol level six, which this broker does not
+    /// serve. Sent after a connect has already been acknowledged, it is
+    /// the one way a decoder's unsupported-version error is reached
+    /// from the read loop rather than from the first packet.
+    ///
+    /// 0x10 and a remaining length of seven, then the protocol name
+    /// "MQTT" and the level byte. The decoder rejects the level before
+    /// it reads anything further, so nothing follows it.
+    const CONNECT_AT_LEVEL_SIX: &[u8] = &[0x10, 0x07, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x06];
+
+    #[tokio::test]
+    async fn a_decode_error_is_reported_before_the_socket_closes() {
+        // The decoder finds this one, so nothing above it has had the
+        // chance to report it, and before this task the socket simply
+        // closed: an MQTT 5 client had no way to learn what it sent
+        // that was wrong.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(shared);
+
+        write(
+            &mut client,
+            &Packet::Connect(Box::new(connect("c", 0))),
+            Version::V5,
+        )
+        .await;
+        let _ = read(&mut client, Version::V5).await;
+
+        client.write_all(PUBLISH_WITH_A_ZERO_ALIAS).await.unwrap();
+
+        match read(&mut client, Version::V5).await {
+            Packet::Disconnect(disconnect) => assert_eq!(
+                disconnect.reason,
+                ReasonCode::ProtocolError,
+                "3.3.2.3.4 is a protocol error, and the code is the point"
+            ),
+            other => panic!("expected a disconnect carrying the reason, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reason_no_disconnect_may_carry_is_reported_as_a_protocol_error() {
+        // Table 3-10 has no unsupported protocol version: 0x84 is a
+        // connack code. Sending it here would be refused by the
+        // encoder, the writer would log and write nothing, and the
+        // client would be back to learning nothing at all -- the very
+        // defect this task fixes, in the one corner that reaches it.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(shared);
+
+        write(
+            &mut client,
+            &Packet::Connect(Box::new(connect("c", 0))),
+            Version::V5,
+        )
+        .await;
+        let _ = read(&mut client, Version::V5).await;
+
+        client.write_all(CONNECT_AT_LEVEL_SIX).await.unwrap();
+
+        match read(&mut client, Version::V5).await {
+            Packet::Disconnect(disconnect) => {
+                assert_eq!(disconnect.reason, ReasonCode::ProtocolError)
+            }
+            other => panic!("expected a disconnect carrying the reason, got {other:?}"),
+        }
     }
 
     #[tokio::test]
