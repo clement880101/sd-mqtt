@@ -84,12 +84,22 @@ pub struct Restoration {
     /// Named rather than counted, because the store still holds every
     /// one of them and nothing in this crate can tell it otherwise: the
     /// broker does no I/O. A shell that does not remove them leaves a
-    /// session, its queue and its share of every body it references on
-    /// disk for the life of the file, and the next restart skips them
-    /// again. Handing back the keys is what lets the shell say
-    /// [`Record::SessionRemoved`] for each.
+    /// session and its queue on disk for the life of the file, and the
+    /// next restart skips them again. Handing back the keys is what
+    /// lets the shell say [`Record::SessionRemoved`] for each.
+    ///
+    /// **A removal does not reclaim the bodies.** `Storage::apply` is
+    /// explicit that a [`Record::SessionRemoved`] does not release the
+    /// bodies of the queue and inflight entries it discards, so the
+    /// shell owes one [`Record::BodyReleased`] per entry of every
+    /// session named here, in the same batch and before the removal.
+    /// [`Restored`] carries those entries, which is where the shell
+    /// gets them; this list is only the keys. This is unlike a session
+    /// that expires through [`Broker::tick`], where `Outbound::clear`
+    /// emits a release for every entry as it discards it.
     ///
     /// [`Record::SessionRemoved`]: storage::record::Record::SessionRemoved
+    /// [`Record::BodyReleased`]: storage::record::Record::BodyReleased
     pub expired: Vec<SessionKey>,
     /// Filters the store held that the broker would no longer accept.
     ///

@@ -8,6 +8,7 @@
 
 mod config;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -225,9 +226,33 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Arc<Shared>,
 
     // A session the restore skipped is still in the store, and nothing
     // in `broker-core` can tell it otherwise: the broker does no I/O.
-    // Leaving them would hold a session, its queue and its share of
-    // every body it references on disk for the life of the file, and
-    // the next restart would skip them again.
+    // Leaving it would hold the session and its queue on disk for the
+    // life of the file, and the next restart would skip them again.
+    //
+    // **The removal is not enough on its own.** `Storage::apply` says a
+    // `SessionRemoved` deliberately does not release the bodies of the
+    // queue and inflight entries it discards, because a caller that
+    // already emits those releases would then release twice and the
+    // store cannot tell the two callers apart. This is that caller, so
+    // it owes one release per entry: one reference is taken by the
+    // `BodyPut` beside each `QueuePushed`, and it is not released when
+    // the delivery moves from the queue into the window, so a queue
+    // entry and an inflight entry hold one reference each. Without
+    // them the count never reaches zero, the payload stays in the file
+    // forever, and the restart after this one no longer sees the
+    // session that referenced it.
+    //
+    // **One batch**, which is what matters: a batch is applied in full
+    // or not at all, so the entries cannot be discarded without their
+    // releases and the releases cannot be applied without the discard.
+    // Split across two, a crash between them loses whichever half went
+    // second, and the half that reaches the store on its own is either
+    // the leak this fixes or a body deleted underneath a live entry.
+    //
+    // The releases go before the removal because that is the order the
+    // facts happened in. The store does not require it — a release
+    // names a body and not a session — but a reader of the batch
+    // should not have to know that to see it is right.
     //
     // Not waited on: nothing was promised to anybody, and a removal
     // that does not survive a crash before the next flush is simply
@@ -235,15 +260,30 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Arc<Shared>,
     // store no longer holds is a no-op rather than a refusal, so a
     // repeat costs nothing.
     if !report.expired.is_empty() {
-        let removals: Vec<Record> = report
-            .expired
+        let expired: HashSet<&storage::record::SessionKey> = report.expired.iter().collect();
+        let mut removals = Vec::new();
+        let mut released = 0_usize;
+        for held in restored
+            .sessions
             .iter()
-            .map(|session| Record::SessionRemoved {
-                session: session.clone(),
-            })
-            .collect();
+            .filter(|held| expired.contains(&held.session.key))
+        {
+            for body in held
+                .queue
+                .iter()
+                .map(|entry| entry.delivery.body)
+                .chain(held.inflight.iter().map(|entry| entry.delivery.body))
+            {
+                removals.push(Record::BodyReleased { id: body });
+                released += 1;
+            }
+            removals.push(Record::SessionRemoved {
+                session: held.session.key.clone(),
+            });
+        }
         tracing::info!(
-            count = removals.len(),
+            count = report.expired.len(),
+            bodies_released = released,
             "sessions whose expiry passed while the broker was down are being removed"
         );
         if writer.apply(removals).is_err() {
@@ -338,7 +378,10 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
 mod tests {
     use super::*;
     use config::StorageSection;
-    use storage::record::{ProtocolVersion, SessionKey, SessionRecord, SubscriptionRecord};
+    use storage::record::{
+        BodyRecord, DeliveryRecord, InflightRecord, InflightState, MessageId, ProtocolVersion,
+        QueueEntry, SessionKey, SessionRecord, SubscriptionRecord,
+    };
     use storage::{Qos, RetainHandling};
 
     /// A configuration whose store is `directory` and whose everything
@@ -375,6 +418,92 @@ mod tests {
                     retain_as_published: false,
                     retain_handling: RetainHandling::SendAlways,
                     subscription_id: None,
+                },
+            },
+        ]
+    }
+
+    /// A body, distinct in every field that is stored.
+    fn a_body(marker: u8) -> (MessageId, BodyRecord) {
+        (
+            MessageId([marker; 16]),
+            BodyRecord {
+                topic: format!("a/{marker}"),
+                payload: bytes::Bytes::from(vec![marker; 8]),
+                qos: Qos::AtLeastOnce,
+                retain: false,
+                expires_at: None,
+                properties: bytes::Bytes::new(),
+            },
+        )
+    }
+
+    /// What a delivery of `body` looks like on the wire.
+    fn a_delivery(body: MessageId) -> DeliveryRecord {
+        DeliveryRecord {
+            body,
+            qos: Qos::AtLeastOnce,
+            retain: false,
+            subscription_ids: Vec::new(),
+            dup: false,
+        }
+    }
+
+    /// One queue entry and one inflight entry for `client_id`, each with
+    /// a body of its own, as a real session holds them.
+    ///
+    /// One reference each, which is how the broker takes them: the
+    /// `BodyPut` beside a `QueuePushed` is the reference the queued
+    /// delivery holds, and it is *not* released when the delivery moves
+    /// into the window, so the entry that is holding it when the broker
+    /// stops is holding exactly one.
+    ///
+    /// `marker` names the queued body and `marker + 1` the one in the
+    /// window, so that two sessions seeded here share nothing and a
+    /// report can say which session's body was left behind.
+    fn a_queue_and_a_window(client_id: &str, marker: u8) -> Vec<Record> {
+        let key = SessionKey::new("", client_id);
+        let (queued, queued_body) = a_body(marker);
+        let (sent, sent_body) = a_body(marker + 1);
+        vec![
+            Record::BodyPut {
+                id: queued,
+                body: queued_body,
+            },
+            Record::QueuePushed {
+                session: key.clone(),
+                entry: QueueEntry {
+                    sequence: 1,
+                    packet_id: None,
+                    delivery: a_delivery(queued),
+                },
+            },
+            Record::BodyPut {
+                id: sent,
+                body: sent_body,
+            },
+            Record::QueuePushed {
+                session: key.clone(),
+                entry: QueueEntry {
+                    sequence: 2,
+                    packet_id: Some(7),
+                    delivery: a_delivery(sent),
+                },
+            },
+            // Popped into the window, which moves the reference rather
+            // than releasing and retaking it.
+            Record::QueuePopped {
+                session: key.clone(),
+                sequence: 2,
+            },
+            Record::InflightPut {
+                session: key,
+                entry: InflightRecord {
+                    packet_id: 7,
+                    sequence: 2,
+                    state: InflightState::AwaitingAck,
+                    sent_at: 0,
+                    delivery: a_delivery(sent),
                 },
             },
         ]
@@ -458,17 +587,29 @@ mod tests {
 
     #[test]
     fn a_session_whose_expiry_passed_is_neither_restored_nor_left_on_disk() {
-        // Two halves, and the second is the one nothing else guards.
+        // Three parts, and the last two are what nothing else guards.
         // `broker-core` cannot remove the session itself — it does no
-        // I/O — so a shell that only skipped it would leave the
-        // session, its queue and its share of every body it
-        // references on disk for the life of the file, and skip them
-        // again on every restart after this one.
+        // I/O — so a shell that only skipped it would leave
+        // the session and its queue on disk for the life of the file,
+        // and skip them again on every restart after this one.
+        //
+        // Removing the session is not enough. `Storage::apply` says a
+        // `SessionRemoved` does not release the bodies of the entries
+        // it discards, so a shell that only removed the session would
+        // leave every body it referenced behind at a reference count
+        // that can never reach zero: a leak that accumulates on every
+        // restart, and which the next restart cannot even see, because
+        // the session that named the bodies is gone.
+        //
+        // So the session is seeded with a queue entry and an inflight
+        // entry, each holding one reference to a body of its own. Both
+        // shapes, because they are released by different halves of the
+        // shell's loop and a fixture with only a queue would let the
+        // inflight half be deleted in silence.
         let directory = tempfile::tempdir().expect("a temporary directory");
-        seed(
-            directory.path(),
-            a_session("ghost", now_seconds().saturating_sub(3_600)),
-        );
+        let mut seeded = a_session("ghost", now_seconds().saturating_sub(3_600));
+        seeded.extend(a_queue_and_a_window("ghost", 0x11));
+        seed(directory.path(), seeded);
 
         let shared = restore_broker(&with_store(directory.path()))
             .expect("the store opens")
@@ -489,9 +630,69 @@ mod tests {
             .open()
             .expect("the store reopens")
             .expect("it exists");
+        let held = store.restore().expect("it reads");
         assert!(
-            store.restore().expect("it reads").sessions.is_empty(),
+            held.sessions.is_empty(),
             "the expired session is gone from the store, not merely skipped"
+        );
+        // Named rather than counted: a leak is only actionable if the
+        // report says which body is still there, and 0x11 is the
+        // queued one while 0x12 is the one in the window.
+        let leaked: Vec<u8> = held.bodies.keys().map(|id| id.0[0]).collect();
+        assert!(
+            held.bodies.is_empty(),
+            "the bodies the expired session referenced are still in the file, \
+             at a reference count nothing will ever bring to zero: {leaked:02x?}"
+        );
+    }
+
+    #[test]
+    fn reclaiming_an_expired_session_leaves_its_neighbour_alone() {
+        // The other edge of the same loop. The releases are owed by
+        // exactly the sessions the restore skipped, and a release
+        // names a body rather than a session, so nothing in the store
+        // would refuse one emitted for a session that is still alive:
+        // it would take the count of a body a live queue entry
+        // references down to zero and delete it, which is a message
+        // lost and a restore that cannot complete. A fixture holding
+        // only expired sessions cannot tell the two apart, because
+        // every release it emits is one that was owed.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let mut seeded = a_session("ghost", now_seconds().saturating_sub(3_600));
+        seeded.extend(a_queue_and_a_window("ghost", 0x11));
+        seeded.extend(a_session("survivor", now_seconds().saturating_add(3_600)));
+        seeded.extend(a_queue_and_a_window("survivor", 0x33));
+        seed(directory.path(), seeded);
+
+        let shared = restore_broker(&with_store(directory.path()))
+            .expect("the store opens")
+            .expect("a directory was configured");
+        assert_eq!(
+            shared.with_broker(|broker| broker.session_count()),
+            1,
+            "one of the two outlived the outage"
+        );
+        drop(shared);
+
+        let store = with_store(directory.path())
+            .storage
+            .open()
+            .expect("the store reopens")
+            .expect("it exists");
+        let held = store.restore().expect("it reads");
+        let keys: Vec<&str> = held
+            .sessions
+            .iter()
+            .map(|session| session.session.key.client_id.as_str())
+            .collect();
+        assert_eq!(keys, vec!["survivor"], "only the ghost was removed");
+        let mut bodies: Vec<u8> = held.bodies.keys().map(|id| id.0[0]).collect();
+        bodies.sort_unstable();
+        assert_eq!(
+            bodies,
+            vec![0x33, 0x34],
+            "the survivor's queued body and the one in its window are both still \
+             held, and the ghost's are both gone"
         );
     }
 
