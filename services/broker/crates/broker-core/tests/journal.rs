@@ -54,6 +54,9 @@
 //!   expiry, and a will cancelled by a graceful disconnect.
 //! - Shared subscriptions, subscription identifiers and every
 //!   retain-handling option.
+//! - A peer that comes back advertising a narrower receive maximum than
+//!   the one its last connection ran under, which strands a redelivery
+//!   in the queue in front of a message numbered below it.
 //!
 //! # What it cannot
 //!
@@ -67,6 +70,13 @@
 //! - **Packet identifiers.** They are not durable state — the store
 //!   holds the identifier each inflight entry was sent under, and that
 //!   is compared — but the allocator's reserved set is not rebuilt here.
+//! - **A case it produces twice in three hundred histories.** The
+//!   stranded redelivery above is generated, and rarely: with the fix
+//!   removed the property found it at case 290 and the budget is 256.
+//!   It is written out as
+//!   [`a_redelivery_stranded_by_a_narrowed_window_is_stored_in_delivery_order`]
+//!   so that it is reached on purpose rather than on a seed, because
+//!   this project does not check proptest's regression files in.
 //! - **A mapping that is wrong the same way in both directions.**
 //!   Convention 5's first example: a quality of service level, a
 //!   retain-handling option or an exchange state translated to storage
@@ -155,6 +165,13 @@ enum Op {
         expiry: u32,
         keep_alive: u16,
         will: Option<GeneratedWill>,
+        /// What the peer says it can receive, which the shell turns
+        /// into the session's send window **after** the connect, the
+        /// same way `connection.rs` does. Section 4.9: it is not
+        /// session state, so a client may come back advertising less
+        /// than it did, and a resume that has already run under the
+        /// wider window then strands redeliveries in the queue.
+        receive_maximum: u16,
     },
     Subscribe {
         client: usize,
@@ -242,15 +259,22 @@ fn any_op() -> impl Strategy<Value = Op> {
             prop_oneof![2 => Just(0u32), 3 => 4u32..12, 2 => Just(u32::MAX)],
             prop_oneof![4 => Just(0u16), 1 => 2u16..4],
             prop_oneof![2 => Just(None), 1 => any_will().prop_map(Some)],
+            // One is as narrow as a window goes and is the value that
+            // strands a redelivery, so it is worth a third of the
+            // connects rather than a third of a wide range.
+            prop_oneof![1 => Just(1u16), 1 => Just(2u16), 1 => Just(u16::MAX)],
         )
             .prop_map(
-                |(client, clean_start, v5, expiry, keep_alive, will)| Op::Connect {
-                    client,
-                    clean_start,
-                    v5,
-                    expiry,
-                    keep_alive,
-                    will,
+                |(client, clean_start, v5, expiry, keep_alive, will, receive_maximum)| {
+                    Op::Connect {
+                        client,
+                        clean_start,
+                        v5,
+                        expiry,
+                        keep_alive,
+                        will,
+                        receive_maximum,
+                    }
                 }
             ),
         6 => (
@@ -335,6 +359,14 @@ struct Coverage {
     an_entry_awaiting_completion: u64,
     /// A resume that put an outstanding entry back in the queue.
     a_resume_that_requeued: u64,
+    /// A redelivery still waiting in the queue once the connection was
+    /// fully established, with a message behind it. It happens when the
+    /// peer comes back advertising a narrower window than the one the
+    /// resume ran under, and it is the case that makes the stored
+    /// queue's key order disagree with the order the session will
+    /// deliver in: the redelivery carries the larger number and is
+    /// delivered first.
+    a_redelivery_left_waiting_in_the_queue: u64,
     /// An exactly-once identifier the broker held and the peer released.
     an_inbound_identifier_released: u64,
     /// A message discarded because the queue was at a bound.
@@ -367,7 +399,7 @@ impl Coverage {
         }
     }
 
-    fn each(&self) -> [u64; 18] {
+    fn each(&self) -> [u64; 19] {
         [
             self.takeover,
             self.clean_start_over_an_existing_session,
@@ -376,6 +408,7 @@ impl Coverage {
             self.two_sessions_holding_one_message,
             self.an_entry_awaiting_completion,
             self.a_resume_that_requeued,
+            self.a_redelivery_left_waiting_in_the_queue,
             self.an_inbound_identifier_released,
             self.a_queue_bound_reached,
             self.a_message_expired_in_a_queue,
@@ -390,7 +423,7 @@ impl Coverage {
         ]
     }
 
-    fn each_mut(&mut self) -> [&mut u64; 18] {
+    fn each_mut(&mut self) -> [&mut u64; 19] {
         [
             &mut self.takeover,
             &mut self.clean_start_over_an_existing_session,
@@ -399,6 +432,7 @@ impl Coverage {
             &mut self.two_sessions_holding_one_message,
             &mut self.an_entry_awaiting_completion,
             &mut self.a_resume_that_requeued,
+            &mut self.a_redelivery_left_waiting_in_the_queue,
             &mut self.an_inbound_identifier_released,
             &mut self.a_queue_bound_reached,
             &mut self.a_message_expired_in_a_queue,
@@ -413,7 +447,7 @@ impl Coverage {
         ]
     }
 
-    const NAMES: [&'static str; 18] = [
+    const NAMES: [&'static str; 19] = [
         "a takeover",
         "a clean start over an existing session",
         "a session that expires",
@@ -421,6 +455,7 @@ impl Coverage {
         "two sessions holding one message",
         "an exactly-once entry awaiting completion",
         "a resume that requeued an outstanding entry",
+        "a redelivery left waiting ahead of a queued message",
         "an inbound exactly-once identifier released",
         "a queue bound reached",
         "a message that expired while queued",
@@ -570,6 +605,7 @@ impl Run {
                 expiry,
                 keep_alive,
                 will,
+                receive_maximum,
             } => {
                 let existed = self.handle_of(*client).is_some();
                 let was_attached = self.attached(*client).is_some();
@@ -620,8 +656,30 @@ impl Run {
                     },
                 };
                 let mut actions = std::mem::take(&mut self.actions);
-                self.broker.connect("", &connect, &mut actions);
+                let registration = self.broker.connect("", &connect, &mut actions);
                 self.actions = actions;
+
+                // Exactly what `connection.rs` does, and in the same
+                // place: after the connect, so the resume the connect
+                // just ran used the window the *last* connection left
+                // behind. That ordering is the whole reason a
+                // redelivery can be stranded.
+                let configured = usize::from(config().max_inflight);
+                if let Some(session) = self.broker.session_mut(registration.subscriber) {
+                    session
+                        .outbound
+                        .set_inflight_limit(usize::from(*receive_maximum).min(configured));
+                    // A redelivery stranded in the queue **with
+                    // something behind it**, which is the whole of the
+                    // condition: a stranded redelivery alone is in
+                    // order with itself, and only a message queued
+                    // earlier sitting behind it can be overtaken.
+                    let waiting: Vec<bool> =
+                        session.outbound.waiting().map(|item| item.dup).collect();
+                    if waiting.iter().rev().skip(1).any(|dup| *dup) {
+                        self.coverage.a_redelivery_left_waiting_in_the_queue += 1;
+                    }
+                }
 
                 if owed_a_will && !clean_start {
                     let still_owed = self
@@ -1262,6 +1320,272 @@ proptest! {
     fn what_the_broker_says_is_enough_to_rebuild_it(history in any_history()) {
         check(&history)?;
     }
+}
+
+/// A redelivery stranded ahead of a queued message is still stored in
+/// the order it will be delivered in.
+///
+/// Written out rather than left to the generator, which produces this
+/// twice in three hundred and eighty-four histories: the property found
+/// it at case 290 of 8,000 when the fix was removed, and 256 is the
+/// configured budget. A case a property reaches by luck is one it also
+/// misses by luck, and this project does not check proptest's
+/// regression files in, so there is nowhere for the seed to live.
+///
+/// The shape, under a window of two and a queue of three:
+///
+/// 1. A client subscribes and publishes to itself until two are
+///    outstanding and a third is waiting.
+/// 2. It reconnects advertising a receive maximum of one. The resume
+///    runs first and under the *old* window, because section 4.9 makes
+///    the receive maximum a property of the connection and the shell
+///    applies it after the connect. So two redeliveries go back to the
+///    head of the queue under fresh numbers, and the narrowed pump
+///    takes only one of them out again.
+/// 3. The one left behind is a redelivery, carrying the largest number
+///    in the queue while sitting in front of a message numbered lower.
+///    Read back in key order it is delivered second, which is a message
+///    the peer has never seen going out ahead of a duplicate it is
+///    still holding an identifier for.
+#[test]
+fn a_redelivery_stranded_by_a_narrowed_window_is_stored_in_delivery_order() {
+    fn connect(receive_maximum: u16) -> Op {
+        Op::Connect {
+            client: 0,
+            clean_start: false,
+            v5: false,
+            expiry: 0,
+            keep_alive: 0,
+            will: None,
+            receive_maximum,
+        }
+    }
+    fn publish() -> Op {
+        Op::Publish {
+            client: 0,
+            topic: 0,
+            qos: 1,
+            retain: false,
+            empty: false,
+            expiry: None,
+        }
+    }
+
+    let history = vec![
+        connect(2),
+        Op::Subscribe {
+            client: 0,
+            filter: 1,
+            qos: 1,
+            no_local: false,
+            retain_as_published: false,
+            handling: 0,
+            subscription_id: None,
+        },
+        // Two fill the window and a third waits behind it. Nothing
+        // acknowledges them, so they stay outstanding.
+        publish(),
+        publish(),
+        publish(),
+        // The first reconnection still has room for both redeliveries.
+        connect(1),
+        // The second does not, and that is the one that strands.
+        connect(1),
+    ];
+
+    let (run, restored) = drive(&history).expect("the history drives cleanly");
+    let handle = run.handle_of(0).expect("the client has a session");
+    let session = run.broker.session(handle).expect("it is registered");
+    let waiting: Vec<bool> = session.outbound.waiting().map(|item| item.dup).collect();
+    assert!(
+        waiting.iter().rev().skip(1).any(|dup| *dup),
+        "the history must actually strand a redelivery ahead of something, got {waiting:?}"
+    );
+    assert_eq!(restored.sessions.len(), 1);
+
+    check(&history).expect("the stored order is the delivery order");
+}
+
+// ---- sequence numbers, walked through the broker ------------------------
+
+/// Every sequence number a session holds, queued or outstanding.
+fn sequences_of(broker: &Broker, client: &str) -> Vec<u64> {
+    let state = broker.durable_state();
+    let held = state
+        .sessions
+        .get(&storage::record::SessionKey::new("", client))
+        .unwrap_or_else(|| panic!("{client} has a session"));
+    let mut numbers: Vec<u64> = held
+        .inflight
+        .iter()
+        .map(|entry| entry.sequence)
+        .chain(held.queue.iter().map(|entry| entry.sequence))
+        .collect();
+    numbers.sort_unstable();
+    numbers
+}
+
+/// Numbering is per session, proved through the broker rather than
+/// against two queues built by hand.
+///
+/// One publication reaches two subscribers, so the two sessions take the
+/// same message at the same instant. Each numbers it one. A counter
+/// shared between them — a static, or a field that moved up to the
+/// registry — numbers the second two, and nothing else in the suite
+/// would say so: the store would take both numbers happily, and the
+/// only symptom is a replica in milestone 6 applying two sessions'
+/// operations in an order neither of them was in.
+#[test]
+fn two_sessions_number_their_queues_independently() {
+    let history = vec![
+        Op::Connect {
+            client: 0,
+            clean_start: false,
+            v5: true,
+            expiry: u32::MAX,
+            keep_alive: 0,
+            will: None,
+            receive_maximum: u16::MAX,
+        },
+        Op::Connect {
+            client: 1,
+            clean_start: false,
+            v5: true,
+            expiry: u32::MAX,
+            keep_alive: 0,
+            will: None,
+            receive_maximum: u16::MAX,
+        },
+        Op::Subscribe {
+            client: 0,
+            filter: 1,
+            qos: 1,
+            no_local: false,
+            retain_as_published: false,
+            handling: 0,
+            subscription_id: None,
+        },
+        Op::Subscribe {
+            client: 1,
+            filter: 1,
+            qos: 1,
+            no_local: false,
+            retain_as_published: false,
+            handling: 0,
+            subscription_id: None,
+        },
+        Op::Publish {
+            client: 0,
+            topic: 0,
+            qos: 1,
+            retain: false,
+            empty: false,
+            expiry: None,
+        },
+    ];
+
+    let (run, _) = drive(&history).expect("the history drives cleanly");
+    assert_eq!(sequences_of(&run.broker, CLIENTS[0]), vec![1]);
+    assert_eq!(
+        sequences_of(&run.broker, CLIENTS[1]),
+        vec![1],
+        "the second session's first message is its first"
+    );
+}
+
+/// A restored session carries on from the number it left, not from one.
+///
+/// Section 7.4's fourth property, and the one the differential test
+/// above cannot reach on its own: it compares two brokers, so a rebuild
+/// that dropped the mark and a `durable_state` that read the mark from
+/// the same wrong place would agree. This asks what the restored
+/// session does *next*, which is the only question a spent number can
+/// be wrong about.
+///
+/// A number handed out twice is not a corruption here — it is a batch
+/// the store refuses, and section 7.3 has the shell waiting on that
+/// batch before it acknowledges, so it is a publisher told a message
+/// was safe and a message that was not.
+#[test]
+fn a_restored_session_carries_on_from_the_number_it_left() {
+    let history = vec![
+        Op::Connect {
+            client: 0,
+            clean_start: false,
+            v5: true,
+            expiry: u32::MAX,
+            keep_alive: 0,
+            will: None,
+            receive_maximum: u16::MAX,
+        },
+        Op::Subscribe {
+            client: 0,
+            filter: 1,
+            qos: 1,
+            no_local: false,
+            retain_as_published: false,
+            handling: 0,
+            subscription_id: None,
+        },
+        Op::Publish {
+            client: 0,
+            topic: 0,
+            qos: 1,
+            retain: false,
+            empty: false,
+            expiry: None,
+        },
+        Op::Publish {
+            client: 0,
+            topic: 0,
+            qos: 1,
+            retain: false,
+            empty: false,
+            expiry: None,
+        },
+        Op::Publish {
+            client: 0,
+            topic: 0,
+            qos: 1,
+            retain: false,
+            empty: false,
+            expiry: None,
+        },
+    ];
+
+    let (run, restored) = drive(&history).expect("the history drives cleanly");
+    assert_eq!(
+        sequences_of(&run.broker, CLIENTS[0]),
+        vec![1, 2, 3],
+        "two in the window and one waiting behind it"
+    );
+
+    let mut rebuilt = rebuild(&restored, run.broker.clock().now());
+    let handle = rebuilt
+        .subscriber_of(&SessionId::new("", CLIENTS[0]))
+        .expect("the session came back");
+    let mut actions = Vec::new();
+    rebuilt
+        .handle(
+            handle,
+            &Packet::Publish(Publish {
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                topic: TOPICS[0].to_string(),
+                packet_id: Some(1),
+                payload: Bytes::from_static(b"after the restart"),
+                properties: Properties::default(),
+            }),
+            &mut actions,
+        )
+        .expect("a publish the broker accepted before it accepts again");
+
+    assert_eq!(
+        sequences_of(&rebuilt, CLIENTS[0]),
+        vec![1, 2, 3, 4],
+        "the next number after a restart is the next number, not the first"
+    );
 }
 
 /// The generator can produce every case this test would be worthless

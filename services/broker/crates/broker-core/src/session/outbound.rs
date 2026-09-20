@@ -518,13 +518,13 @@ impl Outbound {
         // back ends up first.
         //
         // The number is a fresh one rather than the one the entry had.
-        // Section 7.4 spends a sequence for good, and the store refuses
-        // one it has already seen, so an entry coming back out of the
-        // window rejoins the queue as the newest thing in it. It is
-        // still delivered first, because the live queue keeps the order
-        // the requeue below gives it, and it is still ahead in the
-        // stored order too: everything the pump is about to take leaves
-        // the queue again before anything else is offered.
+        // Section 7.4 spends a sequence for good — the pop that moved
+        // this entry into the window spent its old one — and the store
+        // refuses a number it has already seen, so an entry coming back
+        // out of the window rejoins the queue carrying the highest
+        // number in it while sitting at the head of it. Those two facts
+        // disagree, and [`Outbound::renumber`] below is what settles
+        // them.
         for entry in &mut to_resend {
             self.highest_sequence += 1;
             entry.delivery.sequence = self.highest_sequence;
@@ -549,11 +549,78 @@ impl Outbound {
 
         // Reversed, because each requeue goes to the head, so the last one
         // pushed ends up first.
+        let requeued = !to_resend.is_empty();
         for entry in to_resend.into_iter().rev() {
             self.queue.requeue(entry.delivery);
         }
 
         self.pump(now, out);
+        if requeued {
+            self.renumber();
+        }
+    }
+
+    /// Put the queue's numbering back in the order the queue is in.
+    ///
+    /// Section 7.4 makes the sequence number the stored queue's key, so
+    /// reading a restored queue in key order is how the order a session
+    /// will deliver in survives a restart. A resume breaks that: the
+    /// entries coming back out of the window belong at the head and can
+    /// only be written down under fresh numbers, which are the largest
+    /// in the queue. Everything already waiting behind them is then
+    /// numbered *below* messages it must be delivered *after*.
+    ///
+    /// Usually nothing comes of it, because the pump takes every
+    /// requeued entry straight back out again — the window it drained
+    /// had room for exactly them. The exception is a window that has
+    /// been narrowed since: section 4.9 has the peer's receive maximum
+    /// re-read on each connection, the shell narrows the window after
+    /// the resume rather than before, so a client that reconnects
+    /// advertising less than it did leaves entries stranded in the
+    /// queue under numbers that put a newer message in front of them.
+    /// A restart then delivers that newer message ahead of redeliveries
+    /// the peer is still holding identifiers for, which [MQTT-4.6.0-6]
+    /// forbids for any two messages from the same publisher.
+    ///
+    /// So the queue is walked once and everything from the first
+    /// backwards step onwards is given a fresh number, ascending, which
+    /// restores "key order is delivery order" without moving anything.
+    /// The reference each delivery holds on its body is untouched: the
+    /// entry never leaves the queue, so the pop and the push below are
+    /// the same entry under a new key and not a release and a take.
+    ///
+    /// A queue already in order costs a walk and no records, which is
+    /// every resume but the narrowed one.
+    fn renumber(&mut self) {
+        let Self {
+            queue,
+            journal,
+            session,
+            highest_sequence,
+            ..
+        } = self;
+        let mut previous = 0;
+        let mut renumbering = false;
+        for item in queue.iter_mut() {
+            if !renumbering && item.sequence > previous {
+                previous = item.sequence;
+                continue;
+            }
+            // Once one entry has moved, every entry behind it must move
+            // too, or it would overtake them.
+            renumbering = true;
+            let spent = item.sequence;
+            *highest_sequence += 1;
+            item.sequence = *highest_sequence;
+            journal.push(Record::QueuePopped {
+                session: session.clone(),
+                sequence: spent,
+            });
+            journal.push(Record::QueuePushed {
+                session: session.clone(),
+                entry: journal::queue_entry(item),
+            });
+        }
     }
 
     /// Discard everything, reporting each message.
@@ -1689,6 +1756,221 @@ mod tests {
         assert_eq!(sent(&actions).len(), 1, "only the narrowed window");
         assert_eq!(out.inflight_len(), 1);
         assert_eq!(out.queued_len(), 2);
+    }
+
+    // ---- sequence numbers, section 7.4 ---------------------------------
+
+    /// The numbers the queue is holding, in the order it holds them.
+    fn queued_sequences(out: &Outbound) -> Vec<u64> {
+        out.waiting().map(|item| item.sequence).collect()
+    }
+
+    #[test]
+    fn a_sequence_number_is_assigned_on_enqueue_and_counts_up() {
+        // Section 7.4: per-session, assigned on enqueue, monotonic. The
+        // first is one, because the high-water mark of a session nothing
+        // has been queued for is zero.
+        let mut out = Outbound::new(a_key(), QueueLimits::default(), 10);
+        let mut actions = Vec::new();
+        for _ in 0..3 {
+            out.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+        }
+
+        assert_eq!(queued_sequences(&out), vec![1, 2, 3]);
+        assert_eq!(out.highest_sequence(), 3);
+    }
+
+    #[test]
+    fn a_refused_message_does_not_spend_a_number() {
+        // The high-water mark is what was assigned, and nothing is
+        // assigned to a message the queue would not take. A mark raised
+        // by a refusal is not wrong in the way a reused number is, but
+        // it is a number the store will never see and a gap nothing
+        // explains.
+        let mut out = Outbound::new(
+            a_key(),
+            QueueLimits {
+                max_messages: 1,
+                ..QueueLimits::default()
+            },
+            10,
+        );
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtLeastOnce, b"1"), 0, &mut actions);
+        out.offer(delivery(QoS::AtLeastOnce, b"2"), 0, &mut actions);
+
+        assert_eq!(out.queued_len(), 1, "the second was refused");
+        assert_eq!(out.highest_sequence(), 1);
+    }
+
+    #[test]
+    fn a_sequence_number_is_not_reused_after_the_entry_leaves_the_queue() {
+        // The one a naive "next is the length plus one" gets wrong, and
+        // it gets it wrong silently: the store refuses the reused number
+        // and the batch carrying it is a message lost.
+        let mut out = Outbound::new(a_key(), QueueLimits::default(), 10);
+        let mut actions = Vec::new();
+        for _ in 0..3 {
+            out.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+        }
+        out.on_resume(0, &mut actions);
+        assert_eq!(out.queued_len(), 0, "the window took all three");
+
+        out.offer(delivery(QoS::AtLeastOnce, b"fourth"), 0, &mut actions);
+        assert_eq!(
+            queued_sequences(&out),
+            Vec::<u64>::new(),
+            "it went straight out"
+        );
+        assert_eq!(
+            out.outstanding()
+                .last()
+                .expect("it is outstanding")
+                .delivery
+                .sequence,
+            4,
+            "an empty queue must not hand out one again"
+        );
+    }
+
+    #[test]
+    fn two_sessions_number_their_queues_independently() {
+        // Per-session, so the second session's first message is its
+        // first, whatever the first session has spent. A counter shared
+        // between them would number this three.
+        let mut first = Outbound::new(SessionKey::new("", "one"), QueueLimits::default(), 10);
+        let mut second = Outbound::new(SessionKey::new("", "two"), QueueLimits::default(), 10);
+        let mut actions = Vec::new();
+        for _ in 0..2 {
+            first.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+        }
+        second.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+
+        assert_eq!(queued_sequences(&first), vec![1, 2]);
+        assert_eq!(queued_sequences(&second), vec![1]);
+    }
+
+    #[test]
+    fn a_restored_session_carries_on_from_the_mark_it_left() {
+        // Section 7.4: the mark is the highest ever assigned, not the
+        // largest key still present, so a restored session that started
+        // again from one would hand out numbers the store has already
+        // spent on entries it has since delivered.
+        let mut out = Outbound::new(a_key(), QueueLimits::default(), 10);
+        out.set_highest_sequence(41);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+
+        assert_eq!(queued_sequences(&out), vec![42]);
+    }
+
+    #[test]
+    fn a_resume_numbers_a_redelivery_above_what_is_already_waiting() {
+        // The requeued entry goes to the head, so it must also carry the
+        // larger number, or the stored order and the delivered order
+        // disagree.
+        let mut out = online(1);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtLeastOnce, b"sent"), 0, &mut actions);
+        out.offer(delivery(QoS::AtLeastOnce, b"waiting"), 0, &mut actions);
+        assert_eq!(queued_sequences(&out), vec![2], "the second waits");
+
+        out.on_disconnect();
+        actions.clear();
+        out.on_resume(0, &mut actions);
+
+        // The window of one took the redelivery straight back, so only
+        // the message that was already waiting is left.
+        assert_eq!(queued_sequences(&out), vec![2]);
+        assert_eq!(
+            out.outstanding()
+                .next()
+                .expect("the redelivery")
+                .delivery
+                .sequence,
+            3,
+            "a spent number cannot come back, so the redelivery takes a new one"
+        );
+    }
+
+    #[test]
+    fn a_narrowed_window_leaves_the_queue_numbered_in_the_order_it_will_deliver() {
+        // The case the pump does not cover. Section 4.9 re-reads the
+        // peer's receive maximum on every connection and the shell
+        // narrows the window after the resume, so a client that comes
+        // back advertising less than it did strands redeliveries in the
+        // queue. They carry the largest numbers and sit at the head, and
+        // a restart reading the stored queue in key order would deliver
+        // the message behind them first: a message the peer has never
+        // seen, ahead of duplicates it is still holding identifiers for.
+        //
+        // Nothing else sees this. The differential test compares a live
+        // broker against one rebuilt from its own records, and both read
+        // the same queue; what it cannot see is the two of them reading
+        // it in different orders.
+        let mut out = online(3);
+        let mut actions = Vec::new();
+        for payload in [b"a", b"b", b"c"] {
+            out.offer(delivery(QoS::AtLeastOnce, payload), 0, &mut actions);
+        }
+        out.offer(delivery(QoS::AtLeastOnce, b"waiting"), 0, &mut actions);
+        assert_eq!(out.inflight_len(), 3);
+        assert_eq!(queued_sequences(&out), vec![4]);
+
+        out.on_disconnect();
+        out.set_inflight_limit(1);
+        actions.clear();
+        out.on_resume(0, &mut actions);
+
+        let order = queued_sequences(&out);
+        let mut ascending = order.clone();
+        ascending.sort_unstable();
+        assert_eq!(
+            order, ascending,
+            "the stored queue is read in key order, so key order is delivery order"
+        );
+        // Concretely: a, b and c were requeued as 5, 6 and 7, the
+        // narrowed window took only a back, and the message that was
+        // waiting behind them as 4 has to move above the two left.
+        assert_eq!(order, vec![6, 7, 8]);
+        let payloads: Vec<&[u8]> = out
+            .waiting()
+            .map(|item| &item.message.payload[..])
+            .collect();
+        assert_eq!(
+            payloads,
+            vec![&b"b"[..], &b"c"[..], &b"waiting"[..]],
+            "and nothing has changed places"
+        );
+    }
+
+    #[test]
+    fn a_resume_that_the_window_absorbs_renumbers_nothing() {
+        // The common case, and the reason the walk above is a walk
+        // rather than a rewrite: the window the resume drained has room
+        // for exactly what came out of it, so everything still waiting
+        // keeps the number it was given.
+        let mut out = online(2);
+        let mut actions = Vec::new();
+        for payload in [b"a", b"b"] {
+            out.offer(delivery(QoS::AtLeastOnce, payload), 0, &mut actions);
+        }
+        out.offer(delivery(QoS::AtLeastOnce, b"waiting"), 0, &mut actions);
+
+        out.on_disconnect();
+        actions.clear();
+        out.on_resume(0, &mut actions);
+
+        assert_eq!(
+            queued_sequences(&out),
+            vec![3],
+            "the entry that never moved keeps its number"
+        );
+        assert_eq!(
+            out.highest_sequence(),
+            5,
+            "only the two redeliveries spent one"
+        );
     }
 
     #[test]

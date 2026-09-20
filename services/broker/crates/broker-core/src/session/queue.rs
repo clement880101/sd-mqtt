@@ -308,6 +308,19 @@ impl Queue {
         self.entries.iter()
     }
 
+    /// Every message waiting, in order, mutably.
+    ///
+    /// For the one caller that changes a resident entry rather than
+    /// moving it: [`Outbound::renumber`] hands a queued delivery a fresh
+    /// sequence number when a resume has put an older message in front
+    /// of it. Nothing here may change the *order*, which is the queue's
+    /// own to decide.
+    ///
+    /// [`Outbound::renumber`]: crate::session::Outbound
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Delivery> {
+        self.entries.iter_mut()
+    }
+
     /// The message most recently accepted, which is the one a successful
     /// [`Queue::push`] just took.
     ///
