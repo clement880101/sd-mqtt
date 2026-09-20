@@ -721,9 +721,13 @@ proptest! {
 /// out of the ring. Left there it goes quiet, because it is gone, and
 /// the ring expires it under the handle the newcomer now holds: the
 /// replacement is closed for a silence that was never its own, and the
-/// client reconnects into the same trap. Deterministic rather than
-/// generated, because the case is one point and a range around it would
-/// only bury it.
+/// client reconnects into the same trap.
+///
+/// Asserted by *when* the close arrives rather than by its absence. The
+/// newcomer is silent too and is legitimately closed at second sixteen;
+/// the stale entry would have closed it at second two. An assertion that
+/// no close ever arrives would pass just as well against a broker with
+/// no keep-alive at all.
 #[test]
 fn a_takeover_disarms_the_incumbents_keep_alive() {
     let mut broker = Broker::new(BrokerConfig::default());
@@ -731,27 +735,175 @@ fn a_takeover_disarms_the_incumbents_keep_alive() {
 
     let mut incumbent = durable_connect("same", 600);
     incumbent.keep_alive = 1;
-    let first = broker.connect("", &incumbent, &mut out);
+    broker.connect("", &incumbent, &mut out);
 
-    // The newcomer proposes no deadline at all, so nothing it does or
-    // fails to do can legitimately expire it.
-    broker.connect("", &durable_connect("same", 600), &mut out);
+    let mut newcomer = durable_connect("same", 600);
+    newcomer.keep_alive = TEN_SECOND_KEEP_ALIVE;
+    broker.connect("", &newcomer, &mut out);
 
-    out.clear();
-    for _ in 0..10 {
+    assert_eq!(
+        first_timeout(&mut broker, 40),
+        Some(CLOSED_AT),
+        "the newcomer was closed on the displaced connection's clock"
+    );
+}
+
+/// A keep-alive of ten seconds, whose limit is one and a half times
+/// that: fifteen seconds of silence are tolerated and the sixteenth is
+/// not.
+const TEN_SECOND_KEEP_ALIVE: u16 = 10;
+
+/// The second at which a client last heard from at zero, holding
+/// [`TEN_SECOND_KEEP_ALIVE`], is closed.
+const CLOSED_AT: u32 = 16;
+
+/// Tick up to `seconds` times, returning the second at which the first
+/// keep-alive timeout was issued.
+fn first_timeout(broker: &mut Broker, seconds: u32) -> Option<u32> {
+    let mut out = Vec::new();
+    for second in 1..=seconds {
+        out.clear();
         broker.tick(&mut out);
+        if out
+            .iter()
+            .any(|(_, action)| matches!(action, Action::Close(ReasonCode::KeepAliveTimeout)))
+        {
+            return Some(second);
+        }
     }
+    None
+}
 
+/// A client that keeps talking is never closed.
+///
+/// The positive half of the keep-alive: this is the test that fails when
+/// the activity touch stops happening, because then the ring judges a
+/// chatty client by a timestamp that never moves.
+#[test]
+fn a_client_that_pings_is_never_closed() {
+    let mut broker = Broker::new(BrokerConfig::default());
+    let mut out = Vec::new();
+
+    let mut connect = durable_connect("chatty", 600);
+    connect.keep_alive = TEN_SECOND_KEEP_ALIVE;
+    let client = broker.connect("", &connect, &mut out);
+
+    for _ in 1..=(CLOSED_AT * 4) {
+        out.clear();
+        broker
+            .handle(client.subscriber, &Packet::PingReq, &mut out)
+            .expect("a ping is always valid");
+        broker.tick(&mut out);
+        assert!(
+            !out.iter()
+                .any(|(_, action)| matches!(action, Action::Close(ReasonCode::KeepAliveTimeout))),
+            "a client that answers is not silent"
+        );
+    }
     assert!(
-        !out.iter()
-            .any(|(_, action)| matches!(action, Action::Close(ReasonCode::KeepAliveTimeout))),
-        "the newcomer was closed for the connection it replaced"
+        broker
+            .session(client.subscriber)
+            .is_some_and(|session| session.is_connected()),
+        "and it is still attached"
+    );
+}
+
+/// A client that stops talking is closed, on the second the limit says.
+///
+/// The second is asserted rather than the eventual outcome. A ring that
+/// closed everyone immediately, or a sweep that found them a minute
+/// late, would both satisfy "it is closed eventually".
+#[test]
+fn a_silent_client_is_closed_when_its_keep_alive_runs_out() {
+    let mut broker = Broker::new(BrokerConfig::default());
+    let mut out = Vec::new();
+
+    let mut connect = durable_connect("silent", 600);
+    connect.keep_alive = TEN_SECOND_KEEP_ALIVE;
+    let client = broker.connect("", &connect, &mut out);
+
+    assert_eq!(
+        first_timeout(&mut broker, 60),
+        Some(CLOSED_AT),
+        "one and a half times ten is fifteen, and the sixteenth second is too late"
     );
     assert!(
         broker
-            .session(first.subscriber)
-            .is_some_and(|session| session.is_connected()),
-        "and left disconnected by it"
+            .session(client.subscriber)
+            .is_some_and(|session| !session.is_connected()),
+        "and the session knows its connection is gone"
+    );
+}
+
+/// A client that vanishes leaves its will behind.
+///
+/// A keep-alive timeout is the specification's own example of a
+/// situation that publishes one: the client "fails to communicate
+/// within the Keep Alive time". So the departure must be the abrupt
+/// kind. Closing the connection gracefully would discard the will and
+/// nothing else in the suite would notice.
+#[test]
+fn a_silent_client_fires_its_will() {
+    let (mut broker, watcher) = broker_with_a_watcher();
+    let mut out = Vec::new();
+
+    let mut connect = durable_connect("device", 600);
+    connect.keep_alive = TEN_SECOND_KEEP_ALIVE;
+    with_will(&mut connect, Some(0));
+    broker.connect("", &connect, &mut out);
+
+    let mut fired_at = None;
+    for second in 1..=60u32 {
+        out.clear();
+        broker.tick(&mut out);
+        if copies(&out, "gone/device", watcher) > 0 {
+            fired_at = Some(second);
+            break;
+        }
+    }
+
+    assert_eq!(
+        fired_at,
+        Some(CLOSED_AT),
+        "the will goes out on the tick that noticed the silence, not a tick later"
+    );
+}
+
+/// A will owed by a session that expires on the same tick still goes
+/// out.
+///
+/// This is what pins the sweep order in `tick`. A will falls due at the
+/// session expiry interval when the delay is longer, because a will
+/// outliving its session is pointless, so the two land on the same
+/// second by construction rather than by luck. Sweep the expiries first
+/// and the session is destroyed with its will still inside it, which is
+/// silent: no action, no drop, no message.
+#[test]
+fn a_will_due_as_its_session_expires_still_goes_out() {
+    let (mut broker, watcher) = broker_with_a_watcher();
+    let mut out = Vec::new();
+
+    // Five seconds of session, ten of delay. The delay is capped by the
+    // expiry, so both fall due at second five.
+    let mut connect = durable_connect("device", 5);
+    with_will(&mut connect, Some(10));
+    let device = broker.connect("", &connect, &mut out);
+    broker.disconnect(device.subscriber, &mut out);
+
+    let mut fired_at = None;
+    for second in 1..=20u32 {
+        out.clear();
+        broker.tick(&mut out);
+        if copies(&out, "gone/device", watcher) > 0 {
+            fired_at = Some(second);
+        }
+    }
+
+    assert_eq!(fired_at, Some(5), "the will went out as the session ended");
+    assert_eq!(
+        broker.session_count(),
+        1,
+        "and the session itself is gone, leaving only the watcher"
     );
 }
 
