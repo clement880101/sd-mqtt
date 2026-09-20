@@ -1071,7 +1071,18 @@ mod tests {
     /// do not serve. That is the same absence the refusal has to work
     /// around, seen from the writing side.
     fn connect_at_level(level: u8) -> Vec<u8> {
-        let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T'];
+        connect_naming("MQTT", level)
+    }
+
+    /// The same, naming a protocol of the caller's choosing.
+    fn connect_naming(name: &str, level: u8) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            &u16::try_from(name.len())
+                .expect("a short name")
+                .to_be_bytes(),
+        );
+        body.extend_from_slice(name.as_bytes());
         body.push(level);
         // Clean session, no will, no credentials.
         body.push(0x02);
@@ -1120,6 +1131,38 @@ mod tests {
             .expect("the socket closes")
             .unwrap();
         assert_eq!(n, 0, "nothing follows the refusal");
+    }
+
+    #[tokio::test]
+    async fn a_real_mqtt_three_one_client_reaches_the_refusal() {
+        // The client section 2's promise was written about. A 3.1
+        // client sends the protocol name `MQIsdp`, which the decoder
+        // rejected as malformed before it ever read the level, so the
+        // refusal above was unreachable by the one client that needed
+        // it.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(shared);
+
+        client
+            .write_all(&connect_naming("MQIsdp", 3))
+            .await
+            .unwrap();
+
+        // The same four bytes the refusal above asserts, and asserted
+        // as bytes for the same reason: the return code is the whole
+        // content of the answer. 3.1 and 3.1.1 spell a CONNACK
+        // identically, and return code 1 is "unacceptable protocol
+        // version" in both, so a 3.1 client can read this.
+        let mut reply = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut reply))
+            .await
+            .expect("the refusal arrives")
+            .expect("the socket carries it rather than closing");
+        assert_eq!(
+            reply,
+            [0x20, 0x02, 0x00, 0x01],
+            "a connack refusing the version, not silence and not an acceptance"
+        );
     }
 
     #[tokio::test]

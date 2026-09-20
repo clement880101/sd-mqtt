@@ -47,6 +47,12 @@ pub struct Connect {
     pub properties: Properties,
 }
 
+/// The protocol name an MQTT 3.1 client sends, a version this broker
+/// knows and declines rather than one it fails to recognise.
+const MQTT_31_NAME: &str = "MQIsdp";
+/// The one protocol level that name is defined at.
+const MQTT_31_LEVEL: u8 = 3;
+
 const FLAG_CLEAN_START: u8 = 0x02;
 const FLAG_WILL: u8 = 0x04;
 const FLAG_WILL_RETAIN: u8 = 0x20;
@@ -57,11 +63,30 @@ impl Connect {
     /// Decode the body that follows the fixed header.
     pub fn decode_body(reader: &mut Reader<'_>, limits: &Limits) -> Result<Self, CodecError> {
         let name = reader.string()?;
-        if name != "MQTT" {
+        // Two names are known here and only one is served. [MQTT-3.1.2-1]
+        // permits disconnecting on an incorrect protocol name, and an
+        // unrecognised one gets exactly that: a garbled name says
+        // nothing about a version, so answering it with a version error
+        // would tell a client the one thing that was not wrong with its
+        // packet. `MQIsdp` is not garbled. It is the name MQTT 3.1
+        // sends, which section 2 says we reject with an unacceptable
+        // protocol version response rather than in silence, and the
+        // level has to be read before that can be said.
+        if name != "MQTT" && name != MQTT_31_NAME {
             return Err(CodecError::MalformedPacket("protocol name is not MQTT"));
         }
 
         let level = reader.u8()?;
+        if name == MQTT_31_NAME {
+            // 3.1 defines this name at one level. Paired with any
+            // other it describes no protocol that exists, which is a
+            // malformed packet rather than a version we decline.
+            return Err(if level == MQTT_31_LEVEL {
+                CodecError::UnsupportedVersion(MQTT_31_LEVEL)
+            } else {
+                CodecError::MalformedPacket("MQIsdp names MQTT 3.1, whose protocol level is 3")
+            });
+        }
         let version = match level {
             4 => Version::V311,
             5 => Version::V5,
@@ -361,17 +386,67 @@ mod tests {
         assert_eq!(round_trip_connect(&packet, Version::V5), packet);
     }
 
-    #[test]
-    fn rejects_a_wrong_protocol_name() {
+    /// The head of a CONNECT naming a protocol, built by hand.
+    ///
+    /// By hand because the encoder writes the name and the level from a
+    /// `Version`, and there is no `Version` for a protocol we do not
+    /// serve.
+    fn connect_naming(name: &str, level: u8) -> Vec<u8> {
         let mut out = Vec::new();
-        crate::writer::put_string(&mut out, "MQIsdp").unwrap();
-        out.push(4);
+        crate::writer::put_string(&mut out, name).unwrap();
+        out.push(level);
         out.push(0x02);
         crate::writer::put_u16(&mut out, 60);
         crate::writer::put_string(&mut out, "c").unwrap();
-        let mut reader = Reader::new(&out);
-        let err = Connect::decode_body(&mut reader, &Limits::default()).unwrap_err();
-        assert!(matches!(err, CodecError::MalformedPacket(_)));
+        out
+    }
+
+    fn decode_error(bytes: &[u8]) -> CodecError {
+        let mut reader = Reader::new(bytes);
+        Connect::decode_body(&mut reader, &Limits::default()).unwrap_err()
+    }
+
+    #[test]
+    fn rejects_a_wrong_protocol_name() {
+        // The boundary, and the reason this case is `NOTMQTT` rather
+        // than `MQIsdp`: mapping every unrecognised name to a version
+        // error would pass a test that only tried the one name we
+        // know. [MQTT-3.1.2-1] permits disconnecting on an incorrect
+        // name, and a garbled name is not a statement about a version.
+        assert_eq!(
+            decode_error(&connect_naming("NOTMQTT", 4)),
+            CodecError::MalformedPacket("protocol name is not MQTT")
+        );
+    }
+
+    #[test]
+    fn an_mqtt_three_one_client_is_told_its_version_is_not_served() {
+        // Section 2 names MQTT 3.1 as the version rejected with an
+        // unacceptable protocol version response. A 3.1 client sends
+        // the name `MQIsdp`, so refusing that as malformed before ever
+        // reading the level gave the one client the promise was
+        // written about a silent close.
+        assert_eq!(
+            decode_error(&connect_naming("MQIsdp", 3)),
+            CodecError::UnsupportedVersion(3)
+        );
+    }
+
+    #[test]
+    fn an_mqisdp_packet_at_any_other_level_is_malformed() {
+        // `MQIsdp` is the name of one protocol, whose level is 3.
+        // Paired with any other level it describes nothing that exists,
+        // so it is not a version statement either: accepting the name
+        // at any level would make a garbled packet look like a 3.1
+        // client. Level 4 is the interesting one, being 3.1.1's, which
+        // is served under its own name.
+        for level in [2, 4, 5] {
+            assert_eq!(
+                decode_error(&connect_naming("MQIsdp", level)),
+                CodecError::MalformedPacket("MQIsdp names MQTT 3.1, whose protocol level is 3"),
+                "level {level} with the 3.1 name"
+            );
+        }
     }
 
     #[test]
