@@ -16,10 +16,16 @@ use std::path::PathBuf;
 
 pub mod memory;
 pub mod record;
+/// The redb backend, behind the `redb` feature.
+///
+/// Off for `broker-core`, which is the pure crate: it needs the record
+/// vocabulary and nothing that touches a disk. On everywhere else.
+#[cfg(feature = "redb")]
 pub mod redb;
 pub mod restore;
 pub mod writer;
 
+#[cfg(feature = "redb")]
 pub use self::redb::RedbStorage;
 pub use memory::MemoryStorage;
 

@@ -7,8 +7,19 @@ license.workspace = true
 repository.workspace = true
 description = "Durable storage for sd-mqtt sessions, queues, bodies and retained messages"
 
+[features]
+# The redb backend, on by default so that a plain `cargo build` produces a
+# broker that can store something. `broker-core` turns it off: section 7.3
+# makes that crate pure, no-I/O and lock-free, and a database in its
+# dependency tree would be a lie about what it is as well as a cost to
+# every test that builds it. The records, the trait, the restore shape and
+# the in-memory backend are unconditional, because those are the whole of
+# what a pure crate needs.
+default = ["redb"]
+redb = ["dep:redb"]
+
 [dependencies]
-redb = "4.3"
+redb = { version = "4.3", optional = true }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 thiserror.workspace = true

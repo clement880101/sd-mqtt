@@ -69,6 +69,7 @@ dependencies = [
  "mqtt-codec",
  "parking_lot",
  "proptest",
+ "storage",
  "thiserror",
  "uuid",
 ]
