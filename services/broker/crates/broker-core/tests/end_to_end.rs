@@ -199,19 +199,21 @@ fn retain_flags(
         .collect()
 }
 
-/// How many acknowledgements of the kind `qos` calls for went to a
-/// subscriber: a PUBACK at least-once, a PUBREC exactly-once.
-fn acknowledgements(out: &[(SubscriberId, Action)], subscriber: SubscriberId, qos: QoS) -> usize {
+/// The reason codes carried by the acknowledgements `qos` calls for, in
+/// the order they were issued: a PUBACK at least-once, a PUBREC
+/// exactly-once.
+///
+/// The reasons rather than a count, because a count cannot tell a
+/// client that everyone wanted its message from one that nobody did.
+fn answers(out: &[(SubscriberId, Action)], subscriber: SubscriberId, qos: QoS) -> Vec<ReasonCode> {
     out.iter()
         .filter(|(to, _)| *to == subscriber)
-        .filter(|(_, action)| {
-            matches!(
-                (qos, action),
-                (QoS::AtLeastOnce, Action::Send(Packet::PubAck(_)))
-                    | (QoS::ExactlyOnce, Action::Send(Packet::PubRec(_)))
-            )
+        .filter_map(|(_, action)| match (qos, action) {
+            (QoS::AtLeastOnce, Action::Send(Packet::PubAck(ack))) => Some(ack.reason),
+            (QoS::ExactlyOnce, Action::Send(Packet::PubRec(ack))) => Some(ack.reason),
+            _ => None,
         })
-        .count()
+        .collect()
 }
 
 /// How much of a publisher's receive maximum is still reserved.
@@ -555,9 +557,18 @@ proptest! {
     /// bites, because an exactly-once message already held is not
     /// dispatched a second time and it is tempting to return early
     /// without answering it.
+    ///
+    /// The watcher's filter is generated rather than fixed, so that
+    /// roughly half these histories have nobody wanting the message.
+    /// With a watcher always subscribed, the reason code could only ever
+    /// be success and the arm that says nobody wanted it would be
+    /// unreachable: inverting the two would leave the suite green while
+    /// telling a client its message reached no one.
     #[test]
     fn every_received_publish_is_answered_and_frees_its_slot(
         qos in any_qos(),
+        filter in any_filter(),
+        topic in any_topic(),
         retain in any::<bool>(),
         retain_as_published in any::<bool>(),
         redelivered in any::<bool>(),
@@ -566,7 +577,7 @@ proptest! {
         let mut out = Vec::new();
 
         let watcher = broker.connect("", &connect_packet("watcher", 0), &mut out);
-        let mut request = subscribe_packet("a/b", QoS::ExactlyOnce);
+        let mut request = subscribe_packet(&filter, QoS::ExactlyOnce);
         request.filters[0].retain_as_published = retain_as_published;
         broker
             .handle(watcher.subscriber, &Packet::Subscribe(request), &mut out)
@@ -574,12 +585,13 @@ proptest! {
 
         let author = broker.connect("", &connect_packet("author", 0), &mut out);
         let packet_id = (qos != QoS::AtMostOnce).then_some(9);
+        let wanted = reference::matches(&filter, &topic);
 
         out.clear();
         broker
             .handle(
                 author.subscriber,
-                &Packet::Publish(publish_packet("a/b", qos, packet_id, retain, false)),
+                &Packet::Publish(publish_packet(&topic, qos, packet_id, retain, false)),
                 &mut out,
             )
             .expect("a valid publish");
@@ -587,29 +599,53 @@ proptest! {
             broker
                 .handle(
                     author.subscriber,
-                    &Packet::Publish(publish_packet("a/b", qos, packet_id, retain, true)),
+                    &Packet::Publish(publish_packet(&topic, qos, packet_id, retain, true)),
                     &mut out,
                 )
                 .expect("a valid redelivery");
         }
 
         let attempts = 1 + usize::from(redelivered);
-        let expected_answers = if qos == QoS::AtMostOnce { 0 } else { attempts };
         // Only exactly-once recognises a redelivery. At-least-once means
         // exactly that, and the publisher is entitled to a second copy.
         let expected_copies = if qos == QoS::ExactlyOnce { 1 } else { attempts };
 
+        // What a dispatch that happened is answered with.
+        let dispatched = if wanted {
+            ReasonCode::Success
+        } else {
+            ReasonCode::NoMatchingSubscribers
+        };
+        let mut expected_answers = Vec::new();
+        if qos != QoS::AtMostOnce {
+            expected_answers.push(dispatched);
+            if redelivered {
+                // An exactly-once redelivery is not dispatched again, so
+                // the broker learns nothing new about who wanted it and
+                // must not claim nobody did: the first copy may well
+                // have reached a crowd.
+                expected_answers.push(if qos == QoS::ExactlyOnce {
+                    ReasonCode::Success
+                } else {
+                    dispatched
+                });
+            }
+        }
+
         prop_assert_eq!(
-            acknowledgements(&out, author.subscriber, qos),
+            answers(&out, author.subscriber, qos),
             expected_answers,
-            "every attempt is answered, dispatched or not"
+            "filter {:?} topic {:?} wanted {}",
+            filter,
+            topic,
+            wanted
         );
         prop_assert_eq!(
-            copies(&out, "a/b", watcher.subscriber),
-            expected_copies,
+            copies(&out, &topic, watcher.subscriber),
+            if wanted { expected_copies } else { 0 },
             "a redelivery already held must not reach a subscriber twice"
         );
-        for flag in retain_flags(&out, "a/b", watcher.subscriber) {
+        for flag in retain_flags(&out, &topic, watcher.subscriber) {
             prop_assert_eq!(
                 flag,
                 retain && retain_as_published,
@@ -640,16 +676,17 @@ proptest! {
         );
 
         // The retained copy, which is the only way to see that the flag
-        // reached the store rather than only the wire.
+        // reached the store rather than only the wire. Subscribed to the
+        // exact topic, so this half does not depend on the match above.
         let late = broker.connect("", &connect_packet("late", 0), &mut out);
-        let mut late_request = subscribe_packet("a/b", QoS::AtMostOnce);
+        let mut late_request = subscribe_packet(&topic, QoS::AtMostOnce);
         late_request.filters[0].retain_handling = RetainHandling::SendAlways;
         out.clear();
         broker
             .handle(late.subscriber, &Packet::Subscribe(late_request), &mut out)
             .expect("a valid subscribe");
         prop_assert_eq!(
-            copies(&out, "a/b", late.subscriber),
+            copies(&out, &topic, late.subscriber),
             usize::from(retain),
             "a retained message is kept exactly when the flag was set"
         );
