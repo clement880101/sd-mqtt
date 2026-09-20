@@ -11,7 +11,7 @@ use broker_core::subscriptions::SubscriberId;
 use foldhash::fast::RandomState;
 use mqtt_codec::Packet;
 use parking_lot::{Mutex, RwLock};
-use storage::{NotDurable, Record, Writer};
+use storage::{Durable, NotDurable, Writer};
 use tokio::sync::mpsc;
 
 /// Whether a batch of actions carries a promise that must be kept
@@ -50,6 +50,53 @@ pub fn promises_durability(actions: &[Addressed]) -> bool {
     })
 }
 
+/// A journal already on its way to the store, and what is left to wait
+/// for.
+///
+/// Handed out by [`Shared::with_broker_committed`] and awaited outside
+/// the lock that produced it. It holds no lock and borrows nothing: by
+/// the time a caller has one, the broker's guard has been dropped
+/// inside the synchronous call that made it. That is what makes "the
+/// wait is not under the lock" a property of the types rather than a
+/// rule to remember.
+#[derive(Debug)]
+#[must_use = "a commit that promised a publisher something must be waited for"]
+pub enum Committed {
+    /// Nobody is waiting. Either nothing was promised, or there is no
+    /// store and so nothing was promised to a device.
+    ///
+    /// The records are still on their way: durable by the next flush,
+    /// whichever trigger causes it, and by the writer's shutdown at the
+    /// latest.
+    Nothing,
+    /// A promise was made and the flush that keeps it is outstanding.
+    Waiting(Durable),
+    /// A promise was made and the writer was already gone, so it will
+    /// never be kept and nobody is left to report on it.
+    Stopped,
+}
+
+impl Committed {
+    /// Wait for the promise to be kept, if one was made.
+    ///
+    /// Returns at once when nothing was promised, which is every path
+    /// into the broker except the one that answers a client's
+    /// publication.
+    ///
+    /// # Errors
+    ///
+    /// [`NotDurable`] when the store refused the batch, when the flush
+    /// failed, and when the writer has stopped. The caller must not
+    /// acknowledge anything.
+    pub async fn wait(self) -> Result<(), NotDurable> {
+        match self {
+            Self::Nothing => Ok(()),
+            Self::Waiting(durable) => durable.await,
+            Self::Stopped => Err(NotDurable::WriterStopped),
+        }
+    }
+}
+
 /// The broker, and where to send what it produces.
 ///
 /// The broker's methods take an exclusive reference, so every packet in
@@ -60,24 +107,54 @@ pub fn promises_durability(actions: &[Addressed]) -> bool {
 /// the lock is held for the shortest possible span and **never across an
 /// await**, so the number measures the design rather than an accident.
 ///
-/// # The journal leaves under the lock that filled it
+/// # The journal reaches the writer under the lock that filled it
 ///
 /// Section 7.3: the broker says what changed into a buffer and the
-/// shell writes it. Every path into the broker here goes through
-/// [`Shared::with_broker`] or [`Shared::with_broker_journalled`], and
-/// both drain that buffer before releasing the lock, so a record and
-/// the actions it belongs with are always taken together and in order.
-/// A path that took the lock and left the buffer alone would grow it
-/// without bound and lose everything in it on a restart.
+/// shell writes it, and **a record and the actions it belongs with are
+/// always taken together and in order**. Draining the buffer under the
+/// lock is only half of that. The other half is the handoff: two tasks
+/// that take this lock in order A then B can reach the writer's channel
+/// in order B then A if nothing holds a position between the guard
+/// dropping and the send, and `Storage::apply` is order-sensitive.
+///
+/// What that costs is not theoretical. One client reconnecting across
+/// two connections is enough: the closing one journals a session record
+/// carrying its expiry deadline and is preempted, the new one journals a
+/// session record with no deadline and sends first, and the store ends
+/// up holding the disconnect record for a session the broker believes is
+/// live. Restore then reads a deadline already past and drops the
+/// session, its subscriptions and its whole queue. Quieter shapes: a
+/// retained removal applied after a retained put silently loses a
+/// retained message, and a session removal applied after a session put
+/// makes every later record for that session a rejection, which discards
+/// the whole atomic batch, records for unrelated sessions included.
+///
+/// So [`Shared::with_broker_committed`] hands the batch to the writer
+/// **while the guard is still held**, and hands back a [`Committed`] to
+/// be awaited afterwards. It is the only way into the broker here; there
+/// is no longer any way to take records out of a broker section and
+/// write them later, because nothing hands them out.
 ///
 /// # The wait is not under the lock
 ///
-/// [`Shared::commit_durable`] is an `async fn` and takes `&self`
-/// rather than the guard, because the wait is a disk flush: measured
-/// at 334 a second for one waiter alone and 25,100 for a hundred
-/// waiting together. Holding the broker lock across it would serialise
-/// every connection in the process behind one `fsync` and turn the
-/// second number into the first.
+/// The handoff is a channel send and a `oneshot::channel()`, both of
+/// which return without touching the device. The **wait** is the disk
+/// flush: measured at 334 durable writes a second for one waiter alone
+/// and 25,100 for a hundred waiting together. Holding the broker lock
+/// across it would serialise every connection in the process behind one
+/// `fsync` and turn the second number into the first.
+///
+/// That is a property of the types rather than a rule to remember.
+/// [`Shared::with_broker_committed`] is a synchronous `fn`: the guard is
+/// one of its locals, is never returned, never stored and never handed
+/// to the caller, and there is no `.await` in it to hold it across. The
+/// only awaitable thing a caller ever holds is [`Committed`], which by
+/// then is a `oneshot` receiver and nothing else — it owns no lock, and
+/// the guard that produced it was dropped before it existed.
+///
+/// The old backstop still stands behind that: [`parking_lot`]'s guard is
+/// not [`Send`], so an `async fn` that held one across an await would
+/// not compile into anything [`tokio::spawn`] accepts.
 pub struct Shared {
     broker: Mutex<Broker>,
     /// Where the journal goes, and `None` for a broker with no store.
@@ -126,7 +203,7 @@ impl Shared {
     }
 
     /// Do something with the broker, holding the lock for exactly that,
-    /// and commit what it said with nobody waiting on it.
+    /// and hand what it said to the writer with nobody waiting on it.
     ///
     /// The closure must not await and must not block. Anything slow
     /// belongs outside it.
@@ -137,20 +214,27 @@ impl Shared {
     /// wills, and a delivery discarded for size. Section 7.3: those are
     /// journalled where they touch durable state and are never waited
     /// on. A caller that might be about to acknowledge a publication
-    /// wants [`Shared::with_broker_journalled`] instead, and
+    /// wants [`Shared::with_broker_committed`] instead, and
     /// [`promises_durability`] is how it tells.
     pub fn with_broker<T>(&self, f: impl FnOnce(&mut Broker) -> T) -> T {
-        let (value, records) = self.with_broker_journalled(f);
-        self.commit(records);
+        let (value, committed) = self.with_broker_committed(f, |_| false);
+        // Nothing promised anything, so there is nothing to wait for.
+        // The records are on their way regardless.
+        drop(committed);
         value
     }
 
-    /// The same, handing the journal back rather than committing it.
+    /// The same, for a caller that may have to wait for what it said.
     ///
-    /// For the one caller that has to look at what came out before it
-    /// decides whether to wait. The records are still drained under the
-    /// lock that filled them; what is left to the caller is only when
-    /// they are written.
+    /// `promised` is asked, under the lock, whether what came out of
+    /// `f` carries a promise to a publisher; [`promises_durability`] is
+    /// what answers it. It decides only whether anyone waits. The batch
+    /// is handed to the writer either way, and either way it is handed
+    /// over **before the guard is released**, which is what keeps the
+    /// store's order the order the broker produced.
+    ///
+    /// What comes back is awaited once the caller has done whatever it
+    /// wanted the value for, and before it delivers a single action.
     ///
     /// This takes what the broker has handed over and does not go
     /// looking for records still sitting in a session's own buffer.
@@ -158,64 +242,66 @@ impl Shared {
     /// property and is guarded there, by `Broker::sessions_holding_records`
     /// in its own tests; asserting it here would walk every session on
     /// the process's one lock, on every packet.
-    pub fn with_broker_journalled<T>(&self, f: impl FnOnce(&mut Broker) -> T) -> (T, Vec<Record>) {
+    pub fn with_broker_committed<T>(
+        &self,
+        f: impl FnOnce(&mut Broker) -> T,
+        promised: impl FnOnce(&T) -> bool,
+    ) -> (T, Committed) {
         let mut broker = self.broker.lock();
         let value = f(&mut broker);
+        // Under the guard, which is still alive until this function
+        // returns. Everything it calls returns without touching the
+        // device: a send on an unbounded channel, and at most the
+        // allocation of a `oneshot`.
+        let committed = self.hand_over(&mut broker, promised(&value));
+        (value, committed)
+    }
+
+    /// Drain the journal and give it to the writer.
+    ///
+    /// Takes `&mut Broker` rather than the records, and that is the
+    /// point: the only way to hold one is to hold the guard, so this
+    /// cannot be called from a place that has already let go of it.
+    /// It is private for the same reason — a `pub` entry point taking
+    /// records would be the shape the ordering bug was.
+    ///
+    /// Nothing here blocks. [`Writer::apply`] and
+    /// [`Writer::apply_durable`] are channel sends; only awaiting the
+    /// [`Durable`] they hand back waits on a device.
+    fn hand_over(&self, broker: &mut Broker, promised: bool) -> Committed {
         let mut records = Vec::new();
         broker.take_journal(&mut records);
-        (value, records)
-    }
 
-    /// Write `records` down, with nobody waiting on them.
-    ///
-    /// They are durable by the next flush, whichever trigger causes it,
-    /// and by the writer's shutdown at the latest.
-    pub fn commit(&self, records: Vec<Record>) {
-        if records.is_empty() {
-            return;
-        }
         let Some(writer) = &self.writer else {
-            return;
+            // No store: nothing is written down and nothing can be
+            // promised to a device. Milestone one's mode, still
+            // supported, and the journal is dropped rather than left
+            // to grow.
+            return Committed::Nothing;
         };
-        if writer.apply(records).is_err() {
-            // The thread is gone, so nothing sent from here on is
-            // written and nothing will say so again. Loud, once per
-            // batch: a broker still serving clients while writing
-            // nothing down is the failure this whole milestone exists
-            // to prevent.
-            tracing::error!(
-                "the storage writer has stopped; nothing the broker says is being written down"
-            );
+        if !promised {
+            if records.is_empty() {
+                return Committed::Nothing;
+            }
+            if writer.apply(records).is_err() {
+                // The thread is gone, so nothing sent from here on is
+                // written and nothing will say so again. Loud, once per
+                // batch: a broker still serving clients while writing
+                // nothing down is the failure this whole milestone
+                // exists to prevent.
+                tracing::error!(
+                    "the storage writer has stopped; nothing the broker says is being written down"
+                );
+            }
+            return Committed::Nothing;
         }
-    }
-
-    /// Write `records` down and do not return until they are durable.
-    ///
-    /// **Never called with the broker lock held**, and it cannot be:
-    /// the guard is not `Send`, so a caller that tried would not
-    /// compile. That is a backstop rather than the rule. The rule is
-    /// the measurement: one waiter alone gets 334 durable writes a
-    /// second and a hundred waiting together get 25,100, so a lock
-    /// held across this wait would serialise the whole broker behind
-    /// one disk flush and cost seventy-five times the throughput it
-    /// was protecting.
-    ///
-    /// Immediate when there is no store, because then nothing is
-    /// promised to any device.
-    ///
-    /// # Errors
-    ///
-    /// [`NotDurable`] when the store refused the batch or the flush
-    /// failed, and when the writer has stopped. The caller must not
-    /// acknowledge anything.
-    pub async fn commit_durable(&self, records: Vec<Record>) -> Result<(), NotDurable> {
-        let Some(writer) = &self.writer else {
-            return Ok(());
-        };
-        let durable = writer
-            .apply_durable(records)
-            .map_err(|_| NotDurable::WriterStopped)?;
-        durable.await
+        // Empty records are meaningful here and are not skipped: a
+        // connection acknowledging something another batch journalled
+        // still has to wait for that batch to reach the device.
+        match writer.apply_durable(records) {
+            Ok(durable) => Committed::Waiting(durable),
+            Err(_) => Committed::Stopped,
+        }
     }
 
     /// Claim the outbox for a session, returning the receiving half.
@@ -484,6 +570,7 @@ mod tests {
     use super::*;
     use broker_core::subscriptions::SubscriberId;
     use mqtt_codec::ReasonCode;
+    use storage::Record;
 
     #[tokio::test]
     async fn an_outbox_receives_what_is_addressed_to_it() {
@@ -723,10 +810,16 @@ mod tests {
         assert_eq!(shared.report_rejections(), 0, "nothing has been refused");
 
         // A queue entry for a session the store does not hold, which
-        // `Rejection::NoSuchSession` refuses, committed with nobody
+        // `Rejection::NoSuchSession` refuses, applied with nobody
         // waiting: the one case the storage crate has nowhere to
         // report.
-        shared.commit(vec![Record::QueuePushed {
+        //
+        // Given to the writer directly rather than through the shell,
+        // because the shell's only door writes what the broker said
+        // and the broker will not say this. The subject here is what
+        // `Shared::report_rejections` does with a count, not how the
+        // records got there.
+        let applied = writer.apply(vec![Record::QueuePushed {
             session: storage::record::SessionKey::new("", "never-existed"),
             entry: storage::record::QueueEntry {
                 sequence: 1,
@@ -740,6 +833,7 @@ mod tests {
                 },
             },
         }]);
+        assert!(applied.is_ok(), "the writer took it");
 
         let reported = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -767,14 +861,39 @@ mod tests {
         // still supported. Nothing is written down, so nothing can be
         // waited for, and a commit that asked to wait returns rather
         // than hanging.
+        //
+        // The broker really does produce a record here — a durable
+        // session is durable state — so what is being asserted is
+        // that the records were dropped, not that there were none.
         let shared = Shared::new(Default::default());
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            shared.commit_durable(vec![Record::RetainedRemoved { topic: "a".into() }]),
-        )
-        .await
-        .expect("a store-less commit does not wait")
-        .expect("and does not fail");
+        let (journalled, committed) = shared.with_broker_committed(
+            |broker| {
+                let mut out = Vec::new();
+                broker.connect(
+                    "",
+                    &mqtt_codec::packet::Connect {
+                        version: mqtt_codec::Version::V5,
+                        client_id: "durable".to_owned(),
+                        clean_start: false,
+                        keep_alive: 0,
+                        username: None,
+                        password: None,
+                        will: None,
+                        properties: mqtt_codec::Properties::default(),
+                    },
+                    &mut out,
+                );
+                broker.sessions_holding_records() == 0
+            },
+            // Asked for, so that a shell with no store is taking the
+            // path a promise takes and not the quiet one.
+            |_| true,
+        );
+        assert!(journalled, "the broker left nothing in a session's buffer");
+        tokio::time::timeout(std::time::Duration::from_secs(5), committed.wait())
+            .await
+            .expect("a store-less commit does not wait")
+            .expect("and does not fail");
         assert_eq!(shared.rejected_batches(), 0);
     }
 }

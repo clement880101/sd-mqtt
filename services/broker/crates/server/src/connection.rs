@@ -800,31 +800,35 @@ impl Attached {
             let said_goodbye = matches!(packet, Packet::Disconnect(_));
 
             // Section 7.3, and the ordering this milestone exists
-            // for. The journal leaves under the lock that filled it;
-            // whether it is waited for is decided from what came out
-            // beside it, and the wait happens here, after the lock is
-            // released and before a single action is delivered.
-            let ((outcome, actions), records) = self.shared.with_broker_journalled(|broker| {
-                let mut out = Vec::new();
-                let outcome = broker.handle(self.subscriber, &packet, &mut out);
-                (outcome, out)
-            });
+            // for. The journal reaches the writer under the lock that
+            // filled it, so the store sees records in the order the
+            // broker produced them; whether anyone waits for them is
+            // decided from what came out beside them, under the same
+            // lock. The wait is here, after the lock is gone and
+            // before a single action is delivered.
+            let ((outcome, actions), committed) = self.shared.with_broker_committed(
+                |broker| {
+                    let mut out = Vec::new();
+                    let outcome = broker.handle(self.subscriber, &packet, &mut out);
+                    (outcome, out)
+                },
+                |(_, actions)| promises_durability(actions),
+            );
 
-            if promises_durability(&actions) {
-                if let Err(error) = self.shared.commit_durable(records).await {
-                    // Not acknowledged, and not silently. See
-                    // `not_durable` for why the answer is a close.
-                    tracing::error!(
-                        %error,
-                        subscriber = self.subscriber.0,
-                        "a publication could not be made durable; the client is closed \
-                         rather than acknowledged"
-                    );
-                    self.close_with(NOT_DURABLE);
-                    return Err(ConnectionError::NotDurable(error));
-                }
-            } else {
-                self.shared.commit(records);
+            if let Err(error) = committed.wait().await {
+                // Only a batch that promised a publisher something can
+                // fail here; everything else waits for nothing and
+                // succeeds at once. Not acknowledged, and not
+                // silently. See `not_durable` for why the answer is a
+                // close.
+                tracing::error!(
+                    %error,
+                    subscriber = self.subscriber.0,
+                    "a publication could not be made durable; the client is closed \
+                     rather than acknowledged"
+                );
+                self.close_with(NOT_DURABLE);
+                return Err(ConnectionError::NotDurable(error));
             }
             self.shared.deliver(actions);
 
@@ -3184,5 +3188,87 @@ mod tests {
             matches!(read(&mut client, Version::V5).await, Packet::PingResp),
             "the connection is still serving"
         );
+    }
+
+    /// The broker is reachable while somebody is waiting on the device.
+    ///
+    /// # What this does and does not guard
+    ///
+    /// It does **not** guard the ordering `Shared` exists to keep: that
+    /// the journal reaches the writer under the lock that filled it.
+    /// Nothing can, from inside a test. The window a late send opens is
+    /// between a guard dropping and the next instruction, and reaching
+    /// into it needs the scheduler to preempt one task there, which no
+    /// test can ask for. Driving one broker synchronously never enters
+    /// it at all, and a race two tasks lose almost never would pass
+    /// against the bug it was written for. The ordering is structural,
+    /// and the documentation on [`Shared`] says what holds it up.
+    ///
+    /// What this guards is the rule the fix must not break, and the one
+    /// a careless fix would: making the handoff ordered by holding the
+    /// lock across the wait as well. That is a real risk and it is
+    /// visible, because a lock held across a flush stops every other
+    /// connection in the process.
+    ///
+    /// Two worker threads, unlike everything else in this file, because
+    /// that is what turns the failure into a report. On the default
+    /// single-threaded runtime, a second connection blocking on the
+    /// broker's mutex blocks the one thread, so the timeout below could
+    /// never fire and the test would hang instead of failing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_connection_waiting_for_the_device_does_not_hold_up_another() {
+        let (shared, store) = with_gated_store();
+        store.hold();
+
+        let mut publisher = serve_one(Arc::clone(&shared));
+        connect_v5(&mut publisher, "publisher").await;
+        write(
+            &mut publisher,
+            &publication(b"x", QoS::AtLeastOnce, Some(1)),
+            Version::V5,
+        )
+        .await;
+        // The premise, asserted rather than assumed: without a
+        // publisher actually stuck on the flush there is no wait for
+        // anything to be held up by, and the rest of this would pass
+        // against a shell that never waits at all.
+        assert!(
+            quiet_for(&mut publisher, Duration::from_millis(400)).await,
+            "the acknowledgement overtook the flush, so nothing is waiting"
+        );
+
+        // Read with the bound this test owns rather than through
+        // `connect_v5`, whose own two-second read would fire first and
+        // report a reply that did not arrive instead of the reason.
+        // What comes back is discarded here and checked below.
+        let mut other = serve_one(Arc::clone(&shared));
+        write(
+            &mut other,
+            &Packet::Connect(Box::new(connect("other", 0))),
+            Version::V5,
+        )
+        .await;
+        assert!(
+            !quiet_for(&mut other, Duration::from_secs(2)).await,
+            "a second connection could not reach the broker while the first was waiting \
+             on the device: the broker's lock is being held across the flush, which \
+             serialises every connection in the process behind one fsync"
+        );
+
+        // And it is serving, not merely answering once: the same
+        // connection goes round the loop again, through the same lock.
+        write(&mut other, &Packet::PingReq, Version::V5).await;
+        match read(&mut other, Version::V5).await {
+            Packet::PingResp => {}
+            unexpected => panic!("expected the ping back, got {unexpected:?}"),
+        }
+
+        // And the one that was waiting is still owed its
+        // acknowledgement, which arrives when the device does.
+        store.release();
+        match read(&mut publisher, Version::V5).await {
+            Packet::PubAck(ack) => assert_eq!(ack.packet_id, 1),
+            other => panic!("expected the acknowledgement, got {other:?}"),
+        }
     }
 }
