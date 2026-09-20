@@ -367,7 +367,10 @@ proptest! {
 
         // The disconnect happened at second zero and only a tick
         // publishes, so the earliest a will can go out is second one.
-        let fires_at = delay.max(1);
+        // A non-zero delay is rounded up by one tick, because second
+        // zero is the floor of a time that may already be part-way
+        // through: see `deadline` in `session::state`.
+        let fires_at = if delay == 0 { 1 } else { delay + 1 };
         let returned_first = returns_after.is_some_and(|second| second <= fires_at);
         prop_assert_eq!(
             fired,
@@ -922,7 +925,9 @@ fn a_will_due_as_its_session_expires_still_goes_out() {
     let mut out = Vec::new();
 
     // Five seconds of session, ten of delay. The delay is capped by the
-    // expiry, so both fall due at second five.
+    // expiry, so both fall due on the same second: second six, because
+    // a deadline is rounded up a tick so that it cannot fall due before
+    // its interval has really passed.
     let mut connect = durable_connect("device", 5);
     with_will(&mut connect, Some(10));
     let device = broker.connect("", &connect, &mut out);
@@ -937,7 +942,7 @@ fn a_will_due_as_its_session_expires_still_goes_out() {
         }
     }
 
-    assert_eq!(fired_at, Some(5), "the will went out as the session ended");
+    assert_eq!(fired_at, Some(6), "the will went out as the session ended");
     assert_eq!(
         broker.session_count(),
         1,
