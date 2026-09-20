@@ -53,9 +53,8 @@ struct Armed {
 /// fifty thousand armed measured forty microseconds a call and grew
 /// linearly; a herd of a hundred thousand timing out together would
 /// have spent minutes inside one tick, which is precisely the stall the
-/// ring exists to prevent. Every entry now carries its own address in
-/// [`KeepAliveRing::placed`], so a removal touches one bucket slot and
-/// nothing else.
+/// ring exists to prevent. Every entry's address is now recorded, so a
+/// removal touches one bucket slot and nothing else.
 pub struct KeepAliveRing {
     buckets: Vec<Vec<Armed>>,
     /// Where each armed connection sits, as (bucket, index within it).

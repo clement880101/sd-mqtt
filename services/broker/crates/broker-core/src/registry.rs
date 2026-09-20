@@ -47,6 +47,15 @@ pub struct Registration {
 }
 
 /// Sessions by identity.
+///
+/// There is deliberately no `disconnect` here. One existed, marking the
+/// departure graceful, and a graceful departure discards the will: a
+/// shell reaching for the obvious-looking method on the obvious-looking
+/// type would have silently lost every will in the system. Nor could
+/// aligning it have saved it, because a departure must also disarm the
+/// keep-alive and drop the activity cell, and neither lives here.
+/// Ending a connection belongs to the assembly that owns all three:
+/// see `Broker::disconnect`.
 #[derive(Default)]
 pub struct Registry {
     by_identity: HashMap<SessionId, SubscriberId, RandomState>,
@@ -117,13 +126,6 @@ impl Registry {
         }
     }
 
-    /// Note that a session's connection went away.
-    pub fn disconnect(&mut self, subscriber: SubscriberId, now: u32) {
-        if let Some(session) = self.sessions.get_mut(&subscriber) {
-            session.on_disconnected(true, now);
-        }
-    }
-
     /// A session by handle.
     pub fn get(&self, subscriber: SubscriberId) -> Option<&Session> {
         self.sessions.get(&subscriber)
@@ -170,6 +172,18 @@ mod tests {
         SessionId::new("", client)
     }
 
+    /// A connection going away, spelled the way the broker spells it.
+    ///
+    /// The registry used to offer this itself, and offering it was the
+    /// trap: it marked every departure graceful, which discards the
+    /// will. See the note on [`Registry`].
+    fn depart(registry: &mut Registry, subscriber: SubscriberId) {
+        registry
+            .get_mut(subscriber)
+            .expect("a registered session")
+            .on_disconnected(false, 0);
+    }
+
     #[test]
     fn a_first_connect_creates_a_session() {
         let mut registry = Registry::default();
@@ -203,7 +217,7 @@ mod tests {
     fn reconnecting_without_a_clean_start_resumes_the_session() {
         let mut registry = Registry::default();
         let first = registry.register(id("a"), false, 0);
-        registry.disconnect(first.subscriber, 0);
+        depart(&mut registry, first.subscriber);
 
         let second = registry.register(id("a"), false, 10);
         assert!(second.session_present, "the session was still there");
@@ -217,7 +231,7 @@ mod tests {
     fn a_clean_start_discards_whatever_was_there() {
         let mut registry = Registry::default();
         let first = registry.register(id("a"), false, 0);
-        registry.disconnect(first.subscriber, 0);
+        depart(&mut registry, first.subscriber);
 
         let second = registry.register(id("a"), true, 10);
         assert!(!second.session_present, "clean start means a fresh session");

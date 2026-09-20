@@ -1192,3 +1192,129 @@ fn a_clean_start_reports_what_it_discards() {
         "and certainly does not deliver it to the new session"
     );
 }
+
+/// A will carries the properties its client set on it.
+///
+/// Section 3.1.3.2: the will properties "define the Application Message
+/// properties to be sent with the Will Message when it is published,
+/// and properties which define when to publish". The first kind travel;
+/// the second kind, which is the delay alone, must not, because a
+/// publish does not permit a will delay and the encoder refuses to
+/// write one.
+#[test]
+fn a_will_carries_its_properties_but_not_its_delay() {
+    let (mut broker, watcher) = broker_with_a_watcher();
+    let mut out = Vec::new();
+
+    let mut connect = durable_connect("device", 600);
+    connect.will = Some(Will {
+        topic: "gone/device".into(),
+        payload: Bytes::from_static(b"offline"),
+        qos: QoS::AtMostOnce,
+        retain: false,
+        properties: Properties {
+            will_delay_interval: Some(0),
+            message_expiry_interval: Some(120),
+            content_type: Some("text/plain".into()),
+            response_topic: Some("gone/ack".into()),
+            correlation_data: Some(Bytes::from_static(b"cid")),
+            payload_format_indicator: Some(1),
+            user_properties: vec![("why".into(), "it vanished".into())],
+            ..Properties::default()
+        },
+    });
+    let device = broker.connect("", &connect, &mut out);
+    broker.disconnect(device.subscriber, &mut out);
+
+    out.clear();
+    broker.tick(&mut out);
+
+    let published = out
+        .iter()
+        .find_map(|(to, action)| match action {
+            Action::Send(Packet::Publish(publish))
+                if *to == watcher && publish.topic == "gone/device" =>
+            {
+                Some(publish.clone())
+            }
+            _ => None,
+        })
+        .expect("the will went out");
+
+    assert_eq!(
+        published.properties.content_type.as_deref(),
+        Some("text/plain")
+    );
+    assert_eq!(
+        published.properties.response_topic.as_deref(),
+        Some("gone/ack")
+    );
+    assert_eq!(
+        published.properties.correlation_data,
+        Some(Bytes::from_static(b"cid"))
+    );
+    assert_eq!(published.properties.payload_format_indicator, Some(1));
+    assert_eq!(published.properties.message_expiry_interval, Some(120));
+    assert_eq!(
+        published.properties.user_properties,
+        vec![("why".to_string(), "it vanished".to_string())]
+    );
+    assert_eq!(
+        published.properties.will_delay_interval, None,
+        "the delay says when to publish, not what to publish"
+    );
+}
+
+/// A will's message expiry interval becomes a real deadline.
+///
+/// The half `will_message` cannot do, because turning an interval into
+/// a deadline needs a clock and the session layer reads none. Asserted
+/// through the retained store, where a deadline is observable: the will
+/// is there before it and gone after.
+#[test]
+fn a_retained_will_expires_on_the_interval_it_carries() {
+    let mut broker = Broker::new(BrokerConfig::default());
+    let mut out = Vec::new();
+
+    let mut connect = durable_connect("device", 600);
+    connect.will = Some(Will {
+        topic: "gone/device".into(),
+        payload: Bytes::from_static(b"offline"),
+        qos: QoS::AtMostOnce,
+        retain: true,
+        properties: Properties {
+            will_delay_interval: Some(0),
+            message_expiry_interval: Some(5),
+            ..Properties::default()
+        },
+    });
+    let device = broker.connect("", &connect, &mut out);
+    broker.disconnect(device.subscriber, &mut out);
+    broker.tick(&mut out);
+
+    assert!(
+        late_subscriber_sees_the_retained_will(&mut broker, "early"),
+        "retained and within its five seconds"
+    );
+    for _ in 0..10 {
+        out.clear();
+        broker.tick(&mut out);
+    }
+    assert!(
+        !late_subscriber_sees_the_retained_will(&mut broker, "late"),
+        "the interval turned into a deadline and the deadline passed"
+    );
+}
+
+/// Whether a client subscribing now receives the retained will.
+fn late_subscriber_sees_the_retained_will(broker: &mut Broker, client: &str) -> bool {
+    let mut out = Vec::new();
+    let late = broker.connect("", &connect_packet(client, 0), &mut out);
+    let mut request = subscribe_packet("gone/device", QoS::AtMostOnce);
+    request.filters[0].retain_handling = RetainHandling::SendAlways;
+    out.clear();
+    broker
+        .handle(late.subscriber, &Packet::Subscribe(request), &mut out)
+        .expect("a valid subscribe");
+    copies(&out, "gone/device", late.subscriber) > 0
+}

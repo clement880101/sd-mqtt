@@ -1,7 +1,9 @@
 //! A session's lifetime: connect, disconnect, expiry and the will.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
-use mqtt_codec::{QoS, ReasonCode, Version};
+use mqtt_codec::{Properties, QoS, ReasonCode, Version};
 
 use crate::registry::SessionId;
 use crate::session::inbound::Inbound;
@@ -26,6 +28,15 @@ pub struct StoredWill {
     /// Seconds to wait first. MQTT 5 only; a brief outage should not
     /// announce a device as gone.
     pub delay: u32,
+    /// The properties the published message carries.
+    ///
+    /// Section 3.1.3.2 splits the will properties in two: those that
+    /// "define the Application Message properties to be sent with the
+    /// Will Message when it is published", which are these, and "those
+    /// which define when to publish", which is the delay above. The
+    /// delay is held separately and must not appear here, because a
+    /// PUBLISH does not permit it and the encoder refuses to write one.
+    pub properties: Properties,
 }
 
 /// One client's session, connected or not.
@@ -90,6 +101,13 @@ impl Session {
         self.will_at = None;
         self.expires_at = None;
         self.outbound.set_online(true);
+        // Section 4.9: the receive quota "is not preserved across
+        // Network Connections, and [is] re-initialized with each new
+        // Network Connection". The departure resets it too, and every
+        // path into here runs one first, so this is belt and braces
+        // rather than the only guard. It stops being so the moment a
+        // shell defers an acknowledgement across a reconnect.
+        self.inbound.on_disconnect();
     }
 
     /// The connection went away.
@@ -216,8 +234,18 @@ impl Session {
 }
 
 /// Turn a stored will into a message to publish.
+///
+/// The expiry deadline is left for the caller, because it is the only
+/// part that needs a clock and this module reads none.
 pub fn will_message(will: &StoredWill) -> crate::session::message::Message {
-    crate::session::message::Message::new(&will.topic, will.payload.clone(), will.qos, will.retain)
+    let mut message = crate::session::message::Message::new(
+        &will.topic,
+        will.payload.clone(),
+        will.qos,
+        will.retain,
+    );
+    message.properties = Arc::new(will.properties.clone());
+    message
 }
 
 #[cfg(test)]
@@ -242,6 +270,7 @@ mod tests {
             qos: QoS::AtLeastOnce,
             retain: false,
             delay: 0,
+            properties: Properties::default(),
         }
     }
 
@@ -314,6 +343,7 @@ mod tests {
         session.set_expiry_interval(300);
         session.set_will(Some(StoredWill {
             delay: 30,
+            properties: Properties::default(),
             ..will()
         }));
         session.on_disconnected(false, 100);
@@ -332,6 +362,7 @@ mod tests {
         session.set_expiry_interval(10);
         session.set_will(Some(StoredWill {
             delay: 30,
+            properties: Properties::default(),
             ..will()
         }));
         session.on_disconnected(false, 100);
@@ -349,6 +380,7 @@ mod tests {
         session.set_expiry_interval(0);
         session.set_will(Some(StoredWill {
             delay: 30,
+            properties: Properties::default(),
             ..will()
         }));
         session.on_disconnected(false, 100);
@@ -362,6 +394,7 @@ mod tests {
         session.set_expiry_interval(300);
         session.set_will(Some(StoredWill {
             delay: 30,
+            properties: Properties::default(),
             ..will()
         }));
         session.on_disconnected(false, 100);
@@ -380,6 +413,7 @@ mod tests {
         let mut session = session(Version::V311);
         session.set_will(Some(StoredWill {
             delay: 30,
+            properties: Properties::default(),
             ..will()
         }));
         session.on_disconnected(false, 100);

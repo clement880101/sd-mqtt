@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use foldhash::fast::RandomState;
 use mqtt_codec::packet::Connect;
-use mqtt_codec::{Limits, Packet, ReasonCode};
+use mqtt_codec::{Limits, Packet, Properties, ReasonCode};
 
 use crate::clock::CoarseClock;
 use crate::keepalive::{Activity, KeepAliveRing};
@@ -100,6 +100,20 @@ impl Broker {
     /// incumbent's departure runs before the registry reclaims or
     /// replaces the session, because a departure is what arms a will and
     /// the newcomer's will overwrites it a few lines later.
+    ///
+    /// # What the caller must do with `out`
+    ///
+    /// **Drain it in order, and map the handle to a connection rather
+    /// than to a socket.** A handle names a session, not a connection,
+    /// and a takeover gives two connections the same one. So a single
+    /// call can append the close for the connection being displaced and
+    /// then the redeliveries for the one replacing it, both addressed
+    /// to the identical [`SubscriberId`]. A caller that reorders them,
+    /// or that keeps one socket per handle, will close the newcomer or
+    /// send the old connection the new one's traffic.
+    ///
+    /// The rule that makes this tractable: everything before the close
+    /// belongs to the incumbent, everything after it to the newcomer.
     pub fn connect(
         &mut self,
         mountpoint: &str,
@@ -149,12 +163,23 @@ impl Broker {
                 .session_expiry_interval
                 .unwrap_or_default(),
         );
-        session.set_will(connect.will.as_ref().map(|will| StoredWill {
-            topic: will.topic.clone(),
-            payload: will.payload.clone(),
-            qos: will.qos,
-            retain: will.retain,
-            delay: will.properties.will_delay_interval.unwrap_or_default(),
+        session.set_will(connect.will.as_ref().map(|will| {
+            // Section 3.1.3.2 splits the will properties in two: the
+            // application message's own, which travel with it, and the
+            // delay, which says when to send it and must not. A publish
+            // does not permit a will delay and the encoder refuses to
+            // write one, so taking it out here is the same rule as
+            // convention 1 seen from the other side.
+            let mut properties = will.properties.clone();
+            let delay = properties.will_delay_interval.take().unwrap_or_default();
+            StoredWill {
+                topic: will.topic.clone(),
+                payload: will.payload.clone(),
+                qos: will.qos,
+                retain: will.retain,
+                delay,
+                properties,
+            }
         }));
 
         let mut actions = Vec::new();
@@ -254,17 +279,51 @@ impl Broker {
         };
 
         if let Some(will) = due {
-            let message = will_message(&will);
-            self.publish(message, Some(incumbent), now, out);
+            self.publish_will(incumbent, &will, now, out);
         }
 
         true
+    }
+
+    /// Publish a will on behalf of the session that left it.
+    ///
+    /// The one path, so the two callers cannot drift: a will owed to a
+    /// takeover and one owed to a timeout or an expiry are the same
+    /// message.
+    fn publish_will(
+        &mut self,
+        publisher: SubscriberId,
+        will: &StoredWill,
+        now: u32,
+        out: &mut Vec<Addressed>,
+    ) {
+        let mut message = will_message(will);
+        message.expires_at = self.deadline(&message.properties);
+        self.publish(message, Some(publisher), now, out);
+    }
+
+    /// When a message carrying these properties expires, if it does.
+    fn deadline(&self, properties: &Properties) -> Option<u32> {
+        properties
+            .message_expiry_interval
+            .map(|interval| self.clock.deadline(interval))
     }
 
     /// Handle a packet from a connected client.
     ///
     /// An error is the reason to close the connection with; the caller
     /// does the closing.
+    ///
+    /// **Closing the socket is not enough.** A caller that drops the
+    /// connection without also calling [`Broker::disconnect`] leaves
+    /// the session believing it is still attached, and a session that
+    /// believes that never expires, never fires its will and holds its
+    /// queue forever: [`Session::is_expired`] refuses to expire a
+    /// connected session, deliberately, because that is what keeps a
+    /// live client alive. The same applies to an
+    /// [`Action::Close`] handed back from any other call.
+    ///
+    /// [`Session::is_expired`]: crate::session::state::Session::is_expired
     pub fn handle(
         &mut self,
         subscriber: SubscriberId,
@@ -413,10 +472,7 @@ impl Broker {
                 publish.retain,
             );
             message.properties = Arc::new(publish.properties.clone());
-            message.expires_at = publish
-                .properties
-                .message_expiry_interval
-                .map(|interval| self.clock.deadline(interval));
+            message.expires_at = self.deadline(&publish.properties);
 
             Some(self.publish(message, Some(from), now, out))
         } else {
@@ -600,8 +656,7 @@ impl Broker {
             .filter_map(|(id, session)| session.take_due_will(now).map(|will| (*id, will)))
             .collect();
         for (publisher, will) in due {
-            let message = will_message(&will);
-            self.publish(message, Some(publisher), now, out);
+            self.publish_will(publisher, &will, now, out);
         }
 
         let gone: Vec<SubscriberId> = self

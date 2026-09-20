@@ -47,8 +47,6 @@ pub enum Action {
         /// Where it was published, for the log line.
         topic: Arc<str>,
     },
-    /// The session ended ungracefully; publish this will.
-    PublishWill(message::Message),
     /// Close the connection with this reason.
     Close(ReasonCode),
 }
