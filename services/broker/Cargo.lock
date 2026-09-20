@@ -691,6 +691,7 @@ name = "sdmqtt"
 version = "0.1.0"
 dependencies = [
  "broker-core",
+ "bytes",
  "clap",
  "mqtt-codec",
  "sdmqtt-server",

@@ -27,6 +27,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # For the store tests: a directory that is created, opened and thrown
 # away, so that a test never writes into the tree it is run from.
 tempfile.workspace = true
+# `tests/restart.rs` speaks MQTT to the binary over a real socket, and
+# the codec reads and writes through `BytesMut`.
+bytes.workspace = true
 
 [lints]
 workspace = true
