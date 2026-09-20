@@ -1632,3 +1632,63 @@ macro_rules! run_against {
 }
 
 every_contract_test!(run_against, memory, storage::MemoryStorage::new);
+every_contract_test!(run_against, redb, crate::on_disk::fresh);
+
+/// A redb store on a directory that goes when the store does.
+///
+/// The contract's constructor hands back a store and nothing else, so the
+/// directory has to be owned by the store; a `TempDir` dropped at the end
+/// of the constructor would delete the file out from under it. Everything
+/// here is delegation: the backend under test is `storage::RedbStorage`,
+/// unchanged.
+mod on_disk {
+    use storage::{QueueEntry, Record, RedbStorage, Restored, SessionKey, Storage, StorageError};
+
+    /// A store, and the directory it lives in.
+    pub struct OnDisk {
+        store: RedbStorage,
+        /// Dropped after the store, deleting the file it used.
+        _directory: tempfile::TempDir,
+    }
+
+    /// An empty store on a directory of its own.
+    pub fn fresh() -> OnDisk {
+        let directory = tempfile::tempdir().expect("a temporary directory must be available");
+        let store = RedbStorage::open(directory.path().join("store.redb"))
+            .expect("a fresh store must open");
+        OnDisk {
+            store,
+            _directory: directory,
+        }
+    }
+
+    impl Storage for OnDisk {
+        fn apply(&self, records: &[Record]) -> Result<(), StorageError> {
+            self.store.apply(records)
+        }
+
+        fn flush(&self) -> Result<(), StorageError> {
+            self.store.flush()
+        }
+
+        fn restore(&self) -> Result<Restored, StorageError> {
+            self.store.restore()
+        }
+
+        fn queue_head(
+            &self,
+            session: &SessionKey,
+            cursor: u64,
+        ) -> Result<Option<QueueEntry>, StorageError> {
+            self.store.queue_head(session, cursor)
+        }
+
+        fn queue_depth(&self, session: &SessionKey) -> Result<u64, StorageError> {
+            self.store.queue_depth(session)
+        }
+
+        fn highest_sequence(&self, session: &SessionKey) -> Result<u64, StorageError> {
+            self.store.highest_sequence(session)
+        }
+    }
+}

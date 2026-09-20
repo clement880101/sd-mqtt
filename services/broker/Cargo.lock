@@ -823,6 +823,7 @@ dependencies = [
  "proptest",
  "redb",
  "serde",
+ "tempfile",
  "thiserror",
 ]
 

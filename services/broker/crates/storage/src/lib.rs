@@ -16,8 +16,10 @@ use std::path::PathBuf;
 
 pub mod memory;
 pub mod record;
+pub mod redb;
 pub mod restore;
 
+pub use self::redb::RedbStorage;
 pub use memory::MemoryStorage;
 
 pub use record::{
@@ -32,6 +34,25 @@ pub use restore::{Restored, RestoredSession};
 /// Section 7.2 makes this configurable so that an operator can trade
 /// durability for throughput deliberately, rather than discovering the
 /// trade after a power cut.
+///
+/// # Where this is chosen
+///
+/// **On the store, at construction**, not on [`Storage::flush`]. Two
+/// reasons, and the second is the one that decided it.
+///
+/// It is a property of a deployment rather than of a call. An operator
+/// decides once whether this node's acknowledgements are worth a
+/// synchronous write; a per-call argument would let any caller weaken that
+/// for one batch, which is exactly the decision nobody should be making at
+/// a call site.
+///
+/// And [`Storage::flush`] is what the batching writer calls, from one
+/// place, on behalf of waiters that did not choose anything. There is no
+/// caller who would pass a different value, so an argument would only be a
+/// way to get it wrong.
+///
+/// A backend that cannot honour a mode must say so rather than accept it
+/// silently; what redb does with [`SyncMode::Relaxed`] is on that variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
     /// [`Storage::flush`] does not return until the writes are on the
@@ -40,14 +61,22 @@ pub enum SyncMode {
     /// that promise to a publisher without keeping it.
     #[default]
     Immediate,
-    /// [`Storage::flush`] returns once the writes are handed to the
-    /// engine, without waiting for the device.
+    /// [`Storage::flush`] returns without waiting for the device.
     ///
-    /// A commit made this way survives the broker exiting and may not
-    /// survive the machine losing power: a backend is permitted to roll
-    /// back to the last immediate flush. So this is for a deployment that
-    /// has decided it would rather lose a second of at-least-once traffic
-    /// than pay for a synchronous write, and for tests.
+    /// What that is worth depends on the backend, and **on redb it is
+    /// worth nothing at all**. redb has two durability levels and the
+    /// weaker one keeps the commit in this process's memory: a flush made
+    /// this way is atomic and visible to every later read, and it reaches
+    /// no file. A clean shutdown writes it out, so a broker that exits
+    /// normally loses nothing; a broker that is killed loses everything
+    /// since its last immediate flush, however long ago that was, because
+    /// under this mode there has never been one.
+    ///
+    /// So this is for tests and for measuring what the durable path costs,
+    /// and not a durability trade an operator should be offered against
+    /// this backend. A backend with a third level — written to the file,
+    /// not yet synced — could keep the weaker promise honestly, which is
+    /// why the mode exists rather than being deleted.
     Relaxed,
 }
 
@@ -94,6 +123,16 @@ pub enum StorageError {
     /// The underlying device or file system failed.
     #[error("storage I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    /// The storage engine failed for a reason that is none of the above.
+    ///
+    /// A catch-all, and deliberately the last resort rather than the first
+    /// one. The five causes above are separated because an operator's
+    /// response to each differs, and collapsing a sixth kind of failure
+    /// into one of them would be worse than admitting it is a sixth: a
+    /// poisoned lock inside the engine is not a disk that failed, and
+    /// reporting it as one sends an operator to look at the wrong thing.
+    #[error("the storage engine failed: {0}")]
+    Engine(String),
 }
 
 /// Why a store refused a record.
@@ -169,9 +208,9 @@ impl From<FormatError> for StorageError {
                 Self::UnsupportedVersion { found, expected }
             }
             FormatError::NotAStore => Self::NotAStore,
-            other @ (FormatError::Undecodable(_) | FormatError::Trailing { .. }) => {
-                Self::Corrupt(other)
-            }
+            other @ (FormatError::Undecodable(_)
+            | FormatError::Trailing { .. }
+            | FormatError::Damaged(_)) => Self::Corrupt(other),
         }
     }
 }

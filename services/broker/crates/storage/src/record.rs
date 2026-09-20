@@ -122,6 +122,15 @@ pub enum FormatError {
     /// The bytes could not be decoded at all.
     #[error("stored bytes could not be decoded: {0}")]
     Undecodable(postcard::Error),
+    /// The storage engine reported its own structures as damaged.
+    ///
+    /// Not something this module can produce: a backend raises it when
+    /// the engine underneath refuses bytes it wrote itself. It is here
+    /// rather than beside the backend so that damage found by the engine
+    /// and damage found by this decoder reach an operator as the same
+    /// thing, because the answer to both is the same: restore a backup.
+    #[error("the storage engine reported damage: {0}")]
+    Damaged(String),
     /// The bytes decoded, and then there were more of them.
     ///
     /// Rejected rather than ignored. postcard's `from_bytes` stops when the
@@ -136,7 +145,7 @@ pub enum FormatError {
 }
 
 /// Decode a value, and require that it used every byte it was given.
-fn decode_exact<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, FormatError> {
+pub(crate) fn decode_exact<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, FormatError> {
     let (value, rest) = postcard::take_from_bytes(bytes).map_err(FormatError::Undecodable)?;
     if !rest.is_empty() {
         return Err(FormatError::Trailing { extra: rest.len() });
