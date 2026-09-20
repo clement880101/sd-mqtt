@@ -240,7 +240,7 @@ impl Queue {
     /// while an idle member with an empty queue received nothing.
     ///
     /// Both this and `push` get their answer from the same
-    /// [`Queue::refusal`], so they cannot disagree about *whether* a
+    /// private `refusal`, so they cannot disagree about *whether* a
     /// message is refused. They differ in one deliberate way, which is
     /// what they do with the answer: an [`Overflow::DropOldest`] queue
     /// at its bound accepts the message by evicting an older one, and

@@ -31,14 +31,20 @@ pub struct BrokerConfig {
     pub limits: Limits,
     /// How many shards the subscription trie uses.
     pub trie_shards: usize,
-    /// The largest keep-alive interval a client may have, and the one
-    /// the ring is sized for.
+    /// The largest keep-alive interval a client may have.
     ///
     /// Section 5.4: a version 5 client proposing more than this is
     /// clamped to it and told so in the connack, because a clamp the
     /// client is not told about disconnects it while it believes it may
     /// still be silent. The shell applies both halves; the broker only
-    /// arms whatever interval it is handed. Zero disables the ceiling.
+    /// arms whatever interval it is handed.
+    ///
+    /// Zero disables the ceiling and nothing else. It is not the size
+    /// of the keep-alive ring: that has its own floor, because a
+    /// ceiling of none says nothing about how many buckets a sweep
+    /// should be spread over. See [`KeepAliveRing::new`].
+    ///
+    /// [`KeepAliveRing::new`]: crate::keepalive::KeepAliveRing::new
     pub max_keep_alive: u16,
     /// The largest inflight window a session may have.
     ///

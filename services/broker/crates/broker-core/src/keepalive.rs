@@ -72,13 +72,36 @@ pub struct KeepAliveRing {
 const LIMIT_NUMERATOR: u32 = 3;
 const LIMIT_DENOMINATOR: u32 = 2;
 
+/// The smallest interval the ring is ever sized for, in seconds.
+///
+/// `max_keep_alive` is a clamp ceiling, and zero there means "no
+/// ceiling" rather than "no interval": a client may still negotiate any
+/// interval it likes, and every one of them still has to be swept.
+/// Sizing the ring from the ceiling alone gave an operator who wrote
+/// zero a ring of two buckets, so every armed connection landed in one
+/// of two and each tick examined half the population. No wrong answer
+/// and no panic, just the linear sweep the ring exists to avoid.
+///
+/// A minute, because the ring costs one empty vector per bucket and
+/// ninety-odd of them is nothing, while the interval is long enough
+/// that the connections spread across them are spread for a useful
+/// distance.
+const MIN_RING_KEEP_ALIVE: u16 = 60;
+
 impl KeepAliveRing {
     /// A ring sized for keep-alive intervals up to `max_keep_alive`
-    /// seconds. A larger interval still works, by re-arming.
+    /// seconds, and never for fewer than `MIN_RING_KEEP_ALIVE`. A
+    /// larger interval still works, by re-arming.
+    ///
+    /// The floor is what keeps the ring a ring. `max_keep_alive` is the
+    /// version 5 clamp ceiling and zero disables it, which says nothing
+    /// about how many buckets the sweep should be spread over; reading
+    /// it as a size collapsed the whole population onto two.
     pub fn new(max_keep_alive: u16) -> Self {
-        let slots = (u32::from(max_keep_alive) * LIMIT_NUMERATOR / LIMIT_DENOMINATOR) as usize + 2;
+        let sized_for = max_keep_alive.max(MIN_RING_KEEP_ALIVE);
+        let slots = Self::limit(sized_for) as usize + 2;
         Self {
-            buckets: (0..slots.max(2)).map(|_| Vec::new()).collect(),
+            buckets: (0..slots).map(|_| Vec::new()).collect(),
             placed: HashMap::with_hasher(RandomState::default()),
             cursor: 0,
             last_examined: 0,
@@ -172,6 +195,17 @@ impl KeepAliveRing {
                 self.arm(armed, now);
             }
         }
+    }
+
+    /// How many buckets the sweep is spread over.
+    ///
+    /// Exposed so a test can assert the ring has them. Nothing else
+    /// observes the count: a change that collapses it alters no
+    /// outcome the protocol can see, only the cost of every tick, and
+    /// that is exactly the mutation that survives a test measuring
+    /// which connections expired.
+    pub fn buckets(&self) -> usize {
+        self.buckets.len()
     }
 
     /// How many connections are armed.
@@ -368,6 +402,66 @@ mod tests {
         }
         assert_eq!(out.len(), 500);
         assert_eq!(worst, 500, "the herd is examined in one tick");
+    }
+
+    #[test]
+    fn a_maximum_of_zero_still_gives_the_ring_its_buckets() {
+        // Convention 5, in its newest disguise. `max_keep_alive` is
+        // two things at once: the version 5 clamp ceiling, where zero
+        // is documented to an operator as "no ceiling", and the size
+        // of this ring, where zero used to mean two buckets. Every
+        // armed connection then landed in one of two and each tick
+        // examined half the population — the right answer at the cost
+        // the ring exists to avoid.
+        //
+        // Asserted on the bucket count and on the work one tick does,
+        // never on which connections expire. That depends only on each
+        // connection's own timestamp, not on where it sits in the
+        // ring, so a ring of two would pass it.
+        assert_eq!(
+            KeepAliveRing::new(0).buckets(),
+            KeepAliveRing::new(MIN_RING_KEEP_ALIVE).buckets(),
+            "a ceiling of none is not a ring of none"
+        );
+        assert!(
+            KeepAliveRing::new(0).buckets() >= 90,
+            "a minute's interval at one and a half times it is ninety seconds of buckets, got {}",
+            KeepAliveRing::new(0).buckets()
+        );
+
+        // And the cost that count is there to buy. Arrivals are ticked
+        // apart rather than batched, because `arm` places a connection
+        // relative to the cursor and a batch with no ticks between
+        // collapses onto one bucket however many there are.
+        let mut ring = KeepAliveRing::new(0);
+        let mut out = Vec::new();
+        let mut worst = 0;
+        let mut now = 0u32;
+        for arrived in 0u32..50 {
+            if arrived > 0 {
+                now += 1;
+                ring.tick(now, &mut out);
+                worst = worst.max(ring.last_examined());
+            }
+            for _ in 0..20u64 {
+                ring.insert(
+                    SubscriberId(ring.len() as u64),
+                    60,
+                    Activity::new(arrived),
+                    arrived,
+                );
+            }
+        }
+        for _ in 0..150 {
+            now += 1;
+            ring.tick(now, &mut out);
+            worst = worst.max(ring.last_examined());
+        }
+        assert_eq!(out.len(), 1000, "all of them eventually");
+        assert!(
+            worst <= 100,
+            "a thousand armed over fifty seconds must not pile into one tick, worst was {worst}"
+        );
     }
 
     #[test]

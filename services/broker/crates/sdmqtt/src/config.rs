@@ -162,7 +162,14 @@ pub struct BrokerSection {
     pub trie_shards: usize,
     /// The largest keep-alive interval a client may have. A version 5
     /// client proposing more is clamped to this and told so in the
-    /// connack. Zero disables the ceiling.
+    /// connack.
+    ///
+    /// Zero disables the ceiling, and does no more than that: clients
+    /// still keep alive, still propose their own intervals and are
+    /// still disconnected when they fall silent past one. In
+    /// particular it does not shrink the ring the broker sweeps them
+    /// with, which is sized for at least a minute's interval however
+    /// small this is.
     pub max_keep_alive: u16,
     /// The largest inflight window a session may have. A session's
     /// window is the lesser of this and what the client advertises,
