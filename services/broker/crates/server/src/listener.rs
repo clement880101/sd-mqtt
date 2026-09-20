@@ -99,10 +99,27 @@ impl Server {
     /// log line some time later, and a test can read the port it was
     /// given.
     pub async fn bind(config: ServerConfig) -> io::Result<Running> {
+        let shared = Arc::new(Shared::new(config.broker.clone()));
+        Self::bind_shared(config, shared).await
+    }
+
+    /// The same, against a broker somebody else has already built.
+    ///
+    /// **This is what makes section 7.5 true rather than intended.**
+    /// Restore is the first startup phase and must complete before any
+    /// listener binds, so no client can observe a half-restored
+    /// broker. Expressed as a signature: the socket is not bound until
+    /// a whole [`Shared`] exists to hand it, so there is no window in
+    /// which a listener could be serving one that is still being
+    /// filled.
+    ///
+    /// `config.broker` is not read here — the broker arrived built —
+    /// and the caller is expected to have built it from the same
+    /// configuration. Everything else in `config` is used as usual.
+    pub async fn bind_shared(config: ServerConfig, shared: Arc<Shared>) -> io::Result<Running> {
         let listener = TcpListener::bind(config.address).await?;
         let address = listener.local_addr()?;
 
-        let shared = Arc::new(Shared::new(config.broker.clone()));
         let (shutdown, _) = broadcast::channel(1);
         let ticker = spawn_ticker(Arc::clone(&shared), shutdown.subscribe());
         let permits = Arc::new(Semaphore::new(config.max_connections));

@@ -11,9 +11,16 @@ mod config;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use broker_core::broker::Broker;
 use clap::{Args, Parser, Subcommand};
 use config::{Config, ConfigError, LogLevel, Overrides};
 use sdmqtt_server::listener::Server;
+use sdmqtt_server::shared::Shared;
+use storage::record::Record;
+use storage::{Storage, StorageError, Writer};
 
 /// A distributed MQTT broker.
 #[derive(Debug, Parser)]
@@ -47,6 +54,10 @@ struct Serve {
     /// Namespace this listener's clients.
     #[arg(long, value_name = "NAME")]
     mountpoint: Option<String>,
+    /// Keep the store in this directory. Without one, nothing is
+    /// written down and a restart loses every session.
+    #[arg(long, value_name = "PATH")]
+    store_directory: Option<PathBuf>,
     /// One of error, warn, info, debug or trace.
     #[arg(long, value_name = "LEVEL")]
     log_level: Option<LogLevel>,
@@ -59,6 +70,7 @@ impl Serve {
             address: self.address,
             max_connections: self.max_connections,
             mountpoint: self.mountpoint.clone(),
+            store_directory: self.store_directory.clone(),
             log_level: self.log_level,
         }
     }
@@ -97,6 +109,21 @@ enum StartupError {
     /// already on the port.
     #[error("cannot bind: {0}")]
     Bind(#[from] std::io::Error),
+    /// The store would not say what it holds.
+    ///
+    /// Fatal rather than a fresh start. A store that cannot be read is
+    /// a store whose sessions and queued messages are still in it, and
+    /// serving clients as though they were not would destroy them the
+    /// first time anything was written.
+    #[error("cannot read the store: {0}")]
+    Restore(#[source] StorageError),
+    /// The operating system would not give us the writer's thread.
+    ///
+    /// There is no fallback. The writer owns a thread on purpose: a
+    /// durable commit blocks, and blocking a runtime worker stalls
+    /// every connection that worker was driving.
+    #[error("cannot start the storage writer: {0}")]
+    Writer(#[source] std::io::Error),
 }
 
 /// Wait for whichever stop signal comes first, and name it.
@@ -135,7 +162,126 @@ async fn stop_signal() -> Result<&'static str, std::io::Error> {
     tokio::signal::ctrl_c().await.map(|()| "SIGINT")
 }
 
-/// Configure, bind, and serve until told to stop.
+/// The wall clock in whole seconds, as the broker counts time.
+///
+/// Section 7.5: the clock a restored broker starts with decides which
+/// sessions outlived the outage, so it must be a scale that survives
+/// the outage. A clock that started at zero each time — which is what
+/// a broker with no store still does, because nothing it writes down
+/// outlives it — would make every stored expiry meaningless.
+///
+/// A clock before the epoch reads as zero and one beyond 2106 reads as
+/// the end of the range. Neither is reachable by a machine whose time
+/// is set; both are better than a panic in the first line of startup.
+fn now_seconds() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u32::try_from(since.as_secs()).unwrap_or(u32::MAX)
+        })
+}
+
+/// Open the store, rebuild the broker from it, and start its writer.
+///
+/// Section 7.5 in the order it is written: read the clock, read the
+/// store, rebuild, and only then hand back something a listener can be
+/// given. Nothing here binds a socket, so there is no moment at which
+/// a client could reach a broker that is half rebuilt.
+///
+/// `Ok(None)` means the configuration named no store directory, which
+/// is a supported mode and not a failure; see the documentation on
+/// [`config::StorageSection::directory`].
+fn restore_broker(config: &Config) -> Result<Option<Arc<Shared>>, StartupError> {
+    let Some(store) = config.storage.open()? else {
+        return Ok(None);
+    };
+    restore_from(store, config).map(Some)
+}
+
+/// The same, against a store somebody else opened.
+///
+/// A seam, and it exists for one reason: the clock must be read
+/// **before** the store is read, and the difference that makes is the
+/// duration of the read. Against a store that answers in microseconds
+/// the two orders are indistinguishable, so a test that could not make
+/// the read slow could not tell them apart, and the rule section 7.5
+/// states would be guarded by nothing.
+fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Arc<Shared>, StartupError> {
+    // **Before the restore, not after.** Section 7.5: this is what
+    // decides which sessions outlived the outage, and a clock read
+    // afterwards would count the read of the store itself against
+    // every session's expiry — destroying, on a store large enough to
+    // take seconds to read, exactly the sessions that were closest to
+    // surviving.
+    let now = now_seconds();
+    let restored = store.restore().map_err(StartupError::Restore)?;
+
+    let mut broker = Broker::new(config.server().broker);
+    let report = broker_core::restore::restore(&mut broker, &restored, now);
+
+    let writer = Arc::new(
+        Writer::spawn(Arc::clone(&store), config.storage.writer()).map_err(StartupError::Writer)?,
+    );
+
+    // A session the restore skipped is still in the store, and nothing
+    // in `broker-core` can tell it otherwise: the broker does no I/O.
+    // Leaving them would hold a session, its queue and its share of
+    // every body it references on disk for the life of the file, and
+    // the next restart would skip them again.
+    //
+    // Not waited on: nothing was promised to anybody, and a removal
+    // that does not survive a crash before the next flush is simply
+    // done again on the restart that follows. Removing a session the
+    // store no longer holds is a no-op rather than a refusal, so a
+    // repeat costs nothing.
+    if !report.expired.is_empty() {
+        let removals: Vec<Record> = report
+            .expired
+            .iter()
+            .map(|session| Record::SessionRemoved {
+                session: session.clone(),
+            })
+            .collect();
+        tracing::info!(
+            count = removals.len(),
+            "sessions whose expiry passed while the broker was down are being removed"
+        );
+        if writer.apply(removals).is_err() {
+            tracing::error!("the storage writer stopped before the expired sessions were removed");
+        }
+    }
+
+    tracing::info!(
+        sessions = report.sessions,
+        subscriptions = report.subscriptions,
+        expired = report.expired.len(),
+        filters_refused = report.filters_refused,
+        identifier_clashes = report.identifier_clashes,
+        "restored from the store"
+    );
+    // Every number above that should be zero and is not is a
+    // disagreement between what was stored and what came back, and is
+    // worth more than a field in a line an operator may not be
+    // reading.
+    if report.filters_refused > 0 {
+        tracing::warn!(
+            count = report.filters_refused,
+            "the store held filters this build will not accept; \
+             those sessions have silently stopped receiving them"
+        );
+    }
+    if report.identifier_clashes > 0 {
+        tracing::warn!(
+            count = report.identifier_clashes,
+            "the stored state claimed the same packet identifier twice; \
+             nothing was dropped, but the store disagrees with itself"
+        );
+    }
+
+    Ok(Arc::new(Shared::with_store(broker, writer)))
+}
+
+/// Configure, restore, bind, and serve until told to stop.
 async fn run(serve: Serve) -> Result<(), StartupError> {
     let config = Config::load(serve.config.as_deref(), &serve.overrides())?;
 
@@ -146,7 +292,26 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         .with_writer(std::io::stderr)
         .init();
 
-    let running = Server::bind(config.server()).await?;
+    // Section 7.2 and 7.5: the store is opened and the broker rebuilt
+    // from it before anything binds.
+    let shared = match restore_broker(&config)? {
+        Some(shared) => shared,
+        None => {
+            // Loud, because the alternative to a default is silence
+            // and silence is what would make this dangerous. An
+            // operator who meant to configure a store and mistyped the
+            // key gets a broker that works perfectly until it is
+            // restarted.
+            tracing::warn!(
+                "no storage.directory is configured, so nothing is written down: \
+                 sessions, their subscriptions and their queued messages last as \
+                 long as this process and no longer"
+            );
+            Arc::new(Shared::new(config.server().broker))
+        }
+    };
+
+    let running = Server::bind_shared(config.server(), shared).await?;
     tracing::info!(
         address = %running.address(),
         mountpoint = %config.listener.mountpoint,
@@ -167,4 +332,243 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     running.shutdown().await;
     tracing::info!("stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::StorageSection;
+    use storage::record::{ProtocolVersion, SessionKey, SessionRecord, SubscriptionRecord};
+    use storage::{Qos, RetainHandling};
+
+    /// A configuration whose store is `directory` and whose everything
+    /// else is the default.
+    fn with_store(directory: &std::path::Path) -> Config {
+        Config {
+            storage: StorageSection {
+                directory: Some(directory.to_path_buf()),
+                ..StorageSection::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    /// One durable session, expiring at `expires_at`, holding one
+    /// filter.
+    fn a_session(client_id: &str, expires_at: u32) -> Vec<Record> {
+        let key = SessionKey::new("", client_id);
+        vec![
+            Record::SessionPut(SessionRecord {
+                key: key.clone(),
+                version: ProtocolVersion::V5,
+                expiry_interval: 3_600,
+                expires_at: Some(expires_at),
+                will: None,
+                will_at: None,
+            }),
+            Record::SubscriptionAdded {
+                session: key,
+                subscription: SubscriptionRecord {
+                    filter: "a/b".to_owned(),
+                    qos: Qos::AtLeastOnce,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: RetainHandling::SendAlways,
+                    subscription_id: None,
+                },
+            },
+        ]
+    }
+
+    /// Write `records` into a store at `directory` and close it again,
+    /// so that the next open is a restart rather than a second handle.
+    fn seed(directory: &std::path::Path, records: Vec<Record>) {
+        let section = StorageSection {
+            directory: Some(directory.to_path_buf()),
+            ..StorageSection::default()
+        };
+        let store = section.open().expect("the store opens").expect("it exists");
+        store.apply(&records).expect("the store takes them");
+        store.flush().expect("and writes them down");
+    }
+
+    #[test]
+    fn no_configured_directory_restores_nothing_and_is_not_a_failure() {
+        // The decision, at the place that acts on it. Running without
+        // a store is a mode, not an error, and `sdmqtt serve` with no
+        // arguments depends on it.
+        let restored =
+            restore_broker(&Config::default()).expect("an absent store is not a failure");
+        assert!(restored.is_none());
+    }
+
+    #[test]
+    fn a_session_that_outlived_the_outage_comes_back_with_its_subscription() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        // An hour from now, on the wall clock, because that is the
+        // scale a stored expiry is on once it has survived a restart.
+        seed(
+            directory.path(),
+            a_session("survivor", now_seconds().saturating_add(3_600)),
+        );
+
+        let shared = restore_broker(&with_store(directory.path()))
+            .expect("the store opens")
+            .expect("a directory was configured");
+        let (sessions, subscriptions, clock) = shared.with_broker(|broker| {
+            (
+                broker.session_count(),
+                broker.subscription_count(),
+                broker.clock().now(),
+            )
+        });
+        assert_eq!(sessions, 1, "the session came back");
+        assert_eq!(
+            subscriptions, 1,
+            "and its filter re-entered the matching trie, which is the half \
+             a session-only rebuild gets wrong"
+        );
+
+        // Section 7.5, and the reason the clock is read before restore
+        // rather than after: a broker that started its clock at zero
+        // would judge every stored expiry against a scale the store
+        // was never written on. The exact instant is not assertable —
+        // the difference a late read makes is the duration of the
+        // restore — but the scale is, and getting the scale wrong is
+        // the failure that matters.
+        //
+        // Against the epoch directly rather than against
+        // `now_seconds`, which is the function under test here:
+        // convention 5, a round trip cannot see a consistent error. A
+        // clock stuck at zero agrees with itself perfectly, and every
+        // other test in this file seeds its fixture through the same
+        // function, so all of them would agree with it too.
+        let epoch_now = u32::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("this machine's clock is after 1970")
+                .as_secs(),
+        )
+        .expect("and before 2106");
+        assert!(
+            clock.abs_diff(epoch_now) < 60,
+            "the broker's clock is wall time, not seconds since it started: {clock}"
+        );
+    }
+
+    #[test]
+    fn a_session_whose_expiry_passed_is_neither_restored_nor_left_on_disk() {
+        // Two halves, and the second is the one nothing else guards.
+        // `broker-core` cannot remove the session itself — it does no
+        // I/O — so a shell that only skipped it would leave the
+        // session, its queue and its share of every body it
+        // references on disk for the life of the file, and skip them
+        // again on every restart after this one.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        seed(
+            directory.path(),
+            a_session("ghost", now_seconds().saturating_sub(3_600)),
+        );
+
+        let shared = restore_broker(&with_store(directory.path()))
+            .expect("the store opens")
+            .expect("a directory was configured");
+        assert_eq!(
+            shared.with_broker(|broker| broker.session_count()),
+            0,
+            "a session whose expiry passed while the broker was down is not restored"
+        );
+
+        // Dropping the shell drops the writer, which flushes and
+        // joins before it goes, so the removal is on the device by
+        // the time this returns and the store's lock is released.
+        drop(shared);
+
+        let store = with_store(directory.path())
+            .storage
+            .open()
+            .expect("the store reopens")
+            .expect("it exists");
+        assert!(
+            store.restore().expect("it reads").sessions.is_empty(),
+            "the expired session is gone from the store, not merely skipped"
+        );
+    }
+
+    /// A store that takes its time answering [`Storage::restore`].
+    ///
+    /// The whole point of the seam it is passed through. A store that
+    /// answers instantly cannot tell a clock read before the store
+    /// from one read after it, because the difference between them is
+    /// exactly how long the read took — and a store large enough to
+    /// take seconds is the case section 7.5's rule is about.
+    struct SlowToRead {
+        inner: storage::MemoryStorage,
+        delay: std::time::Duration,
+    }
+
+    impl storage::Storage for SlowToRead {
+        fn apply(&self, records: &[Record]) -> Result<(), storage::StorageError> {
+            self.inner.apply(records)
+        }
+
+        fn flush(&self) -> Result<(), storage::StorageError> {
+            self.inner.flush()
+        }
+
+        fn restore(&self) -> Result<storage::Restored, storage::StorageError> {
+            std::thread::sleep(self.delay);
+            self.inner.restore()
+        }
+
+        fn queue_head(
+            &self,
+            session: &SessionKey,
+            cursor: u64,
+        ) -> Result<Option<storage::QueueEntry>, storage::StorageError> {
+            self.inner.queue_head(session, cursor)
+        }
+
+        fn queue_depth(&self, session: &SessionKey) -> Result<u64, storage::StorageError> {
+            self.inner.queue_depth(session)
+        }
+
+        fn highest_sequence(&self, session: &SessionKey) -> Result<u64, storage::StorageError> {
+            self.inner.highest_sequence(session)
+        }
+    }
+
+    #[test]
+    fn the_clock_is_read_before_the_store_and_not_after() {
+        // Section 7.5, and the only shape that can see the
+        // difference. The store takes three seconds to answer and
+        // holds a session expiring one second from now:
+        //
+        // - read before, the clock is now and the session survives,
+        //   which is right: it was alive when the broker started.
+        // - read after, the clock is three seconds on and the session
+        //   is destroyed, and removed from the store, for having
+        //   expired during the read of the store that was going to
+        //   restore it.
+        //
+        // Every other test here passes either way, because every
+        // other store answers in microseconds.
+        let delay = std::time::Duration::from_secs(3);
+        let store = SlowToRead {
+            inner: storage::MemoryStorage::new(),
+            delay,
+        };
+        let expires_at = now_seconds().saturating_add(1);
+        storage::Storage::apply(&store, &a_session("close-run", expires_at))
+            .expect("the store takes them");
+
+        let shared = restore_from(Arc::new(store), &Config::default())
+            .expect("a store that is slow is not a store that failed");
+        assert_eq!(
+            shared.with_broker(|broker| broker.session_count()),
+            1,
+            "a session alive when the broker started must not be destroyed \
+             by how long the broker took to read the store"
+        );
+    }
 }

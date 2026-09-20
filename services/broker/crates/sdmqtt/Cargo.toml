@@ -11,6 +11,10 @@ description = "A distributed MQTT broker"
 sdmqtt-server = { path = "../server", version = "0.1.0" }
 broker-core = { path = "../broker-core", version = "0.1.0" }
 mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
+# With its default features, which is the redb backend: this is the
+# crate that actually opens a file. `broker-core` and `sdmqtt-server`
+# turn them off, and the binary is where the choice of engine is made.
+storage = { path = "../storage", version = "0.1.0" }
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "derive", "error-context"] }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
@@ -18,6 +22,11 @@ thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "signal"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+
+[dev-dependencies]
+# For the store tests: a directory that is created, opened and thrown
+# away, so that a test never writes into the tree it is run from.
+tempfile.workspace = true
 
 [lints]
 workspace = true

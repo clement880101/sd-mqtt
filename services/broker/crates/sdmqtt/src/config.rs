@@ -12,20 +12,57 @@
 //! the broker on its default port, and an operator reads the absence of
 //! a complaint as confirmation. The same argument makes an unreadable
 //! environment value an error rather than a fallback.
+//!
+//! # No store directory means no store
+//!
+//! `storage.directory` has **no default**, and a configuration that
+//! does not set it starts a broker that writes nothing down: sessions,
+//! their subscriptions and their queued messages last as long as the
+//! process and no longer. This is a deliberate choice between two
+//! defensible ones, and the reasons are worth the paragraph.
+//!
+//! Refusing to start without one was the alternative. It was rejected
+//! because this binary's first promise is that `sdmqtt serve` with no
+//! arguments and no configuration file starts a working broker, and a
+//! refusal makes that false. Running without a store is also a real
+//! mode rather than a degenerate one: it is what milestone one did, it
+//! is what the test suite runs, and a broker in front of a stream of
+//! at-most-once telemetry has nothing to gain from a disk.
+//!
+//! Defaulting the directory to some path was the other alternative, and
+//! it is the worst of the three: an operator who never asked for
+//! persistence would get a database file appearing in whatever
+//! directory the service happened to start in, and would discover it
+//! when the disk filled.
+//!
+//! So the absence is honoured, and it is made loud instead: starting
+//! without a store writes a warning naming exactly what will not
+//! survive a restart. Silence is what would make this dangerous, not
+//! the default.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use broker_core::broker::BrokerConfig;
 use mqtt_codec::Limits;
 use sdmqtt_server::connection::{outbox_depth_for, ConnectionConfig};
 use sdmqtt_server::listener::{ServerConfig, DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT};
 use serde::Deserialize;
+use storage::{RedbStorage, Storage, StorageError, WriterConfig};
 use thiserror::Error;
 
 /// Where the configuration file is looked for when none is named.
 pub const DEFAULT_PATH: &str = "sdmqtt.toml";
+
+/// What the store is called inside its directory.
+///
+/// A directory rather than a file is configured because a store is not
+/// necessarily one file — redb's is, another backend's need not be —
+/// and because an operator pointing a broker at a directory can be told
+/// to back the whole of it up.
+pub const STORE_FILE: &str = "sdmqtt.redb";
 
 /// The environment variable naming the configuration file.
 pub const PATH_VARIABLE: &str = "SDMQTT_CONFIG";
@@ -76,6 +113,35 @@ pub enum ConfigError {
         value: String,
         /// Why that cannot work.
         why: &'static str,
+    },
+    /// The store's directory does not exist and could not be made.
+    ///
+    /// Names the path, because the usual causes — a typo, a parent
+    /// that is not there, a volume not mounted yet, no permission —
+    /// are all things an operator fixes by looking at the path and
+    /// cannot fix without seeing it.
+    #[error("cannot create the store directory {path}: {source}")]
+    StoreDirectory {
+        /// The directory that could not be made.
+        path: PathBuf,
+        /// Why not.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The store itself could not be opened.
+    ///
+    /// Separate from the directory failing, because the answers are
+    /// different: a store held by another process means find the other
+    /// broker, a store from a later build means run the right build,
+    /// and a corrupt one means reach for a backup. [`StorageError`]
+    /// keeps those apart and this keeps its message.
+    #[error("cannot open the store at {path}: {source}")]
+    StoreUnopenable {
+        /// The store file that could not be opened.
+        path: PathBuf,
+        /// Why not.
+        #[source]
+        source: StorageError,
     },
 }
 
@@ -200,6 +266,157 @@ impl Default for BrokerSection {
     }
 }
 
+/// How hard a flush tries, as a configuration file spells it.
+///
+/// A second spelling of [`storage::SyncMode`] rather than a
+/// `Deserialize` on that one, because the storage crate has no serde
+/// dependency and a configuration format is not its business. The
+/// mapping is pinned by a test in both directions: a transposition
+/// here would round trip perfectly and quietly turn every
+/// acknowledgement into a promise this broker does not keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
+pub enum Sync {
+    /// A flush does not return until the writes are on the device.
+    ///
+    /// The default, and the only mode in which section 7.3's promise
+    /// is kept: an acknowledgement is sent after a durable commit, and
+    /// anything weaker makes the promise without keeping it.
+    #[default]
+    Immediate,
+    /// A flush returns without waiting for the device.
+    ///
+    /// **Worth nothing against the redb backend**, whose weaker
+    /// durability level keeps the commit in this process's memory and
+    /// writes it out only on a clean shutdown. A broker that is killed
+    /// loses everything since its last immediate flush, and under this
+    /// mode there has never been one. For measuring what the durable
+    /// path costs, not for trading durability away.
+    Relaxed,
+}
+
+impl Sync {
+    /// The storage crate's spelling.
+    pub fn to_storage(self) -> storage::SyncMode {
+        match self {
+            Sync::Immediate => storage::SyncMode::Immediate,
+            Sync::Relaxed => storage::SyncMode::Relaxed,
+        }
+    }
+}
+
+impl std::str::FromStr for Sync {
+    type Err = &'static str;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "immediate" => Ok(Sync::Immediate),
+            "relaxed" => Ok(Sync::Relaxed),
+            _ => Err("one of immediate or relaxed"),
+        }
+    }
+}
+
+/// The storage section.
+///
+/// Section 7.2 names what is configurable: where the store is, how
+/// hard a flush tries, and the two triggers that decide when the
+/// batching writer flushes. The third trigger — an acknowledgement
+/// that must not be lost — is deliberately not here, because it is a
+/// correctness requirement rather than a tuning choice.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StorageSection {
+    /// Where the store lives.
+    ///
+    /// **No default, and no directory means no store.** A broker
+    /// configured without one keeps its sessions, their subscriptions
+    /// and their queued messages in memory alone, and a restart
+    /// destroys all three. The module documentation has why this is
+    /// the default rather than a refusal or an invented path; the
+    /// short version is that `sdmqtt serve` with no arguments must
+    /// keep starting a working broker, and a database file appearing
+    /// in whatever directory the service started in is worse than
+    /// either.
+    ///
+    /// The directory is created if it is not there. The store inside
+    /// it is [`STORE_FILE`].
+    pub directory: Option<PathBuf>,
+    /// How hard a flush tries. Immediate by default.
+    pub sync: Sync,
+    /// How long after a flush the next one becomes due, in
+    /// milliseconds, if anything is outstanding.
+    ///
+    /// Two by default: section 7.2 asks for an interval in the low
+    /// milliseconds, and this only ever applies to writes nobody is
+    /// waiting on — a waiter flushes at once. Zero flushes every batch
+    /// on its own, which is the uncoalesced rate and is useful for
+    /// measuring it; it cannot spin the writer, which blocks rather
+    /// than waking to find nothing outstanding.
+    pub flush_interval_ms: u64,
+    /// How many records may be applied before a flush becomes due.
+    ///
+    /// A thousand by default, which is where the storage crate's
+    /// measurement was taken: coalesced a thousand at a time, the
+    /// durable rate is over 300,000 a second. It bounds how much work
+    /// one flush has to do, which is what keeps the flush from
+    /// becoming the stall.
+    pub flush_records: u64,
+}
+
+impl Default for StorageSection {
+    /// No store, immediate flushes, two milliseconds, a thousand
+    /// records.
+    fn default() -> Self {
+        let writer = WriterConfig::default();
+        Self {
+            directory: None,
+            sync: Sync::Immediate,
+            flush_interval_ms: u64::try_from(writer.interval.as_millis()).unwrap_or(u64::MAX),
+            flush_records: writer.records,
+        }
+    }
+}
+
+impl StorageSection {
+    /// Open the store, or say there is not one.
+    ///
+    /// `Ok(None)` is the configured absence of a directory and is not
+    /// a failure. Everything else that goes wrong is one, and names
+    /// the path: a startup that says only "cannot open the store"
+    /// leaves an operator guessing which of the three paths in their
+    /// deployment it meant.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::StoreDirectory`] when the directory is not there
+    /// and cannot be made, and [`ConfigError::StoreUnopenable`] when
+    /// the store itself will not open — held by another process, from
+    /// a build that writes a format this one does not read, or
+    /// corrupt.
+    pub fn open(&self) -> Result<Option<Arc<dyn Storage>>, ConfigError> {
+        let Some(directory) = &self.directory else {
+            return Ok(None);
+        };
+        std::fs::create_dir_all(directory).map_err(|source| ConfigError::StoreDirectory {
+            path: directory.clone(),
+            source,
+        })?;
+        let path = directory.join(STORE_FILE);
+        let store = RedbStorage::open_with(&path, self.sync.to_storage())
+            .map_err(|source| ConfigError::StoreUnopenable { path, source })?;
+        Ok(Some(Arc::new(store)))
+    }
+
+    /// How the batching writer should be configured.
+    pub fn writer(&self) -> WriterConfig {
+        WriterConfig {
+            interval: Duration::from_millis(self.flush_interval_ms),
+            records: self.flush_records,
+        }
+    }
+}
+
 /// The log section.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -216,6 +433,8 @@ pub struct Config {
     pub listener: Listener,
     /// The broker section.
     pub broker: BrokerSection,
+    /// The storage section.
+    pub storage: StorageSection,
     /// The log section.
     pub log: Log,
 }
@@ -233,6 +452,8 @@ pub struct Overrides {
     pub max_connections: Option<usize>,
     /// The listener's namespace.
     pub mountpoint: Option<String>,
+    /// Where the store lives.
+    pub store_directory: Option<PathBuf>,
     /// How much to log.
     pub log_level: Option<LogLevel>,
 }
@@ -353,6 +574,26 @@ impl Config {
                 why: "the outbox the shell would build cannot hold one drain of a queue this size",
             });
         }
+
+        // An empty directory is not the same as no directory, and it
+        // is what a file saying `directory = ""` asks for. Refused
+        // here rather than read as "no store", because the two are
+        // opposite intentions and the difference between them is a
+        // broker that loses everything on a restart. The environment
+        // is the one place an empty value does mean "no store", and it
+        // clears the key rather than setting it to this.
+        if self
+            .storage
+            .directory
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(ConfigError::Unusable {
+                key: "storage.directory",
+                value: String::new(),
+                why: "name a directory, or leave the key out entirely to run with no store",
+            });
+        }
         Ok(())
     }
 
@@ -374,6 +615,27 @@ impl Config {
         if let Some(value) = lookup("SDMQTT_MOUNTPOINT") {
             self.listener.mountpoint = value;
         }
+        if let Some(value) = lookup("SDMQTT_STORAGE_DIRECTORY") {
+            // An empty value turns the store off rather than naming a
+            // directory called "". It is the only way an environment
+            // can undo a directory a file set, and `create_dir_all("")`
+            // would otherwise fail with an error naming nothing.
+            self.storage.directory = (!value.is_empty()).then(|| PathBuf::from(value));
+        }
+        if let Some(value) = lookup("SDMQTT_STORAGE_SYNC") {
+            self.storage.sync = parse("SDMQTT_STORAGE_SYNC", &value, "sync mode")?;
+        }
+        if let Some(value) = lookup("SDMQTT_STORAGE_FLUSH_INTERVAL_MS") {
+            self.storage.flush_interval_ms = parse(
+                "SDMQTT_STORAGE_FLUSH_INTERVAL_MS",
+                &value,
+                "millisecond count",
+            )?;
+        }
+        if let Some(value) = lookup("SDMQTT_STORAGE_FLUSH_RECORDS") {
+            self.storage.flush_records =
+                parse("SDMQTT_STORAGE_FLUSH_RECORDS", &value, "record count")?;
+        }
         if let Some(value) = lookup("SDMQTT_LOG") {
             self.log.level = parse("SDMQTT_LOG", &value, "log level")?;
         }
@@ -390,6 +652,9 @@ impl Config {
         }
         if let Some(mountpoint) = &overrides.mountpoint {
             self.listener.mountpoint.clone_from(mountpoint);
+        }
+        if let Some(directory) = &overrides.store_directory {
+            self.storage.directory = Some(directory.clone());
         }
         if let Some(level) = overrides.log_level {
             self.log.level = level;
@@ -644,12 +909,17 @@ mod tests {
             address: Some("127.0.0.1:18832".parse().unwrap()),
             max_connections: Some(13),
             mountpoint: Some("tenant-c".to_owned()),
+            store_directory: Some(PathBuf::from("/var/lib/sdmqtt")),
             log_level: Some(LogLevel::Warn),
         });
 
         assert_eq!(config.listener.address.to_string(), "127.0.0.1:18832");
         assert_eq!(config.listener.max_connections, 13);
         assert_eq!(config.listener.mountpoint, "tenant-c");
+        assert_eq!(
+            config.storage.directory.as_deref(),
+            Some(Path::new("/var/lib/sdmqtt"))
+        );
         assert_eq!(config.log.level, LogLevel::Warn);
     }
 
@@ -810,5 +1080,273 @@ mod tests {
         Config::default()
             .validate()
             .expect("the defaults must pass the guard they ship with");
+    }
+
+    // ----------------------------------------------------------------
+    // Section 7.2 and 7.5: where the store is, and what happens
+    // without one.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn no_configured_directory_means_no_store() {
+        // The decision, written as an assertion rather than only as a
+        // paragraph. `sdmqtt serve` with no arguments and no file
+        // starts a working broker, and it starts one that writes
+        // nothing down.
+        let config = Config::from_toml("").expect("an empty file is a valid one");
+        assert_eq!(config.storage.directory, None);
+        assert!(
+            config
+                .storage
+                .open()
+                .expect("an absent store is not a failure")
+                .is_none(),
+            "no directory opens no store rather than inventing a path"
+        );
+    }
+
+    #[test]
+    fn the_storage_defaults_are_what_the_documentation_says() {
+        // Immediate, two milliseconds, a thousand records: the three
+        // numbers the field documentation states. Asserted against
+        // the writer's own defaults as well as against the literals,
+        // so that a change on either side has to be made on both.
+        let storage = StorageSection::default();
+        assert_eq!(storage.sync, Sync::Immediate);
+        assert_eq!(storage.flush_interval_ms, 2);
+        assert_eq!(storage.flush_records, 1_000);
+        assert_eq!(storage.writer(), WriterConfig::default());
+        assert_eq!(storage.sync.to_storage(), storage::SyncMode::Immediate);
+    }
+
+    #[test]
+    fn every_storage_key_parses_and_reaches_the_writer() {
+        // Convention: parsed is not the same as applied. A key read
+        // into this struct and never handed to the writer is a
+        // setting that does nothing, which is worse than one that was
+        // never offered.
+        let text = r#"
+            [storage]
+            directory = "/var/lib/sdmqtt"
+            sync = "relaxed"
+            flush_interval_ms = 25
+            flush_records = 7
+        "#;
+        let config = Config::from_toml(text).expect("every key is known");
+        assert_eq!(
+            config.storage.directory.as_deref(),
+            Some(Path::new("/var/lib/sdmqtt"))
+        );
+        assert_eq!(config.storage.sync, Sync::Relaxed);
+        assert_eq!(config.storage.flush_interval_ms, 25);
+        assert_eq!(config.storage.flush_records, 7);
+
+        let writer = config.storage.writer();
+        assert_eq!(writer.interval, Duration::from_millis(25));
+        assert_eq!(writer.records, 7);
+        assert_eq!(config.storage.sync.to_storage(), storage::SyncMode::Relaxed);
+    }
+
+    #[test]
+    fn an_unknown_storage_key_is_an_error() {
+        let error = Config::from_toml("[storage]\ndirectroy = \"/tmp/x\"\n")
+            .expect_err("a misspelled key that is dropped leaves the broker with no store");
+        assert!(
+            error.to_string().contains("directroy"),
+            "the message must name the key: {error}"
+        );
+    }
+
+    #[test]
+    fn the_configured_directory_is_where_the_store_is_opened() {
+        // The directory is created if it is not there, and the store
+        // is `STORE_FILE` inside it. Both halves: a test that only
+        // checked `open` succeeded would pass against a store opened
+        // anywhere at all.
+        let parent = tempfile::tempdir().expect("a temporary directory");
+        let directory = parent.path().join("not").join("there").join("yet");
+        let config = StorageSection {
+            directory: Some(directory.clone()),
+            ..StorageSection::default()
+        };
+
+        let store = config
+            .open()
+            .expect("a directory that can be made is made")
+            .expect("a configured directory opens a store");
+        assert!(
+            directory.join(STORE_FILE).is_file(),
+            "the store is a file called {STORE_FILE} inside the configured directory"
+        );
+        assert!(
+            store
+                .restore()
+                .expect("a fresh store reads")
+                .sessions
+                .is_empty(),
+            "a store made just now holds nothing"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_created_is_a_startup_failure_naming_it() {
+        // Not a panic, and not a silent fall back to no store, which
+        // would be the worst of the three: a broker that looks like
+        // it is persisting and is not.
+        let parent = tempfile::tempdir().expect("a temporary directory");
+        let blocking = parent.path().join("a-file");
+        std::fs::write(&blocking, b"not a directory").expect("the file is written");
+        let wanted = blocking.join("store");
+
+        let config = StorageSection {
+            directory: Some(wanted.clone()),
+            ..StorageSection::default()
+        };
+        let error = match config.open() {
+            Err(error) => error,
+            // `Arc<dyn Storage>` is not `Debug`, so the success side
+            // is named here rather than through `expect_err`.
+            Ok(_) => panic!("a file is not a directory, and opening one must not succeed"),
+        };
+        assert!(
+            matches!(&error, ConfigError::StoreDirectory { path, .. } if path == &wanted),
+            "expected the directory failure naming {wanted:?}, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains(&wanted.display().to_string()),
+            "the message must name the path an operator has to fix: {error}"
+        );
+    }
+
+    #[test]
+    fn a_store_that_will_not_open_is_told_apart_from_a_directory_that_will_not_be_made() {
+        // Convention 2: the two failures have different fixes — find
+        // the other process, run the right build, reach for a backup
+        // on one; look at the path on the other — so a caller
+        // asserting a category would be guarding neither.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(STORE_FILE);
+        std::fs::write(&path, b"this is not an sd-mqtt store").expect("the file is written");
+
+        let config = StorageSection {
+            directory: Some(directory.path().to_path_buf()),
+            ..StorageSection::default()
+        };
+        let error = match config.open() {
+            Err(error) => error,
+            Ok(_) => panic!("some other file is not a store, and must not open as one"),
+        };
+        assert!(
+            matches!(&error, ConfigError::StoreUnopenable { path: named, .. } if named == &path),
+            "expected the open failure naming {path:?}, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains(&path.display().to_string()),
+            "the message must name the store: {error}"
+        );
+    }
+
+    #[test]
+    fn the_environment_can_name_a_store_and_can_take_one_away() {
+        // The only place an empty value means "no store": an
+        // environment has no way to remove a key a file set, so it
+        // needs one to say so.
+        let mut config =
+            Config::from_toml("[storage]\ndirectory = \"/from/the/file\"\n").expect("a valid file");
+        config
+            .apply_env(|variable| {
+                (variable == "SDMQTT_STORAGE_DIRECTORY").then(|| "/from/the/environment".to_owned())
+            })
+            .expect("a readable value");
+        assert_eq!(
+            config.storage.directory.as_deref(),
+            Some(Path::new("/from/the/environment"))
+        );
+
+        config
+            .apply_env(|variable| (variable == "SDMQTT_STORAGE_DIRECTORY").then(String::new))
+            .expect("an empty value is readable");
+        assert_eq!(
+            config.storage.directory, None,
+            "an empty value turns the store off rather than naming a directory called \"\""
+        );
+    }
+
+    #[test]
+    fn the_environment_reads_the_rest_of_the_storage_section() {
+        let mut config = Config::default();
+        config
+            .apply_env(|variable| match variable {
+                "SDMQTT_STORAGE_SYNC" => Some("relaxed".to_owned()),
+                "SDMQTT_STORAGE_FLUSH_INTERVAL_MS" => Some("11".to_owned()),
+                "SDMQTT_STORAGE_FLUSH_RECORDS" => Some("13".to_owned()),
+                _ => None,
+            })
+            .expect("all three are readable");
+        assert_eq!(config.storage.sync, Sync::Relaxed);
+        assert_eq!(config.storage.writer().interval, Duration::from_millis(11));
+        assert_eq!(config.storage.writer().records, 13);
+    }
+
+    #[test]
+    fn an_unreadable_storage_value_is_named_rather_than_ignored() {
+        let mut config = Config::default();
+        let error = config
+            .apply_env(|variable| (variable == "SDMQTT_STORAGE_SYNC").then(|| "fsync".to_owned()))
+            .expect_err("a sync mode we do not have is not a fallback");
+        assert!(
+            error.to_string().contains("SDMQTT_STORAGE_SYNC")
+                && error.to_string().contains("fsync"),
+            "said: {error}"
+        );
+    }
+
+    #[test]
+    fn the_command_line_overrides_the_file_and_the_environment_for_the_store() {
+        let mut config =
+            Config::from_toml("[storage]\ndirectory = \"/from/the/file\"\n").expect("a valid file");
+        config.apply(&Overrides {
+            store_directory: Some(PathBuf::from("/from/the/flag")),
+            ..Overrides::default()
+        });
+        assert_eq!(
+            config.storage.directory.as_deref(),
+            Some(Path::new("/from/the/flag"))
+        );
+    }
+
+    #[test]
+    fn a_directory_named_as_the_empty_string_is_refused() {
+        // Opposite intentions: leaving the key out asks for no store,
+        // and writing an empty string is a mistake. Reading the
+        // second as the first would give an operator who meant to
+        // persist a broker that loses everything on a restart, with
+        // no complaint.
+        let config = Config::from_toml("[storage]\ndirectory = \"\"\n").expect("it parses");
+        let error = config
+            .validate()
+            .expect_err("an empty directory is not a directory");
+        assert!(
+            matches!(&error, ConfigError::Unusable { key, .. } if *key == "storage.directory"),
+            "expected the key to be named, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn the_two_sync_spellings_map_both_ways() {
+        // Convention 5: a round trip cannot see a consistent error, so
+        // the mapping is pinned in one direction as well as covered in
+        // both. Transposing these would compile, round trip, and turn
+        // every acknowledgement this broker sends into a promise it
+        // does not keep, against a backend whose relaxed mode reaches
+        // no file at all.
+        assert_eq!(Sync::Immediate.to_storage(), storage::SyncMode::Immediate);
+        assert_eq!(Sync::Relaxed.to_storage(), storage::SyncMode::Relaxed);
+        assert_eq!("immediate".parse::<Sync>(), Ok(Sync::Immediate));
+        assert_eq!("relaxed".parse::<Sync>(), Ok(Sync::Relaxed));
+        assert!(
+            "Immediate".parse::<Sync>().is_err(),
+            "the spelling is exact"
+        );
     }
 }

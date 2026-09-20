@@ -8,12 +8,17 @@
 //! travel. A layer whose whole job is reading bytes off a socket should
 //! be tested against one.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use broker_core::broker::Broker;
 use bytes::BytesMut;
 use mqtt_codec::packet::{Connect, Publish, Subscribe, SubscriptionOptions};
 use mqtt_codec::{decode, encode, Limits, Packet, Properties, QoS, ReasonCode, Version};
 use sdmqtt_server::listener::{Running, Server, ServerConfig};
+use sdmqtt_server::shared::Shared;
+use storage::record::{ProtocolVersion, Record, SessionKey, SessionRecord, SubscriptionRecord};
+use storage::{MemoryStorage, Storage, Writer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -326,6 +331,144 @@ async fn a_connection_past_the_limit_is_closed_rather_than_queued() {
         .expect("the refusal is prompt rather than a wait in a queue")
         .expect("the socket is readable");
     assert_eq!(read, 0, "the connection past the limit was closed");
+
+    running.shutdown().await;
+}
+
+/// Connect without a clean start, and hand back what the broker said.
+///
+/// The resumption half of the handshake above, which always starts
+/// clean: a session can only be observed to have survived by a client
+/// that asks for the one it had.
+async fn resume(running: &Running, client_id: &str) -> (TcpStream, BytesMut, bool) {
+    let mut stream = TcpStream::connect(running.address())
+        .await
+        .expect("the listener accepts");
+    let mut buf = BytesMut::new();
+    send(
+        &mut stream,
+        &Packet::Connect(Box::new(Connect {
+            version: Version::V5,
+            client_id: client_id.into(),
+            clean_start: false,
+            keep_alive: 0,
+            username: None,
+            password: None,
+            will: None,
+            properties: Properties::default(),
+        })),
+    )
+    .await;
+    let present = match next(&mut stream, &mut buf).await {
+        Some(Packet::ConnAck(ack)) => {
+            assert_eq!(ack.reason, ReasonCode::Success);
+            ack.session_present
+        }
+        other => panic!("expected an acknowledgement, got {other:?}"),
+    };
+    (stream, buf, present)
+}
+
+#[tokio::test]
+async fn what_restore_built_is_the_broker_the_listener_serves() {
+    // Section 7.5, walked rather than constructed. Restore is proved
+    // in `broker-core` and the shell's own tests call it directly, so
+    // every assertion about it is made against a `Shared` the test
+    // holds. Nothing asked whether the `Shared` a listener is given is
+    // the one its clients reach — and a `bind_shared` that quietly
+    // built a fresh broker instead passed the entire workspace suite.
+    // Convention 5: a test that constructs the type instead of walking
+    // the path.
+    //
+    // So this walks it: a store, a restore, a listener bound against
+    // what came back, and a real socket asking for the session.
+    let store = Arc::new(MemoryStorage::new());
+    let key = SessionKey::new("", "resumed");
+    store
+        .apply(&[
+            Record::SessionPut(SessionRecord {
+                key: key.clone(),
+                version: ProtocolVersion::V5,
+                expiry_interval: 3_600,
+                // The broker's clock is restored to `now` below, and
+                // both are counted from zero here rather than from the
+                // wall clock: what this test is about is which broker
+                // the listener serves, not which sessions outlived an
+                // outage, and a stored expiry on an invented scale
+                // cannot go stale while the test runs.
+                expires_at: Some(3_600),
+                will: None,
+                will_at: None,
+            }),
+            Record::SubscriptionAdded {
+                session: key,
+                subscription: SubscriptionRecord {
+                    filter: "restored/filter".to_owned(),
+                    qos: storage::Qos::AtMostOnce,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: storage::RetainHandling::SendAlways,
+                    subscription_id: None,
+                },
+            },
+        ])
+        .expect("the store takes them");
+
+    let config = ServerConfig::ephemeral();
+    let mut broker = Broker::new(config.broker.clone());
+    let report =
+        broker_core::restore::restore(&mut broker, &store.restore().expect("the store reads"), 0);
+    assert_eq!(report.sessions, 1, "the fixture restored a session");
+
+    let writer = Writer::spawn(
+        Arc::clone(&store) as Arc<dyn Storage>,
+        storage::WriterConfig::default(),
+    )
+    .expect("a writer thread");
+    let running = Server::bind_shared(
+        config,
+        Arc::new(Shared::with_store(broker, Arc::new(writer))),
+    )
+    .await
+    .expect("the server binds");
+
+    let (mut resumed, mut resumed_buf, present) = resume(&running, "resumed").await;
+    assert!(
+        present,
+        "the session the store held is the one a client reaches"
+    );
+
+    // And the other half, which a session-only rebuild gets wrong: the
+    // filter is in the matching trie of the broker actually serving,
+    // not merely on a session in it.
+    let (mut publisher, _) = handshake(&running, "publisher", 0).await;
+    send(
+        &mut publisher,
+        &Packet::Publish(Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: "restored/filter".into(),
+            packet_id: None,
+            payload: bytes::Bytes::from_static(b"to a restored subscription"),
+            properties: Properties::default(),
+        }),
+    )
+    .await;
+    match next(&mut resumed, &mut resumed_buf).await {
+        Some(Packet::Publish(publish)) => {
+            assert_eq!(&publish.payload[..], b"to a restored subscription");
+        }
+        other => panic!("expected the publication, got {other:?}"),
+    }
+
+    // The discrimination. A broker that reported every session present
+    // would pass everything above.
+    let (_stranger, _stranger_buf, stranger_present) = resume(&running, "stranger").await;
+    assert!(
+        !stranger_present,
+        "a session the store never held is not present"
+    );
 
     running.shutdown().await;
 }
