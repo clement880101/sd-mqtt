@@ -15,7 +15,7 @@ static binary cost, and snmalloc's musl support.
 | Area | Pick | License | Why |
 |---|---|---|---|
 | Async runtime | tokio | MIT | Only portable choice with the ecosystem; io_uring runtimes are Linux-only |
-| Storage engine | fjall | MIT OR Apache-2.0 | LSM matches the queue workload; behind a `Storage` trait |
+| Storage engine | redb | MIT OR Apache-2.0 | One dependency; native head pop, flat as queues drain; behind a `Storage` trait |
 | Storage alternate | redb | MIT OR Apache-2.0 | 1 dependency; documented swap target |
 | Cluster membership | own, over the TCP mesh | n/a | The mesh already exists for routing; zero new deps |
 | Cluster metadata | own LWW + HLC anti-entropy | n/a | Gossip libraries cannot hold retained payloads |
@@ -135,16 +135,52 @@ argument validation users will rely on. Hand-writing that is worse for users
 and more code for us. The 340 KiB difference is about two percent of the
 binary budget.
 
-**fjall over redb.** redb's dependency tree is essentially libc, which is
-lighter. fjall brings roughly forty transitive crates. The offline queue is
-append-heavy with deletion from the head and values up to megabytes, which is
-exactly the LSM shape: appends are journal writes with group commit, and
-head deletions become tombstones that compaction drops in bulk. redb's
-copy-on-write B-tree rewrites the path to the root on every commit and only
-returns disk space on an explicit compaction call, which is awkward for a
-process meant to run for months. Both sit behind the same `Storage` trait, so
-a redb backend remains a supported build for anyone who wants the smaller
-tree.
+**redb over fjall. This reverses the original choice, which was wrong.**
+
+The original reasoning was that an offline queue is append-heavy with
+deletion from the head and values up to megabytes, which is the shape a
+log-structured merge tree is built for: appends are journal writes with
+group commit, and head deletions become tombstones that compaction drops in
+bulk. That last clause is true and irrelevant. Compaction does drop them in
+bulk, eventually; **between compactions every head read walks all of them**,
+because fjall's head read is a forward scan rather than a seek.
+
+Measured on the same workload, a hundred thousand entries of 256 bytes
+appended and then drained from the head:
+
+| pops completed | fjall, first-key read | fjall, cursor read | redb `pop_first` |
+|---:|---:|---:|---:|
+| 10,000 | 1,357/s | 326,404/s | 1,479,199/s |
+| 30,000 | 197/s | 286,455/s | 1,481,207/s |
+| 100,000 | did not finish | 296,102/s | 1,467,934/s |
+
+A persisted head cursor recovers most of fjall's loss, but redb needs no
+workaround: it has a native remove-and-return-head, and it is flat.
+
+The other three facts all point the same way. redb's dependency tree is
+`libc` and nothing else, against forty-two for fjall. redb passes this
+project's `cargo deny` unchanged, while fjall pulls in `xxhash-rust`
+(BSL-1.0) and `varint-rs` (0BSD), both permissive and MIT-compatible but
+both outside the allow list, so choosing it would mean amending the licence
+policy. And redb spawns no background threads, where fjall's write path
+contains unbounded loops of `std::thread::sleep` that must never run on an
+async runtime's thread.
+
+What redb gives up is key-value separation. It stores values in the tree, so
+a multi-megabyte payload costs write amplification that fjall's separate
+blob storage avoids. Message bodies are stored once and referenced by every
+queue entry, so this is paid per message rather than per subscriber, and the
+configured maximum packet size bounds it. It is recorded in the design's
+open questions as a figure to measure rather than a risk to assume.
+
+The concern that redb "only returns disk space on an explicit compaction
+call" was overstated. Freed pages are reused, so the file is bounded by its
+high-water mark; a drain-and-refill cycle held steady rather than growing.
+Compaction reclaims the space and is a maintenance operation.
+
+Both still sit behind the same `Storage` trait. Comparing two engines is
+what found the head-read problem, so the trait is written as though a second
+backend existed even though only one is built.
 
 **aws-lc-rs over a pure-Rust provider.** It is a large C codebase. It is also
 the rustls default, the fastest provider on every platform they benchmark,
