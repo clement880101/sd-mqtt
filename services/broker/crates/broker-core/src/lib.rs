@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod clock;
 pub mod retained;
 pub mod session;
 pub mod subscriptions;
