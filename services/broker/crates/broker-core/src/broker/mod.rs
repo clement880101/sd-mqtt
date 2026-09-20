@@ -20,6 +20,10 @@ use crate::session::state::{will_message, Session, StoredWill};
 use crate::session::Action;
 use crate::subscriptions::{SharedSubscriptions, SubscriberId, SubscriptionTrie};
 
+/// The inflight window a session has when nothing narrows it, from
+/// section 6 of the design.
+pub const DEFAULT_MAX_INFLIGHT: u16 = 20;
+
 /// How the broker is configured.
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
@@ -29,6 +33,12 @@ pub struct BrokerConfig {
     pub trie_shards: usize,
     /// The largest keep-alive interval the ring is sized for.
     pub max_keep_alive: u16,
+    /// The largest inflight window a session may have.
+    ///
+    /// Section 6: a session's window is the lesser of this and the
+    /// peer's receive maximum. One gives strict ordering, and is the
+    /// only way to ask for it that does not depend on the client.
+    pub max_inflight: u16,
 }
 
 impl Default for BrokerConfig {
@@ -37,6 +47,7 @@ impl Default for BrokerConfig {
             limits: Limits::default(),
             trie_shards: 32,
             max_keep_alive: 3600,
+            max_inflight: DEFAULT_MAX_INFLIGHT,
         }
     }
 }
@@ -76,7 +87,7 @@ impl Broker {
             subscriptions: SubscriptionTrie::new(config.trie_shards),
             shared: SharedSubscriptions::new(config.trie_shards),
             retained: RetainedStore::new(),
-            registry: Registry::default(),
+            registry: Registry::new(usize::from(config.max_inflight)),
             keepalive: KeepAliveRing::new(config.max_keep_alive),
             activities: HashMap::with_hasher(RandomState::default()),
             config,
@@ -86,6 +97,15 @@ impl Broker {
     /// The clock, so the shell can advance it and a test can read it.
     pub fn clock(&self) -> &Arc<CoarseClock> {
         &self.clock
+    }
+
+    /// What this broker was configured with.
+    ///
+    /// The shell reads the inflight maximum from here rather than
+    /// holding its own copy, so that the two cannot disagree about a
+    /// number one of them narrows and the other enforces.
+    pub fn config(&self) -> &BrokerConfig {
+        &self.config
     }
 
     /// The handle an identity currently holds, if any.
@@ -1082,6 +1102,59 @@ mod tests {
             }],
             properties: Properties::default(),
         })
+    }
+
+    /// A subscribe to one filter at the given quality of service.
+    fn subscribe_at(filter: &str, qos: QoS) -> Packet {
+        let Packet::Subscribe(mut subscribe) = subscribe_to(filter) else {
+            unreachable!("subscribe_to builds a subscribe");
+        };
+        subscribe.filters[0].qos = qos;
+        Packet::Subscribe(subscribe)
+    }
+
+    #[test]
+    fn the_configured_window_bounds_what_a_session_holds_unacknowledged() {
+        // The configured half of section 6's "lesser of", at the layer
+        // that owns it: there is no shell here, so nothing narrows the
+        // window to a peer's advertisement and what is left is the
+        // configured number on its own. A window of one is how section
+        // 6 says strict ordering is asked for, and before this task it
+        // could only be had from a client advertising a receive
+        // maximum of one.
+        for max_inflight in [1u16, 3] {
+            let mut broker = Broker::new(BrokerConfig {
+                max_inflight,
+                ..BrokerConfig::default()
+            });
+            let mut out = Vec::new();
+            let sub = broker.connect("", &connect_v5("sub"), &mut out);
+            broker
+                .handle(
+                    sub.subscriber,
+                    &subscribe_at("a/b", QoS::AtLeastOnce),
+                    &mut out,
+                )
+                .expect("the subscribe is accepted");
+            out.clear();
+
+            // Two more than the window, so the count below is the
+            // window rather than the supply.
+            for _ in 0..usize::from(max_inflight) + 2 {
+                broker.publish(
+                    Message::new("a/b", Bytes::from_static(b"x"), QoS::AtLeastOnce, false),
+                    None,
+                    0,
+                    &mut out,
+                );
+            }
+
+            assert_eq!(
+                publishes_to(&out, sub.subscriber).len(),
+                usize::from(max_inflight),
+                "a configured window of {max_inflight} sends that many and queues the rest"
+            );
+        }
     }
 
     /// Every publish addressed to one subscriber, in order.

@@ -62,18 +62,25 @@ pub struct Session {
 
 impl Session {
     /// A fresh session, connected.
+    ///
+    /// `max_inflight` is the configured window, which section 6 makes
+    /// one half of the lesser-of pair. The other half is the peer's
+    /// receive maximum, which the shell narrows this to once it has
+    /// read the connect packet; it is not known here, and a session
+    /// exists before any connection has advertised anything.
     pub fn new(
         id: SessionId,
         subscriber: SubscriberId,
         version: Version,
         epoch: u64,
         _now: u32,
+        max_inflight: usize,
     ) -> Self {
         // A fresh session has a connection attached, so its outbound path
         // does too. Leaving it offline would make `is_connected` lie and
         // silently discard every at-most-once delivery, which such a path
         // does not queue for an absent client.
-        let mut outbound = Outbound::new(QueueLimits::default(), 20);
+        let mut outbound = Outbound::new(QueueLimits::default(), max_inflight);
         outbound.set_online(true);
 
         Self {
@@ -281,7 +288,7 @@ mod tests {
     use mqtt_codec::{Packet, QoS, ReasonCode, Version};
 
     fn session(version: Version) -> Session {
-        Session::new(SessionId::new("", "c"), SubscriberId(1), version, 1, 0)
+        Session::new(SessionId::new("", "c"), SubscriberId(1), version, 1, 0, 20)
     }
 
     fn will() -> StoredWill {

@@ -148,6 +148,10 @@ pub struct BrokerSection {
     pub trie_shards: usize,
     /// The largest keep-alive interval the ring is sized for.
     pub max_keep_alive: u16,
+    /// The largest inflight window a session may have. A session's
+    /// window is the lesser of this and what the client advertises,
+    /// and one gives strict ordering.
+    pub max_inflight: u16,
 }
 
 impl Default for BrokerSection {
@@ -160,6 +164,7 @@ impl Default for BrokerSection {
             max_client_id_len: limits.max_client_id_len,
             trie_shards: broker.trie_shards,
             max_keep_alive: broker.max_keep_alive,
+            max_inflight: broker.max_inflight,
         }
     }
 }
@@ -300,6 +305,7 @@ impl Config {
                 limits,
                 trie_shards: self.broker.trie_shards,
                 max_keep_alive: self.broker.max_keep_alive,
+                max_inflight: self.broker.max_inflight,
             },
             connection: ConnectionConfig {
                 limits,
@@ -358,6 +364,7 @@ mod tests {
             max_client_id_len = 23
             trie_shards = 2
             max_keep_alive = 60
+            max_inflight = 3
 
             [log]
             level = "debug"
@@ -372,6 +379,7 @@ mod tests {
         assert_eq!(config.broker.max_client_id_len, 23);
         assert_eq!(config.broker.trie_shards, 2);
         assert_eq!(config.broker.max_keep_alive, 60);
+        assert_eq!(config.broker.max_inflight, 3);
         assert_eq!(config.log.level, LogLevel::Debug);
 
         // Parsed is not the same as applied. A field read into this
@@ -386,7 +394,28 @@ mod tests {
         assert_eq!(server.broker.limits.max_client_id_len, 23);
         assert_eq!(server.broker.trie_shards, 2);
         assert_eq!(server.broker.max_keep_alive, 60);
+        assert_eq!(server.broker.max_inflight, 3);
         assert_eq!(server.connection.limits, server.broker.limits);
+    }
+
+    #[test]
+    fn the_documented_defaults_are_the_literals_they_replace() {
+        // Written against the numbers rather than against the
+        // constants they now live in, because the point is that moving
+        // a literal into configuration cannot quietly change it. An
+        // assertion spelled `DEFAULT_MAX_INFLIGHT` would hold whatever
+        // that became.
+        let config = Config::default();
+        assert_eq!(
+            config.broker.max_inflight, 20,
+            "section 6: the inflight window defaults to 20"
+        );
+
+        let server = config.server();
+        assert_eq!(
+            server.broker.max_inflight, 20,
+            "and the default reaches the broker"
+        );
     }
 
     #[test]

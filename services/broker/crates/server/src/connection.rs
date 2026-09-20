@@ -217,16 +217,26 @@ where
 
         let mut out = Vec::new();
         let registration = broker.connect(&config.mountpoint, &connect, &mut out);
+        let configured = usize::from(broker.config().max_inflight);
         if let Some(session) = broker.session_mut(registration.subscriber) {
             // Section 4.9: what the client can receive bounds what we
             // may have outstanding towards it, and what we advertise
             // bounds what it may have outstanding towards us. Two
             // directions, two settings, neither of them session state.
-            if version == Version::V5 {
-                // A 3.1.1 client advertises nothing, so there is nothing
-                // to narrow to and the broker's own window stands.
-                session.outbound.set_inflight_limit(window);
-            }
+            //
+            // Section 6: the lesser of the two. An absent Receive
+            // Maximum means 65535 [3.1.2.11.3], so assigning the peer's
+            // value would quietly replace the configured window with
+            // the protocol's ceiling. A 3.1.1 client advertises nothing
+            // at all, which is the same absence by another road and
+            // lands on the same number; that is why this is not guarded
+            // on the version.
+            //
+            // Set on every connect rather than only on a fresh session,
+            // because a resumed one carries the window the last
+            // connection narrowed it to and this one may advertise
+            // something else entirely.
+            session.outbound.set_inflight_limit(window.min(configured));
             session
                 .inbound
                 .set_receive_maximum(usize::from(config.receive_maximum));
@@ -1962,5 +1972,185 @@ mod tests {
             }
             other => panic!("expected an acknowledgement, got {other:?}"),
         }
+    }
+
+    /// How long to wait before concluding that nothing more is coming.
+    ///
+    /// Only ever the gap between two messages already in flight on an
+    /// in-memory socket, and never the whole of an assertion: what
+    /// follows the quiet period is a positive check that the
+    /// connection was withholding rather than broken.
+    const WINDOW_QUIET: Duration = Duration::from_millis(500);
+
+    /// The next reply, or `None` if none arrives within `within`.
+    async fn read_within(
+        client: &mut tokio::io::DuplexStream,
+        buf: &mut BytesMut,
+        version: Version,
+        within: Duration,
+    ) -> Option<Packet> {
+        tokio::time::timeout(within, read_buffered(client, buf, version))
+            .await
+            .ok()
+    }
+
+    /// Connect at `version`, advertising `receive_maximum` if there is
+    /// one, and check the acknowledgement arrived.
+    async fn connect_advertising(
+        client: &mut tokio::io::DuplexStream,
+        version: Version,
+        client_id: &str,
+        receive_maximum: Option<u16>,
+    ) {
+        let mut packet = connect(client_id, 0);
+        packet.version = version;
+        packet.properties.receive_maximum = receive_maximum;
+        write(client, &Packet::Connect(Box::new(packet)), version).await;
+        assert!(matches!(read(client, version).await, Packet::ConnAck(_)));
+    }
+
+    /// Subscribe to `a/+` at `qos` over an already connected client.
+    async fn subscribe_at(client: &mut tokio::io::DuplexStream, version: Version, qos: QoS) {
+        write(
+            client,
+            &Packet::Subscribe(mqtt_codec::packet::Subscribe {
+                packet_id: 1,
+                filters: vec![mqtt_codec::packet::SubscriptionOptions {
+                    filter: "a/+".into(),
+                    qos,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: mqtt_codec::packet::RetainHandling::DoNotSend,
+                }],
+                properties: Properties::default(),
+            }),
+            version,
+        )
+        .await;
+        assert!(matches!(read(client, version).await, Packet::SubAck(_)));
+    }
+
+    /// The window the broker actually applies to a subscriber, measured
+    /// over a real connection.
+    ///
+    /// Section 6 makes it "the lesser of the configured maximum and the
+    /// peer's receive maximum", so what is measured is how many
+    /// quality-of-service 1 publications the broker will hold
+    /// unacknowledged before it stops. Measured rather than read off an
+    /// accessor because the defect is in the wiring: a unit test of
+    /// `set_inflight_limit` passed throughout.
+    async fn measured_window(
+        version: Version,
+        receive_maximum: Option<u16>,
+        max_inflight: u16,
+    ) -> usize {
+        // More than any window these tests configure or advertise, so
+        // the count below is the window and not the supply.
+        const OFFERED: u16 = 8;
+
+        let shared = Arc::new(Shared::new(BrokerConfig {
+            max_inflight,
+            ..BrokerConfig::default()
+        }));
+        let mut subscriber = serve_one(Arc::clone(&shared));
+        let mut publisher = serve_one(Arc::clone(&shared));
+
+        connect_advertising(&mut subscriber, version, "sub", receive_maximum).await;
+        subscribe_at(&mut subscriber, version, QoS::AtLeastOnce).await;
+        connect_advertising(&mut publisher, Version::V5, "pub", None).await;
+
+        for packet_id in 1..=OFFERED {
+            write(
+                &mut publisher,
+                &publication(b"x", QoS::AtLeastOnce, Some(packet_id)),
+                Version::V5,
+            )
+            .await;
+        }
+
+        // Nothing is acknowledged, so the window is what stops this.
+        let mut buf = BytesMut::new();
+        let mut held: Vec<u16> = Vec::new();
+        while held.len() < usize::from(OFFERED) {
+            let Some(packet) = read_within(&mut subscriber, &mut buf, version, WINDOW_QUIET).await
+            else {
+                break;
+            };
+            match packet {
+                Packet::Publish(publish) => {
+                    held.push(publish.packet_id.expect("a qos 1 publish carries one"));
+                }
+                other => panic!("expected a publication, got {other:?}"),
+            }
+        }
+
+        assert!(
+            held.len() < usize::from(OFFERED),
+            "all {OFFERED} offered messages arrived, so this measured the supply \
+             rather than a window: the broker held no window at all"
+        );
+
+        // Convention 5: this is not an assertion of absence. One
+        // acknowledgement frees exactly one slot, and the message that
+        // follows proves the connection was withholding rather than
+        // wedged, closed or simply out of messages.
+        write(
+            &mut subscriber,
+            &Packet::PubAck(mqtt_codec::packet::Ack {
+                packet_id: held[0],
+                reason: ReasonCode::Success,
+                properties: Properties::default(),
+            }),
+            version,
+        )
+        .await;
+        match read_buffered(&mut subscriber, &mut buf, version).await {
+            Packet::Publish(publish) => assert!(
+                !held.contains(&publish.packet_id.expect("a qos 1 publish carries one")),
+                "the freed slot must carry the next message, not a redelivery"
+            ),
+            other => panic!("expected the next publication, got {other:?}"),
+        }
+
+        held.len()
+    }
+
+    #[tokio::test]
+    async fn a_client_that_advertises_no_receive_maximum_gets_the_configured_window() {
+        // An absent Receive Maximum means 65535 [3.1.2.11.3], which is
+        // not a licence to hold 65535 messages: section 6 takes the
+        // lesser of the two, and the configured maximum is the lesser.
+        assert_eq!(
+            measured_window(Version::V5, None, 4).await,
+            4,
+            "the configured maximum, not the protocol's ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_advertises_more_than_we_allow_gets_our_number() {
+        assert_eq!(
+            measured_window(Version::V5, Some(10), 4).await,
+            4,
+            "ours is the lesser"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_advertises_less_than_we_allow_gets_its_own_number() {
+        assert_eq!(
+            measured_window(Version::V5, Some(2), 4).await,
+            2,
+            "theirs is the lesser"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_three_one_one_client_gets_the_configured_window() {
+        // 3.1.1 has no Receive Maximum to advertise, so it is the
+        // absent case by another road and must land on the same number.
+        // It kept the constructor's 20 before this task only because
+        // the assignment that replaced it was guarded on version 5.
+        assert_eq!(measured_window(Version::V311, None, 4).await, 4);
     }
 }

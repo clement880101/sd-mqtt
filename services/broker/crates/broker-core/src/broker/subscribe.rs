@@ -201,7 +201,14 @@ mod tests {
             trie: SubscriptionTrie::new(4),
             shared: SharedSubscriptions::new(4),
             retained,
-            session: Session::new(SessionId::new("", "c"), SubscriberId(1), Version::V5, 1, 0),
+            session: Session::new(
+                SessionId::new("", "c"),
+                SubscriberId(1),
+                Version::V5,
+                1,
+                0,
+                20,
+            ),
         }
     }
 
