@@ -96,7 +96,10 @@ impl Broker {
     /// Accept a connection.
     ///
     /// Taking over a session that already has a live connection is not an
-    /// error: the newcomer wins and the incumbent is told why.
+    /// error: the newcomer wins and the incumbent is told why. The
+    /// incumbent's departure runs before the registry reclaims or
+    /// replaces the session, because a departure is what arms a will and
+    /// the newcomer's will overwrites it a few lines later.
     pub fn connect(
         &mut self,
         mountpoint: &str,
@@ -105,18 +108,14 @@ impl Broker {
     ) -> Registration {
         let now = self.clock.now();
         let identity = SessionId::new(mountpoint, &connect.client_id);
-        let registration = self.registry.register(identity, connect.clean_start, now);
 
-        if registration.took_over {
-            out.push((
-                registration.subscriber,
-                Action::Close(ReasonCode::SessionTakenOver),
-            ));
-            // The incumbent never disconnected, so nothing disarmed its
-            // keep-alive. Left in the ring it would expire on the
-            // displaced connection's silence and close the newcomer.
-            self.keepalive.remove(registration.subscriber);
-        }
+        let displaced = self.displace_incumbent(&identity, connect.clean_start, now, out);
+        let mut registration = self.registry.register(identity, connect.clean_start, now);
+        // The registry judges takeover by whether the session was still
+        // connected, and this layer disconnected it a moment ago on
+        // purpose, so the registry now says no. The observation above is
+        // the true one.
+        registration.took_over = displaced;
 
         if !registration.session_present {
             // A clean start discards the session [MQTT-3.1.2-4], and the
@@ -161,6 +160,95 @@ impl Broker {
             .insert(registration.subscriber, connect.keep_alive, activity, now);
 
         registration
+    }
+
+    /// End a live connection that a newcomer is taking over from, and
+    /// publish the will it leaves if one is due. Returns whether there
+    /// was one to displace.
+    ///
+    /// # Which takeovers publish a will
+    ///
+    /// Closing a connection without having received a normal
+    /// disconnection is one of the situations [MQTT-3.1.2-8] names, so
+    /// the will is armed by the departure like any other. What differs
+    /// is whether the newcomer suppresses it.
+    ///
+    /// [MQTT-3.1.3-9] forbids sending the will when "a new Network
+    /// Connection to this Session is made before the Will Delay Interval
+    /// has passed". Both halves of that matter:
+    ///
+    /// - A delay of zero, which is the default, has already passed by
+    ///   the time the connection closes, so nothing is suppressed and
+    ///   the will goes out.
+    /// - A delay above zero is suppressed, because the takeover is
+    ///   exactly the new connection the clause describes.
+    /// - MQTT 3.1.1 has no delay at all and its [MQTT-3.1.2-8] is
+    ///   unconditional, so a takeover always publishes. The session
+    ///   already knows this and forces the delay to zero for that
+    ///   version.
+    ///
+    /// # Clean start
+    ///
+    /// A clean-start takeover publishes the will whatever the delay
+    /// says. [MQTT-3.1.2-8] fires the will when "the Will Delay Interval
+    /// has elapsed **or the Session ends**", and clean start ends the
+    /// incumbent's session rather than resuming it. Section 3.1.4's own
+    /// commentary reads the pair the same way: with clean start set, or
+    /// a session expiry interval of zero, the will "will be sent because
+    /// the original Session is ended on the takeover".
+    ///
+    /// That does not contradict [MQTT-3.1.3-9], whose operative words
+    /// are "to this Session". A clean start is not a new connection to
+    /// the incumbent's session; it discards that session and begins
+    /// another, so the clause never engages.
+    ///
+    /// It is expressed by ending the session's life here rather than by
+    /// testing the delay again, so the rule that a will falls due when
+    /// its session ends stays the session's, where it is tested. A
+    /// session expiry interval of zero already reaches the same place by
+    /// the same route.
+    fn displace_incumbent(
+        &mut self,
+        identity: &SessionId,
+        clean_start: bool,
+        now: u32,
+        out: &mut Vec<Addressed>,
+    ) -> bool {
+        let Some(incumbent) = self.registry.subscriber_of(identity) else {
+            return false;
+        };
+        if !self
+            .registry
+            .get(incumbent)
+            .is_some_and(Session::is_connected)
+        {
+            return false;
+        }
+
+        out.push((incumbent, Action::Close(ReasonCode::SessionTakenOver)));
+        // The incumbent never disconnected, so nothing else disarms its
+        // keep-alive. Left in the ring it would expire on the displaced
+        // connection's silence and close the newcomer.
+        self.keepalive.remove(incumbent);
+        self.activities.remove(&incumbent);
+
+        let due = {
+            let session = self.registry.get_mut(incumbent).expect("just looked it up");
+            if clean_start {
+                // The session ends now, so it outlives its connection by
+                // nothing and the delay has nothing left to cap.
+                session.set_expiry_interval(0);
+            }
+            session.on_disconnected(false, now);
+            session.take_due_will(now)
+        };
+
+        if let Some(will) = due {
+            let message = will_message(&will);
+            self.publish(message, Some(incumbent), now, out);
+        }
+
+        true
     }
 
     /// Handle a packet from a connected client.

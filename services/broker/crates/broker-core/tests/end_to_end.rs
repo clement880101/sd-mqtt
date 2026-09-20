@@ -94,6 +94,36 @@ fn durable_connect(client: &str, seconds: u32) -> Connect {
     connect
 }
 
+/// A will on the topic a watcher below listens to.
+fn with_will(connect: &mut Connect, delay: Option<u32>) {
+    connect.will = Some(Will {
+        topic: "gone/device".into(),
+        payload: Bytes::from_static(b"offline"),
+        qos: QoS::AtMostOnce,
+        retain: false,
+        properties: Properties {
+            will_delay_interval: delay,
+            ..Properties::default()
+        },
+    });
+}
+
+/// A broker with one client watching `gone/+`, which is where every
+/// will in these tests is published.
+fn broker_with_a_watcher() -> (Broker, SubscriberId) {
+    let mut broker = Broker::new(BrokerConfig::default());
+    let mut out = Vec::new();
+    let watcher = broker.connect("", &connect_packet("watcher", 0), &mut out);
+    broker
+        .handle(
+            watcher.subscriber,
+            &Packet::Subscribe(subscribe_packet("gone/+", QoS::AtMostOnce)),
+            &mut out,
+        )
+        .expect("a valid subscribe");
+    (broker, watcher.subscriber)
+}
+
 fn subscribe_packet(filter: &str, qos: QoS) -> Subscribe {
     Subscribe {
         packet_id: 1,
@@ -722,5 +752,147 @@ fn a_takeover_disarms_the_incumbents_keep_alive() {
             .session(first.subscriber)
             .is_some_and(|session| session.is_connected()),
         "and left disconnected by it"
+    );
+}
+
+/// A takeover closes the incumbent's connection without a normal
+/// disconnection, which is one of the situations [MQTT-3.1.2-8] names,
+/// so its will is armed. Whether it then goes out is decided by
+/// [MQTT-3.1.3-9]: a new connection *to this session* before the delay
+/// has passed suppresses it.
+///
+/// The four cases below are the whole of that rule. Each one is a point
+/// rather than a range, so each is its own deterministic test: a
+/// generator over the delay would only make the boundary harder to read.
+#[test]
+fn a_takeover_publishes_a_will_with_no_delay() {
+    // The default delay of zero has already passed by the time the
+    // connection closes, so nothing suppresses it.
+    let (mut broker, watcher) = broker_with_a_watcher();
+    let mut out = Vec::new();
+
+    let mut incumbent = durable_connect("device", 600);
+    with_will(&mut incumbent, Some(0));
+    broker.connect("", &incumbent, &mut out);
+
+    out.clear();
+    broker.connect("", &durable_connect("device", 600), &mut out);
+
+    assert_eq!(
+        copies(&out, "gone/device", watcher),
+        1,
+        "a displaced connection with no delay publishes its will at once"
+    );
+}
+
+#[test]
+fn a_takeover_suppresses_a_will_that_is_still_delayed() {
+    let (mut broker, watcher) = broker_with_a_watcher();
+    let mut out = Vec::new();
+
+    let mut incumbent = durable_connect("device", 600);
+    with_will(&mut incumbent, Some(30));
+    broker.connect("", &incumbent, &mut out);
+
+    out.clear();
+    broker.connect("", &durable_connect("device", 600), &mut out);
+    assert_eq!(
+        copies(&out, "gone/device", watcher),
+        0,
+        "[MQTT-3.1.3-9]: a new connection to the session before the delay"
+    );
+
+    // And it stays suppressed, rather than merely being deferred.
+    for _ in 0..60 {
+        out.clear();
+        broker.tick(&mut out);
+        assert_eq!(copies(&out, "gone/device", watcher), 0, "still suppressed");
+    }
+}
+
+#[test]
+fn a_takeover_publishes_a_will_under_protocol_3_1_1() {
+    // 3.1.1 has no will delay and its [MQTT-3.1.2-8] is unconditional:
+    // the will is published when the connection is closed, full stop.
+    let (mut broker, watcher) = broker_with_a_watcher();
+    let mut out = Vec::new();
+
+    let mut incumbent = durable_connect("device", 600);
+    incumbent.version = Version::V311;
+    // A delay this long would suppress the will in MQTT 5. The version
+    // is what must decide, not the number.
+    with_will(&mut incumbent, Some(30));
+    broker.connect("", &incumbent, &mut out);
+
+    out.clear();
+    broker.connect("", &durable_connect("device", 600), &mut out);
+
+    assert_eq!(
+        copies(&out, "gone/device", watcher),
+        1,
+        "3.1.1 knows no delay, so a takeover always publishes"
+    );
+}
+
+#[test]
+fn a_clean_start_takeover_publishes_a_will_whatever_its_delay() {
+    // [MQTT-3.1.2-8] fires the will when the delay elapses *or the
+    // session ends*, and a clean start ends the incumbent's session
+    // rather than resuming it. [MQTT-3.1.3-9] does not hold it back,
+    // because its subject is a new connection "to this Session" and
+    // this one is not.
+    let (mut broker, watcher) = broker_with_a_watcher();
+    let mut out = Vec::new();
+
+    let mut incumbent = durable_connect("device", 600);
+    with_will(&mut incumbent, Some(30));
+    broker.connect("", &incumbent, &mut out);
+
+    let mut newcomer = durable_connect("device", 600);
+    newcomer.clean_start = true;
+    out.clear();
+    broker.connect("", &newcomer, &mut out);
+
+    assert_eq!(
+        copies(&out, "gone/device", watcher),
+        1,
+        "the session ended, so the delay had nothing left to wait for"
+    );
+}
+
+#[test]
+fn a_takeover_does_not_publish_the_newcomers_will() {
+    // The ordering this whole restructure exists for. The incumbent's
+    // departure must be processed before `set_will` replaces it, or the
+    // broker publishes the wrong message, or none at all.
+    let (mut broker, watcher) = broker_with_a_watcher();
+    let mut out = Vec::new();
+
+    let mut incumbent = durable_connect("device", 600);
+    with_will(&mut incumbent, Some(0));
+    incumbent.will.as_mut().expect("just set").payload = Bytes::from_static(b"the first");
+    broker.connect("", &incumbent, &mut out);
+
+    let mut newcomer = durable_connect("device", 600);
+    with_will(&mut newcomer, Some(0));
+    newcomer.will.as_mut().expect("just set").payload = Bytes::from_static(b"the second");
+    out.clear();
+    broker.connect("", &newcomer, &mut out);
+
+    let payloads: Vec<Bytes> = out
+        .iter()
+        .filter_map(|(to, action)| match action {
+            Action::Send(Packet::Publish(publish))
+                if *to == watcher && publish.topic == "gone/device" =>
+            {
+                Some(publish.payload.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        payloads,
+        vec![Bytes::from_static(b"the first")],
+        "the will that went out is the one being displaced"
     );
 }
