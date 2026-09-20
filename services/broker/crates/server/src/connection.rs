@@ -29,6 +29,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use broker_core::broker::Broker;
+use broker_core::registry::SessionId;
 use broker_core::session::Action;
 use broker_core::subscriptions::SubscriberId;
 use bytes::BytesMut;
@@ -139,29 +141,20 @@ where
     };
     let version = connect.version;
 
-    let assigned = if connect.client_id.is_empty() {
-        // [MQTT-3.1.3-6]: a zero length identifier is a special case and
-        // the server assigns a unique one, then processes the connect as
-        // if the client had sent it.
-        if version == Version::V311 && !connect.clean_start {
-            // [MQTT-3.1.3-8]: in 3.1.1 the pair is illegal, because the
-            // client could never be told which session to resume.
-            refuse(
-                &mut write_half,
-                version,
-                ReasonCode::ClientIdentifierNotValid,
-            )
-            .await?;
-            return Err(ConnectionError::Protocol(
-                ReasonCode::ClientIdentifierNotValid,
-            ));
-        }
-        let assigned = assign_identifier();
-        connect.client_id.clone_from(&assigned);
-        Some(assigned)
-    } else {
-        None
-    };
+    if connect.client_id.is_empty() && version == Version::V311 && !connect.clean_start {
+        // [MQTT-3.1.3-8]: in 3.1.1 the pair is illegal, because there is
+        // no property to tell the client which session it was given, so
+        // it could never resume the one it is asking to keep.
+        refuse(
+            &mut write_half,
+            version,
+            ReasonCode::ClientIdentifierNotValid,
+        )
+        .await?;
+        return Err(ConnectionError::Protocol(
+            ReasonCode::ClientIdentifierNotValid,
+        ));
+    }
 
     let window = match connect.properties.receive_maximum {
         // Section 3.1.2.11.3 makes zero a protocol error. It is refused
@@ -178,7 +171,24 @@ where
 
     // From here the broker knows about this connection and is owed a
     // disconnect.
-    let (registration, actions) = shared.with_broker(|broker| {
+    //
+    // One lock span for everything it must do before the client hears
+    // anything. The identifier is checked for a clash and used under the
+    // same guard, so nothing can claim it in between; the two flow
+    // control limits are set there too, so no publish from another
+    // connection can overshoot a window not yet narrowed.
+    let registered = shared.with_broker(|broker| {
+        // [MQTT-3.1.3-6]: a zero length identifier is a special case and
+        // the server assigns a unique one, then processes the connect as
+        // if the client had sent it [MQTT-3.1.3-7].
+        let assigned = if connect.client_id.is_empty() {
+            let assigned = assign_identifier(broker, &config.mountpoint, candidate_identifier)?;
+            connect.client_id.clone_from(&assigned);
+            Some(assigned)
+        } else {
+            None
+        };
+
         let mut out = Vec::new();
         let registration = broker.connect(&config.mountpoint, &connect, &mut out);
         if let Some(session) = broker.session_mut(registration.subscriber) {
@@ -195,8 +205,22 @@ where
                 .inbound
                 .set_receive_maximum(usize::from(config.receive_maximum));
         }
-        (registration, out)
+        Some((registration, out, assigned))
     });
+
+    let Some((registration, actions, assigned)) = registered else {
+        // Every candidate identifier was taken. Nothing was registered,
+        // so nothing is owed; the client is told rather than dropped.
+        refuse(
+            &mut write_half,
+            version,
+            ReasonCode::ClientIdentifierNotValid,
+        )
+        .await?;
+        return Err(ConnectionError::Protocol(
+            ReasonCode::ClientIdentifierNotValid,
+        ));
+    };
 
     let attached = Attached {
         shared: Arc::clone(&shared),
@@ -324,14 +348,48 @@ fn acknowledgement(
     }
 }
 
-/// A client identifier for a client that sent none.
+/// A client identifier for a client that sent none, held by nobody.
 ///
 /// [MQTT-3.2.2-16] requires one "not used by any other Session currently
-/// in the Server". A process-wide counter cannot collide with itself,
-/// the timestamp separates one run of the process from the next, and the
-/// prefix separates the whole space from identifiers a client would
-/// plausibly choose.
-fn assign_identifier() -> String {
+/// in the Server", and the registry is the only thing that knows. The
+/// consequence of skipping the question is not a duplicate name:
+/// `Broker::connect` would read the newcomer as that client returning
+/// and take the session over, so an unrelated client is disconnected and
+/// its state handed away. Rare, invisible, and catastrophic for whoever
+/// hits it, which is the argument for asking rather than reasoning about
+/// the odds.
+///
+/// `candidates` is a parameter because a clash cannot be waited for: it
+/// is how a test seeds one. `None` when every attempt clashed, which
+/// means something is wrong with the candidates rather than with the
+/// broker, and the connection is refused.
+fn assign_identifier(
+    broker: &Broker,
+    mountpoint: &str,
+    mut candidates: impl FnMut() -> String,
+) -> Option<String> {
+    // Bounded because this runs under the broker's lock, where retrying
+    // for as long as it takes would stall every other connection.
+    (0..ASSIGNMENT_ATTEMPTS).find_map(|_| {
+        let candidate = candidates();
+        broker
+            .subscriber_of(&SessionId::new(mountpoint, &candidate))
+            .is_none()
+            .then_some(candidate)
+    })
+}
+
+/// How many identifiers to try before giving up.
+const ASSIGNMENT_ATTEMPTS: usize = 8;
+
+/// One identifier that is probably free.
+///
+/// A process-wide counter cannot collide with itself, the timestamp
+/// separates one run of the process from the next, and the prefix
+/// separates the whole space from identifiers a client would plausibly
+/// choose. It is a candidate rather than an answer because none of that
+/// is a proof, and [`assign_identifier`] asks.
+fn candidate_identifier() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let serial = NEXT.fetch_add(1, Ordering::Relaxed);
     let started = SystemTime::now()
@@ -827,6 +885,65 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the session was left attached after the connection failed");
+    }
+
+    #[test]
+    fn an_identifier_a_live_session_holds_is_not_handed_out_again() {
+        // Seeded, because a clash between a nanosecond timestamp and a
+        // counter cannot be waited for. What it guards is not a
+        // duplicate name: the broker reads a repeated identifier as that
+        // client returning, so handing one out would take an unrelated
+        // client's session over and disconnect it.
+        let shared = Shared::new(BrokerConfig::default());
+        shared.with_broker(|broker| {
+            let mut out = Vec::new();
+            broker.connect("", &connect("taken", 0), &mut out);
+        });
+
+        let mut offered = ["taken", "free"].into_iter();
+        let assigned = shared
+            .with_broker(|broker| assign_identifier(broker, "", || offered.next().unwrap().into()));
+
+        assert_eq!(assigned.as_deref(), Some("free"));
+    }
+
+    #[test]
+    fn an_assignment_that_never_finds_a_free_identifier_gives_up() {
+        // The loop runs under the broker's lock, so it is bounded. This
+        // is the path that refuses the connection rather than spinning.
+        let shared = Shared::new(BrokerConfig::default());
+        shared.with_broker(|broker| {
+            let mut out = Vec::new();
+            broker.connect("", &connect("taken", 0), &mut out);
+        });
+
+        let mut attempts = 0;
+        let assigned = shared.with_broker(|broker| {
+            assign_identifier(broker, "", || {
+                attempts += 1;
+                "taken".into()
+            })
+        });
+
+        assert_eq!(assigned, None);
+        assert_eq!(attempts, ASSIGNMENT_ATTEMPTS);
+    }
+
+    #[test]
+    fn an_identifier_taken_on_another_mountpoint_is_free_here() {
+        // A handle is an identity, and an identity is a mountpoint and
+        // an identifier. Asking without the mountpoint would refuse
+        // names that are not in use on this listener at all.
+        let shared = Shared::new(BrokerConfig::default());
+        shared.with_broker(|broker| {
+            let mut out = Vec::new();
+            broker.connect("tenant-a", &connect("taken", 0), &mut out);
+        });
+
+        let assigned =
+            shared.with_broker(|broker| assign_identifier(broker, "tenant-b", || "taken".into()));
+
+        assert_eq!(assigned.as_deref(), Some("taken"));
     }
 
     #[tokio::test]

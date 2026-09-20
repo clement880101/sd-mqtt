@@ -88,6 +88,19 @@ impl Broker {
         &self.clock
     }
 
+    /// The handle an identity currently holds, if any.
+    ///
+    /// For the one caller that must ask before it invents an identifier.
+    /// [MQTT-3.2.2-16] requires an assigned client identifier to be "a
+    /// new Client Identifier not used by any other Session currently in
+    /// the Server", and the consequence of getting that wrong is not a
+    /// duplicate name: [`Broker::connect`] would read the newcomer as
+    /// the same client and take the session over, disconnecting an
+    /// unrelated one and handing its state away.
+    pub fn subscriber_of(&self, id: &SessionId) -> Option<SubscriberId> {
+        self.registry.subscriber_of(id)
+    }
+
     /// One session, mutably.
     ///
     /// For the two settings a connection owns and a session does not:
