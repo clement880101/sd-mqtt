@@ -18,6 +18,7 @@ pub mod memory;
 pub mod record;
 pub mod redb;
 pub mod restore;
+pub mod writer;
 
 pub use self::redb::RedbStorage;
 pub use memory::MemoryStorage;
@@ -28,6 +29,7 @@ pub use record::{
     SessionKey, SessionRecord, SubscriptionRecord, WillRecord, FORMAT_MAGIC, FORMAT_VERSION,
 };
 pub use restore::{Restored, RestoredSession};
+pub use writer::{Durable, NotDurable, Writer, WriterConfig, WriterStopped};
 
 /// How hard a flush tries.
 ///

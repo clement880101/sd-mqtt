@@ -13,10 +13,24 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 thiserror.workspace = true
 bytes = { workspace = true, features = ["serde"] }
+# Only `oneshot`, and only for the writer's waiter. The thing waiting is
+# an async connection task in `sdmqtt-server`, and section 7.3 has it
+# waiting for a durable commit before it acknowledges; a synchronous
+# channel would park a runtime worker for the length of a disk flush,
+# which is the cost this whole module exists to avoid. tokio is already a
+# dependency of two crates in this workspace, so this adds nothing to the
+# lock file or to the licence gate.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+# `rt` and `macros` for `#[tokio::test]`, because the waiter is awaited
+# rather than blocked on, and a test that blocks on it would not be
+# exercising the path the shell takes. `time` is what bounds the waits
+# that cannot be made deterministic, so a broken writer fails rather than
+# hangs.
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
 
 [lints]
 workspace = true
