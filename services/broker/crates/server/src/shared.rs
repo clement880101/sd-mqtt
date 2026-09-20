@@ -67,9 +67,21 @@ impl Shared {
 
     /// Send each action to the session it is addressed to.
     ///
-    /// Never blocks. A session whose outbox is full has a reader slower
-    /// than its traffic, and waiting here would stall every other
-    /// connection behind it. The drop is counted rather than silent.
+    /// Never blocks. Waiting here would hold the read half of the
+    /// outboxes lock, which every connect and every teardown needs the
+    /// write half of, and would block the caller: another connection
+    /// with its own client to serve, or the one ticker task that drives
+    /// every deadline in the process.
+    ///
+    /// **A full outbox should now be impossible.** Its depth is derived
+    /// from the configured queue and window bounds, and a configuration
+    /// that breaks the relation is refused at startup, so no drain can
+    /// produce more actions at once than the channel holds. The branch
+    /// is kept because the alternative to an unreachable branch is an
+    /// unchecked assumption, and it shouts rather than counting quietly:
+    /// a message discarded here carries no reason to the session that
+    /// lost it, and if it was an acknowledged delivery its window slot
+    /// is held for a receipt that can never come.
     pub fn deliver(&self, actions: Vec<Addressed>) {
         if actions.is_empty() {
             return;
@@ -81,8 +93,24 @@ impl Shared {
                 // and us delivering it. Ordinary, not an error.
                 continue;
             };
-            if sender.try_send(action).is_err() {
-                self.dropped_for_slow_reader.fetch_add(1, Ordering::Relaxed);
+            match sender.try_send(action) {
+                Ok(()) => {}
+                // The writer has stopped and its receiver is gone. That
+                // is the same ordinary teardown as a missing outbox,
+                // reached a moment later, and counting it as a slow
+                // reader would make the counter report routine
+                // disconnections as a capacity problem.
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Err(mpsc::error::TrySendError::Full(action)) => {
+                    self.dropped_for_slow_reader.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        subscriber = subscriber.0,
+                        kind = ?std::mem::discriminant(&action),
+                        "an outbox was full, which its sizing should make \
+                         impossible; an action was discarded with no reason \
+                         delivered to the session"
+                    );
+                }
             }
         }
     }
@@ -167,6 +195,29 @@ mod tests {
             )]);
         }
         assert_eq!(shared.dropped_for_slow_reader(), 99);
+    }
+
+    #[tokio::test]
+    async fn a_closed_outbox_is_not_a_slow_reader() {
+        // A writer that has stopped leaves its outbox registered for a
+        // moment longer than its receiver. That is the ordinary end of
+        // a connection, and counting it here would make the slow-reader
+        // figure climb with routine disconnections, which is the one
+        // thing it must not do if anyone is to act on it.
+        let shared = Shared::new(Default::default());
+        let inbox = shared.register_outbox(SubscriberId(1), 8);
+        drop(inbox);
+
+        shared.deliver(vec![(
+            SubscriberId(1),
+            broker_core::session::Action::Close(ReasonCode::Success),
+        )]);
+
+        assert_eq!(
+            shared.dropped_for_slow_reader(),
+            0,
+            "a closed outbox is a departure, not a capacity problem"
+        );
     }
 
     #[tokio::test]
