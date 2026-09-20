@@ -12,6 +12,7 @@ pub mod clock;
 pub mod journal;
 pub mod keepalive;
 pub mod registry;
+pub mod restore;
 pub mod retained;
 pub mod session;
 pub mod subscriptions;

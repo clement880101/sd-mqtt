@@ -149,6 +149,26 @@ impl Broker {
         out.append(&mut self.journal);
     }
 
+    /// Throw away everything said so far, everywhere it is held.
+    ///
+    /// For [`crate::restore`] and nothing else. Restore rebuilds a
+    /// broker by walking the same paths a live client walks, so those
+    /// paths say what they always say; but it is reading what was
+    /// already written down, not deciding anything new, and writing it
+    /// back would be a second copy of a state the store already holds.
+    ///
+    /// It reaches into every session as well as the broker's own
+    /// buffer, because a record left in a session's buffer is not
+    /// discarded by clearing this one: it would simply be handed over
+    /// by whichever call next drained that session, long after the
+    /// restore that produced it.
+    pub fn discard_journal(&mut self) {
+        for (_, session) in self.registry.iter_mut() {
+            session.take_journal(&mut self.journal);
+        }
+        self.journal.clear();
+    }
+
     /// Everything about this broker that must survive it.
     ///
     /// Durable state only. What it leaves out, and why leaving it out is

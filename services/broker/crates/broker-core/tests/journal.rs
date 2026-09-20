@@ -65,11 +65,14 @@
 //!   session, which is where the records come from, so a rebuild that
 //!   put nothing back into the matching structures would still compare
 //!   equal. What the records *carry* is what this test guards; that
-//!   restore re-enters them into the trie is task 4's to prove, and
+//!   restore re-enters them into both is proved in `restore`'s own
+//!   tests, by publishing to a restored filter, and
 //!   `tests/differential.rs` already guards the trie itself.
 //! - **Packet identifiers.** They are not durable state — the store
 //!   holds the identifier each inflight entry was sent under, and that
-//!   is compared — but the allocator's reserved set is not rebuilt here.
+//!   is compared — but the allocator's reserved set is not compared.
+//!   That restore takes both the window's identifiers and the queue's
+//!   out of circulation is `outbound`'s own tests.
 //! - **A case it produces twice in three hundred histories.** The
 //!   stranded redelivery above is generated, and rarely: with the fix
 //!   removed the property found it at case 290 and the budget is 256.
@@ -99,7 +102,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use broker_core::broker::{Broker, BrokerConfig};
 use broker_core::journal;
 use broker_core::registry::SessionId;
-use broker_core::session::state::StoredWill;
+use broker_core::restore::restore;
 use broker_core::subscriptions::SubscriberId;
 use bytes::Bytes;
 use mqtt_codec::packet::{
@@ -110,7 +113,7 @@ use mqtt_codec::{Packet, Properties, QoS, ReasonCode, Version};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{TestCaseResult, TestRunner};
-use storage::record::{InflightState, ProtocolVersion, Record};
+use storage::record::{InflightState, Record};
 use storage::{MemoryStorage, Restored, Storage};
 
 // ---- the universe the generator draws from ------------------------------
@@ -1061,120 +1064,22 @@ fn ack(packet_id: u16, reason: ReasonCode) -> Ack {
 /// Build a second broker holding exactly what the store says the first
 /// one had.
 ///
-/// This is the shell's restore phase, written here because task 4 has not
-/// built it yet, and it uses only the seams section 7.5 names:
-/// `Inbound::reserve`, `Outbound::restore` and the queue's requeue.
-///
-/// Retained messages go in **last**, after every subscription, so that
-/// establishing a subscription here delivers nothing: a rebuild that
-/// handed a retained message to a session being restored would put a
-/// message in its queue that the original never had.
+/// [`broker_core::restore`] is the real thing, and using it is the
+/// point: a copy of the restore path living in this file would be a
+/// second implementation of section 7.5 that this property compared
+/// against the first, and the two would agree with each other while
+/// both disagreed with what the shell actually runs.
 fn rebuild(restored: &Restored, now: u32) -> Broker {
     let mut broker = Broker::new(config());
-    broker.clock().advance(now);
-    let mut actions = Vec::new();
-
-    for held in &restored.sessions {
-        let record = &held.session;
-        let connect = Connect {
-            version: match record.version {
-                ProtocolVersion::V311 => Version::V311,
-                ProtocolVersion::V5 => Version::V5,
-            },
-            client_id: record.key.client_id.clone(),
-            clean_start: false,
-            keep_alive: 0,
-            username: None,
-            password: None,
-            will: None,
-            properties: Properties::default(),
-        };
-        let registration = broker.connect(&record.key.mountpoint, &connect, &mut actions);
-        actions.clear();
-        let handle = registration.subscriber;
-
-        for subscription in &held.subscriptions {
-            let packet = Packet::Subscribe(Subscribe {
-                packet_id: 1,
-                filters: vec![SubscriptionOptions {
-                    filter: subscription.filter.clone(),
-                    qos: journal::live_qos(subscription.qos),
-                    no_local: subscription.no_local,
-                    retain_as_published: subscription.retain_as_published,
-                    retain_handling: journal::live_retain_handling(subscription.retain_handling),
-                }],
-                properties: Properties {
-                    subscription_identifiers: subscription
-                        .subscription_id
-                        .iter()
-                        .copied()
-                        .collect(),
-                    ..Properties::default()
-                },
-            });
-            broker
-                .handle(handle, &packet, &mut actions)
-                .expect("a filter the broker accepted once it accepts again");
-            actions.clear();
-        }
-
-        let session = broker.session_mut(handle).expect("just connected");
-        session.set_expiry_interval(record.expiry_interval);
-        session.set_will(record.will.as_ref().map(|will| StoredWill {
-            topic: will.topic.clone(),
-            payload: will.payload.clone(),
-            qos: journal::live_qos(will.qos),
-            retain: will.retain,
-            delay: will.delay,
-            properties: journal::live_properties(&will.properties),
-        }));
-        session.set_will_at(record.will_at);
-        session.set_expires_at(record.expires_at);
-
-        for packet_id in &held.inbound {
-            session.inbound.reserve(*packet_id);
-        }
-
-        // The window in the order the messages arrived, which is
-        // sequence order; the store keys it by packet identifier and so
-        // hands it back in a different one.
-        let mut inflight = held.inflight.clone();
-        inflight.sort_by_key(|entry| entry.sequence);
-        for entry in &inflight {
-            let body = restored
-                .bodies
-                .get(&entry.delivery.body)
-                .expect("an inflight entry names a body the store still holds");
-            let message = journal::live_message(entry.delivery.body, body);
-            session
-                .outbound
-                .restore(journal::live_inflight(entry, message));
-        }
-
-        // The queue newest first, because each requeue goes to the head.
-        for entry in held.queue.iter().rev() {
-            let body = restored
-                .bodies
-                .get(&entry.delivery.body)
-                .expect("a queued entry names a body the store still holds");
-            let message = journal::live_message(entry.delivery.body, body);
-            session.outbound.requeue(journal::live_delivery(
-                &entry.delivery,
-                message,
-                entry.sequence,
-                entry.packet_id,
-            ));
-        }
-        session.outbound.set_highest_sequence(held.highest_sequence);
-    }
-
-    for (topic, record) in &restored.retained {
-        broker.retained().set(topic, journal::live_retained(record));
-    }
-
-    // Rebuilding is reading what was already said. Whatever it said
-    // along the way is noise and is thrown away.
-    broker.take_journal(&mut Vec::new());
+    let report = restore(&mut broker, restored, now);
+    assert_eq!(
+        report.filters_refused, 0,
+        "every filter the broker accepted once it accepts again"
+    );
+    assert_eq!(
+        report.identifier_clashes, 0,
+        "the stored state must not claim one identifier twice"
+    );
     broker
 }
 

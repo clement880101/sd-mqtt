@@ -680,8 +680,23 @@ impl Outbound {
     ///
     /// It goes to the head, so a caller replaying a stored queue replays
     /// it newest first.
-    pub fn requeue(&mut self, item: Delivery) {
+    ///
+    /// The identifier is reserved, when the entry carries one, exactly
+    /// as [`Outbound::restore`] reserves the window's. A queued entry
+    /// carries one when a resume put it back before it could be resent,
+    /// and the peer is holding that identifier just as surely as it
+    /// holds an outstanding one: an allocator rebuilt without it hands
+    /// the same value to an unrelated message and the peer discards one
+    /// of the two as a repeat. Reports whether it was free, so that a
+    /// stored state disagreeing with itself is visible rather than
+    /// silent.
+    pub fn requeue(&mut self, item: Delivery) -> bool {
+        let was_free = match item.packet_id {
+            Some(packet_id) => self.packet_ids.reserve(packet_id),
+            None => true,
+        };
         self.queue.requeue(item);
+        was_free
     }
 
     /// Every message outstanding, in the order sent, for persistence.
@@ -1368,6 +1383,74 @@ mod tests {
         assert_eq!(resent.len(), 1);
         assert_eq!(resent[0].packet_id, Some(7));
         assert!(resent[0].dup);
+    }
+
+    #[test]
+    fn a_requeued_message_keeps_its_identifier_out_of_circulation() {
+        // The queue's half of the same rule as
+        // `a_restored_window_keeps_its_identifiers_out_of_circulation`,
+        // and the easier one to miss: a queued entry carries an
+        // identifier only when a resume put it back before it could be
+        // resent, which is a state a live broker passes through and a
+        // stored one can be read back in the middle of. The peer holds
+        // that identifier either way. Without the reservation the
+        // allocator hands the same value to the next message and the
+        // peer discards one of the two as a repeat.
+        let mut out = online(10);
+        let mut waiting = delivery(QoS::AtLeastOnce, b"waiting");
+        waiting.packet_id = Some(1);
+        waiting.dup = true;
+        assert!(out.requeue(waiting));
+
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtLeastOnce, b"new"), 0, &mut actions);
+        let issued: Vec<Option<u16>> = sent(&actions).iter().map(|p| p.packet_id).collect();
+        assert!(
+            !issued.contains(&Some(1)) || issued.iter().filter(|id| **id == Some(1)).count() == 1,
+            "the requeued message may use its own identifier and nothing else may"
+        );
+        assert!(
+            out.packet_ids.is_in_use(1),
+            "the identifier the peer is holding must be reserved"
+        );
+        assert_eq!(
+            sent(&actions)
+                .iter()
+                .find(|p| &p.payload[..] == b"new")
+                .expect("the new message went out")
+                .packet_id,
+            Some(2),
+            "so a new message takes the next one instead"
+        );
+    }
+
+    #[test]
+    fn requeueing_an_identifier_the_window_holds_reports_the_clash() {
+        let mut out = online(10);
+        assert!(out.restore(InflightEntry {
+            packet_id: 4,
+            delivery: delivery(QoS::AtLeastOnce, b"outstanding"),
+            state: InflightState::AwaitingAck,
+            sent_at: 0,
+        }));
+        let mut waiting = delivery(QoS::AtLeastOnce, b"waiting");
+        waiting.packet_id = Some(4);
+        assert!(
+            !out.requeue(waiting),
+            "the stored state claims one identifier twice"
+        );
+        assert_eq!(
+            out.queued_len(),
+            1,
+            "but the message is not dropped over it"
+        );
+    }
+
+    #[test]
+    fn requeueing_a_message_that_never_had_an_identifier_reserves_nothing() {
+        let mut out = Outbound::new(a_key(), QueueLimits::default(), 10);
+        assert!(out.requeue(delivery(QoS::AtLeastOnce, b"never sent")));
+        assert_eq!(out.packet_ids.in_use(), 0);
     }
 
     #[test]
