@@ -1023,9 +1023,20 @@ mod tests {
     /// Drive one connection over an in-memory socket, returning the
     /// client's half so a test can write packets and read replies.
     fn serve_one(shared: Arc<Shared>) -> tokio::io::DuplexStream {
+        serve_one_with_config(shared, ConnectionConfig::default())
+    }
+
+    /// The same, for a test whose subject is a configured limit. The
+    /// defaults are far above anything a test can reach in a reasonable
+    /// number of packets, so a limit that has to be exercised rather
+    /// than only read has to be lowered first.
+    fn serve_one_with_config(
+        shared: Arc<Shared>,
+        config: ConnectionConfig,
+    ) -> tokio::io::DuplexStream {
         let (client, server) = tokio::io::duplex(8192);
         tokio::spawn(async move {
-            let _ = serve(server, shared, ConnectionConfig::default()).await;
+            let _ = serve(server, shared, config).await;
         });
         client
     }
@@ -2416,25 +2427,148 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn the_acknowledgement_reports_our_own_receive_maximum() {
-        let shared = Arc::new(Shared::new(BrokerConfig::default()));
-        let mut client = serve_one(shared);
-
+    /// Connect over `client` and return the acknowledgement, which must
+    /// be a successful one.
+    async fn acknowledged(client: &mut tokio::io::DuplexStream) -> ConnAck {
         write(
-            &mut client,
+            client,
             &Packet::Connect(Box::new(connect("c", 0))),
             Version::V5,
         )
         .await;
-        match read(&mut client, Version::V5).await {
+        match read(client, Version::V5).await {
             Packet::ConnAck(ack) => {
-                assert!(
-                    ack.properties.receive_maximum.is_some(),
-                    "a client cannot honour a limit it was never told"
-                );
+                assert_eq!(ack.reason, ReasonCode::Success);
+                ack
             }
             other => panic!("expected an acknowledgement, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_acknowledgement_reports_the_receive_maximum_it_enforces() {
+        // The number was asserted to be present and not to be anything
+        // in particular, which is convention 2: any constant passed,
+        // including one the broker does not enforce. The two can
+        // disagree silently, and a client that believes a limit larger
+        // than the real one is disconnected for keeping to what it was
+        // told.
+        //
+        // So the advertised number is read off the wire and then spent:
+        // exactly-once exchanges hold their slot until their completion
+        // [MQTT-3.3.4-9], and none is sent here, so the count that fits
+        // is the limit the broker actually imposes.
+        const IMPOSED: u16 = 3;
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one_with_config(
+            shared,
+            ConnectionConfig {
+                receive_maximum: IMPOSED,
+                ..ConnectionConfig::default()
+            },
+        );
+
+        let advertised = acknowledged(&mut client)
+            .await
+            .properties
+            .receive_maximum
+            .expect("a client cannot honour a limit it was never told");
+        assert_eq!(
+            advertised, IMPOSED,
+            "the client is told the configured limit"
+        );
+
+        let mut buf = BytesMut::new();
+        for packet_id in 1..=advertised {
+            write(
+                &mut client,
+                &publication(b"x", QoS::ExactlyOnce, Some(packet_id)),
+                Version::V5,
+            )
+            .await;
+            match read_buffered(&mut client, &mut buf, Version::V5).await {
+                Packet::PubRec(ack) => assert_eq!(ack.packet_id, packet_id),
+                other => panic!(
+                    "the client was told it could have {advertised} outstanding \
+                     and the {packet_id} was answered with {other:?}"
+                ),
+            }
+        }
+
+        write(
+            &mut client,
+            &publication(b"x", QoS::ExactlyOnce, Some(advertised + 1)),
+            Version::V5,
+        )
+        .await;
+        match read_buffered(&mut client, &mut buf, Version::V5).await {
+            Packet::Disconnect(disconnect) => assert_eq!(
+                disconnect.reason,
+                ReasonCode::ReceiveMaximumExceeded,
+                "[MQTT-3.3.4-9]: one past the advertised limit is refused"
+            ),
+            other => panic!("expected the refusal past the limit, got {other:?}"),
+        }
+    }
+
+    /// A frame header declaring a packet of exactly `total` bytes, whose
+    /// body never arrives.
+    ///
+    /// The decoder refuses an oversized packet from its declared length
+    /// alone, before any of the body is read, so this is the whole of
+    /// an oversized packet that a test needs to send.
+    fn frame_declaring(total: usize) -> Vec<u8> {
+        let remaining = total - 2;
+        assert!(remaining < 128, "one byte of type and one of length");
+        // A publish at quality of service zero, which is legal at any
+        // point in a connection and so cannot be refused for any other
+        // reason than its size.
+        vec![0x30, remaining as u8]
+    }
+
+    #[tokio::test]
+    async fn the_acknowledgement_advertises_the_maximum_packet_size_it_enforces() {
+        // Section 5.4 lists it in scope and 3.1.2.11.4 defaults it to
+        // unlimited, so a client told nothing assumes it may send
+        // anything and learns our limit by being disconnected for
+        // exceeding it. The property had no assertion at all: deleting
+        // it from the acknowledgement passed the whole suite.
+        //
+        // Advertised and enforced are asserted together, because either
+        // alone permits the pair to disagree, and a limit a client is
+        // told but not held to is as bad as one it is held to but not
+        // told.
+        const LIMIT: u32 = 64;
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one_with_config(
+            shared,
+            ConnectionConfig {
+                limits: Limits {
+                    max_packet_size: LIMIT,
+                    ..Limits::default()
+                },
+                ..ConnectionConfig::default()
+            },
+        );
+
+        let advertised = acknowledged(&mut client)
+            .await
+            .properties
+            .maximum_packet_size
+            .expect("a client that is told nothing assumes it may send anything");
+        assert_eq!(advertised, LIMIT, "the client is told the configured limit");
+
+        client
+            .write_all(&frame_declaring(advertised as usize + 1))
+            .await
+            .unwrap();
+        match read(&mut client, Version::V5).await {
+            Packet::Disconnect(disconnect) => assert_eq!(
+                disconnect.reason,
+                ReasonCode::PacketTooLarge,
+                "3.2.2.3.6: one byte past the advertised size is refused"
+            ),
+            other => panic!("expected the refusal past the limit, got {other:?}"),
         }
     }
 
