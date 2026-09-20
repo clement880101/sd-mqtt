@@ -73,8 +73,21 @@ was not, which is the failure mode that survives review by looking green.
   degrading the sweep from bounded work to scanning the whole population
   every second changed no outcome and passed.
 
+- **A test asserting an absence.** The broker's keep-alive was guarded by
+  one test asserting that no timeout occurred, and every property fixed
+  the interval at zero, which disables the mechanism. Five mutations
+  survived the whole suite, including one that deleted the keep-alive
+  entirely. A test that asserts nothing happened cannot tell a working
+  feature from a missing one.
+- **A test measuring the cheap half.** The keep-alive ring proved its
+  sweep was bounded while an operation beside it scanned the whole
+  population on every departure, measured at forty microseconds with
+  fifty thousand armed. The accessor added to assert bounded work
+  measured only the half that already was.
+
 The question to ask of any new test: what would have to be true for this
-to fail, and can the inputs actually make it true?
+to fail, and can the inputs actually make it true? If the answer is "the
+feature would have to be absent", the test is not guarding it.
 
 ## 6. Beware a harness that mirrors the implementation
 
