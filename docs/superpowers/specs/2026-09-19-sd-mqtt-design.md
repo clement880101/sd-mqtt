@@ -834,6 +834,96 @@ needs it, and the resolution is recorded as an architecture decision record.
 - **Channel binding.** SCRAM-SHA-256-PLUS defends against an attacker who
   terminates TLS in the middle. Whether that threat model applies depends on
   whether deployments terminate TLS at a proxy. Milestone 7 decides.
-- **Conformance suite choice.** Milestone 1 selects and pins one. The
-  criteria are that it is independent of any broker implementation, that it
-  covers both protocol versions, and that its license permits use in CI.
+- **Conformance suite choice — settled.** Eclipse Paho's interoperability
+  tests, `eclipse-paho/paho.mqtt.testing`, pinned at commit
+  `9d7bb80bb8b9d9cfc0b52f8cb4c1916401281103`. It is maintained by the Paho
+  project rather than by any broker, tests a broker purely over the wire,
+  covers both protocol versions (27 tests for MQTT 5, 10 for 3.1.1), and
+  needs nothing but Python 3 to run. Its licence is `EPL-2.0 OR
+  BSD-3-Clause`.
+
+  **The licence rule here is the weaker one.** A test tool run in CI is
+  never linked into the shipped binary and never distributed, so what its
+  licence must do is permit use. That is weaker than the dependency policy
+  in `deny.toml`, which governs code that ships and is why EPL-2.0 is not
+  on that allow list. The distinction happens not to change the answer,
+  because the suite's BSD-3-Clause option is already allowed, but the rule
+  being applied is the weaker one and `deny.toml` is unchanged.
+
+  The runner is `services/broker/conformance/run.sh` and the CI job is
+  `conformance`. The suite has no expected-failure mechanism, so the runner
+  supplies one: it runs **every test on its own against a broker started
+  for it**, and compares the failing set against
+  `conformance/known-failures.txt`, failing the build on a new failure and
+  equally on a listed test that has started passing. Per-test isolation is
+  not tidiness: run whole, `test_subscribe_identifiers` and
+  `test_will_message` fail only because of state an earlier test left
+  behind, and a baseline taken from a whole-suite run would encode the
+  running order as conformance.
+
+  As of the milestone 1 run, of 37 tests **12 fail, one is ignored as
+  flaky and the remaining 24 pass.** The twelve classify as two deferred
+  (both `test_subscribe_failure`, which needs a filter the broker is
+  configured to refuse — authorization is milestone 7), three suite
+  assumptions, and seven that are real defects. None has been fixed: each
+  one's fix belongs in a layer below the shell, and patching the shell
+  would hide it.
+
+- **Eight conformance defects behind seven failing tests.** In rough
+  order of seriousness (`test_client_topic_alias` exposes the first two):
+
+  1. **Topic aliases are neither resolved nor stripped.** A PUBLISH
+     carrying a Topic Alias is accepted, the alias is never mapped, and a
+     later PUBLISH with an empty topic name and only the alias is dropped
+     rather than routed — a silent message loss. The alias property is
+     then forwarded verbatim to subscribers that advertised no Topic Alias
+     Maximum, which 3.1.2.11.5 forbids. The codec already refuses alias
+     zero; nothing above it implements the mapping. `broker-core`, plus a
+     per-connection alias table in the shell.
+  2. **A protocol error after CONNACK closes the socket silently.** Alias
+     zero is caught by the codec and the connection is dropped with no
+     DISCONNECT, so an MQTT 5 client never learns the reason. The shell,
+     `server/src/connection.rs`, which has the version and the reason code
+     and already has a `refuse` path for the pre-CONNACK case.
+  3. **A 3.1.1 `CleanSession=0` session is not stored.** It is given a
+     session expiry interval of zero, so it is discarded the moment the
+     client disconnects. [MQTT-3.1.2-4] requires it to be kept. The 3.1.1
+     flag needs mapping to an interval that does not expire.
+     `broker-core/src/broker/mod.rs`.
+  4. **A DISCONNECT's Session Expiry Interval is ignored.** 3.14.2.2.2
+     lets a client change the interval on the way out; the handler passes
+     only the reason code to `detach`. Note that a fix must also make a
+     non-zero interval on DISCONNECT a protocol error when CONNECT said
+     zero, [MQTT-3.14.4-3]. `broker-core/src/broker/mod.rs`.
+  5. **A retained message loses its properties.** `RetainedMessage` holds
+     payload, QoS and expiry, so User Properties and Content Type are
+     dropped; [MQTT-3.3.2-17] requires User Properties to be forwarded
+     unaltered, and they are part of the stored Application Message.
+     Live forwarding is correct, so this is the retained store only.
+     `broker-core/src/retained.rs`.
+  6. **Message Expiry Interval is not decremented.** A delivery that
+     waited in a session queue forwards the interval it arrived with;
+     [MQTT-3.3.2-6] requires the received value minus the time waited.
+     Expiry itself works — the expired messages are dropped — so only the
+     rewrite on delivery is missing. `broker-core`.
+  7. **A client's Maximum Packet Size is not honoured outbound.**
+     [MQTT-3.1.2-24] forbids sending a packet larger than the client
+     advertised. Like Receive Maximum, this is per connection and not
+     session state, so it belongs beside `set_inflight_limit` in the
+     shell.
+  8. **A will can fire up to a second early.** The deadline is
+     `tick + delay` on a clock that advances in whole seconds, so a
+     disconnect part-way through a tick shortens the delay by the
+     remainder: a three-second Will Delay Interval was observed firing at
+     2.8s. Every other deadline in the broker errs late, which is
+     harmless; this one errs early, which 3.1.3.2.2 does not allow.
+     `broker-core/src/session/state.rs`.
+
+  The three suite assumptions, recorded so they are not re-investigated:
+  `test_server_keep_alive` asserts a CONNACK property 3.2.2.3.14 says the
+  server MAY send; `test_server_topic_alias` asserts the server uses
+  aliases, which 3.3.2.3.4 permits rather than requires; and
+  `test_flow_control2` is the suite's own client raising `BrokenPipeError`
+  while writing another PUBREL — a raw probe confirms the broker sends
+  exactly the DISCONNECT with reason 0x93 the test is looking for, after
+  the 1024th unacknowledged QoS 2 publication.

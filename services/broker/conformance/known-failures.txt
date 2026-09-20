@@ -1,0 +1,41 @@
+# What the Paho interoperability suite fails against this broker, and why.
+#
+# The runner compares the tests that fail against this list and fails the
+# build on any difference in either direction: a test that starts failing
+# is a regression, and a test listed here that starts passing means the
+# line is stale and must be removed. The suite has no expected-failure
+# mechanism of its own, so the comparison lives in `run.sh`.
+#
+# Every line is classified as one of:
+#
+#   deferred   a later milestone covers it; nothing is wrong today
+#   assumption the suite asserts something the specification permits
+#              rather than requires, or the suite's own client is at
+#              fault
+#   defect     a real defect in this broker, reported and not yet fixed
+#   flaky      the test's own race; its result is ignored in both
+#              directions, because listing it as failing would break the
+#              build on the runs where it passes
+#
+# Format: <suite>:<test> <classification> <one line>
+
+# --- deferred to a later milestone -------------------------------------
+v5:test_subscribe_failure    deferred   Needs a filter the broker is configured to refuse; authorization is milestone 7.
+v311:test_subscribe_failure  deferred   The same, over 3.1.1.
+
+# --- the suite assumes more than the specification requires ------------
+v5:test_server_keep_alive    assumption 3.2.2.3.14 says the Server MAY send Server Keep Alive; the test asserts it is present.
+v5:test_server_topic_alias   assumption 3.3.2.3.4 lets a Server use topic aliases; the test asserts it does.
+v5:test_flow_control2        assumption The broker does send DISCONNECT 0x93 after 1024 unacknowledged QoS 2 publications; the suite's client raises BrokenPipeError writing the next PUBREL before it reads the DISCONNECT already in its buffer.
+
+# --- the test races with itself ----------------------------------------
+v5:test_subscribe_options    flaky      Waits on aclient's subscribeds after bclient subscribes, so it can publish before bclient's SUBSCRIBE is processed; observed passing three runs in four, and a direct probe shows noLocal routing is correct.
+
+# --- real defects, reported, deliberately not fixed here ---------------
+v5:test_session_expiry       defect     A DISCONNECT's Session Expiry Interval is ignored, so it cannot extend the session (3.14.2.2.2).
+v311:test_offline_message_queueing defect A 3.1.1 CleanSession=0 session gets expiry 0 and is discarded at disconnect; [MQTT-3.1.2-4] requires it to be stored.
+v5:test_retained_message     defect     The retained store keeps payload, QoS and expiry only, so a retained delivery loses its User Properties and Content Type ([MQTT-3.3.2-17]).
+v5:test_publication_expiry   defect     A queued delivery forwards the original Message Expiry Interval instead of the value minus the time waited ([MQTT-3.3.2-6]).
+v5:test_maximum_packet_size  defect     A client's Maximum Packet Size is not honoured on the way out ([MQTT-3.1.2-24]).
+v5:test_client_topic_alias   defect     A topic alias is never resolved and never stripped, and a protocol error after CONNACK closes the socket with no DISCONNECT.
+v5:test_will_delay           defect     The coarse one-second clock can fire a will up to a second before its Will Delay Interval has elapsed.
