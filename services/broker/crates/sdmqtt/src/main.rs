@@ -99,7 +99,43 @@ enum StartupError {
     Bind(#[from] std::io::Error),
 }
 
-/// Configure, bind, and serve until interrupted.
+/// Wait for whichever stop signal comes first, and name it.
+///
+/// Both are ordinary endings rather than faults. They are distinguished
+/// in the log because they mean different things to whoever is reading
+/// it: a termination is a deployment stopping the process, an interrupt
+/// is a person at a keyboard.
+///
+/// Termination matters more than it looks. Docker, Kubernetes and
+/// systemd all stop a process with `SIGTERM` and escalate to `SIGKILL`
+/// after a grace period, so a broker that ignores it is killed on every
+/// orderly stop: no session detached, no will published, and every
+/// client left to discover the shutdown by timeout. The graceful
+/// shutdown below would be unreachable in the one environment this is
+/// built to run in.
+#[cfg(unix)]
+async fn stop_signal() -> Result<&'static str, std::io::Error> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    // Installed before either is awaited, so a signal arriving during
+    // startup is caught rather than killing the process by default.
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        interrupted = tokio::signal::ctrl_c() => interrupted.map(|()| "SIGINT"),
+        _ = terminate.recv() => Ok("SIGTERM"),
+    }
+}
+
+/// Wait for an interrupt.
+///
+/// Tokio's named signals are unix only, so the interrupt is the
+/// portable path and the only one everywhere else.
+#[cfg(not(unix))]
+async fn stop_signal() -> Result<&'static str, std::io::Error> {
+    tokio::signal::ctrl_c().await.map(|()| "SIGINT")
+}
+
+/// Configure, bind, and serve until told to stop.
 async fn run(serve: Serve) -> Result<(), StartupError> {
     let config = Config::load(serve.config.as_deref(), &serve.overrides())?;
 
@@ -118,13 +154,14 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         "sdmqtt is serving MQTT over TCP"
     );
 
-    // An interrupt is the ordinary way this process ends, so it is an
+    // A signal is the ordinary way this process ends, so it is an
     // ending rather than an error: the listener stops accepting, the
     // port is released, and the exit status says nothing went wrong.
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::error!(%error, "cannot listen for an interrupt; stopping");
-    } else {
-        tracing::info!("interrupted, stopping");
+    match stop_signal().await {
+        Ok(signal) => tracing::info!(signal, "signalled, stopping"),
+        // Nothing can be done about it, and waiting forever for a
+        // signal that will never arrive is worse than stopping.
+        Err(error) => tracing::error!(%error, "cannot listen for a stop signal; stopping"),
     }
 
     running.shutdown().await;
