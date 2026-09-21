@@ -708,45 +708,89 @@ fn payload_of(message: &RetainedMessage) -> (Option<String>, Option<&'static str
     }
 }
 
+/// One page of retained messages, as copied out under the lock.
+struct RetainedHeld {
+    /// The page, in topic order, with nothing formatted yet.
+    entries: Vec<(String, RetainedMessage)>,
+    /// How many the store holds, not how many are on this page.
+    total: usize,
+    /// Whether the store holds anything after this page.
+    more: bool,
+}
+
 /// What the retained handler copies out while it holds the lock.
 ///
-/// The retained store enumerates by walking its trie and building a
-/// topic string per entry, which is the only enumeration it offers.
-/// That walk is O(the store) under the lock whatever this module
-/// does; what this module controls is that no payload is copied and
-/// nothing is formatted until the lock is gone. The selection still
-/// bounds the rows built to one page.
+/// # Why this one does not go through [`select`]
 ///
-/// Named rather than written inside the handler's closure so that
-/// the measurement can time exactly what the lock is held for: see
-/// `what_a_page_costs_under_the_lock`.
-fn retained_held(broker: &Broker, _paging: &Paging) -> Vec<(String, RetainedMessage)> {
-    let mut entries = Vec::new();
-    broker.retained().entries(&mut entries);
-    entries
+/// [`select`] bounds the *rows built* to a page and it always did,
+/// but it bounds nothing about the pass: it sees every item, so it
+/// needs every item, and the only enumeration the retained store
+/// offered was a walk that built a topic string and cloned a message
+/// per entry. That is 44.9 milliseconds at a hundred thousand topics
+/// on the process's one lock, on an endpoint that needs no token.
+///
+/// The store now keeps its topics in order beside the tree, so this
+/// seeks to the cursor and takes one page. See
+/// [`RetainedStore::page`]. The rows are still built outside the
+/// lock, as the module documentation says they must be: a page of a
+/// hundred inline payloads is a hundred kilobytes of copying and
+/// UTF-8 validation, which is not a thing to do while the broker
+/// waits.
+///
+/// The cursor's other two parts are ignored because a retained key
+/// only ever has one: the key is `[topic, "", ""]`, so the whole of
+/// the ordering is the topic, and the comparison this replaces
+/// reached the same answer through the array.
+///
+/// [`RetainedStore::page`]: broker_core::retained::RetainedStore::page
+fn retained_held(broker: &Broker, paging: &Paging) -> RetainedHeld {
+    let after = paging.after.as_ref().map(|after| after[0].as_str());
+    let mut entries = Vec::with_capacity(paging.limit);
+    let more = broker.retained().page(after, paging.limit, &mut entries);
+    RetainedHeld {
+        entries,
+        // Constant time: the store's ordered index is its own count.
+        total: broker.retained_count(),
+        more,
+    }
 }
 
 async fn retained(State(state): State<AdminState>, paging: Paging) -> Json<Page<RetainedView>> {
-    let held = state
+    let RetainedHeld {
+        entries,
+        total,
+        more,
+    } = state
         .shared
         .with_broker(|broker| retained_held(broker, &paging));
-    let selection = select(
-        held.iter()
-            .map(|(topic, message)| ([topic.as_str(), "", ""], message)),
-        paging.after.as_ref(),
-        paging.limit,
-    );
-    Json(page(selection, |key, message| {
-        let (text, text_omitted) = payload_of(message);
-        RetainedView {
-            topic: key[0].to_owned(),
-            size: message.payload.len(),
-            qos: codec_qos_number(message.qos),
-            expires_at: message.expires_at,
-            text,
-            text_omitted,
-        }
-    }))
+    // A cursor only when something is actually left, exactly as
+    // [`page`] decides it: a page that is full but final must say
+    // `next: null`.
+    let next = more
+        .then(|| {
+            entries
+                .last()
+                .map(|(topic, _)| encode_cursor([topic.as_str(), "", ""]))
+        })
+        .flatten();
+    Json(Page {
+        items: entries
+            .iter()
+            .map(|(topic, message)| {
+                let (text, text_omitted) = payload_of(message);
+                RetainedView {
+                    topic: topic.clone(),
+                    size: message.payload.len(),
+                    qos: codec_qos_number(message.qos),
+                    expires_at: message.expires_at,
+                    text,
+                    text_omitted,
+                }
+            })
+            .collect(),
+        total,
+        next,
+    })
 }
 
 // ---------------------------------------------------------------
@@ -1565,6 +1609,125 @@ mod tests {
         let here = client_ids(&response.body);
         assert_eq!(here, ["client-0000", "client-0001", "client-0002"]);
         assert!(response.body.contains("\"total\":500"), "{}", response.body);
+        admin.shutdown().await;
+    }
+
+    /// A broker holding `count` retained messages, on topics that do
+    /// not sort in the order they are written.
+    ///
+    /// Reversed rather than shuffled, because a page that comes out
+    /// in order only because it was written in order proves nothing,
+    /// and a deterministic wrong order is a better test than a
+    /// random one.
+    fn a_broker_retaining(count: usize) -> Arc<Shared> {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        shared.with_broker(|broker: &mut Broker| {
+            for index in (0..count).rev() {
+                broker.retained().set(
+                    &format!("site/{index:04}/state"),
+                    RetainedMessage {
+                        payload: Bytes::from_static(b"21.5"),
+                        qos: mqtt_codec::QoS::AtMostOnce,
+                        expires_at: None,
+                        properties: Arc::new(Properties::default().into()),
+                    },
+                );
+            }
+        });
+        shared
+    }
+
+    /// The same walk over the retained resource, which reaches the
+    /// store's ordered index rather than this module's selection.
+    ///
+    /// The sessions walk above cannot see this one. The two resources
+    /// answer a page by different means now — sessions through a
+    /// bounded pass, retained through a seek into the store's own
+    /// order — so a cursor that is wrong in one is not wrong in the
+    /// other, and the boundary between a full final page and a page
+    /// with something after it is the case that distinguishes them.
+    #[tokio::test]
+    async fn a_walk_of_the_retained_pages_visits_every_topic_once_and_then_stops() {
+        for count in [0_usize, 1, 4, 5, 6] {
+            let admin = admin_over(a_broker_retaining(count), vec![]).await;
+
+            let mut seen = Vec::new();
+            let mut pages = 0;
+            let mut cursor: Option<String> = None;
+            loop {
+                let path = match &cursor {
+                    None => "/api/v1/retained?limit=5".to_owned(),
+                    Some(after) => format!("/api/v1/retained?limit=5&after={}", escape(after)),
+                };
+                let response = testing::get(admin.address(), &path).await;
+                assert_eq!(response.status, 200, "{}", response.body);
+                pages += 1;
+                assert!(pages <= 10, "the walk does not end: {}", response.body);
+
+                let body = &response.body;
+                assert!(
+                    body.contains(&format!("\"total\":{count}")),
+                    "every page carries the whole count: {body}"
+                );
+                let here = field_values(body, "\"topic\":\"");
+                assert!(here.len() <= 5, "a page holds at most what was asked");
+                if cursor.is_some() {
+                    assert!(
+                        !here.is_empty(),
+                        "a cursor was handed out for a page with nothing on it: {body}"
+                    );
+                }
+                seen.extend(here);
+                match next_cursor(body) {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
+
+            let expected: Vec<String> = (0..count)
+                .map(|index| format!("site/{index:04}/state"))
+                .collect();
+            assert_eq!(seen, expected, "with {count} topics and pages of five");
+            admin.shutdown().await;
+        }
+    }
+
+    /// A cursor naming a topic that has been cleared since it was
+    /// handed out resumes after it.
+    ///
+    /// The case a reader hits in practice, and the one an offset
+    /// cursor gets wrong: read a page, the last topic on it is
+    /// cleared, ask for the next page.
+    #[tokio::test]
+    async fn a_retained_cursor_survives_the_topic_it_names_going_away() {
+        let shared = a_broker_retaining(4);
+        let admin = admin_over(Arc::clone(&shared), vec![]).await;
+
+        let first = testing::get(admin.address(), "/api/v1/retained?limit=2").await;
+        assert_eq!(
+            field_values(&first.body, "\"topic\":\""),
+            ["site/0000/state", "site/0001/state"]
+        );
+        let cursor = next_cursor(&first.body).expect("there are two more");
+
+        shared.with_broker(|broker: &mut Broker| broker.retained().remove("site/0001/state"));
+
+        let second = testing::get(
+            admin.address(),
+            &format!("/api/v1/retained?limit=2&after={}", escape(&cursor)),
+        )
+        .await;
+        assert_eq!(
+            field_values(&second.body, "\"topic\":\""),
+            ["site/0002/state", "site/0003/state"],
+            "{}",
+            second.body
+        );
+        assert!(
+            second.body.contains("\"total\":3"),
+            "and the total is what the store holds now: {}",
+            second.body
+        );
         admin.shutdown().await;
     }
 
