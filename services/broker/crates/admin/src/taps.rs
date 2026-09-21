@@ -15,7 +15,7 @@
 //! genuine SUBSCRIBE packet, and reads its deliveries out of the
 //! outbox [`Shared::register_outbox`] hands it — the same three calls
 //! a TCP connection makes. There is no second matcher here, for the
-//! same reason [`crate::resources::publish`] has no second publish:
+//! same reason the publish endpoint has no second publish:
 //! a second implementation of matching is a second set of rules that
 //! will drift from the first the day either is corrected. Shared
 //! subscriptions, the rule that a leading wildcard does not match a
@@ -121,10 +121,22 @@
 //!    so a tap never displaces anybody. The reverse — a real client
 //!    connecting with a tap's identifier — displaces the tap, which
 //!    notices its [`Action::Close`] and reports itself closed; the
-//!    epoch check in [`Tap::teardown`] is what stops it then
+//!    epoch check in `Tap::teardown` is what stops it then
 //!    detaching the newcomer.
 //! 7. **A full ring drops; it never pushes back.** There is no path
 //!    from this module to anything the broker waits on.
+//!
+//! **How much of that a test can see**, because the list is worth
+//! less if it is seven assertions. Four, five and six have tests of
+//! their own, named for them. One, two and seven are visible only
+//! through their consequence, which is
+//! `a_tap_does_not_take_a_message_from_a_real_subscriber`: a real
+//! client and a tap on one filter, and the real client's own socket
+//! is read to prove it still got the message. The rest of one and
+//! two is [`Shared::deliver`]'s property and is guarded in `server`,
+//! where it lives. Three is the compiler's: [`parking_lot`]'s guard
+//! is not [`Send`], so a drain task that held one across an `await`
+//! would not compile into anything [`tokio::spawn`] accepts.
 //!
 //! # What a tap does cost
 //!
