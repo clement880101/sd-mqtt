@@ -2,109 +2,87 @@
  * Topics: what the broker is holding, a way to publish, and a way to
  * watch.
  *
- * # The subscribe half, and the mechanism it does not have
+ * # The subscribe half is a tap
  *
- * **The events stream does not carry publications.** Section 11.1:
- * it carries counter deltas, connect and disconnect events, and
- * later rule outcomes. There is no resource and no stream on the
- * admin API through which a browser can see a message pass. So the
- * "subscribe" half of this tool had to choose a mechanism, and the
- * choice is recorded here and in `services/web/README.md` rather
- * than left to be inferred from the code.
+ * **The events stream carries no publications.** Section 11.1: it
+ * carries counter deltas, connect and disconnect events, and later
+ * rule outcomes. So the subscribe half cannot be built out of the
+ * stream, and milestone three built it out of the retained resource
+ * instead — paging the store and matching a filter here in the
+ * browser. That saw retained messages only and sampled rather than
+ * streamed, which the page said on screen and the readme said at
+ * length.
  *
- * **What is built: a watcher over the retained store.** The watcher
- * takes an MQTT topic filter, pages the retained resource, matches
- * each topic against the filter with the protocol's own rules, and
- * re-reads on an interval, marking what changed since the last pass.
+ * **What it is now.** The watcher asks the broker to open a *tap*: a
+ * real subscriber inside the broker, made by the same
+ * `Broker::connect`, `Broker::handle` and `Shared::register_outbox`
+ * a TCP connection uses, collecting matching publications into a
+ * bounded ring this page polls. See
+ * `services/broker/crates/admin/src/taps.rs`, which is where the
+ * mechanism and its four limits are written down.
  *
- * **What that costs, said plainly rather than in a footnote.** It
- * sees retained messages only. A publication that is not retained
- * never appears, so a filter over a topic that is published to
- * constantly but never retained shows nothing at all — and the page
- * says so on screen, because a watcher that draws nothing is
- * otherwise indistinguishable from a broker with no traffic.
+ * Two things follow that are worth naming here, because they are
+ * what the page is shaped by.
  *
- * **Its limit, which is the thing the plan asks for.** A filter of
- * `#` on a busy broker is the obvious abuse of anything that
- * forwards matching messages. Here the abuse is bounded by
- * construction rather than by a rule that has to be enforced: one
- * pass reads at most {@link WATCH_PAGES} pages of
- * {@link WATCH_PAGE_SIZE} topics, so `#` costs exactly what
- * `sensors/kitchen/temperature` costs, and a store larger than that
- * is reported as partially watched rather than silently truncated.
- * The cost is a request per interval per browser, which is bounded
- * and visible, instead of an open-ended fan-out the broker would
- * have to police.
+ * **There is no matcher in this file.** There was one, and it is
+ * gone. The filter is handed to the broker and the broker's
+ * subscription machinery decides what matches, which is how a
+ * shared subscription, the rule that a leading wildcard does not
+ * match a `$` topic, and no-local come for free rather than being
+ * reimplemented here in TypeScript and drifting the first time
+ * either copy is corrected.
  *
- * **What was not built, and why.** The mechanism that would show
- * live traffic is a *tap*: a real subscriber inside the broker whose
- * deliveries a browser can read. It is buildable on what already
- * exists — `Broker::connect`, `Broker::handle` with a subscribe, and
- * `Shared::register_outbox` — and it would need its own bounded ring
- * per tap, a cap on how many exist, a payload cap and an expiry for
- * one nobody is polling, or a forgotten tap is a session that never
- * leaves. That is a change to the broker and to the admin API, with
- * a new abuse surface and a session-creating code path, and it does
- * not belong inside a commit that writes three pages. Recorded so
- * that it stays a decision rather than becoming an omission.
+ * **Polling, not a second stream.** Section 11.1 allows the
+ * interface exactly one events stream per document, and it is
+ * already spent. A tap is read once a second with a cursor, which is
+ * one request per second per open watcher and is bounded and
+ * visible, and the messages arrive in the order the broker caught
+ * them however many of them a poll returns.
+ *
+ * **The limits are the broker's and are shown on screen.** Nothing
+ * here hard-codes them: every answer carries them and the page
+ * renders what it was told. A watcher drawing nothing has to be
+ * distinguishable from a watcher whose ring is being overrun, so the
+ * counts — caught, dropped by the ring, lost by the broker, missed
+ * by this reader — are on the page beside the rows rather than in a
+ * log nobody reads.
  */
 import { useSignal, useSignalEffect } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
 import * as v from 'valibot';
 
-import { ApiError, fetchPage, publish, type Page, type RetainedView } from '../api.js';
+import {
+  ApiError,
+  closeTap,
+  fetchPage,
+  openTap,
+  publish,
+  readTap,
+  type Page,
+  type RetainedView,
+  type TapLimits,
+  type TappedMessage,
+  type TapView,
+} from '../api.js';
 import { gauges, generation } from '../live.js';
 
 /** How many retained rows the browser asks for at a time. */
 const PAGE = 200;
 
-/** How many pages one pass of the watcher reads. See the module docs. */
-const WATCH_PAGES = 5;
-
-/** How many rows each of those pages holds. */
-const WATCH_PAGE_SIZE = 200;
-
-/** How often the watcher reads, in milliseconds. */
-const WATCH_INTERVAL = 2_000;
+/**
+ * How often the watcher reads its tap, in milliseconds.
+ *
+ * A second, the same cadence the events stream is sampled at, so
+ * that the two halves of a live page move together. Faster would
+ * cost the broker requests for messages that are not there yet;
+ * slower would let a busy filter overrun the ring between polls,
+ * which is survivable — the tap counts what it dropped and this page
+ * says so — but is not worth choosing.
+ */
+const TAP_POLL = 1_000;
 
 /** How long a row stays marked as having just changed. */
 const FLASH = 4_000;
-
-// ---------------------------------------------------------------
-// Topic filters, by the protocol's rules
-// ---------------------------------------------------------------
-
-/**
- * Whether `topic` matches `filter`, as MQTT 4.7 defines it.
- *
- * `+` matches exactly one level and `#` matches the rest, including
- * the level it sits in, so `sport/#` matches `sport`. A filter
- * beginning with a wildcard does not match a topic beginning with
- * `$`, which is the rule that keeps a subscribe-to-everything client
- * away from the broker's own status topics.
- */
-export function matches(filter: string, topic: string): boolean {
-  const wanted = filter.split('/');
-  const actual = topic.split('/');
-  if (topic.startsWith('$') && (wanted[0] === '#' || wanted[0] === '+')) {
-    return false;
-  }
-  for (let index = 0; index < wanted.length; index += 1) {
-    const level = wanted[index];
-    if (level === '#') {
-      // [MQTT-4.7.1-2]: the parent level matches too, so `sport/#`
-      // matches `sport`, which is why this is not `index < actual.length`.
-      return index === wanted.length - 1 && actual.length >= index;
-    }
-    if (index >= actual.length) {
-      return false;
-    }
-    if (level !== '+' && level !== actual[index]) {
-      return false;
-    }
-  }
-  return wanted.length === actual.length;
-}
 
 // ---------------------------------------------------------------
 // The publish form
@@ -441,105 +419,167 @@ function Retained({ reloadKey, onCleared }: { reloadKey: number; onCleared: () =
 }
 
 // ---------------------------------------------------------------
-// The watcher
+// The watcher, which is now a tap
 // ---------------------------------------------------------------
 
-/** What the watcher holds about one topic. */
-interface Watched {
-  topic: string;
-  payload: string;
-  /** When this tool last saw the payload change, in milliseconds. */
-  changed: number;
-  /** How many changes it has seen since the watch started. */
-  changes: number;
+/** What one tapped row shows for its payload. */
+function tappedPayload(message: TappedMessage): string {
+  if (message.text !== null) {
+    return message.text;
+  }
+  return message.text_omitted === 'binary'
+    ? `(${message.size} bytes, not text)`
+    : `(${message.size} bytes, over the tap's payload cap)`;
+}
+
+/** A tap as the page holds it: what it is, and what it is bounded by. */
+interface Held {
+  view: TapView;
+  limits: TapLimits;
 }
 
 /** The subscribe half. See the module documentation for what it is. */
 function Watcher() {
   const filter = useSignal('#');
+  const held = useSignal<Held | null>(null);
   const running = useSignal(false);
-  const seen = useSignal<Watched[]>([]);
-  const truncated = useSignal(false);
+  const opening = useSignal(false);
+  const rows = useSignal<TappedMessage[]>([]);
+  const missed = useSignal(0);
+  const polls = useSignal(0);
   const failure = useSignal<string | null>(null);
-  const passes = useSignal(0);
-  const held = useRef(new Map<string, Watched>());
+  const note = useSignal<string | null>(null);
+  /** The cursor, which is opaque in the same sense a page's is. */
+  const cursor = useRef<number | null>(null);
   const timer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
+  /** What to close on the way out, read from an unmount handler. */
+  const openTapId = useRef<number | null>(null);
 
-  const pass = async (wanted: string) => {
+  const stopPolling = () => {
+    clearInterval(timer.current);
+    timer.current = undefined;
+    running.value = false;
+  };
+
+  /** Give the tap back to the broker. */
+  const release = () => {
+    stopPolling();
+    if (openTapId.current !== null) {
+      closeTap(openTapId.current);
+      openTapId.current = null;
+    }
+  };
+
+  const poll = async () => {
+    const current = held.value;
+    if (!current) {
+      return;
+    }
     try {
-      let cursor: string | null = null;
-      const found = new Map<string, string>();
-      let more = false;
-      for (let page = 0; page < WATCH_PAGES; page += 1) {
-        const answer: Page<RetainedView> = await fetchPage<RetainedView>('retained', {
-          limit: WATCH_PAGE_SIZE,
-          after: cursor,
-        });
-        for (const row of answer.items) {
-          if (matches(wanted, row.topic)) {
-            found.set(row.topic, payloadOf(row));
-          }
-        }
-        cursor = answer.next;
-        if (!cursor) {
-          break;
-        }
-        more = page === WATCH_PAGES - 1;
+      const read = await readTap(current.view.id, cursor.current);
+      cursor.current = read.next;
+      if (read.messages.length > 0) {
+        // Newest first, because that is where a person looks, and
+        // trimmed to the broker's own capacity so the document never
+        // holds more rows than the ring behind it does. The retained
+        // browser is not windowed and says so; this one is bounded
+        // instead, which is the cheaper half of the same problem.
+        rows.value = [...read.messages].reverse().concat(rows.value).slice(0, read.limits.capacity);
       }
-      truncated.value = more;
-      const now = Date.now();
-      const next = new Map<string, Watched>();
-      for (const [topic, payload] of found) {
-        const before = held.current.get(topic);
-        next.set(
-          topic,
-          before && before.payload === payload
-            ? before
-            : {
-                topic,
-                payload,
-                changed: now,
-                changes: before ? before.changes + 1 : 1,
-              },
-        );
-      }
-      held.current = next;
-      seen.value = [...next.values()].sort((left, right) => right.changed - left.changed);
-      passes.value += 1;
+      missed.value += read.missed;
+      polls.value += 1;
+      held.value = { view: read, limits: read.limits };
       failure.value = null;
+      if (read.closed !== null) {
+        // The broker ended it: something took its session over.
+        // Nothing to give back, so the identifier is dropped rather
+        // than deleted.
+        openTapId.current = null;
+        stopPolling();
+        note.value = `${read.closed} Nothing more will arrive. Start another watch.`;
+      }
     } catch (error) {
+      if (error instanceof ApiError && error.code === 'not_found') {
+        openTapId.current = null;
+        stopPolling();
+        note.value = error.message;
+        return;
+      }
       failure.value = error instanceof Error ? error.message : String(error);
     }
   };
 
-  const start = () => {
-    held.current = new Map();
-    seen.value = [];
-    passes.value = 0;
-    running.value = true;
-    void pass(filter.value);
-    clearInterval(timer.current);
-    timer.current = setInterval(() => void pass(filter.value), WATCH_INTERVAL);
+  const start = async () => {
+    release();
+    rows.value = [];
+    missed.value = 0;
+    polls.value = 0;
+    cursor.current = null;
+    failure.value = null;
+    note.value = null;
+    held.value = null;
+    opening.value = true;
+    try {
+      const opened = await openTap(filter.value);
+      const { limits, ...view } = opened;
+      held.value = { view, limits };
+      openTapId.current = view.id;
+      running.value = true;
+      void poll();
+      timer.current = setInterval(() => void poll(), TAP_POLL);
+    } catch (error) {
+      if (error instanceof ApiError) {
+        failure.value = `The broker would not open a tap (${error.code}): ${error.message}`;
+      } else {
+        failure.value = String(error);
+      }
+    } finally {
+      opening.value = false;
+    }
   };
 
-  const stop = () => {
-    running.value = false;
-    clearInterval(timer.current);
-    timer.current = undefined;
-  };
+  // Two ways out, because they catch different things. Unmount
+  // covers navigating to another page of this application, which is
+  // the common one; `pagehide` covers the tab being closed or
+  // navigated away from, which unmount does not reliably see. Both
+  // are courtesies: a tap nobody gives back expires on its own after
+  // the idle timeout, which is what that limit is for.
+  useEffect(() => {
+    const leaving = () => release();
+    window.addEventListener('pagehide', leaving);
+    return () => {
+      window.removeEventListener('pagehide', leaving);
+      release();
+    };
+  }, []);
 
-  useEffect(() => () => clearInterval(timer.current), []);
-
+  const current = held.value;
+  const topics = new Set(rows.value.map((row) => row.topic)).size;
   const now = Date.now();
   return (
     <section class="watcher">
       <h2>Watch a filter</h2>
       <p class="hint">
-        This watches the <strong>retained</strong> store, because the events stream carries counter
-        deltas and connection events and no publications. A message that is published without the
-        retain flag never appears here, however busy its topic is. One pass reads at most{' '}
-        {(WATCH_PAGES * WATCH_PAGE_SIZE).toLocaleString()} topics, so a filter of <code>#</code>{' '}
-        costs what any other filter costs.
+        This opens a <strong>tap</strong>: a real subscriber inside the broker, subscribed with the
+        filter below through the same path an MQTT connection uses. It sees live traffic, retained
+        or not.{' '}
+        {current ? (
+          <>
+            The broker allows {current.limits.max_taps} taps at once; this one holds the last{' '}
+            {current.limits.capacity.toLocaleString()} messages and drops its oldest to make room,
+            carries at most {current.limits.max_payload_bytes.toLocaleString()} bytes of a payload
+            and describes anything larger, and closes itself if nothing reads it for{' '}
+            {current.limits.idle_timeout_seconds} seconds. It is the session{' '}
+            <code>{current.view.client_id}</code> on the Clients page, which is what a tap looks
+            like from the inside.
+          </>
+        ) : (
+          <>
+            It is capped, bounded and expiring: the broker sends its own limits with every answer
+            and they are shown here once a tap is open. It does not replay the retained store —
+            that is the list above.
+          </>
+        )}
       </p>
       <div class="controls">
         <label>
@@ -551,12 +591,19 @@ function Watcher() {
             onInput={(event) => (filter.value = (event.target as HTMLInputElement).value)}
           />
         </label>
-        <button type="button" onClick={() => (running.value ? stop() : start())}>
-          {running.value ? 'Stop' : 'Watch'}
+        <button
+          type="button"
+          disabled={opening.value}
+          onClick={() => (running.value ? release() : void start())}
+        >
+          {opening.value ? 'Opening…' : running.value ? 'Stop' : 'Watch'}
         </button>
-        {running.value ? (
+        {current ? (
           <span class="quiet">
-            {seen.value.length.toLocaleString()} matching · {passes.value} passes
+            {rows.value.length.toLocaleString()} shown across {topics.toLocaleString()} topic
+            {topics === 1 ? '' : 's'} · {current.view.delivered.toLocaleString()} caught ·{' '}
+            {current.view.dropped.toLocaleString()} dropped by the ring ·{' '}
+            {current.view.lost.toLocaleString()} lost by the broker · {polls.value} polls
           </span>
         ) : null}
       </div>
@@ -565,37 +612,51 @@ function Watcher() {
           {failure.value}
         </p>
       ) : null}
-      {truncated.value ? (
+      {note.value ? (
         <p class="notice" role="status">
-          The broker holds more retained topics than one pass reads, so this is watching the first{' '}
-          {(WATCH_PAGES * WATCH_PAGE_SIZE).toLocaleString()} in topic order and not the whole store.
+          {note.value}
         </p>
       ) : null}
-      {running.value ? (
+      {missed.value > 0 ? (
+        <p class="notice" role="status">
+          {missed.value.toLocaleString()} message{missed.value === 1 ? '' : 's'} arrived and left
+          the tap's ring before this page read them, so they are not below. The filter is producing
+          more than {current ? current.limits.capacity.toLocaleString() : 'the ring'} messages a
+          second; narrow it to see everything.
+        </p>
+      ) : null}
+      {current ? (
         <div class="table">
-          <div class="row head watch-row" role="row">
+          <div class="row head tap-row" role="row">
+            <span>time</span>
             <span>topic</span>
             <span>payload</span>
-            <span>changes</span>
-            <span>last change</span>
+            <span>qos</span>
+            <span>retain</span>
           </div>
           <div class="rows">
-            {seen.value.map((row) => (
+            {rows.value.map((row) => (
               <div
-                class={`row watch-row${now - row.changed < FLASH ? ' fresh' : ''}`}
+                class={`row tap-row${now - row.at < FLASH ? ' fresh' : ''}`}
                 role="row"
-                key={row.topic}
+                key={row.seq}
               >
-                <span class="mono">{row.topic}</span>
-                <span class="mono">{row.payload}</span>
-                <span>{row.changes}</span>
-                <span>{new Date(row.changed).toLocaleTimeString()}</span>
+                <span class="quiet">{new Date(row.at).toLocaleTimeString()}</span>
+                <span class="mono" title={row.topic}>
+                  {row.topic}
+                </span>
+                <span class="mono" title={tappedPayload(row)}>
+                  {tappedPayload(row)}
+                </span>
+                <span>{row.qos}</span>
+                <span>{row.retain ? 'yes' : 'no'}</span>
               </div>
             ))}
-            {seen.value.length === 0 ? (
+            {rows.value.length === 0 ? (
               <p class="empty">
-                Nothing retained matches this filter yet. If the traffic you are looking for is not
-                retained, this tool cannot see it.
+                {running.value
+                  ? 'Nothing has been published to this filter since the watch started. A tap shows live traffic only, so a topic that was retained an hour ago and has not been published to since is in the list above, not here.'
+                  : 'The watch has stopped.'}
               </p>
             ) : null}
           </div>

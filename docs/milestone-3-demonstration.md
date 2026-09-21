@@ -131,40 +131,194 @@ fix by reasoning, not by bisection, and it is recorded here as such.
   from `/api/v1/retained`, checked independently.
 - The watcher on `sensors/#` listed the three matching topics and
   counted each change; a value published three times showed four
-  changes, counting the one it started with.
+  changes, counting the one it started with. **That watcher no
+  longer exists**: see the second run below, which replaced it.
 - The six retained messages **survived the broker restart** and were
   listed again after it, which is the store doing its job.
 
-**What the watcher is not.** It is not a subscription, and the page
-says so where an operator will read it. Demonstrated rather than
-asserted: publishing `sensors/attic/temp=3.0` **without** the retain
-flag answered "Published. 2 subscribers received it" and the watcher
-showed nothing, because it reads the retained store and a
+**What the watcher was not.** It was not a subscription, and the
+page said so where an operator would read it. Demonstrated rather
+than asserted: publishing `sensors/attic/temp=3.0` **without** the
+retain flag answered "Published. 2 subscribers received it" and the
+watcher showed nothing, because it read the retained store and a
 publication that is not retained never goes there.
-
-The reason is that the events stream carries counter deltas and
-connection events and no publications, and the mechanism that would
-carry them — a tap that is a real subscriber inside the broker — is
-a change to the broker and to the admin API rather than to a page.
-The design and its limits are written down in
-`services/web/README.md`.
 
 With 1,207 retained topics the watcher said it was watching the
 first 1,000 in topic order rather than pretending to the whole
-store. That bound is what stops a filter of `#` from costing more
+store. That bound is what stopped a filter of `#` from costing more
 than a filter of one topic.
+
+Both of those are now history. The next section is what replaced
+them.
+
+## Second run: the watcher is a tap
+
+Run later on 2026-09-21, same machine, same branch, same production
+path: the interface served from the binary on `http://127.0.0.1:1884/`,
+a broker with a store on `/tmp/sdmqtt-demo`, and traffic from
+`scripts/mqtt-load.py`.
+
+The gap the first run recorded — "the subscribe tool cannot see live
+traffic", the largest of the nine unfinished things — is closed. The
+watcher now asks the broker to open a **tap**: a real subscriber
+inside the broker, made with `Broker::connect`, `Broker::handle` with
+a SUBSCRIBE packet and the outbox `Shared::register_outbox` hands it,
+collecting matching publications into a bounded ring the page polls
+once a second. `services/broker/crates/admin/src/taps.rs` has the
+mechanism and the reason behind each of its four limits.
+
+### The thing that could not be done before
+
+A tap was opened on `sensors/#` from the page. It showed nothing,
+and said so: *"Nothing has been published to this filter since the
+watch started."* Then a client connected over the MQTT port and
+published three messages, none of them retained:
+
+```
+sensors/attic/temp   = 3.0
+sensors/kitchen/temp = 24.75
+devices/lamp/state   = off
+```
+
+Within one poll the page showed two rows, freshly highlighted:
+`sensors/kitchen/temp = 24.75` and `sensors/attic/temp = 3.0`, both
+with retain `no`. `devices/lamp/state` was not among them, because it
+does not match the filter. `/api/v1/retained` still said `"total": 6`
+throughout, and the retained browser on the same screen still showed
+`sensors/kitchen/temp = 21.5` — the value from an hour of retention
+ago, beside the live 24.75 the tap had just caught. Those two numbers
+on one screen are the whole difference between the two mechanisms.
+
+### Under real traffic
+
+`scripts/mqtt-load.py traffic 20 300 350` — twenty seconds of three
+hundred publications a second of 350 bytes, across eight topics —
+against a tap on `#`. The page read, in order, as it went:
+
+```
+ 256 shown across  8 topics ·   300 caught ·    44 dropped by the ring ·   7 polls
+ 256 shown across  8 topics · 1,800 caught · 1,544 dropped by the ring ·  12 polls
+ 256 shown across  8 topics · 3,900 caught · 3,644 dropped by the ring ·  19 polls
+ 256 shown across 10 topics · 6,002 caught · 5,746 dropped by the ring ·  27 polls
+```
+
+and drew the notice it owes an operator: *"881 messages arrived and
+left the tap's ring before this page read them, so they are not
+below. The filter is producing more than 256 messages a second;
+narrow it to see everything."* The document held exactly 256 rows
+throughout, counted in the DOM. **Nothing was lost by the broker**:
+the `lost` counter, which is what the tap's own session queue
+overflowing would move, stayed at zero for the whole run, and the
+broker's log has no warning in it — fifteen lines, none above info.
+
+That is the ring doing its job rather than failing: a tap on `#`
+against a broker doing three hundred a second is the abuse case, and
+what it costs is one subscriber's fan-out and one request a second.
+
+### The limits, each shown binding
+
+- **Eight taps.** Opening them one at a time by hand: the first six
+  (beside the two already open) answered `200`, and the seventh
+  answered `429` with `"code": "resource_exhausted"` and a message
+  naming the cap and saying how to get a slot back. `/api/v1/taps`
+  then read `"live": 8`.
+- **256 messages, oldest dropped.** Above, and the rows at the top of
+  the list were the newest.
+- **1 KiB of payload.** A 2,000-byte publication showed as
+  `(2000 bytes, over the tap's payload cap)` with its real size, not
+  as a truncated string pretending to be the payload.
+- **120 seconds unread.** A tap was opened on `forgotten/#` and left.
+  It disappeared from `/api/v1/taps` 2 minutes and 5 seconds later —
+  the 120-second lease plus the five-second sweep, which is the
+  latest the sweep can be. Reading it then answered `404` in the one
+  error shape, `/api/v1/subscriptions` was empty, and
+  `/api/v1/sessions` was empty: the broker had the whole session
+  back.
+
+**What did not work the first time.** The expiry was measured wrong
+to begin with. The check polled `GET /api/v1/taps/2` every five
+seconds waiting for a `404`, and the tap never expired, because
+**reading a tap is what renews its lease** — the measurement was
+keeping alive the thing it was measuring. It is a real property,
+tested and deliberate, and it took being caught by it to believe it.
+The number above was taken by polling the *list*, which does not
+touch a lease.
+
+### That a tap is only an observer
+
+- With a real subscriber on `sensors/#` over the MQTT port and the
+  tap on `#` both attached, a publish answered `"delivered": 2`, and
+  the real subscriber's socket received the message — 108 bytes
+  carrying its topic and payload. The tap took nothing from it.
+- Publishing to `$SYS/fake/probe` answered `"delivered": 0` with a
+  tap on `#` open. The rule that a leading wildcard does not match a
+  `$` topic is the broker's, and the tap is subject to it for free
+  because it goes through the broker's own matching rather than a
+  second copy of it.
+- `POST /api/v1/taps` with `$share/g/sensors/#` answered `400`,
+  `"field": "filter"`, and a sentence saying why: a tap in a share
+  group would take messages away from the clients meant to have them.
+  That is the one filter through which a subscriber changes what
+  other subscribers receive, which is the one thing a tap may not be.
+- The taps were visible on the Clients page as `$admin-tap-2` …
+  `$admin-tap-9`, each with one subscription, and
+  `/api/v1/subscriptions` showed all eight at `qos 0`,
+  `retain_as_published: true`, `retain_handling: 2`. A tap is a
+  client and looks like one; that is the point of naming it
+  legibly.
+
+### What the page does when its tap goes away
+
+Deleting the page's tap from outside, with `curl -X DELETE`: within
+one poll the page stopped polling, put the button back to "Watch",
+kept the rows it already had on screen, and showed the broker's own
+sentence.
+
+**And a defect that found**, small and now fixed. The sentence read
+"either it was never opened, or nobody read it for 120 seconds and
+it expired" — true of the state and wrong about the cause, because
+it had just been deleted. The registry holds no tombstones and
+cannot tell the three apart, so the sentence now names all three.
+
+### What is rough
+
+- **The list scrolls under you.** New rows are prepended, so a reader
+  who has scrolled down into the history is carried backwards through
+  it as messages arrive. Someone left at the top is unaffected.
+  Recorded rather than half-fixed: holding the scroll position
+  against a prepend is a real piece of work and this is a stream you
+  are meant to watch from the top.
+- **`lost` has no demonstration.** It counts a discard the broker
+  reports against a tap, and the broker did not produce one in any of
+  this, because a connected at-most-once subscriber is dispatched to
+  directly and its queue stays empty. The counter is there so that
+  the branch is not the one branch of four that drops a message
+  silently; that it is wired up is tested by handing the action to
+  `Shared::deliver`, and that the broker would ever raise one is not
+  something this run can show.
+- **A tap writes to the store.** Its session and its subscription are
+  journalled like anybody else's, so opening and closing one costs a
+  handful of records. Not its messages.
 
 ## The things that are unfinished
 
-1. **The subscribe tool cannot see live traffic.** The largest gap,
-   described above and in the readme.
+1. ~~**The subscribe tool cannot see live traffic.**~~ **Closed.**
+   It was the largest gap; the second run above is what closed it.
+   Left in the list rather than deleted, because a list of
+   unfinished things that quietly loses entries cannot be read as a
+   record of anything.
 2. **There is no automated test for any of this.** Every behaviour
    above was checked by hand in a browser against a real broker, and
    several were checked by breaking the code and watching the check
    fail. That is better than nothing and worse than a suite: nothing
    will catch a regression in these pages except somebody doing it
    again. The repository has no browser test runner, and adding one
-   is a decision with its own weight.
+   is a decision with its own weight. **Still true of the pages, and
+   no longer true of what they talk to**: the tap has twenty-five
+   tests in `crates/admin/src/taps.rs`, all of them against a real
+   broker over a real socket, and thirty deliberate mutations were
+   run against them. The browser half of the watcher is still
+   guarded by nothing but somebody doing it again.
 3. **The restart notice is late on an idle broker**, as described.
 4. **`queued` has no resource behind it.** Every other gauge can be
    fetched; queue depth arrives only on the events stream, so a
@@ -191,16 +345,28 @@ than a filter of one topic.
    pressing "Load the next page" will eventually put tens of
    thousands of rows in the document and slow the page down in
    exactly the way the Clients table was measured not to. The
-   watcher's bound does not help here, because it is a different
-   list.
+   watcher is not windowed either, and does not need to be: it is
+   bounded at the tap's 256 messages, which was counted in the DOM
+   under three hundred publications a second.
 9. **A second browser tab is a second stream.** The one-stream rule
    is per document, which is all a page can enforce. Six tabs on the
    Overview page will exhaust the connection budget exactly as
    section 11.1 describes.
+10. **A tap's list scrolls under a reader who has scrolled into it**,
+   and **`lost` has no demonstration**, and **a tap writes a handful
+   of records to the store**. All three are described at the end of
+   the second run.
 
 ## Budget
 
-The bundle is **51.5 KB gzipped against the 150 KB of section 15**,
-which is 34% of it, summed per file the way the broker embeds and
+The bundle is **52.1 KB gzipped against the 150 KB of section 15**,
+which is 35% of it, summed per file the way the broker embeds and
 serves them. The shell alone was 13.3 KB, so the three pages, uPlot,
-the virtual core and valibot cost about 38 KB between them.
+the virtual core and valibot cost about 39 KB between them.
+
+It was 51.5 KB before the tap. The watcher gained a message list, a
+cursor and a lifecycle and lost the MQTT 4.7 matcher it used to
+carry, which nets to **+0.6 KB**. The matcher going is worth more
+than the six hundred bytes: a second implementation of the matching
+rules, in a language no conformance suite is pointed at, is the kind
+of thing convention 8 is about.

@@ -30,6 +30,7 @@ export type ErrorCode =
   | 'method_not_allowed'
   | 'not_acceptable'
   | 'unauthorized'
+  | 'resource_exhausted'
   | 'internal';
 
 /** A failure the API described in its own shape. */
@@ -167,4 +168,111 @@ export function publish(message: PublishRequest): Promise<PublishAccepted> {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(message),
   });
+}
+
+// ---------------------------------------------------------------
+// Taps
+// ---------------------------------------------------------------
+
+/**
+ * A tap: a real subscriber inside the broker whose deliveries this
+ * interface reads.
+ *
+ * Written against `services/broker/crates/admin/src/taps.rs`, where
+ * the four limits and the reason for each are recorded. The one
+ * thing this module must not do is hard-code them: every answer
+ * carries `limits`, and the page renders what the broker said rather
+ * than what this file believes. A build of the interface older than
+ * the broker it is served by would otherwise tell an operator the
+ * wrong numbers, and the numbers are the whole point.
+ */
+export interface TapLimits {
+  /** How many taps the broker allows at once. */
+  max_taps: number;
+  /** How many messages one tap holds before the oldest goes. */
+  capacity: number;
+  /** The largest payload it carries rather than describes. */
+  max_payload_bytes: number;
+  /** How long it survives with nobody reading it. */
+  idle_timeout_seconds: number;
+}
+
+/** One publication a tap caught. */
+export interface TappedMessage {
+  /** Where this sits in the tap's own sequence. */
+  seq: number;
+  topic: string;
+  /** The level it was delivered at, which is the tap's granted zero. */
+  qos: number;
+  /** Whether the publisher set the retain flag. */
+  retain: boolean;
+  /** The payload's size in bytes, whether or not it is carried. */
+  size: number;
+  /** The payload, when it is text and within the payload cap. */
+  text: string | null;
+  /** Why `text` is null, when it is: `binary` or `too_large`. */
+  text_omitted?: 'binary' | 'too_large';
+  /** When the tap caught it, in milliseconds since the epoch. */
+  at: number;
+}
+
+/** A tap, without its contents. */
+export interface TapView {
+  id: number;
+  filter: string;
+  /** The session it is, as the Clients page shows it. */
+  client_id: string;
+  /** How many publications it has caught since it opened. */
+  delivered: number;
+  /** How many it dropped from its ring to make room. */
+  dropped: number;
+  /** How many the broker discarded before they reached the ring. */
+  lost: number;
+  /** Why the broker closed it, when it has. */
+  closed: string | null;
+}
+
+/** What opening a tap answers. */
+export interface TapOpened extends TapView {
+  limits: TapLimits;
+}
+
+/** What reading a tap answers. */
+export interface TapRead extends TapView {
+  limits: TapLimits;
+  /** Everything after the cursor that was passed, oldest first. */
+  messages: TappedMessage[];
+  /** What to pass as `after` next time. */
+  next: number;
+  /** How many this reader missed between its cursor and the ring. */
+  missed: number;
+}
+
+/** Open a tap on `filter`. */
+export function openTap(filter: string): Promise<TapOpened> {
+  return request<TapOpened>('/api/v1/taps', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ filter }),
+  });
+}
+
+/** Read everything a tap has caught since `after`. */
+export function readTap(id: number, after: number | null): Promise<TapRead> {
+  const suffix = after === null ? '' : `?after=${after}`;
+  return request<TapRead>(`/api/v1/taps/${id}${suffix}`);
+}
+
+/**
+ * Close a tap.
+ *
+ * `keepalive` so that a tab being closed still gets the request out:
+ * an unclosed tap is not a leak — the broker expires it after
+ * `idle_timeout_seconds` — but a tap that leaves when its tab does is
+ * a slot somebody else can have now rather than in two minutes.
+ * Nothing waits on the answer, and a failure is deliberately
+ * swallowed: there is no page left to show it to.
+ */
+export function closeTap(id: number): void {
+  void fetch(`/api/v1/taps/${id}`, { method: 'DELETE', keepalive: true }).catch(() => {});
 }

@@ -2,8 +2,9 @@
 
 Preact 10 with signals, routed by preact-iso, bundled by Vite 8, styled
 with hand-written CSS over Open Props tokens. Section 11.2 of the
-design says what it is for; there are no pages yet, only the shell and
-the pipeline around it.
+design says what it is for. Three of its six pages are built —
+Overview, Clients and Topics — over the shell and the pipeline that
+carries them.
 
 ## Running it
 
@@ -96,55 +97,75 @@ Either way, that path is guarded against the broker directly rather
 than by anyone noticing it here:
 `crates/admin/src/events.rs::a_client_that_goes_away_ends_its_stream`.
 
-## The subscribe tool, and the mechanism it does not have
+## The subscribe tool, which is a tap
 
-The Topics page has a publish form and a watcher. The watcher is the
-"subscribe" half, and it is **not** a subscription. This is the
-decision and what it costs.
+The Topics page has a publish form, a retained browser and a
+watcher. The watcher is the "subscribe" half, and it **is** a
+subscription now. This is what changed and what it costs.
 
-**The events stream carries no publications.** Section 11.1: it
-carries counter deltas, connect and disconnect events, and later rule
-outcomes. Nothing on the admin API lets a browser see a message pass.
-So the tool either needed a new broker mechanism or had to be built
-from what is there.
+**What it was.** Milestone three had no mechanism to build it out
+of. The events stream carries counter deltas, connect and disconnect
+events and no publications (section 11.1), so the watcher took a
+filter, paged the retained resource, matched each topic with the
+protocol's rules *here in the browser*, and re-read every two
+seconds. It saw retained messages only — a publication without the
+retain flag never appeared — and it sampled rather than streamed. It
+said so on screen, because a watcher that draws nothing is otherwise
+indistinguishable from a quiet broker.
 
-**What is built.** The watcher takes an MQTT topic filter, pages the
-retained resource, matches each topic with the protocol's own rules
-(4.7, including that a leading wildcard does not match a `$` topic)
-and re-reads every two seconds, marking what changed.
+**What it is.** A *tap*: a real subscriber inside the broker, opened
+on request, collecting matching publications into a bounded ring
+this page polls. `POST /api/v1/taps` with a filter,
+`GET /api/v1/taps/{id}?after=<cursor>` to read, `DELETE` to give it
+back. It is a genuine session — `Broker::connect`, `Broker::handle`
+with a SUBSCRIBE packet, and the outbox `Shared::register_outbox`
+hands it, which are the same three calls a TCP connection makes.
 
-**What it costs.** It sees retained messages only. A publication
-without the retain flag never appears, so a filter over a topic
-published to a thousand times a second but never retained shows
-nothing at all. The page says this on screen, because a watcher that
-draws nothing is otherwise indistinguishable from a quiet broker. It
-also samples rather than streams: a value that changes twice between
-two passes is one change here.
+**There is no matcher in this application any more.** There was one,
+and deleting it was half the point. A second implementation of
+MQTT 4.7 in TypeScript is a second set of rules that drifts from the
+broker's the first time either is corrected, and the browser's copy
+is the one nothing tests against a conformance suite. Shared
+subscriptions, the rule that a leading wildcard does not match a `$`
+topic, no-local and retain-as-published are all the broker's, and
+the page gets them by not having an opinion.
 
-**Its limit.** A filter of `#` on a busy broker is the obvious abuse
-of anything that forwards matching messages. Here it is bounded by
-construction: one pass reads at most five pages of two hundred
-topics, so `#` costs exactly what one topic costs, and a store
-holding more than that is reported as partially watched rather than
-silently truncated. The cost to the broker is one request per
-interval per open tab, which is bounded and visible.
+**Polling rather than a second stream**, because section 11.1 allows
+one events stream per document and it is spent. One request a second
+per open watcher, with a cursor, which is bounded and visible.
 
-**What was not built, and what it would take.** A *tap*: a real
-subscriber inside the broker whose deliveries a browser can read. It
-needs no new matching rules, because it can be a genuine session —
-`Broker::connect`, `Broker::handle` with a subscribe, and
-`Shared::register_outbox` are all public and are what a connection
-itself uses. What it needs beyond that is the part that makes it
-safe: a bounded ring per tap with a counted drop, a cap on how many
-taps exist, a payload cap, and an expiry for a tap nobody is polling
-— because a forgotten tap is a session that never leaves, and a
-session that never leaves is a client on the Clients page that
-nothing can explain. Polling rather than a second stream, because
-section 11.1 allows the interface exactly one.
+**The limits, which are the hard half and are the broker's.** A tap
+is a way for somebody holding this interface to make the broker do
+work, and a filter of `#` on a busy broker is the obvious abuse.
+`services/broker/crates/admin/src/taps.rs` records four numbers and
+the reason each is the number it is; in summary, eight taps at once,
+256 messages each with the oldest dropped, 1 KiB of payload carried
+and anything larger described, and 120 seconds unread before a tap
+closes itself. **This application hard-codes none of them.** Every
+answer carries a `limits` object and the page renders what the
+broker said, so an interface older than the broker serving it cannot
+quote the wrong bounds — and the bounds are the whole point, because
+an operator watching a filter and seeing nothing needs to know
+whether that means no traffic or a ring being overrun. The counts
+are on the page beside the rows: caught, dropped by the ring, lost
+by the broker, and missed by this particular reader.
 
-That is a change to the broker and to the admin API, with its own
-abuse surface and a session-creating code path, and it was not put
-inside a commit that writes three pages.
+**What a tap does not do.** It does not replay the retained store: a
+tap subscribes with retain handling "do not send", because the
+retained browser is on the same screen with its own bounds, and
+sending a whole store into a 256-message ring would fill the ring
+with history that is already visible. So a topic retained an hour
+ago and not published to since is in the list above the watcher, not
+in it.
+
+**What it costs.** A tap is a client. It appears on the Clients page
+as `$admin-tap-<n>`, which is deliberate — a session the Clients
+page cannot explain is worse than one with an odd name — and its
+session and subscription are journalled like anybody else's. Not its
+messages: a fire-and-forget delivery to an attached session writes
+nothing. A tab that closes without deleting its tap leaves it until
+the idle timeout, which is what the timeout is for; the page tries
+on both unmount and `pagehide` anyway.
 
 ## Attribution
 
