@@ -348,7 +348,10 @@ pub struct TapView {
     ///
     /// Null for a live tap. A closed tap still answers, so that a
     /// reader learns why rather than finding a `404` it cannot
-    /// explain, and it no longer counts against [`MAX_TAPS`].
+    /// explain, and it no longer counts against [`MAX_TAPS`] — it
+    /// has given its ring back as well as its session, which is
+    /// what makes that exemption honest. It answers until
+    /// [`MAX_CLOSED_KEPT`] later taps have closed after it.
     pub closed: Option<String>,
 }
 
