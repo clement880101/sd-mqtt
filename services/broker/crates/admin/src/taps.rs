@@ -43,7 +43,7 @@
 //! tap somebody is watching, and a watcher that goes quiet for a
 //! reason it is not told is the failure this whole feature exists to
 //! stop. A tap the broker has closed does not count, because it holds
-//! no broker resources any more; see [`Taps::live`].
+//! no broker resources any more; see [`Taps::reserve`].
 //!
 //! **[`TAP_CAPACITY`], how many messages one tap holds: 256, and the
 //! oldest goes.** The page renders the ring as a plain list and is
@@ -149,6 +149,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -601,36 +602,117 @@ impl Tap {
 // The registry
 // ---------------------------------------------------------------
 
+/// What the registry holds behind its lock.
+#[derive(Debug, Default)]
+struct Held {
+    taps: Vec<Arc<Tap>>,
+    /// Slots claimed by a request that is still building its tap.
+    ///
+    /// Counted against the cap. Without it the cap would be asked
+    /// before a session is built and enforced after, and two
+    /// requests arriving together would both pass the question and
+    /// both answer it — a limit two callers can walk past together
+    /// is not a limit.
+    reserved: usize,
+}
+
+impl Held {
+    /// How many slots are spoken for: taps that hold a session, plus
+    /// requests on their way to holding one.
+    ///
+    /// A **closed** tap is not counted. It holds nothing the broker
+    /// has to do anything about, and refusing a new tap because of
+    /// one would be capping history rather than work.
+    fn taken(&self) -> usize {
+        self.taps.iter().filter(|tap| tap.is_live()).count() + self.reserved
+    }
+}
+
 /// Every tap this process holds.
 #[derive(Debug, Default)]
 pub struct Taps {
-    held: Mutex<Vec<Arc<Tap>>>,
+    held: Mutex<Held>,
     next_id: AtomicU64,
+}
+
+/// A slot claimed but not yet filled.
+///
+/// The obligation is discharged by [`Drop`] rather than by a line at
+/// the end of [`open`], for the reason a connection's detach is:
+/// [`open`] has half a dozen ways out, several of which are `?`, and
+/// a slot leaked on one of them is a tap nobody can ever open again.
+#[derive(Debug)]
+pub struct Reservation {
+    taps: Arc<Taps>,
+    filled: bool,
+}
+
+impl Reservation {
+    /// Put `tap` in the slot this reservation is holding.
+    fn fill(mut self, tap: Arc<Tap>) {
+        let mut held = self.taps.held.lock();
+        held.reserved -= 1;
+        held.taps.push(tap);
+        self.filled = true;
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.filled {
+            self.taps.held.lock().reserved -= 1;
+        }
+    }
 }
 
 impl Taps {
     /// An empty registry.
     pub fn new() -> Self {
         Self {
-            held: Mutex::new(Vec::new()),
+            held: Mutex::new(Held::default()),
             next_id: AtomicU64::new(1),
         }
     }
 
     /// How many taps hold a session, which is what the cap counts.
     pub fn live(&self) -> usize {
-        self.held.lock().iter().filter(|tap| tap.is_live()).count()
+        self.held
+            .lock()
+            .taps
+            .iter()
+            .filter(|tap| tap.is_live())
+            .count()
+    }
+
+    /// Claim a slot, or say the cap is full.
+    ///
+    /// **This is the only place the cap is asked about**, and it is
+    /// asked and answered under one acquisition of the lock. The
+    /// alternative — ask before building the session, enforce after
+    /// — is two checks, of which only the second binds, and only the
+    /// first is on the path anything ordinary walks.
+    pub fn reserve(self: &Arc<Self>) -> Option<Reservation> {
+        let mut held = self.held.lock();
+        if held.taken() >= MAX_TAPS {
+            return None;
+        }
+        held.reserved += 1;
+        Some(Reservation {
+            taps: Arc::clone(self),
+            filled: false,
+        })
     }
 
     /// Every tap, closed ones included.
     fn list(&self) -> Vec<TapView> {
-        self.held.lock().iter().map(|tap| tap.view()).collect()
+        self.held.lock().taps.iter().map(|tap| tap.view()).collect()
     }
 
     /// One tap by identifier.
     fn get(&self, id: u64) -> Option<Arc<Tap>> {
         self.held
             .lock()
+            .taps
             .iter()
             .find(|tap| tap.id == id)
             .map(Arc::clone)
@@ -644,8 +726,8 @@ impl Taps {
     /// broker lock.
     fn take(&self, id: u64) -> Option<Arc<Tap>> {
         let mut held = self.held.lock();
-        let at = held.iter().position(|tap| tap.id == id)?;
-        Some(held.remove(at))
+        let at = held.taps.iter().position(|tap| tap.id == id)?;
+        Some(held.taps.remove(at))
     }
 
     /// Close and forget everything that nobody has read in time.
@@ -658,7 +740,7 @@ impl Taps {
         let expired: Vec<Arc<Tap>> = {
             let mut held = self.held.lock();
             let mut expired = Vec::new();
-            held.retain(|tap| {
+            held.taps.retain(|tap| {
                 if tap.is_idle(now) {
                     expired.push(Arc::clone(tap));
                     false
@@ -684,7 +766,7 @@ impl Taps {
     /// Shutdown. A tap left behind is a session the broker never
     /// detaches, and a clean stop is how sessions reach disk.
     pub fn close_all(&self, shared: &Shared) {
-        let all: Vec<Arc<Tap>> = std::mem::take(&mut *self.held.lock());
+        let all: Vec<Arc<Tap>> = std::mem::take(&mut self.held.lock().taps);
         for tap in &all {
             tap.teardown(shared);
         }
@@ -737,10 +819,11 @@ pub fn open(state: &AdminState, filter: &str) -> Result<Arc<Tap>, ApiError> {
         ));
     }
 
-    // Counted, and the count is of live taps: a tap the broker has
-    // closed holds nothing and standing in the way of a new one would
-    // be a cap on history rather than on work.
-    if state.taps.live() >= MAX_TAPS {
+    // The slot is claimed **before** anything is built, and given
+    // back by dropping this on any way out that is not a success.
+    // See [`Taps::reserve`]: one check, under one lock, and no
+    // window between asking and taking.
+    let Some(slot) = state.taps.reserve() else {
         return Err(ApiError::new(
             ErrorCode::ResourceExhausted,
             format!(
@@ -750,13 +833,15 @@ pub fn open(state: &AdminState, filter: &str) -> Result<Arc<Tap>, ApiError> {
                 IDLE_TIMEOUT.as_secs()
             ),
         ));
-    }
+    };
 
     let id = state.taps.next_id.fetch_add(1, Ordering::Relaxed);
     let filter = filter.to_owned();
 
-    // The connect, and the identifier it takes. Both under one
-    // acquisition of the lock: a name checked in one section and used
+    // The connect, and the identifier it takes.
+    // Everything that can refuse happens **before** the connect, and
+    // in this same section. A refusal after it would leave a session
+    // attached to nothing, and a name checked in one section and used
     // in another is a name a real client could claim in between.
     let connected = state.shared.with_broker(|broker| {
         mqtt_codec::topic::validate_subscription(&filter, &broker.config().limits).map_err(
@@ -768,6 +853,21 @@ pub fn open(state: &AdminState, filter: &str) -> Result<Arc<Tap>, ApiError> {
                 )
             },
         )?;
+        // Sized the way a connection's is, from the bounds this
+        // broker is configured with. A smaller channel would make
+        // `Shared::deliver`'s "this should be impossible" branch
+        // reachable, and an unreachable branch a tap can reach is a
+        // warning an operator cannot act on.
+        let Some(depth) = outbox_depth_for(
+            broker.config().max_queue_messages,
+            broker.config().max_inflight,
+        ) else {
+            return Err(ApiError::new(
+                ErrorCode::Internal,
+                "this broker's queue bounds do not size an outbox, so a tap cannot be \
+                 attached",
+            ));
+        };
         let Some(client_id) = free_identifier(broker, id) else {
             return Err(ApiError::new(
                 ErrorCode::ResourceExhausted,
@@ -778,27 +878,10 @@ pub fn open(state: &AdminState, filter: &str) -> Result<Arc<Tap>, ApiError> {
         let connect = tap_connect(&client_id);
         let mut out = Vec::new();
         let registration = broker.connect(MOUNTPOINT, &connect, &mut out);
-        Ok((client_id, registration, out))
+        Ok((client_id, registration, out, depth))
     })?;
-    let (client_id, registration, connect_actions) = connected;
+    let (client_id, registration, connect_actions, depth) = connected;
 
-    // Sized the way a connection's is, from the bounds this broker is
-    // configured with. A smaller channel would make
-    // `Shared::deliver`'s "this should be impossible" branch
-    // reachable, and an unreachable branch that a tap can reach is
-    // a warning an operator cannot act on.
-    let depth = state.shared.with_broker(|broker| {
-        outbox_depth_for(
-            broker.config().max_queue_messages,
-            broker.config().max_inflight,
-        )
-    });
-    let Some(depth) = depth else {
-        return Err(ApiError::new(
-            ErrorCode::Internal,
-            "this broker's queue bounds do not size an outbox, so a tap cannot be attached",
-        ));
-    };
     let outbox = state.shared.register_outbox(registration.subscriber, depth);
     state.shared.deliver(connect_actions);
 
@@ -848,7 +931,7 @@ pub fn open(state: &AdminState, filter: &str) -> Result<Arc<Tap>, ApiError> {
 
     let task = tokio::spawn(drain(Arc::clone(&state_inner), outbox));
     *tap.task.lock() = Some(task);
-    state.taps.held.lock().push(Arc::clone(&tap));
+    slot.fill(Arc::clone(&tap));
     tracing::info!(tap = id, %filter, "a tap was opened");
     Ok(tap)
 }
@@ -992,7 +1075,7 @@ struct ReadQuery {
 async fn create(
     State(state): State<AdminState>,
     _authorized: Authorized,
-    body: Result<Json<TapRequest>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<TapRequest>, JsonRejection>,
 ) -> Result<Json<TapOpened>, ApiError> {
     let Json(request) = body.map_err(|rejection| {
         ApiError::invalid_request(format!(
@@ -1021,9 +1104,10 @@ async fn list(State(state): State<AdminState>, _authorized: Authorized) -> Json<
 async fn read(
     State(state): State<AdminState>,
     _authorized: Authorized,
-    Path(id): Path<u64>,
-    query: Result<Query<ReadQuery>, axum::extract::rejection::QueryRejection>,
+    id: Result<Path<u64>, PathRejection>,
+    query: Result<Query<ReadQuery>, QueryRejection>,
 ) -> Result<Json<TapRead>, ApiError> {
+    let Path(id) = id.map_err(path_not_a_tap)?;
     let Query(query) = query.map_err(|rejection| {
         ApiError::invalid_request(format!("the query string is not usable: {rejection}"))
     })?;
@@ -1037,8 +1121,9 @@ async fn read(
 async fn close(
     State(state): State<AdminState>,
     _authorized: Authorized,
-    Path(id): Path<u64>,
+    id: Result<Path<u64>, PathRejection>,
 ) -> Result<Json<TapView>, ApiError> {
+    let Path(id) = id.map_err(path_not_a_tap)?;
     let Some(tap) = state.taps.take(id) else {
         return Err(gone(id));
     };
@@ -1047,15 +1132,32 @@ async fn close(
     Ok(Json(tap.view()))
 }
 
+/// A path segment that is not a tap identifier.
+///
+/// Answered in this API's one shape and not in axum's plain text.
+/// Section 13: "the path you asked for is not served" is a failure a
+/// client has to be able to tell from a proxy that swallowed the
+/// request, and it can only do that if every failure looks the same.
+/// A `404` rather than a `400`, because `/api/v1/taps/banana` names
+/// no tap for the same reason `/api/v1/taps/9999` names none, and a
+/// caller that has to distinguish them has learned something about
+/// our routing rather than about its own request.
+fn path_not_a_tap(_rejection: PathRejection) -> ApiError {
+    ApiError::not_found("that is not the identifier of a tap this broker opened")
+}
+
 /// The one sentence for a tap that is not there.
 ///
-/// It says both things it could mean, because this API cannot tell
-/// them apart and a reader that is told only "no such tap" will go
-/// looking for a bug in its own identifier.
+/// It says all three things it could mean, because this API cannot
+/// tell them apart — the registry holds no tombstones — and a reader
+/// told only "no such tap" will go looking for a bug in its own
+/// identifier. The third was added after watching a page answer
+/// "it expired" to a tap that had just been deleted from a second
+/// window, which was true of the state and wrong about the cause.
 fn gone(id: u64) -> ApiError {
     ApiError::not_found(format!(
-        "there is no tap {id}: either it was never opened, or nobody read it for {} seconds \
-         and it expired. Open another.",
+        "there is no tap {id}: it was never opened, or somebody closed it, or nobody read \
+         it for {} seconds and it expired. Open another.",
         IDLE_TIMEOUT.as_secs()
     ))
 }
@@ -1685,18 +1787,77 @@ mod tests {
         both.stop().await;
     }
 
-    /// A filter that is not a filter takes the one error shape.
+    /// A filter that is not a filter takes the one error shape, and
+    /// costs nothing.
+    ///
+    /// The second half is the interesting one. A refusal happens
+    /// after the slot has been claimed, so a slot that is not given
+    /// back on the way out is a tap nobody can ever open again —
+    /// and with the cap at eight, eight bad filters would be enough
+    /// to close the feature until the broker restarts. So the
+    /// refusals are followed by filling the cap, which is the only
+    /// assertion that can see it.
     #[tokio::test]
-    async fn a_filter_that_will_not_do_is_refused_in_the_one_shape() {
+    async fn a_filter_that_will_not_do_is_refused_and_costs_no_slot() {
         let both = Both::start().await;
-        for filter in ["", "a/#/b", "a/b+"] {
+        for filter in ["", "a/#/b", "a/b+", "$share/g/x"] {
             let refused = both.open(filter).await;
             assert_eq!(refused.status, 400, "{filter}: {}", refused.body);
             let body = json(&refused.body);
             assert_eq!(body["error"]["code"], "invalid_request", "{filter}");
             assert_eq!(body["error"]["field"], "filter", "{filter}");
         }
+        for index in 0..MAX_TAPS {
+            let answer = both.open(&format!("still/{index}")).await;
+            assert_eq!(
+                answer.status, 200,
+                "tap {index} after four refusals: {}",
+                answer.body
+            );
+        }
         both.stop().await;
+    }
+
+    /// The cap counts a slot that is claimed but not yet filled.
+    ///
+    /// A unit test of [`Taps::reserve`], deliberately, because what
+    /// it guards is a race: two requests that both ask "is there
+    /// room" before either says "I am taking it". No end-to-end test
+    /// can make that happen on demand, and one that tried would be
+    /// green on a fast machine with the bug present, which is
+    /// convention 5's test measuring the wrong dimension. That
+    /// [`open`] asks this and not something else is what the cap
+    /// test over HTTP covers.
+    #[test]
+    fn a_claimed_slot_counts_against_the_cap_before_it_is_filled() {
+        let taps = Arc::new(Taps::new());
+        let mut claimed: Vec<Reservation> = (0..MAX_TAPS)
+            .map(|index| {
+                taps.reserve()
+                    .unwrap_or_else(|| panic!("slot {index} is free"))
+            })
+            .collect();
+        assert!(
+            taps.reserve().is_none(),
+            "every slot is claimed, though none is filled"
+        );
+        assert_eq!(taps.live(), 0, "and no tap exists yet");
+
+        // Give exactly one back, and there is room for exactly one
+        // more. `pop` rather than consuming the whole list, which
+        // would release all of them and prove nothing about the
+        // arithmetic.
+        drop(claimed.pop().expect("one was claimed"));
+        // Bound, not asserted on in place: a temporary reservation
+        // is dropped at the end of its statement and gives the slot
+        // straight back, so `assert!(reserve().is_some())` would
+        // leave the registry exactly as it found it and the line
+        // after it would pass whatever this one did.
+        let refilled = taps.reserve();
+        assert!(refilled.is_some(), "the abandoned slot came back");
+        assert!(taps.reserve().is_none(), "and only that one");
+        drop(refilled);
+        drop(claimed);
     }
 
     // -----------------------------------------------------------
@@ -2073,6 +2234,34 @@ mod tests {
         both.stop().await;
     }
 
+    /// A path segment that is not an identifier takes the one shape
+    /// too.
+    ///
+    /// Without this the extractor's own rejection answers, which is
+    /// plain text with no `error` key. Section 13: a client tests
+    /// for a failure by looking for that key, and one response that
+    /// does not have it makes the test wrong everywhere.
+    #[tokio::test]
+    async fn a_path_that_is_not_an_identifier_takes_the_one_shape() {
+        let both = Both::start().await;
+        for path in ["/api/v1/taps/banana", "/api/v1/taps/-1", "/api/v1/taps/1.5"] {
+            let answer = testing::request(both.admin.address(), "GET", path, None).await;
+            assert_eq!(answer.status, 404, "{path}: {}", answer.body);
+            assert_eq!(
+                json(&answer.body)["error"]["code"],
+                "not_found",
+                "{path}: {}",
+                answer.body
+            );
+            assert_eq!(
+                answer.header("content-type"),
+                Some("application/json"),
+                "{path}"
+            );
+        }
+        both.stop().await;
+    }
+
     /// A tap that is not there says both things that can mean.
     #[tokio::test]
     async fn a_tap_that_is_not_there_says_which_two_things_that_means() {
@@ -2080,11 +2269,13 @@ mod tests {
         let missing = both.read_raw(404, None).await;
         assert_eq!(missing.status, 404, "{}", missing.body);
         assert_eq!(json(&missing.body)["error"]["code"], "not_found");
-        assert!(
-            missing.body.contains("expired"),
-            "an operator is told why it might be gone: {}",
-            missing.body
-        );
+        for cause in ["never opened", "closed it", "expired"] {
+            assert!(
+                missing.body.contains(cause),
+                "an operator is told every reason it might be gone, including \"{cause}\": {}",
+                missing.body
+            );
+        }
         assert_eq!(both.close(404).await.status, 404);
         both.stop().await;
     }

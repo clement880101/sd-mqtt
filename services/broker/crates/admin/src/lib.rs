@@ -48,7 +48,7 @@ pub use error::{ApiError, ErrorCode};
 pub use events::{EventBody, EventId, Events};
 pub use health::Readiness;
 pub use resources::{ListenerProtocol, ListenerView};
-pub use taps::{Tap, TapLimits, Taps, IDLE_TIMEOUT, MAX_TAPS, TAP_CAPACITY};
+pub use taps::{Reservation, Tap, TapLimits, Taps, IDLE_TIMEOUT, MAX_TAPS, TAP_CAPACITY};
 
 /// How often the events stream's numbers are sampled.
 ///
