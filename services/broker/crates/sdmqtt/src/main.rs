@@ -42,6 +42,20 @@ struct Cli {
 enum Command {
     /// Serve MQTT over TCP.
     Serve(Serve),
+    /// Print the third-party notices for everything in this binary.
+    ///
+    /// Section 3 and the licence policy in
+    /// `docs/research/component-selection.md`: the code compiled into
+    /// this binary is not all MIT, and the licences it is under ask
+    /// for their text to travel with it. Until this existed nothing
+    /// in the repository carried a single one of them, and the readme
+    /// pointed at a file in a release artifact that has never been
+    /// built.
+    ///
+    /// A subcommand rather than only a URL, because the admin
+    /// listener can be turned off and a user who has the binary must
+    /// still be able to read what is in it.
+    Licenses,
 }
 
 /// What `serve` accepts, every one of it optional.
@@ -101,6 +115,14 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let serve = match cli.command {
         Some(Command::Serve(serve)) => serve,
+        Some(Command::Licenses) => {
+            // Straight to standard output, so that `sdmqtt licenses >
+            // THIRD-PARTY.txt` and a pipe into a pager both do the
+            // obvious thing. Nothing is logged around it: this is not
+            // the broker starting.
+            print!("{}", sdmqtt_admin::NOTICES);
+            return ExitCode::SUCCESS;
+        }
         None => Serve::default(),
     };
 

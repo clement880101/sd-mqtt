@@ -42,7 +42,7 @@ pub mod taps;
 #[cfg(test)]
 mod testing;
 
-pub use assets::INTERFACE_BUILT;
+pub use assets::{INTERFACE_BUILT, NOTICES, NOTICES_PATH};
 pub use config::{AdminConfig, AdminStartError, Token};
 pub use error::{ApiError, ErrorCode};
 pub use events::{EventBody, EventId, Events};

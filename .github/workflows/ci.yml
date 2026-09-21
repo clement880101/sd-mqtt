@@ -87,14 +87,33 @@ jobs:
             exit 1
           fi
 
+  # The licence gate is a gate. It says a crate's licence is one we
+  # accept; it says nothing about whether we attributed it, and for two
+  # milestones nothing did. The attribution check below is the other
+  # half, and it is checked against the built binary rather than
+  # against the dependency graph, for the reason the script's own
+  # documentation gives.
   licenses:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/broker
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: taiki-e/install-action@cargo-deny
       - name: License and advisory gate
         run: cargo deny --manifest-path services/broker/Cargo.toml --config deny.toml check
+      # The same release build the budgets job measures, because the
+      # audit reads the crate paths rustc recorded in it.
+      - name: Build the binary the notices are audited against
+        working-directory: services/broker
+        run: cargo build --release --all-features -p sdmqtt
+      - name: The notices may not drift from what ships
+        run: scripts/rust-notices.py --check
 
   devcontainer:
     runs-on: ubuntu-latest

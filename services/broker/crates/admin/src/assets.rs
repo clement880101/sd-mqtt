@@ -77,6 +77,20 @@ include!(concat!(env!("OUT_DIR"), "/interface.rs"));
 /// The document the interface is entered through.
 const INDEX: &str = "/index.html";
 
+/// Where the third-party attribution is served.
+///
+/// **Not under `/assets/`**, and not a document of the interface. It
+/// is served whether or not one was built, because the crates
+/// compiled into this binary are attributed either way, and it is
+/// revalidated rather than cached forever because its name carries no
+/// hash of its contents.
+///
+/// A plain path with no version in it, so that the sentence in the
+/// readme naming it stays true across releases. The same bytes are
+/// [`NOTICES`], which `sdmqtt licenses` prints for anyone who has the
+/// binary and no listener to point a browser at.
+pub const NOTICES_PATH: &str = "/third-party-notices.txt";
+
 /// An encoding this listener can answer with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Encoding {
@@ -226,6 +240,12 @@ pub fn negotiate(header: Option<&str>) -> Option<Encoding> {
 /// The document served at `path`, if this binary has one.
 fn asset_for(path: &str) -> Option<&'static Asset> {
     let path = if path == "/" { INDEX } else { path };
+    // Before the interface's own documents, and outside the `ASSETS`
+    // table, because it is answered in a build that has no table at
+    // all: the crates are in the binary whether or not the bundle is.
+    if path == NOTICES_PATH {
+        return Some(&NOTICES_ASSET);
+    }
     if ASSETS.is_empty() {
         return (path == INDEX).then_some(&PLACEHOLDER);
     }
@@ -694,6 +714,121 @@ mod tests {
                 "with no interface built, the root is the page that says so"
             );
         }
+        admin.shutdown().await;
+    }
+
+    // -----------------------------------------------------------
+    // The third-party notices
+    // -----------------------------------------------------------
+
+    /// The Rust half is in the binary, and names what obliges us.
+    ///
+    /// Named crates rather than a length or a substring like
+    /// "License", because the failure this guards is a generator that
+    /// produced *something*: an empty list, a list of the workspace's
+    /// own crates, a list of build tooling. `sync_wrapper` and `ryu`
+    /// are the two whose only branch on our allow list is Apache-2.0,
+    /// which is the licence that asks for its text to travel with the
+    /// work, so they are the two whose absence matters most.
+    #[test]
+    fn the_notices_name_the_apache_licensed_crates_that_ship() {
+        assert!(
+            NOTICES.contains("sync_wrapper 1."),
+            "sync_wrapper is Apache-2.0 with no alternative and is linked in"
+        );
+        assert!(
+            NOTICES.contains("ryu 1."),
+            "ryu offers Apache-2.0 OR BSL-1.0, and BSL-1.0 is not on the allow list"
+        );
+        assert!(
+            NOTICES.contains("Apache License"),
+            "naming an Apache-2.0 crate without carrying the licence text is \
+             the half of the obligation that is not met by a list"
+        );
+        assert!(
+            NOTICES.contains("Version 2.0, January 2004"),
+            "and it is the Apache 2.0 text rather than a line mentioning it"
+        );
+        // The ones a reader would notice missing, and a cross-section
+        // of the licences: MIT, Zlib and the standard library.
+        for named in ["tokio 1.", "axum 0.", "redb 4.", "foldhash 0.", "hyper 1."] {
+            assert!(
+                NOTICES.contains(named),
+                "{named} is in the binary and unnamed"
+            );
+        }
+        assert!(
+            NOTICES.contains("the Rust standard library"),
+            "std is linked from the sysroot and is in no manifest, which is \
+             exactly why it is the piece a manifest-driven list loses"
+        );
+    }
+
+    /// The browser half ships exactly when the browser half ships.
+    ///
+    /// **Both directions.** This is the bug that was found: the
+    /// notices were generated correctly, one directory above the
+    /// bundle, and the build script embeds only what is inside it, so
+    /// the binary carried the libraries and none of their notices. A
+    /// test that only checked for their presence would pass in a tree
+    /// with no interface, which is every tree the suite normally runs
+    /// in — so the other branch asserts they are absent, and says so.
+    #[test]
+    fn the_bundled_libraries_are_attributed_exactly_when_they_are_embedded() {
+        if INTERFACE_BUILT {
+            for library in ["preact", "uplot", "open-props", "valibot", "virtual-core"] {
+                assert!(
+                    NOTICES.contains(library),
+                    "{library} is in the bundle this binary embeds and is unattributed"
+                );
+            }
+        } else {
+            assert!(
+                NOTICES.contains("compiled without the browser interface"),
+                "with no bundle embedded the notices say so rather than going quiet"
+            );
+            assert!(
+                !NOTICES.contains("uPlot Copyright"),
+                "and do not attribute libraries that are not in this binary"
+            );
+        }
+    }
+
+    /// A user of the binary can read them over the listener.
+    ///
+    /// Served whether or not an interface was built, because the
+    /// crates are compiled in either way, and through the same
+    /// negotiation as everything else rather than a second path.
+    #[tokio::test]
+    async fn the_notices_are_served_and_are_the_bytes_that_were_embedded() {
+        let admin = serving().await;
+        let address = admin.address();
+
+        let plain = get(address, NOTICES_PATH, &[]).await;
+        assert_eq!(plain.status, 200);
+        assert_eq!(
+            plain.header("content-type"),
+            Some("text/plain; charset=utf-8")
+        );
+        assert_eq!(
+            plain.body,
+            NOTICES.as_bytes(),
+            "what is served is what `sdmqtt licenses` prints, to the byte"
+        );
+
+        let brotli = get(address, NOTICES_PATH, &[("Accept-Encoding", "br")]).await;
+        assert_eq!(brotli.status, 200);
+        assert_eq!(brotli.header("content-encoding"), Some("br"));
+        assert!(
+            brotli.body.len() < plain.body.len(),
+            "seventy-five kilobytes of licence text compresses or something is wrong"
+        );
+        assert_ne!(
+            brotli.header("etag"),
+            plain.header("etag"),
+            "two encodings are two representations here as everywhere else"
+        );
+
         admin.shutdown().await;
     }
 
