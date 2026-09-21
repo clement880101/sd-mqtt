@@ -876,13 +876,22 @@ in CI, not when the code is written.
 
 ## 15. Budgets
 
-| Metric | Target |
-|---|---|
-| Release binary, all features, stripped, link-time optimized | under 15 MB |
-| Idle resident memory, single node, no clients | under 30 MB |
-| UI bundle, gzipped | under 150 KB |
-| Direct dependencies across broker crates | under 35 |
-| Concurrent connections per node, target hardware | 100,000 |
+| Metric | Target | Today | Checked |
+|---|---|---|---|
+| Release binary, all features, stripped, link-time optimized | under 15 MB | 2.52 MB | every push |
+| Idle resident memory, single node, no clients | under 30 MB | not yet measured | scheduled |
+| UI bundle, gzipped | under 150 KB | no interface yet | reported as skipped |
+| Direct dependencies across broker crates | under 35 | 14 | every push |
+| Concurrent connections per node, target hardware | 100,000 | not yet measured | milestone 7 |
+
+The "today" column is the trend, not the limit, and is what tells a
+reader whether a budget is at 94% or at 4%. Recorded at milestone 3
+with `scripts/budgets.sh`: the binary was 2,523,184 bytes on macOS
+arm64, and the fourteen distinct direct dependencies were `bytes`,
+`clap`, `foldhash`, `parking_lot`, `postcard`, `prometheus-client`,
+`redb`, `serde`, `thiserror`, `tokio`, `toml`, `tracing`,
+`tracing-subscriber` and `uuid`. The binary's size is platform
+dependent; CI measures it on Linux x86-64 and its figure will differ.
 
 Durable queue storage and inter-node traffic scale with the replication
 factor. At the default factor of 2, plan for roughly twice the queue disk a
@@ -900,6 +909,14 @@ gzipped interface bundle. Idle resident memory is measurable but needs a
 process started and settled, so it is checked as a scheduled job rather than
 on every push. The connection target is a load test, not a build gate, and is
 milestone 7's to prove.
+
+`scripts/budgets.sh` is what does it, from the `budgets` job. It prints
+every budget's measurement and its headroom whether or not the budget
+is met, because a green tick cannot tell 94% from 4%. The interface
+bundle cannot be measured until there is an interface, so that line
+reports **skipped, and why**, rather than passing: a check that
+quietly passes when it cannot measure is worse than no check, and
+would report three budgets met having looked at two.
 
 ## 16. Milestones
 

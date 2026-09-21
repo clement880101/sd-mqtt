@@ -103,6 +103,26 @@ jobs:
           path: services/broker/conformance/.work/*.out
           if-no-files-found: ignore
 
+  # Section 15 says budgets are checked in CI and that exceeding one
+  # fails the build. Two milestones went by with that untrue, which
+  # convention 8's walk found. Three of the five are checked here; the
+  # script says which and why the other two are not, and says out loud
+  # that the interface bundle cannot be measured yet rather than
+  # counting it as passed.
+  budgets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/broker
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Budgets
+        run: scripts/budgets.sh
+
   fuzz:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
