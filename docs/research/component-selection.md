@@ -339,9 +339,10 @@ prints it and the admin listener serves it at
 `/third-party-notices.txt`; both are the same embedded bytes, put there
 by `crates/admin/build.rs`.
 
-Two halves, each generated from what actually ships, each committed so
-that a reader can see it without building anything, and each checked in
-CI against the thing it was generated from:
+Two halves, each committed so that a reader can see it without building
+anything, and each checked in CI against the thing it was generated
+from. They are **not** generated the same way, and the paragraph after
+the two says which is which:
 
 - **The crates.** `scripts/rust-notices.py` writes
   `services/broker/THIRD-PARTY-NOTICES.txt` from the packages reachable
@@ -363,24 +364,35 @@ CI against the thing it was generated from:
 produced the first half from the same dependency graph, at the cost of a
 second tool in every contributor's path and in three CI jobs. The script
 needs only `cargo` and `python3`, which `scripts/budgets.sh` already
-needs. What `cargo-about` would not do is the part that matters most:
+needs. What `cargo-about` would not do is read the binary at all:
 
-**The list is audited against the binary, not trusted.** A dependency
-graph is a manifest, and section 11.2's rule is that the attribution
-comes from the artifact. rustc records the source path of every panic
-site, so the crates that ship are named in the bytes a user receives.
-`scripts/rust-notices.py --check` reads them out of the release binary
-and fails on any crate the binary names that the file does not. The
-converse is deliberately not asserted: a crate can be linked in and
-leave no path string, which `ryu` and `sync_wrapper` both do, so the
-binary names a subset and the graph is what generates the list.
+**The list is generated from the graph and checked against the binary,
+which is less than section 11.2 asks for.** Section 11.2's rule is
+that the attribution comes from the artifact, and the bundle's half
+obeys it: the module graph a bundler emits *is* the artifact. A Cargo
+graph is not. So the crates half is generated from the manifest and
+the binary is used for one assertion in one direction: rustc records
+the source path of every panic site, so a crate that ships is usually
+named in the bytes a user receives, and `scripts/rust-notices.py
+--check` fails on any crate the binary names that the file does not.
+The converse cannot be asserted — a crate can be linked in and leave
+no path string, which `ryu` and `sync_wrapper` both do — so the check
+finds an omission and never confirms the list is right. Calling that
+"generated from the artifact" would be the flattering description of
+it, and the script's own documentation has always said otherwise.
 
-That audit is also what found the piece a manifest cannot: the binary
-carries the Rust standard library and the crates the Rust project
-vendors into it — addr2line, gimli, object, rustc-demangle, hashbrown —
-which arrive prebuilt from the sysroot and appear in no Cargo graph.
-They are attributed in a section of their own, under the MIT branch of
-the Rust project's MIT OR Apache-2.0.
+That one-way check is still what found the piece a manifest cannot:
+the binary carries the Rust standard library, which arrives prebuilt
+from the sysroot and appears in no Cargo graph. Five of its crates —
+addr2line, gimli, object, rustc-demangle, hashbrown — are named in the
+bytes. Nothing else the sysroot holds leaves a path string, whether it
+is linked in or not, so the notices name the sysroot's whole contents,
+read from the toolchain, and say plainly that this is an upper bound
+on what the binary carries rather than a claim about each name. An
+earlier version listed twelve crates as being in the binary, which
+nothing had checked and five of which were all the bytes could show.
+It is attributed in a section of its own, under the MIT branch of the
+Rust project's MIT OR Apache-2.0.
 
 Build-time dependencies are not listed. The category above says why:
 running a tool to produce an artifact does not distribute the tool. An

@@ -10,6 +10,30 @@
 //! not exist; in both cases what was missing was the last step, and a
 //! test of the document rather than of the command would have been
 //! green throughout.
+//!
+//! # This file is not the drift gate, and reads like it
+//!
+//! Said out loud here because this is where a reader meets it. What
+//! is below compares the command's output against the embedded
+//! constant it was compiled from, and then asserts that three
+//! strings are in it. Both sides of that equality come from the same
+//! bytes, so it cannot notice a stale document: a
+//! `THIRD-PARTY-NOTICES.txt` that no longer matches the dependency
+//! graph is embedded, printed and compared to itself, and every
+//! assertion here passes.
+//!
+//! **The gate is `scripts/rust-notices.py --check`, and it runs in
+//! CI.** It regenerates the file from the graph, fails on any
+//! difference, and reads the release binary for crates the file
+//! omits. No `cargo test` runs it — it needs `python3` and a release
+//! binary, neither of which a test has — so a green suite locally
+//! says nothing about whether the notices are current. Run it by
+//! hand before changing a dependency:
+//!
+//! ```text
+//! (cd services/broker && cargo build --release --all-features -p sdmqtt)
+//! scripts/rust-notices.py --check
+//! ```
 
 use std::process::Command;
 
