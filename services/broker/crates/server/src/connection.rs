@@ -827,6 +827,32 @@ impl Attached {
                     "a publication could not be made durable; the client is closed \
                      rather than acknowledged"
                 );
+                // **Everything addressed to somebody else still goes.**
+                // The promise that was not kept is this publisher's, and
+                // its acknowledgement is the one packet that must not be
+                // sent. The same batch carries the publication to every
+                // subscriber the message matched, and those connections
+                // are alive, were promised nothing, and have already had
+                // the delivery recorded against their window. Returning
+                // without delivering left each of them holding a slot
+                // for a packet that was never sent and that nothing
+                // would ever resend: `Outbound` has no retransmission
+                // timer, deliberately, because a connection either
+                // delivers a packet or dies — and this path was the one
+                // case where a live connection did neither. The slot
+                // stays held until that peer reconnects and resume
+                // redelivers.
+                //
+                // Ours are dropped rather than filtered out one by one:
+                // this connection is being closed, so the only thing
+                // left for it is the close below, and its own session
+                // resumes on the next connection.
+                self.shared.deliver(
+                    actions
+                        .into_iter()
+                        .filter(|(to, _)| *to != self.subscriber)
+                        .collect(),
+                );
                 self.close_with(NOT_DURABLE);
                 return Err(ConnectionError::NotDurable(error));
             }
@@ -3169,6 +3195,57 @@ mod tests {
             .expect("the connection closes")
             .expect("the read succeeds");
         assert_eq!(n, 0, "the acknowledgement must never follow the refusal");
+    }
+
+    #[tokio::test]
+    async fn a_failing_flush_closes_the_publisher_without_stranding_its_subscribers() {
+        // The batch that carries the acknowledgement carries the
+        // publication to every matching subscriber too, and those
+        // connections are alive and were promised nothing. Returning
+        // before delivering took the acknowledgement away — right —
+        // and the publication with it, leaving each subscriber holding
+        // a window slot for a packet that was never sent and that
+        // nothing resends: `Outbound` has no retransmission timer
+        // because a connection either delivers a packet or dies, and
+        // this path was the case where a live one did neither.
+        //
+        // The subscriber is at least-once on purpose: at-most-once
+        // holds no slot, so the loss would be one message rather than
+        // a stuck window, and this test would be making a weaker claim
+        // than the bug deserves.
+        let (shared, store) = with_gated_store();
+        let mut subscriber = serve_one(Arc::clone(&shared));
+        connect_v5(&mut subscriber, "subscriber").await;
+        subscribe_at(&mut subscriber, Version::V5, QoS::AtLeastOnce).await;
+
+        let mut publisher = serve_one(Arc::clone(&shared));
+        connect_v5(&mut publisher, "publisher").await;
+        // Only now, so that the connect and the subscribe above are
+        // not the thing that fails.
+        store.fail();
+        write(
+            &mut publisher,
+            &publication(b"x", QoS::AtLeastOnce, Some(1)),
+            Version::V5,
+        )
+        .await;
+
+        assert_eq!(
+            next_disconnect(&mut publisher).await.reason,
+            ReasonCode::ImplementationSpecificError,
+            "the publisher is still closed rather than acknowledged"
+        );
+        match read(&mut subscriber, Version::V5).await {
+            Packet::Publish(publish) => {
+                assert_eq!(publish.payload.as_ref(), b"x");
+                assert!(
+                    publish.packet_id.is_some(),
+                    "an at-least-once delivery holds a window slot, which is what would \
+                     have been stranded"
+                );
+            }
+            other => panic!("the subscriber is owed the publication, got {other:?}"),
+        }
     }
 
     #[tokio::test]
