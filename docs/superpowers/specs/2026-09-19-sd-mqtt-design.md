@@ -859,6 +859,49 @@ global memory ceiling that surfaces as unexplained failure.
 Library crates expose typed errors. The binary uses a context-carrying error
 type at the top level and converts at the boundary.
 
+### 13.1 The HTTP API's error shape
+
+The admin listener is one of those boundaries. **Every failure it returns
+takes one shape and no other**, so that the interface has one thing to parse
+and one thing to branch on:
+
+```json
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "limit must be between 1 and 1000, not 0",
+    "field": "limit"
+  }
+}
+```
+
+`code` is a fixed string from a closed set and is the only part a client may
+branch on. `message` is one English sentence for a person, may be reworded in
+any release, and nothing may match on it — the alternative makes every
+message a compatibility surface, and the first improvement to the wording
+silently sends an interface down the wrong branch. `field` names the request
+parameter at fault where one is at fault, and is absent otherwise, so a form
+can mark an input without reading the sentence.
+
+The codes today are `invalid_request`, `not_found`, `method_not_allowed`,
+`unauthorized` and `internal`. Adding one is a compatible change and renaming
+one is not; a client treats an unknown code as the class its HTTP status
+implies. The status is **derived from the code** rather than sent beside it,
+so the two cannot disagree.
+
+The body is nested under `error` so that a client which forgot to look at the
+status code still cannot confuse a failure with a success: no successful
+response has a top-level `error` key and every failure has one.
+
+Two things are deliberately outside it. The health endpoints answer their own
+document either way, because an unready readiness probe is that endpoint
+working rather than failing and a probe wants the same shape both times. The
+metrics endpoint answers in the exposition format on success, and in this
+shape on failure.
+
+`crates/admin/src/error.rs` is where this lives, and is the authority if the
+two ever disagree.
+
 ## 14. Testing
 
 - **Codec**: property-based round-trip tests, plus a corpus of malformed

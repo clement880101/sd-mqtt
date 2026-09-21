@@ -304,6 +304,23 @@ impl Broker {
         self.registry.get(subscriber)
     }
 
+    /// Every session, connected or not, for a report.
+    ///
+    /// Immutable and in no particular order, because the registry is
+    /// a hash map. A caller that needs an order must impose one, and
+    /// the admin API does.
+    ///
+    /// **Whoever calls this is holding the process's one lock.** It
+    /// walks every session, so a caller that does anything per
+    /// session beyond reading a field is doing that work with every
+    /// connection in the process waiting behind it. The admin API
+    /// takes what it needs here and builds its answer afterwards; see
+    /// `sdmqtt-admin`'s `resources` module for why the shape is what
+    /// it is.
+    pub fn sessions(&self) -> impl Iterator<Item = (SubscriberId, &Session)> {
+        self.registry.iter().map(|(id, session)| (*id, session))
+    }
+
     /// Accept a connection.
     ///
     /// Taking over a session that already has a live connection is not an

@@ -11,6 +11,10 @@ description = "The admin listener for sd-mqtt: health, metrics, and the read res
 broker-core = { path = "../broker-core", version = "0.1.0" }
 mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
 sdmqtt-server = { path = "../server", version = "0.1.0" }
+# Default features off, as `sdmqtt-server` does and for the same
+# reason: this crate needs the record vocabulary a session's
+# subscriptions are held in, and has no use for a disk.
+storage = { path = "../storage", version = "0.1.0", default-features = false }
 # Default features off, and not for weight: they cost two crates.
 # `tower-log` routes tower's internals through a second logging facade
 # beside the tracing this project standardised on, and the form
@@ -57,7 +61,6 @@ tokio = { version = "1", features = [
 # `tests` drive a real MQTT listener and read what the admin API says
 # about it, which needs the codec a client speaks.
 bytes.workspace = true
-storage = { path = "../storage", version = "0.1.0", default-features = false }
 
 [lints]
 workspace = true

@@ -23,6 +23,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Router;
 use sdmqtt_server::shared::Shared;
@@ -31,13 +32,17 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 pub mod config;
+pub mod error;
 pub mod health;
+pub mod resources;
 
 #[cfg(test)]
 mod testing;
 
 pub use config::{AdminConfig, AdminStartError, Token};
+pub use error::{ApiError, ErrorCode};
 pub use health::Readiness;
+pub use resources::{ListenerProtocol, ListenerView};
 
 /// Everything a handler can reach.
 ///
@@ -49,19 +54,59 @@ pub struct AdminState {
     pub shared: Arc<Shared>,
     /// What startup has managed so far. See [`Readiness`].
     pub readiness: Arc<Readiness>,
+    /// What this node is called.
+    ///
+    /// Membership is milestone 5, so today this names a cluster of
+    /// one. It is configurable rather than derived from a hostname
+    /// because a hostname is not stable across a container restart
+    /// and a node identifier has to be.
+    pub node_id: Arc<str>,
+    /// What this node has bound.
+    ///
+    /// Given rather than discovered: a bound socket does not know
+    /// what it is for, and the broker does not know a listener
+    /// exists. What startup bound is what the API reports.
+    pub listeners: Arc<Vec<ListenerView>>,
+    /// When this process started serving, for the uptime the
+    /// Overview page shows.
+    pub started: Instant,
 }
 
 impl AdminState {
-    /// A state over one broker, nothing ready yet.
+    /// A state over one broker, nothing ready and nothing bound yet.
     ///
-    /// The gates are handed back so that the startup path can open
-    /// them as it passes each one. They start shut: a node that has
-    /// not said it is ready is not.
+    /// The readiness gates start shut: a node that has not said it is
+    /// ready is not. The caller opens them as startup passes each
+    /// one, and fills in the listeners it bound.
     pub fn new(shared: Arc<Shared>) -> Self {
         Self {
             shared,
             readiness: Arc::new(Readiness::starting()),
+            node_id: Arc::from("local"),
+            listeners: Arc::new(Vec::new()),
+            started: Instant::now(),
         }
+    }
+
+    /// Share readiness gates somebody else is holding.
+    #[must_use]
+    pub fn with_readiness(mut self, readiness: Arc<Readiness>) -> Self {
+        self.readiness = readiness;
+        self
+    }
+
+    /// Name this node.
+    #[must_use]
+    pub fn with_node_id(mut self, node_id: impl Into<Arc<str>>) -> Self {
+        self.node_id = node_id.into();
+        self
+    }
+
+    /// Say what was bound.
+    #[must_use]
+    pub fn with_listeners(mut self, listeners: Vec<ListenerView>) -> Self {
+        self.listeners = Arc::new(listeners);
+        self
     }
 }
 
@@ -123,8 +168,20 @@ impl AdminServer {
 }
 
 /// The routes this listener serves.
+///
+/// The two fallbacks are registered rather than left to axum's
+/// defaults, which are an empty `404` and an empty `405` with no
+/// body at all. Section 13 and [`error`]: every failure this API
+/// returns has the one shape, and "the path you asked for is not
+/// served" is a failure a client has to be able to tell from a proxy
+/// that swallowed the request.
 fn router(state: AdminState) -> Router {
-    Router::new().merge(health::routes()).with_state(state)
+    Router::new()
+        .merge(health::routes())
+        .merge(resources::routes())
+        .fallback(error::not_found)
+        .method_not_allowed_fallback(error::method_not_allowed)
+        .with_state(state)
 }
 
 /// A bound admin listener and the task serving it.

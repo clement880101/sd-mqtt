@@ -25,8 +25,8 @@
 //!
 //! # The health endpoints are outside the error envelope
 //!
-//! Every other endpoint answers a failure with the one error shape
-//! this crate uses. These do not: an unready readiness probe is the
+//! Every other endpoint answers a failure with the one shape in
+//! [`crate::error`]. These do not: an unready readiness probe is the
 //! endpoint working correctly, not failing, and a probe reading it
 //! wants the same document whichever way it went. The status code
 //! carries ready against unready and the body says which gate is
@@ -217,10 +217,8 @@ mod tests {
                 .expect("a valid address"),
             ..AdminConfig::default()
         };
-        let state = AdminState {
-            shared: Arc::new(Shared::new(BrokerConfig::default())),
-            readiness,
-        };
+        let state = AdminState::new(Arc::new(Shared::new(BrokerConfig::default())))
+            .with_readiness(readiness);
         AdminServer::bind(&config, state)
             .await
             .expect("loopback needs no token")
