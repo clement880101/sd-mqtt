@@ -7,7 +7,7 @@ use mqtt_codec::{Properties, QoS, ReasonCode, Version};
 use storage::record::{ProtocolVersion, Record, SessionRecord, SubscriptionRecord, WillRecord};
 
 use crate::journal::{self, Journal};
-use crate::registry::SessionId;
+use crate::registry::{Presence, SessionId};
 use crate::session::inbound::Inbound;
 use crate::session::outbound::Outbound;
 use crate::session::queue::{QueueLimits, QueueTotal};
@@ -67,6 +67,14 @@ pub struct Session {
     /// handed over. The queue, the window and the inbound identifiers
     /// keep their own; this one is for the fields above.
     journal: Journal,
+    /// Where a gained or lost connection is written down.
+    ///
+    /// Held by the session rather than asked of it, for the reason
+    /// the queue's total is: connectedness changes in three methods
+    /// here and a caller that has to remember to report each of them
+    /// is a caller that will forget one. Free until somebody is
+    /// reading; see [`Presence`].
+    presence: Presence,
 }
 
 /// The configured bounds every session is built with.
@@ -89,6 +97,8 @@ pub struct SessionBounds {
     /// The process-wide count of queued messages this session's queue
     /// counts into.
     pub total: QueueTotal,
+    /// Where this session records gaining or losing a connection.
+    pub presence: Presence,
 }
 
 impl Session {
@@ -105,6 +115,7 @@ impl Session {
             max_inflight,
             queue,
             total,
+            presence,
         } = bounds;
         // A fresh session has a connection attached, so its outbound path
         // does too. Leaving it offline would make `is_connected` lie and
@@ -114,6 +125,7 @@ impl Session {
         let mut outbound = Outbound::sharing(key.clone(), queue, max_inflight, total);
         outbound.set_online(true);
 
+        presence.record(subscriber, &id, true);
         let mut session = Self {
             id,
             subscriber,
@@ -128,6 +140,7 @@ impl Session {
             expiry_interval: 0,
             expires_at: None,
             journal: Journal::new(),
+            presence,
         };
         // A session exists the moment it is made, and nothing else will
         // say so: every record that follows names it, and the store
@@ -197,6 +210,7 @@ impl Session {
     pub fn claim(&mut self, epoch: u64, _now: u32) {
         self.epoch = epoch;
         self.connected = true;
+        self.presence.record(self.subscriber, &self.id, true);
         self.will_at = None;
         self.expires_at = None;
         self.outbound.set_online(true);
@@ -216,6 +230,7 @@ impl Session {
     /// after the delay in MQTT 5 and at once in 3.1.1.
     pub fn on_disconnected(&mut self, graceful: bool, now: u32) {
         self.connected = false;
+        self.presence.record(self.subscriber, &self.id, false);
         self.outbound.on_disconnect();
         self.inbound.on_disconnect();
 

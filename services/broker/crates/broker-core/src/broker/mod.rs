@@ -14,7 +14,7 @@ use storage::record::Record;
 use crate::clock::CoarseClock;
 use crate::journal::{self, DurableSession, DurableState};
 use crate::keepalive::{Activity, KeepAliveRing};
-use crate::registry::{Registration, Registry, SessionId};
+use crate::registry::{Presence, Registration, Registry, SessionId};
 use crate::retained::{RetainedMessage, RetainedStore};
 use crate::session::message::Message;
 use crate::session::queue::{Delivery, DropReason, QueueLimits};
@@ -1057,6 +1057,20 @@ impl Broker {
     /// How many sessions exist, connected or not.
     pub fn session_count(&self) -> usize {
         self.registry.len()
+    }
+
+    /// Which sessions have gained or lost a connection since a reader
+    /// last looked.
+    ///
+    /// For an observer that would otherwise walk every session to
+    /// find out, which is what the events stream did: see
+    /// [`Presence`]. Nothing is recorded until a reader arms it, and
+    /// arming it and taking a first picture belong under one
+    /// acquisition of this broker's lock.
+    ///
+    /// [`Presence`]: crate::registry::Presence
+    pub fn presence(&self) -> &Presence {
+        self.registry.presence()
     }
 
     /// How many subscriptions are held, for a metric and for tests.

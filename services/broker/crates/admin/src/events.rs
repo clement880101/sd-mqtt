@@ -69,7 +69,7 @@
 //! [`Metrics::admin_events_dropped`]: sdmqtt_server::metrics::Metrics::admin_events_dropped
 //! [`Shared::with_broker_committed`]: sdmqtt_server::shared::Shared::with_broker_committed
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -84,6 +84,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use broker_core::registry::SessionId;
+use broker_core::subscriptions::SubscriberId;
 use futures_core::Stream;
 use parking_lot::Mutex;
 use sdmqtt_server::metrics::Metrics;
@@ -634,7 +635,21 @@ struct Sample {
     totals: CounterTotals,
     gauges: Gauges,
     attached: usize,
-    connected: HashSet<SessionId>,
+    /// Who was connected, by handle, with the name to report when
+    /// they go.
+    ///
+    /// Keyed by [`SubscriberId`] rather than by identity because the
+    /// broker's own record of a change is keyed that way, and
+    /// because a handle is eight bytes the broker never reuses while
+    /// an identity is two reference-counted strings to hash. The
+    /// name is carried so that a departure can be reported after the
+    /// session holding it has gone.
+    connected: HashMap<SubscriberId, SessionId>,
+    /// Whether the broker is recording changes for this sampler yet.
+    ///
+    /// False for exactly one tick, which arms the recording and takes
+    /// the first picture under one acquisition of the lock.
+    watching: bool,
 }
 
 /// Read the broker and turn what changed into events.
@@ -656,17 +671,43 @@ struct Sample {
 ///
 /// # What it costs the one lock in the process
 ///
-/// The gauges are five numbers the broker already maintains, so the
-/// ordinary tick is O(1) under the lock. Working out *who* connected
-/// is not: it is a walk of every session, and the Clients page exists
-/// because there may be a hundred thousand of them.
+/// Working out *who* connected used to be a walk of every session,
+/// built into a fresh set under the lock and diffed against the last
+/// one. It was behind a tripwire that skipped it when no counter had
+/// moved, which protects an idle broker and nothing else: one
+/// connect or one disconnect a second arms it, and that is the
+/// normal state of a broker with a hundred thousand sessions on it.
+/// Measured on a release build, the set build alone held the lock
+/// for 11.9 milliseconds at a hundred thousand sessions and 570
+/// microseconds at ten thousand — against the 405 microseconds that
+/// made summing every queue unacceptable for a scraper asking every
+/// fifteen seconds, and this ran every second whether or not anybody
+/// was watching.
 ///
-/// So the walk is behind a tripwire that is itself O(1). A session
-/// cannot attach without `sockets_opened` moving, and cannot detach
-/// without the outbox count moving, so when neither has moved since
-/// the last sample there is nothing to diff and the walk is skipped
-/// entirely. An idle broker pays five atomic loads a second.
-fn sample(state: &AdminState, previous: &mut Sample) {
+/// So the broker records what changed where it changes, and this
+/// reads the record: [`Presence`], which is the same answer
+/// [`QueueTotal`] is. The work under the lock is now the number of
+/// sessions that *moved*, and [`sample`] returns that number so a
+/// test can say so — `one_sample_reads_only_what_changed`, which is
+/// convention 5's "measure the algorithm" and not a stopwatch.
+///
+/// Two things still walk: the first sample of all, which arms the
+/// recording and takes the first picture under one acquisition of
+/// the lock, and a sample after the broker's log overflowed, which
+/// means nothing read it for sixty-five thousand changes. Both
+/// rebuild the whole picture, which is what makes them correct
+/// rather than an optimisation with a hole in it.
+///
+/// **The two gauges that are not O(1).** `subscription_count` walks
+/// the subscription trie and `retained_count` walks the retained
+/// tree, both under this lock and both on every tick. They are not
+/// this function's to fix — the metrics endpoint reads the same two
+/// — but the sentence that used to be here said all five gauges were
+/// maintained numbers, and that was not true.
+///
+/// [`Presence`]: broker_core::registry::Presence
+/// [`QueueTotal`]: broker_core::session::QueueTotal
+fn sample(state: &AdminState, previous: &mut Sample) -> usize {
     let metrics = state.shared.metrics();
     let totals = CounterTotals {
         bytes_received: metrics.bytes_received().get(),
@@ -674,18 +715,9 @@ fn sample(state: &AdminState, previous: &mut Sample) {
         sockets_opened: metrics.socket_opened().get(),
     };
     let attached = state.shared.outbox_count();
-    // The tripwire. `sockets_opened` only rises, so a connect always
-    // moves it; a disconnect with no connect beside it always moves
-    // the outbox count. Neither moving means nobody arrived and
-    // nobody left.
-    let walk = totals.sockets_opened != previous.totals.sockets_opened
-        || attached != previous.attached
-        // The first sample of all, so that clients already connected
-        // when this listener started are not invisible until the
-        // next one moves.
-        || previous.connected.is_empty() && attached > 0;
 
-    let (gauges, now) = state.shared.with_broker(|broker| {
+    let mut changes = Vec::new();
+    let (gauges, walked) = state.shared.with_broker(|broker| {
         let gauges = Gauges {
             connections: attached as u64,
             sessions: broker.session_count() as u64,
@@ -693,31 +725,83 @@ fn sample(state: &AdminState, previous: &mut Sample) {
             retained: broker.retained_count() as u64,
             queue_depth: broker.queue_depth() as u64,
         };
-        let now = walk.then(|| {
+        // Arming and the first picture, in that order and under one
+        // acquisition of the lock: a connect between the two would
+        // otherwise be in neither.
+        let whole = if previous.watching {
+            broker.presence().take(&mut changes)
+        } else {
+            broker.presence().watch();
+            true
+        };
+        let walked = whole.then(|| {
             broker
                 .sessions()
                 .filter(|(_, session)| session.is_connected())
-                .map(|(_, session)| session.id().clone())
-                .collect::<HashSet<_>>()
+                .map(|(subscriber, session)| (subscriber, session.id().clone()))
+                .collect::<HashMap<_, _>>()
         });
-        (gauges, now)
+        (gauges, walked)
     });
+    previous.watching = true;
 
-    if let Some(now) = now {
-        for arrived in now.difference(&previous.connected) {
-            state.events.publish(EventBody::Connected {
-                mountpoint: arrived.mountpoint.to_string(),
-                client_id: arrived.client_id.to_string(),
-            });
+    let examined = match walked {
+        // The whole picture, because there was no usable record of
+        // what changed. Everything the sampler holds and the broker
+        // does not is a departure, and the other way round is an
+        // arrival.
+        Some(now) => {
+            let examined = now.len();
+            for (subscriber, id) in &now {
+                if !previous.connected.contains_key(subscriber) {
+                    state.events.publish(EventBody::Connected {
+                        mountpoint: id.mountpoint.to_string(),
+                        client_id: id.client_id.to_string(),
+                    });
+                }
+            }
+            for (subscriber, id) in &previous.connected {
+                if !now.contains_key(subscriber) {
+                    state.events.publish(EventBody::Disconnected {
+                        mountpoint: id.mountpoint.to_string(),
+                        client_id: id.client_id.to_string(),
+                    });
+                }
+            }
+            previous.connected = now;
+            examined
         }
-        for left in previous.connected.difference(&now) {
-            state.events.publish(EventBody::Disconnected {
-                mountpoint: left.mountpoint.to_string(),
-                client_id: left.client_id.to_string(),
-            });
+        // The ordinary tick: only what moved, and nothing was
+        // touched under the lock but that.
+        None => {
+            let examined = changes.len();
+            for change in changes {
+                // A change is only an event if it is news. The record
+                // carries the state a session ended up in, so a
+                // client that dropped and came back between two
+                // samples says "connected" to a sampler that already
+                // had it connected, and that is not a connect.
+                if change.connected {
+                    if previous
+                        .connected
+                        .insert(change.subscriber, change.id.clone())
+                        .is_none()
+                    {
+                        state.events.publish(EventBody::Connected {
+                            mountpoint: change.id.mountpoint.to_string(),
+                            client_id: change.id.client_id.to_string(),
+                        });
+                    }
+                } else if previous.connected.remove(&change.subscriber).is_some() {
+                    state.events.publish(EventBody::Disconnected {
+                        mountpoint: change.id.mountpoint.to_string(),
+                        client_id: change.id.client_id.to_string(),
+                    });
+                }
+            }
+            examined
         }
-        previous.connected = now;
-    }
+    };
 
     // Emitted only when something moved. A counters event every
     // interval forever would churn the ring, and a browser that
@@ -741,6 +825,7 @@ fn sample(state: &AdminState, previous: &mut Sample) {
     previous.totals = totals;
     previous.gauges = gauges;
     previous.attached = attached;
+    examined
 }
 
 /// Sample every `interval` until the listener stops.
@@ -752,7 +837,8 @@ pub(crate) fn spawn_sampler(state: AdminState, interval: Duration) -> JoinHandle
             totals: CounterTotals::default(),
             gauges: Gauges::default(),
             attached: 0,
-            connected: HashSet::new(),
+            connected: HashMap::new(),
+            watching: false,
         };
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -763,7 +849,9 @@ pub(crate) fn spawn_sampler(state: AdminState, interval: Duration) -> JoinHandle
             tokio::select! {
                 biased;
                 () = stopping(&mut shutdown) => return,
-                _ = ticker.tick() => sample(&state, &mut previous),
+                // What it examined is for the test that says the
+                // work is bounded; the loop has no use for it.
+                _ = ticker.tick() => { sample(&state, &mut previous); },
             }
         }
     })
@@ -775,6 +863,7 @@ mod tests {
     use crate::testing::Stream as TestStream;
     use crate::{AdminConfig, AdminRunning, AdminServer};
     use broker_core::broker::BrokerConfig;
+    use broker_core::registry::MAX_PENDING_PRESENCE;
     use sdmqtt_server::shared::Shared;
     use std::net::SocketAddr;
 
@@ -1222,5 +1311,367 @@ mod tests {
             .await
             .expect("the body ends");
         assert!(ended.contains("retry:"), "it was a real stream: {ended}");
+    }
+
+    // -----------------------------------------------------------
+    // What a sample costs
+    // -----------------------------------------------------------
+
+    /// A broker holding `population` connected sessions.
+    fn populated(population: usize) -> AdminState {
+        let state = AdminState::new(Arc::new(Shared::new(BrokerConfig::default())));
+        for n in 0..population {
+            attach(&state, n);
+        }
+        state
+    }
+
+    /// Connect one more client the way a connection does.
+    fn attach(state: &AdminState, n: usize) {
+        let connect = mqtt_codec::packet::Connect {
+            version: mqtt_codec::Version::V5,
+            client_id: format!("client-{n}"),
+            clean_start: true,
+            keep_alive: 0,
+            username: None,
+            password: None,
+            will: None,
+            properties: mqtt_codec::Properties::default(),
+        };
+        state.shared.with_broker(|broker| {
+            let mut out = Vec::new();
+            broker.connect("", &connect, &mut out);
+        });
+        // What a real connection moves as it arrives, and what the
+        // counters event is drawn from.
+        state.shared.metrics().socket_opened().inc();
+    }
+
+    /// The sample a fresh sampler starts from.
+    fn first_sample() -> Sample {
+        Sample {
+            at: Instant::now(),
+            totals: CounterTotals::default(),
+            gauges: Gauges::default(),
+            attached: 0,
+            connected: HashMap::new(),
+            watching: false,
+        }
+    }
+
+    /// Take the connection away from client `n`, the way a socket
+    /// closing does.
+    fn detach(state: &AdminState, n: usize) {
+        let id = SessionId::new("", &format!("client-{n}"));
+        let actions = state.shared.with_broker(|broker| {
+            let mut out = Vec::new();
+            if let Some(subscriber) = broker.subscriber_of(&id) {
+                broker.disconnect(subscriber, &mut out);
+            }
+            out
+        });
+        drop(actions);
+    }
+
+    /// Every event the ring still holds, as `kind:client_id`.
+    fn published(state: &AdminState) -> Vec<String> {
+        state
+            .events
+            .subscribe(Some(FIRST - 1))
+            .backlog
+            .iter()
+            .map(|stored| match stored.body.as_ref() {
+                EventBody::Connected { client_id, .. } => format!("connected:{client_id}"),
+                EventBody::Disconnected { client_id, .. } => format!("disconnected:{client_id}"),
+                EventBody::Counters { .. } | EventBody::Resynchronise { .. } => {
+                    "counters".to_owned()
+                }
+            })
+            .filter(|line| line != "counters")
+            .collect()
+    }
+
+    /// One sample reads what moved and not the population.
+    ///
+    /// Convention 5, and the shape
+    /// `removing_costs_the_same_however_many_are_armed` uses: the
+    /// assertion is in sessions examined rather than in
+    /// microseconds, so it is a statement about the algorithm and
+    /// does not flake on a loaded machine. The walk this replaced
+    /// would read the whole population here, so the numbers below
+    /// would be 10,000 rather than 1.
+    #[test]
+    fn one_sample_reads_only_what_changed() {
+        for population in [1usize, 100, 10_000] {
+            let state = populated(population);
+            let mut previous = first_sample();
+
+            // The first sample of all has no record to read, so it
+            // takes the whole picture — and arms the record.
+            assert_eq!(
+                sample(&state, &mut previous),
+                population,
+                "the first sample learns the population"
+            );
+
+            // Everything after it reads only what moved.
+            attach(&state, population);
+            assert_eq!(
+                sample(&state, &mut previous),
+                1,
+                "one connect with {population} sessions on the broker"
+            );
+            detach(&state, population);
+            assert_eq!(
+                sample(&state, &mut previous),
+                1,
+                "one disconnect with {population} sessions on the broker"
+            );
+            assert_eq!(
+                sample(&state, &mut previous),
+                0,
+                "and nothing at all when nothing happened"
+            );
+        }
+    }
+
+    /// The events a sample publishes are the ones that happened.
+    ///
+    /// The bounded-work test above would pass just as well if the
+    /// sampler read the record and threw it away, and the whole
+    /// point of the record is the events it produces.
+    #[test]
+    fn a_connect_and_a_disconnect_are_each_reported_once() {
+        let state = populated(3);
+        let mut previous = first_sample();
+        sample(&state, &mut previous);
+        assert_eq!(
+            published(&state).len(),
+            3,
+            "the three that were already connected"
+        );
+
+        attach(&state, 3);
+        sample(&state, &mut previous);
+        detach(&state, 3);
+        sample(&state, &mut previous);
+        // And a sample over which nothing happened says nothing.
+        sample(&state, &mut previous);
+
+        let seen = published(&state);
+        assert_eq!(
+            &seen[3..],
+            &["connected:client-3", "disconnected:client-3"],
+            "once each, in order: {seen:?}"
+        );
+    }
+
+    /// A client that leaves and comes back between two samples is
+    /// not news.
+    ///
+    /// The record keeps the state a session ended up in, not a
+    /// history, and the walk this replaced could not see the middle
+    /// of an interval either. What must not happen is a second
+    /// `connected` for a client the page already shows as connected,
+    /// which is a row the Clients table would then hold twice.
+    #[test]
+    fn a_flap_inside_one_interval_is_not_reported_twice() {
+        let state = populated(1);
+        let mut previous = first_sample();
+        sample(&state, &mut previous);
+        let before = published(&state).len();
+
+        detach(&state, 0);
+        attach(&state, 0);
+        sample(&state, &mut previous);
+        assert_eq!(
+            published(&state).len(),
+            before,
+            "it ended the interval exactly as it started it: {:?}",
+            published(&state)
+        );
+
+        // And the sampler still holds it, so its departure is still
+        // reported when it really goes.
+        detach(&state, 0);
+        sample(&state, &mut previous);
+        assert_eq!(
+            published(&state).last().map(String::as_str),
+            Some("disconnected:client-0"),
+            "{:?}",
+            published(&state)
+        );
+    }
+
+    /// A sampler that stopped reading is given the whole picture
+    /// rather than a record with holes in it.
+    ///
+    /// Convention 5's "a path no test walks": the overflow branch is
+    /// reached only after [`MAX_PENDING_PRESENCE`] changes nobody
+    /// read, which no ordinary test produces and a real broker
+    /// reaches only if this task has stopped. Deleting the branch
+    /// leaves a sampler whose set has quietly lost entries and whose
+    /// pages therefore show clients that are not there.
+    #[test]
+    fn a_record_that_overflowed_makes_the_next_sample_walk() {
+        let state = populated(1);
+        let mut previous = first_sample();
+        sample(&state, &mut previous);
+
+        // Past the bound, with nobody reading in between.
+        for n in 0..MAX_PENDING_PRESENCE + 1 {
+            attach(&state, 1_000_000 + n);
+        }
+        // The walk sees every one of them, rather than the handful
+        // the record had room for.
+        let before = state.events.next_id();
+        let examined = sample(&state, &mut previous);
+        assert_eq!(
+            examined,
+            MAX_PENDING_PRESENCE + 2,
+            "the whole population, because the record could not be trusted"
+        );
+        // And every one of them is reported. Counted as identifiers
+        // issued rather than read out of the ring, which holds only
+        // its last thousand: one connect each, and one counters
+        // event.
+        assert_eq!(
+            state.events.next_id() - before,
+            MAX_PENDING_PRESENCE as EventId + 2,
+            "one event for every arrival the record lost, and the counters"
+        );
+    }
+
+    /// What one sample costs under the broker's one lock, at the two
+    /// populations the Clients page was built for.
+    ///
+    /// **A measurement, not an assertion**, which is why it is
+    /// ignored: a wall clock on a shared machine is not a thing to
+    /// gate a build on. The assertion beside it is
+    /// `one_sample_reads_only_what_changed`, which counts sessions
+    /// examined rather than microseconds, exactly as
+    /// `removing_costs_the_same_however_many_are_armed` counts
+    /// entries touched.
+    ///
+    ///     cargo test -p sdmqtt-admin --release -- --ignored --nocapture what_one_sample_costs
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn what_one_sample_costs() {
+        for population in [10_000usize, 100_000] {
+            let state = populated(population);
+            let mut previous = first_sample();
+            // The first sample of all is the one that learns the
+            // population; every one after it is the steady state,
+            // which is what this measures.
+            sample(&state, &mut previous);
+
+            let runs = 20u32;
+            let mut worst = Duration::ZERO;
+            let mut total = Duration::ZERO;
+            for run in 0..runs as usize {
+                // One connect a second is the normal state of a
+                // broker this size, and it is what arms the walk.
+                attach(&state, population + run);
+                let started = Instant::now();
+                sample(&state, &mut previous);
+                let took = started.elapsed();
+                worst = worst.max(took);
+                total += took;
+            }
+            println!(
+                "{population} sessions: {:?} mean, {:?} worst, over {runs} samples",
+                total / runs,
+                worst
+            );
+        }
+    }
+
+    /// What one sample costs on a broker that also holds
+    /// subscriptions and retained messages.
+    ///
+    /// The measurement above isolates the thing this module changed,
+    /// so its broker holds nothing else. This one is the whole tick,
+    /// and it is here because two of the five gauges are not the
+    /// maintained numbers the sampler's documentation used to claim:
+    /// `subscription_count` walks the subscription trie and
+    /// `retained_count` walks the retained tree, both on this lock
+    /// and both on every tick, and the metrics endpoint asks for the
+    /// same two. Neither is this module's to fix; what is this
+    /// module's is not to say they are free.
+    ///
+    ///     cargo test -p sdmqtt-admin --release -- --ignored --nocapture what_a_whole_sample_costs
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn what_a_whole_sample_costs() {
+        for population in [10_000usize, 100_000] {
+            let state = populated(population);
+            // One subscription each, and a retained message per ten
+            // sessions.
+            for n in 0..population {
+                subscribe(&state, n, &format!("site/{}/device/{n}/telemetry", n % 100));
+            }
+            for n in 0..population / 10 {
+                retain(&state, &format!("site/{}/device/{n}/state", n % 100));
+            }
+
+            let mut previous = first_sample();
+            sample(&state, &mut previous);
+
+            let runs = 20u32;
+            let mut worst = Duration::ZERO;
+            let mut total = Duration::ZERO;
+            for run in 0..runs as usize {
+                attach(&state, population + run);
+                let started = Instant::now();
+                sample(&state, &mut previous);
+                let took = started.elapsed();
+                worst = worst.max(took);
+                total += took;
+            }
+            println!(
+                "{population} sessions, {population} subscriptions, {} retained: {:?} mean, {:?} worst",
+                population / 10,
+                total / runs,
+                worst
+            );
+        }
+    }
+
+    /// Subscribe client `n` to `filter`, through the packet path.
+    fn subscribe(state: &AdminState, n: usize, filter: &str) {
+        let id = SessionId::new("", &format!("client-{n}"));
+        state.shared.with_broker(|broker| {
+            let Some(subscriber) = broker.subscriber_of(&id) else {
+                return;
+            };
+            let packet = mqtt_codec::Packet::Subscribe(mqtt_codec::packet::Subscribe {
+                packet_id: 1,
+                filters: vec![mqtt_codec::packet::SubscriptionOptions {
+                    filter: filter.to_owned(),
+                    qos: mqtt_codec::QoS::AtMostOnce,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: mqtt_codec::packet::RetainHandling::SendAlways,
+                }],
+                properties: mqtt_codec::Properties::default(),
+            });
+            let mut out = Vec::new();
+            let _ = broker.handle(subscriber, &packet, &mut out);
+        });
+    }
+
+    /// Retain a small message on `topic`.
+    fn retain(state: &AdminState, topic: &str) {
+        state.shared.with_broker(|broker| {
+            broker.retained().set(
+                topic,
+                broker_core::retained::RetainedMessage {
+                    payload: bytes::Bytes::from_static(b"21.5"),
+                    qos: mqtt_codec::QoS::AtMostOnce,
+                    expires_at: None,
+                    properties: Arc::new(mqtt_codec::Properties::default().into()),
+                },
+            );
+        });
     }
 }
