@@ -44,7 +44,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
 
-use mqtt_codec::{PacketKind, Version};
+use mqtt_codec::{PacketKind, ReasonCode, Version};
 
 /// The label set of every family in this module: a fixed number of
 /// borrowed name-and-value pairs.
@@ -145,6 +145,252 @@ fn version_index(version: Version) -> usize {
     }
 }
 
+/// Every reason code the standard assigns, in the order the handles
+/// are indexed in.
+const ALL_REASONS: [ReasonCode; 43] = [
+    ReasonCode::Success,
+    ReasonCode::GrantedQos1,
+    ReasonCode::GrantedQos2,
+    ReasonCode::DisconnectWithWillMessage,
+    ReasonCode::NoMatchingSubscribers,
+    ReasonCode::NoSubscriptionExisted,
+    ReasonCode::ContinueAuthentication,
+    ReasonCode::ReAuthenticate,
+    ReasonCode::UnspecifiedError,
+    ReasonCode::MalformedPacket,
+    ReasonCode::ProtocolError,
+    ReasonCode::ImplementationSpecificError,
+    ReasonCode::UnsupportedProtocolVersion,
+    ReasonCode::ClientIdentifierNotValid,
+    ReasonCode::BadUserNameOrPassword,
+    ReasonCode::NotAuthorized,
+    ReasonCode::ServerUnavailable,
+    ReasonCode::ServerBusy,
+    ReasonCode::Banned,
+    ReasonCode::ServerShuttingDown,
+    ReasonCode::BadAuthenticationMethod,
+    ReasonCode::KeepAliveTimeout,
+    ReasonCode::SessionTakenOver,
+    ReasonCode::TopicFilterInvalid,
+    ReasonCode::TopicNameInvalid,
+    ReasonCode::PacketIdentifierInUse,
+    ReasonCode::PacketIdentifierNotFound,
+    ReasonCode::ReceiveMaximumExceeded,
+    ReasonCode::TopicAliasInvalid,
+    ReasonCode::PacketTooLarge,
+    ReasonCode::MessageRateTooHigh,
+    ReasonCode::QuotaExceeded,
+    ReasonCode::AdministrativeAction,
+    ReasonCode::PayloadFormatInvalid,
+    ReasonCode::RetainNotSupported,
+    ReasonCode::QosNotSupported,
+    ReasonCode::UseAnotherServer,
+    ReasonCode::ServerMoved,
+    ReasonCode::SharedSubscriptionsNotSupported,
+    ReasonCode::ConnectionRateExceeded,
+    ReasonCode::MaximumConnectTime,
+    ReasonCode::SubscriptionIdentifiersNotSupported,
+    ReasonCode::WildcardSubscriptionsNotSupported,
+];
+
+/// Where a reason code's handle sits in the flat array, by its wire
+/// byte.
+///
+/// Built at compile time from [`ALL_REASONS`] so that the two cannot
+/// disagree. A byte no code uses is [`u8::MAX`], which
+/// [`reason_index`] can never be handed: its argument is the enum,
+/// and every value of the enum is in the table.
+const REASON_SLOT: [u8; 256] = {
+    let mut table = [u8::MAX; 256];
+    let mut at = 0;
+    while at < ALL_REASONS.len() {
+        table[ALL_REASONS[at] as usize] = at as u8;
+        at += 1;
+    }
+    table
+};
+
+/// The label value for a reason code.
+///
+/// Exhaustive, so a code added to the standard and to the codec is a
+/// compile error here rather than a series that quietly never appears.
+fn reason_label(reason: ReasonCode) -> &'static str {
+    match reason {
+        ReasonCode::Success => "success",
+        ReasonCode::GrantedQos1 => "granted_qos1",
+        ReasonCode::GrantedQos2 => "granted_qos2",
+        ReasonCode::DisconnectWithWillMessage => "disconnect_with_will_message",
+        ReasonCode::NoMatchingSubscribers => "no_matching_subscribers",
+        ReasonCode::NoSubscriptionExisted => "no_subscription_existed",
+        ReasonCode::ContinueAuthentication => "continue_authentication",
+        ReasonCode::ReAuthenticate => "re_authenticate",
+        ReasonCode::UnspecifiedError => "unspecified_error",
+        ReasonCode::MalformedPacket => "malformed_packet",
+        ReasonCode::ProtocolError => "protocol_error",
+        ReasonCode::ImplementationSpecificError => "implementation_specific_error",
+        ReasonCode::UnsupportedProtocolVersion => "unsupported_protocol_version",
+        ReasonCode::ClientIdentifierNotValid => "client_identifier_not_valid",
+        ReasonCode::BadUserNameOrPassword => "bad_user_name_or_password",
+        ReasonCode::NotAuthorized => "not_authorized",
+        ReasonCode::ServerUnavailable => "server_unavailable",
+        ReasonCode::ServerBusy => "server_busy",
+        ReasonCode::Banned => "banned",
+        ReasonCode::ServerShuttingDown => "server_shutting_down",
+        ReasonCode::BadAuthenticationMethod => "bad_authentication_method",
+        ReasonCode::KeepAliveTimeout => "keep_alive_timeout",
+        ReasonCode::SessionTakenOver => "session_taken_over",
+        ReasonCode::TopicFilterInvalid => "topic_filter_invalid",
+        ReasonCode::TopicNameInvalid => "topic_name_invalid",
+        ReasonCode::PacketIdentifierInUse => "packet_identifier_in_use",
+        ReasonCode::PacketIdentifierNotFound => "packet_identifier_not_found",
+        ReasonCode::ReceiveMaximumExceeded => "receive_maximum_exceeded",
+        ReasonCode::TopicAliasInvalid => "topic_alias_invalid",
+        ReasonCode::PacketTooLarge => "packet_too_large",
+        ReasonCode::MessageRateTooHigh => "message_rate_too_high",
+        ReasonCode::QuotaExceeded => "quota_exceeded",
+        ReasonCode::AdministrativeAction => "administrative_action",
+        ReasonCode::PayloadFormatInvalid => "payload_format_invalid",
+        ReasonCode::RetainNotSupported => "retain_not_supported",
+        ReasonCode::QosNotSupported => "qos_not_supported",
+        ReasonCode::UseAnotherServer => "use_another_server",
+        ReasonCode::ServerMoved => "server_moved",
+        ReasonCode::SharedSubscriptionsNotSupported => "shared_subscriptions_not_supported",
+        ReasonCode::ConnectionRateExceeded => "connection_rate_exceeded",
+        ReasonCode::MaximumConnectTime => "maximum_connect_time",
+        ReasonCode::SubscriptionIdentifiersNotSupported => "subscription_identifiers_not_supported",
+        ReasonCode::WildcardSubscriptionsNotSupported => "wildcard_subscriptions_not_supported",
+    }
+}
+
+/// Where a reason code's handle sits in the flat array.
+fn reason_index(reason: ReasonCode) -> usize {
+    usize::from(REASON_SLOT[reason as usize])
+}
+
+/// The two packets this broker puts a connection-level reason code on.
+///
+/// A CONNACK says why a connection was refused or accepted; a
+/// DISCONNECT says why one is ending. The per-subscription and
+/// per-publication codes a SUBACK or a PUBACK carries are not here:
+/// they belong to one request rather than to the connection, and
+/// section 11.3's reason-code dimension is about why a client's time
+/// with this broker went the way it did.
+const REASON_KINDS: [PacketKind; 2] = [PacketKind::ConnAck, PacketKind::Disconnect];
+
+/// How a socket ended.
+///
+/// The cross-product this labels is [`ConnectionError`]'s variants
+/// plus the two endings that are not errors, which is why it is an
+/// enum here rather than a string built at the call site: a new way
+/// for a connection to end has to be given a label before it
+/// compiles.
+///
+/// [`ConnectionError`]: crate::connection::ConnectionError
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketOutcome {
+    /// The client closed, or said goodbye, and nothing went wrong.
+    Clean,
+    /// No connect packet arrived in time.
+    ConnectTimeout,
+    /// The first packet was not a connect.
+    NotAConnect,
+    /// The peer sent something that is not a valid packet.
+    Malformed,
+    /// The peer broke the protocol and was told which rule.
+    Protocol,
+    /// The socket failed, or ended partway through a packet.
+    Io,
+    /// Something this broker produced could not be encoded.
+    Codec,
+    /// A publication could not be made durable, so the client was
+    /// closed rather than acknowledged.
+    NotDurable,
+    /// The connection was dropped before it finished: a shutdown, or
+    /// a panic. Counted from [`Drop`] rather than from a return, so
+    /// that a cancelled connection is an ending like any other rather
+    /// than a socket that is open forever in the exposition.
+    Abandoned,
+}
+
+/// Every socket outcome, in the order the handles are indexed in.
+const SOCKET_OUTCOMES: [SocketOutcome; 9] = [
+    SocketOutcome::Clean,
+    SocketOutcome::ConnectTimeout,
+    SocketOutcome::NotAConnect,
+    SocketOutcome::Malformed,
+    SocketOutcome::Protocol,
+    SocketOutcome::Io,
+    SocketOutcome::Codec,
+    SocketOutcome::NotDurable,
+    SocketOutcome::Abandoned,
+];
+
+/// The label value for a socket outcome.
+fn outcome_label(outcome: SocketOutcome) -> &'static str {
+    match outcome {
+        SocketOutcome::Clean => "clean",
+        SocketOutcome::ConnectTimeout => "connect_timeout",
+        SocketOutcome::NotAConnect => "not_a_connect",
+        SocketOutcome::Malformed => "malformed",
+        SocketOutcome::Protocol => "protocol",
+        SocketOutcome::Io => "io",
+        SocketOutcome::Codec => "codec",
+        SocketOutcome::NotDurable => "not_durable",
+        SocketOutcome::Abandoned => "abandoned",
+    }
+}
+
+/// Where a socket outcome's handle sits in the flat array.
+fn outcome_index(outcome: SocketOutcome) -> usize {
+    match outcome {
+        SocketOutcome::Clean => 0,
+        SocketOutcome::ConnectTimeout => 1,
+        SocketOutcome::NotAConnect => 2,
+        SocketOutcome::Malformed => 3,
+        SocketOutcome::Protocol => 4,
+        SocketOutcome::Io => 5,
+        SocketOutcome::Codec => 6,
+        SocketOutcome::NotDurable => 7,
+        SocketOutcome::Abandoned => 8,
+    }
+}
+
+/// How an authentication ended.
+///
+/// Authentication itself is milestone 7. The outcomes are registered
+/// now and are **deliberately zero rather than missing**, so that the
+/// dashboard and the alerting rule an operator writes against this
+/// broker today keep working unchanged when it arrives. A family with
+/// no series is skipped by the encoder entirely, which is why the
+/// handles are resolved here like every other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthOutcome {
+    /// The client proved who it said it was.
+    Success,
+    /// It did not, and was refused.
+    Failure,
+}
+
+/// Every authentication outcome, in the order the handles are indexed
+/// in.
+const AUTH_OUTCOMES: [AuthOutcome; 2] = [AuthOutcome::Success, AuthOutcome::Failure];
+
+/// The label value for an authentication outcome.
+fn auth_label(outcome: AuthOutcome) -> &'static str {
+    match outcome {
+        AuthOutcome::Success => "success",
+        AuthOutcome::Failure => "failure",
+    }
+}
+
+/// Where an authentication outcome's handle sits in the flat array.
+fn auth_index(outcome: AuthOutcome) -> usize {
+    match outcome {
+        AuthOutcome::Success => 0,
+        AuthOutcome::Failure => 1,
+    }
+}
+
 /// One counter per packet type per version, resolved at startup.
 #[derive(Debug)]
 struct PacketCounters([[Counter; PACKET_KINDS.len()]; VERSIONS.len()]);
@@ -177,6 +423,19 @@ pub struct Metrics {
     registry: Mutex<Registry>,
     packets_received: PacketCounters,
     packets_sent: PacketCounters,
+    /// Bytes counted where they cross the socket, not by adding up
+    /// what the packets should have weighed. The whole point of a byte
+    /// counter is to be able to see the difference.
+    bytes_received: Counter,
+    bytes_sent: Counter,
+    sockets_opened: Counter,
+    sockets_refused: Counter,
+    sockets_closed: [Counter; SOCKET_OUTCOMES.len()],
+    /// Indexed by [`REASON_KINDS`] then by [`ALL_REASONS`].
+    reasons_sent: [[Counter; ALL_REASONS.len()]; REASON_KINDS.len()],
+    /// Registered and never incremented until milestone 7. See
+    /// [`AUTH_OUTCOMES`].
+    authentications: [Counter; AUTH_OUTCOMES.len()],
 }
 
 impl Default for Metrics {
@@ -202,10 +461,78 @@ impl Metrics {
             "packets_sent",
             "Packets written to a client, by type and protocol version",
         );
+
+        let bytes_received = Counter::default();
+        registry.register(
+            "bytes_received",
+            "Bytes read from client sockets",
+            bytes_received.clone(),
+        );
+        let bytes_sent = Counter::default();
+        registry.register(
+            "bytes_sent",
+            "Bytes written to client sockets",
+            bytes_sent.clone(),
+        );
+
+        let sockets_opened = Counter::default();
+        registry.register(
+            "sockets_opened",
+            "Client sockets this broker began serving",
+            sockets_opened.clone(),
+        );
+        let sockets_refused = Counter::default();
+        registry.register(
+            "sockets_refused",
+            "Client sockets closed without being served, at the connection limit",
+            sockets_refused.clone(),
+        );
+        let closed = Family::<[(&'static str, &'static str); 1], Counter>::default();
+        registry.register(
+            "sockets_closed",
+            "Client sockets that have finished, by how they ended",
+            closed.clone(),
+        );
+        let sockets_closed = std::array::from_fn(|at| {
+            closed.get_or_create_owned(&[("outcome", outcome_label(SOCKET_OUTCOMES[at]))])
+        });
+
+        let reasons = Family::<Labels2, Counter>::default();
+        registry.register(
+            "reason_codes_sent",
+            "Connection-level reason codes this broker gave a client, by packet type",
+            reasons.clone(),
+        );
+        let reasons_sent = std::array::from_fn(|kind| {
+            std::array::from_fn(|reason| {
+                reasons.get_or_create_owned(&[
+                    ("kind", kind_label(REASON_KINDS[kind])),
+                    ("reason", reason_label(ALL_REASONS[reason])),
+                ])
+            })
+        });
+
+        let auth = Family::<[(&'static str, &'static str); 1], Counter>::default();
+        registry.register(
+            "authentications",
+            "Authentication attempts, by outcome",
+            auth.clone(),
+        );
+        let authentications = std::array::from_fn(|at| {
+            auth.get_or_create_owned(&[("outcome", auth_label(AUTH_OUTCOMES[at]))])
+        });
+
         Self {
             registry: Mutex::new(registry),
             packets_received,
             packets_sent,
+            bytes_received,
+            bytes_sent,
+            sockets_opened,
+            sockets_refused,
+            sockets_closed,
+            reasons_sent,
+            authentications,
         }
     }
 
@@ -217,6 +544,53 @@ impl Metrics {
     /// The counter for a packet written to a client.
     pub fn packet_sent(&self, version: Version, kind: PacketKind) -> &Counter {
         self.packets_sent.get(version, kind)
+    }
+
+    /// Bytes read from a client socket.
+    pub fn bytes_received(&self) -> &Counter {
+        &self.bytes_received
+    }
+
+    /// Bytes written to a client socket.
+    pub fn bytes_sent(&self) -> &Counter {
+        &self.bytes_sent
+    }
+
+    /// A socket this broker has begun serving.
+    pub fn socket_opened(&self) -> &Counter {
+        &self.sockets_opened
+    }
+
+    /// A socket closed unserved, because the node is at its
+    /// connection limit.
+    pub fn socket_refused(&self) -> &Counter {
+        &self.sockets_refused
+    }
+
+    /// A socket that has finished, by how it ended.
+    pub fn socket_closed(&self, outcome: SocketOutcome) -> &Counter {
+        &self.sockets_closed[outcome_index(outcome)]
+    }
+
+    /// A connection-level reason code given to a client.
+    ///
+    /// `kind` must be one of [`REASON_KINDS`]; anything else is a
+    /// programming error and panics rather than landing on the wrong
+    /// series.
+    pub fn reason_sent(&self, kind: PacketKind, reason: ReasonCode) -> &Counter {
+        let at = REASON_KINDS
+            .iter()
+            .position(|candidate| *candidate == kind)
+            .expect("a reason code is only counted for a CONNACK or a DISCONNECT");
+        &self.reasons_sent[at][reason_index(reason)]
+    }
+
+    /// An authentication attempt, by outcome.
+    ///
+    /// Nothing calls this yet and that is the point: see
+    /// [`AuthOutcome`]. Milestone 7 is where it starts moving.
+    pub fn authentication(&self, outcome: AuthOutcome) -> &Counter {
+        &self.authentications[auth_index(outcome)]
     }
 
     /// Render the whole registry in the Prometheus text format.

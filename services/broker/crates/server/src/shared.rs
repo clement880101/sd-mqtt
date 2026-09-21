@@ -14,6 +14,8 @@ use parking_lot::{Mutex, RwLock};
 use storage::{Applied, Durable, NotDurable, Writer};
 use tokio::sync::mpsc;
 
+use crate::metrics::Metrics;
+
 /// Whether a batch of actions carries a promise that must be kept
 /// before it is delivered.
 ///
@@ -197,6 +199,14 @@ pub struct Shared {
     /// so that a standing count is reported once rather than every
     /// second. See [`Shared::report_rejections`].
     rejections_reported: AtomicU64,
+    /// What this process counts, and what the metrics endpoint
+    /// renders.
+    ///
+    /// It lives here because this is the one thing every connection,
+    /// the ticker and the listener all already hold. The handles
+    /// inside it are owned and lock-free; see [`crate::metrics`] for
+    /// why that is not an optimisation to consider.
+    metrics: Arc<Metrics>,
 }
 
 impl Shared {
@@ -226,7 +236,13 @@ impl Shared {
             paced: AtomicU64::new(0),
             pacing_reported: AtomicU64::new(0),
             rejections_reported: AtomicU64::new(0),
+            metrics: Arc::new(Metrics::new()),
         }
+    }
+
+    /// What this process counts.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
     }
 
     /// Do something with the broker, holding the lock for exactly that,

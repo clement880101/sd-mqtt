@@ -25,6 +25,7 @@
 //! that is a backstop rather than the rule: the rule is that the span is
 //! as short as the work and everything written goes out after it.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,12 +36,13 @@ use broker_core::session::Action;
 use broker_core::subscriptions::SubscriberId;
 use bytes::BytesMut;
 use mqtt_codec::packet::{ConnAck, Connect, Disconnect};
-use mqtt_codec::{encode, CodecError, Limits, Packet, Properties, ReasonCode, Version};
+use mqtt_codec::{encode, CodecError, Limits, Packet, PacketKind, Properties, ReasonCode, Version};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::framing::{FrameError, FrameReader};
+use crate::metrics::{Metrics, SocketOutcome};
 use crate::shared::{promises_durability, Shared};
 
 /// What a client's receive maximum is when it does not say.
@@ -233,13 +235,37 @@ async fn serve_with_candidates<S>(
     socket: S,
     shared: Arc<Shared>,
     config: ConnectionConfig,
+    candidates: impl FnMut() -> String + Send,
+) -> Result<(), ConnectionError>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    // Section 11.3's socket lifecycle. The close is counted from
+    // [`Drop`] for the same reason the disconnect obligation is: this
+    // future is dropped rather than returned from whenever the
+    // listener is shut down, and a socket counted open and never
+    // counted closed looks right for an hour and then looks like a
+    // leak forever.
+    let open = OpenSocket::new(Arc::clone(shared.metrics()));
+    let served = serve_counted(socket, shared, config, candidates).await;
+    open.ended(&served);
+    served
+}
+
+/// The body of [`serve_with_candidates`], with the socket already
+/// counted.
+async fn serve_counted<S>(
+    socket: S,
+    shared: Arc<Shared>,
+    config: ConnectionConfig,
     mut candidates: impl FnMut() -> String + Send,
 ) -> Result<(), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    let metrics = Arc::clone(shared.metrics());
     let (read_half, write_half) = tokio::io::split(socket);
-    let mut reader = FrameReader::new(read_half, config.limits);
+    let mut reader = FrameReader::new(read_half, config.limits, metrics.bytes_received().clone());
     let mut write_half = write_half;
 
     // Nothing below this point is owed to the broker: it does not know
@@ -275,6 +301,7 @@ where
                     &mut write_half,
                     Version::V311,
                     ReasonCode::UnsupportedProtocolVersion,
+                    &metrics,
                 )
                 .await;
             }
@@ -282,6 +309,13 @@ where
         }
     };
     let version = connect.version;
+    // The one packet that is not counted in the read loop, because the
+    // read loop does not exist until it has been answered. A first
+    // packet that is *not* a connect is not counted by type at all:
+    // its version is whatever it claimed to be and this broker never
+    // learnt it. The `not_a_connect` socket outcome is what records
+    // those.
+    metrics.packet_received(version, PacketKind::Connect).inc();
 
     if connect.client_id.is_empty() && version == Version::V311 && !connect.clean_start {
         // [MQTT-3.1.3-8]: in 3.1.1 the pair is illegal, because there is
@@ -291,6 +325,7 @@ where
             &mut write_half,
             version,
             ReasonCode::ClientIdentifierNotValid,
+            &metrics,
         )
         .await?;
         return Err(ConnectionError::Protocol(
@@ -304,7 +339,13 @@ where
         // zero as "no limit" and a silent inversion of a limit is worse
         // than a refusal.
         Some(0) => {
-            refuse(&mut write_half, version, ReasonCode::ProtocolError).await?;
+            refuse(
+                &mut write_half,
+                version,
+                ReasonCode::ProtocolError,
+                &metrics,
+            )
+            .await?;
             return Err(ConnectionError::Protocol(ReasonCode::ProtocolError));
         }
         Some(advertised) => usize::from(advertised),
@@ -318,7 +359,13 @@ where
         // the acknowledgement, so honouring it literally and refusing
         // it come to the same thing. Refused, so the client is told.
         Some(0) => {
-            refuse(&mut write_half, version, ReasonCode::ProtocolError).await?;
+            refuse(
+                &mut write_half,
+                version,
+                ReasonCode::ProtocolError,
+                &metrics,
+            )
+            .await?;
             return Err(ConnectionError::Protocol(ReasonCode::ProtocolError));
         }
         // Absent means unlimited: 3.1.2.11.4 says "If the Maximum
@@ -411,6 +458,7 @@ where
             &mut write_half,
             version,
             ReasonCode::ClientIdentifierNotValid,
+            &metrics,
         )
         .await?;
         return Err(ConnectionError::Protocol(
@@ -420,6 +468,7 @@ where
 
     let attached = Attached {
         shared: Arc::clone(&shared),
+        metrics: Arc::clone(&metrics),
         subscriber: registration.subscriber,
         epoch: registration.epoch,
         version,
@@ -498,6 +547,7 @@ async fn refuse<W: AsyncWrite + Unpin>(
     writer: &mut W,
     version: Version,
     reason: ReasonCode,
+    metrics: &Metrics,
 ) -> Result<(), ConnectionError> {
     let ack = Packet::ConnAck(ConnAck {
         // [MQTT-3.2.2-6]: a non-zero reason code carries a zero session
@@ -510,6 +560,13 @@ async fn refuse<W: AsyncWrite + Unpin>(
     encode(&ack, version, &mut buf)?;
     writer.write_all(&buf).await?;
     writer.flush().await?;
+    // Counted here as well as in the writer loop, because a refusal
+    // never reaches one: there is no session, so there is no outbox.
+    // A count that only covered the loop would report none of the
+    // traffic an operator most wants to see.
+    metrics.bytes_sent().inc_by(buf.len() as u64);
+    metrics.packet_sent(version, PacketKind::ConnAck).inc();
+    metrics.reason_sent(PacketKind::ConnAck, reason).inc();
     Ok(())
 }
 
@@ -695,6 +752,9 @@ impl TopicAliases {
 /// A connection the broker knows about, and therefore owes a disconnect.
 struct Attached {
     shared: Arc<Shared>,
+    /// The same handles [`Shared`] holds, kept here so the read loop
+    /// does not follow two pointers for every packet.
+    metrics: Arc<Metrics>,
     subscriber: SubscriberId,
     /// Which claim on the handle is ours. A takeover raises it, and a
     /// connection whose claim has been superseded must not tear down the
@@ -729,10 +789,18 @@ impl Attached {
         // packet. It is written here rather than queued because a resumed
         // session's redeliveries are already in the outbox and would
         // otherwise overtake it.
+        let reason = ack.reason;
         let mut buf = BytesMut::new();
         encode(&Packet::ConnAck(ack), self.version, &mut buf)?;
         write_half.write_all(&buf).await?;
         write_half.flush().await?;
+        // Written here rather than queued, so counted here rather
+        // than in the writer loop. See the comment above.
+        self.metrics.bytes_sent().inc_by(buf.len() as u64);
+        self.metrics
+            .packet_sent(self.version, PacketKind::ConnAck)
+            .inc();
+        self.metrics.reason_sent(PacketKind::ConnAck, reason).inc();
 
         let (gone, mut writer_gone) = oneshot::channel();
         let version = self.version;
@@ -742,8 +810,9 @@ impl Attached {
             subscriber: self.subscriber,
             epoch: self.epoch,
         };
+        let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
-            write_loop(write_half, outbox, version, limit).await;
+            write_loop(write_half, outbox, version, limit, metrics).await;
             drop(gone);
         });
 
@@ -781,6 +850,14 @@ impl Attached {
                     Err(other) => return Err(other.into()),
                 },
             };
+
+            // Counted before anything is decided about it: a packet
+            // that turns out to break the protocol still arrived, and
+            // a counter that only counted the ones this broker liked
+            // could not be compared against a client's own.
+            self.metrics
+                .packet_received(self.version, packet.kind())
+                .inc();
 
             if matches!(packet, Packet::Connect(_)) {
                 // [MQTT-3.2.0-2] forbids a second acknowledgement, and a
@@ -921,11 +998,12 @@ async fn write_loop<W: AsyncWrite + Unpin>(
     mut outbox: mpsc::Receiver<Action>,
     version: Version,
     limit: SizeLimit,
+    metrics: Arc<Metrics>,
 ) {
     let mut buf = BytesMut::new();
     while let Some(action) = outbox.recv().await {
         buf.clear();
-        let last = render(&action, version, &mut buf);
+        let rendered = render(&action, version, &mut buf);
         if limit.exceeded(buf.len()) {
             // [MQTT-3.1.2-24]: not one byte of it goes out. The size
             // is checked here rather than in the broker because this
@@ -934,10 +1012,24 @@ async fn write_loop<W: AsyncWrite + Unpin>(
             buf.clear();
             limit.discard(&action);
         }
-        if !buf.is_empty() && writer.write_all(&buf).await.is_err() {
-            break;
+        if !buf.is_empty() {
+            if writer.write_all(&buf).await.is_err() {
+                break;
+            }
+            // After the write, not before it: what is counted as sent
+            // is what the socket took. An action rendered and then
+            // discarded for size, or one the encoder refused, leaves
+            // an empty buffer and is counted by neither of these — it
+            // is a discard, and section 11.3 has it counted as one.
+            metrics.bytes_sent().inc_by(buf.len() as u64);
+            if let Some(kind) = rendered.kind {
+                metrics.packet_sent(version, kind).inc();
+                if let Some(reason) = rendered.reason {
+                    metrics.reason_sent(kind, reason).inc();
+                }
+            }
         }
-        if last {
+        if rendered.last {
             break;
         }
     }
@@ -1047,8 +1139,33 @@ fn reportable(reason: ReasonCode) -> ReasonCode {
     }
 }
 
-/// Turn one action into bytes, reporting whether it ends the connection.
-fn render(action: &Action, version: Version, buf: &mut BytesMut) -> bool {
+/// What rendering one action produced.
+struct Rendered {
+    /// Whether this action ends the connection.
+    last: bool,
+    /// The packet type in the buffer, and `None` when nothing was
+    /// written: an action that is not a packet, one the encoder
+    /// refused, or a close a 3.1.1 client gets no packet for.
+    kind: Option<PacketKind>,
+    /// The connection-level reason code the packet carries, for the
+    /// two packet types that carry one.
+    reason: Option<ReasonCode>,
+}
+
+impl Rendered {
+    /// Nothing was written and the connection continues.
+    fn nothing() -> Self {
+        Self {
+            last: false,
+            kind: None,
+            reason: None,
+        }
+    }
+}
+
+/// Turn one action into bytes, reporting whether it ends the
+/// connection and what it put in the buffer.
+fn render(action: &Action, version: Version, buf: &mut BytesMut) -> Rendered {
     match action {
         Action::Send(packet) => {
             if let Err(error) = encode(packet, version, buf) {
@@ -1057,8 +1174,13 @@ fn render(action: &Action, version: Version, buf: &mut BytesMut) -> bool {
                 // written packet would corrupt the stream.
                 tracing::error!(%error, kind = ?packet.kind(), "an outgoing packet was refused");
                 buf.clear();
+                return Rendered::nothing();
             }
-            false
+            Rendered {
+                last: false,
+                kind: Some(packet.kind()),
+                reason: None,
+            }
         }
         Action::Dropped {
             id,
@@ -1067,11 +1189,16 @@ fn render(action: &Action, version: Version, buf: &mut BytesMut) -> bool {
             topic,
         } => {
             tracing::debug!(?id, ?reason, ?qos, %topic, "a message was discarded");
-            false
+            Rendered::nothing()
         }
         Action::Close(reason) => {
             // MQTT 3.1.1 has no server-sent disconnect, so there the
             // close is the whole message.
+            let mut rendered = Rendered {
+                last: true,
+                kind: None,
+                reason: None,
+            };
             if version == Version::V5 {
                 let packet = Packet::Disconnect(Disconnect {
                     reason: *reason,
@@ -1080,10 +1207,61 @@ fn render(action: &Action, version: Version, buf: &mut BytesMut) -> bool {
                 if let Err(error) = encode(&packet, version, buf) {
                     tracing::error!(%error, ?reason, "a disconnect was refused");
                     buf.clear();
+                } else {
+                    rendered.kind = Some(PacketKind::Disconnect);
+                    rendered.reason = Some(*reason);
                 }
             }
-            true
+            rendered
         }
+    }
+}
+
+/// A socket counted for as long as this broker is serving it.
+///
+/// The open is counted when one of these is made and the close when
+/// it is dropped, so the two can never get out of step: there is no
+/// path out of [`serve_with_candidates`], including a cancellation
+/// and including a panic, that runs one without the other.
+///
+/// The outcome starts at [`SocketOutcome::Abandoned`] and is set by
+/// [`OpenSocket::ended`] on the way out, so a connection that is
+/// dropped rather than returned from is counted as the ending it
+/// actually had rather than as a clean one.
+struct OpenSocket {
+    metrics: Arc<Metrics>,
+    outcome: Cell<SocketOutcome>,
+}
+
+impl OpenSocket {
+    fn new(metrics: Arc<Metrics>) -> Self {
+        metrics.socket_opened().inc();
+        Self {
+            metrics,
+            outcome: Cell::new(SocketOutcome::Abandoned),
+        }
+    }
+
+    /// Record how the connection ended, ready for the drop that
+    /// counts it.
+    fn ended(&self, served: &Result<(), ConnectionError>) {
+        self.outcome.set(match served {
+            Ok(()) => SocketOutcome::Clean,
+            Err(ConnectionError::ConnectTimeout(_)) => SocketOutcome::ConnectTimeout,
+            Err(ConnectionError::NotAConnect) => SocketOutcome::NotAConnect,
+            Err(ConnectionError::Frame(FrameError::Protocol(_))) => SocketOutcome::Malformed,
+            Err(ConnectionError::Frame(FrameError::Io(_))) => SocketOutcome::Io,
+            Err(ConnectionError::Codec(_)) => SocketOutcome::Codec,
+            Err(ConnectionError::Io(_)) => SocketOutcome::Io,
+            Err(ConnectionError::Protocol(_)) => SocketOutcome::Protocol,
+            Err(ConnectionError::NotDurable(_)) => SocketOutcome::NotDurable,
+        });
+    }
+}
+
+impl Drop for OpenSocket {
+    fn drop(&mut self) {
+        self.metrics.socket_closed(self.outcome.get()).inc();
     }
 }
 
@@ -3346,6 +3524,287 @@ mod tests {
         match read(&mut publisher, Version::V5).await {
             Packet::PubAck(ack) => assert_eq!(ack.packet_id, 1),
             other => panic!("expected the acknowledgement, got {other:?}"),
+        }
+    }
+
+    mod counting {
+        //! What a connection counts, driven through the same socket every
+        //! other test in this file uses.
+        //!
+        //! Convention 5: none of these builds a counter and asserts it
+        //! counts. Each one writes packets into a real connection and
+        //! reads the exposition afterwards, because the thing that can be
+        //! missing is the call, not the counter.
+
+        use super::*;
+        use broker_core::broker::BrokerConfig;
+        use mqtt_codec::packet::{RetainHandling, Subscribe, SubscriptionOptions};
+        use mqtt_codec::{PacketKind, Version};
+        use std::sync::Arc;
+
+        use crate::metrics::SocketOutcome;
+
+        #[tokio::test]
+        async fn a_connect_and_a_publish_are_counted_by_type_and_version() {
+            let shared = Arc::new(Shared::new(BrokerConfig::default()));
+            let mut client = serve_one(Arc::clone(&shared));
+
+            connect_v5(&mut client, "counted").await;
+            write(
+                &mut client,
+                &publication(b"hello", QoS::AtMostOnce, None),
+                Version::V5,
+            )
+            .await;
+            // A ping and its answer, so that the publish is known to have
+            // been read before anything is asserted: the broker answers in
+            // order, so an answered ping means everything before it was
+            // handled.
+            write(&mut client, &Packet::PingReq, Version::V5).await;
+            assert_eq!(read(&mut client, Version::V5).await, Packet::PingResp);
+
+            let metrics = shared.metrics();
+            assert_eq!(
+                metrics
+                    .packet_received(Version::V5, PacketKind::Connect)
+                    .get(),
+                1,
+                "the connect"
+            );
+            assert_eq!(
+                metrics
+                    .packet_received(Version::V5, PacketKind::Publish)
+                    .get(),
+                1,
+                "the publish"
+            );
+            assert_eq!(
+                metrics
+                    .packet_received(Version::V311, PacketKind::Publish)
+                    .get(),
+                0,
+                "a version 5 publish must not be counted as a 3.1.1 one"
+            );
+            assert_eq!(
+                metrics.packet_sent(Version::V5, PacketKind::ConnAck).get(),
+                1,
+                "the acknowledgement"
+            );
+            assert_eq!(
+                metrics.packet_sent(Version::V5, PacketKind::PingResp).get(),
+                1,
+                "the ping answer"
+            );
+        }
+
+        #[tokio::test]
+        async fn bytes_are_counted_in_both_directions() {
+            // The exact byte counts, not "more than zero". A counter that
+            // adds up what the packets should have weighed rather than
+            // what crossed the socket is the thing this is for, and it
+            // would pass a greater-than-zero assertion.
+            let shared = Arc::new(Shared::new(BrokerConfig::default()));
+            let mut client = serve_one(Arc::clone(&shared));
+
+            let connect = Packet::Connect(Box::new(connect("bytes", 0)));
+            write(&mut client, &connect, Version::V5).await;
+            let ack = read(&mut client, Version::V5).await;
+            write(&mut client, &Packet::PingReq, Version::V5).await;
+            assert_eq!(read(&mut client, Version::V5).await, Packet::PingResp);
+
+            let metrics = shared.metrics();
+            let expected_in = encoded_size(&connect) + encoded_size(&Packet::PingReq);
+            let expected_out = encoded_size(&ack) + encoded_size(&Packet::PingResp);
+            assert_eq!(
+                metrics.bytes_received().get(),
+                expected_in as u64,
+                "every byte read from the socket"
+            );
+            assert_eq!(
+                metrics.bytes_sent().get(),
+                expected_out as u64,
+                "every byte written to the socket"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_socket_is_counted_open_once_and_closed_once() {
+            // The mutation that matters is a socket counted open and never
+            // counted closed, which looks right for an hour and then looks
+            // like a leak forever. So both halves are asserted, and the
+            // close is asserted after the connection has actually ended.
+            let shared = Arc::new(Shared::new(BrokerConfig::default()));
+            let (client, server) = tokio::io::duplex(8192);
+            let served = tokio::spawn({
+                let shared = Arc::clone(&shared);
+                async move { serve(server, shared, ConnectionConfig::default()).await }
+            });
+            let mut client = client;
+
+            connect_v5(&mut client, "counted-socket").await;
+            assert_eq!(
+                shared.metrics().socket_opened().get(),
+                1,
+                "the socket is counted as soon as it is being served"
+            );
+
+            drop(client);
+            let _ = served.await.expect("the task finishes");
+
+            assert_eq!(
+                shared.metrics().socket_closed(SocketOutcome::Clean).get(),
+                1,
+                "a client that closes cleanly is counted as a clean ending"
+            );
+            let all: u64 = [
+                SocketOutcome::Clean,
+                SocketOutcome::ConnectTimeout,
+                SocketOutcome::NotAConnect,
+                SocketOutcome::Malformed,
+                SocketOutcome::Protocol,
+                SocketOutcome::Io,
+                SocketOutcome::Codec,
+                SocketOutcome::NotDurable,
+                SocketOutcome::Abandoned,
+            ]
+            .into_iter()
+            .map(|outcome| shared.metrics().socket_closed(outcome).get())
+            .sum();
+            assert_eq!(all, 1, "one socket, counted closed exactly once");
+        }
+
+        #[tokio::test]
+        async fn the_reason_a_connection_ends_is_counted_against_the_packet_that_carried_it() {
+            // A second connect is a protocol error, which the broker
+            // reports in a DISCONNECT. The reason code is the interesting
+            // half: a dashboard that says "twelve disconnects" and cannot
+            // say why is not worth scraping.
+            let shared = Arc::new(Shared::new(BrokerConfig::default()));
+            let mut client = serve_one(Arc::clone(&shared));
+
+            connect_v5(&mut client, "twice").await;
+            write(
+                &mut client,
+                &Packet::Connect(Box::new(connect("twice", 0))),
+                Version::V5,
+            )
+            .await;
+            let disconnect = next_disconnect(&mut client).await;
+            assert_eq!(disconnect.reason, ReasonCode::ProtocolError);
+
+            let metrics = shared.metrics();
+            assert_eq!(
+                metrics
+                    .reason_sent(PacketKind::Disconnect, ReasonCode::ProtocolError)
+                    .get(),
+                1,
+                "the reason the disconnect carried"
+            );
+            assert_eq!(
+                metrics
+                    .reason_sent(PacketKind::ConnAck, ReasonCode::Success)
+                    .get(),
+                1,
+                "the reason the acknowledgement carried"
+            );
+            assert_eq!(
+                metrics
+                    .reason_sent(PacketKind::ConnAck, ReasonCode::ProtocolError)
+                    .get(),
+                0,
+                "a disconnect's reason must not be counted against the acknowledgement"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_refusal_before_any_session_is_counted_too() {
+            // The connack that refuses a connect is written by `refuse`,
+            // which is a different path from the writer loop everything
+            // else goes through. A count that only covers the writer loop
+            // misses every refusal, which is the traffic an operator most
+            // wants to see.
+            let shared = Arc::new(Shared::new(BrokerConfig::default()));
+            let mut client = serve_one(Arc::clone(&shared));
+
+            write(
+                &mut client,
+                &Packet::Connect(Box::new(advertising(0))),
+                Version::V5,
+            )
+            .await;
+            assert_eq!(
+                connack_reason(&mut client, Version::V5).await,
+                ReasonCode::ProtocolError
+            );
+
+            let metrics = shared.metrics();
+            assert_eq!(
+                metrics
+                    .reason_sent(PacketKind::ConnAck, ReasonCode::ProtocolError)
+                    .get(),
+                1,
+                "the refusal's reason"
+            );
+            assert_eq!(
+                metrics.packet_sent(Version::V5, PacketKind::ConnAck).get(),
+                1,
+                "the refusal is a packet sent"
+            );
+            assert!(
+                metrics.bytes_sent().get() > 0,
+                "the refusal's bytes crossed the socket"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_subscribe_is_not_counted_as_a_publish() {
+            // Convention 5, and the first of task 2's mutations: a table
+            // that maps two packet types onto one handle passes every
+            // assertion above, because every one of them names a type
+            // nothing else shares a slot with.
+            let shared = Arc::new(Shared::new(BrokerConfig::default()));
+            let mut client = serve_one(Arc::clone(&shared));
+
+            connect_v5(&mut client, "subscriber").await;
+            write(
+                &mut client,
+                &Packet::Subscribe(Subscribe {
+                    packet_id: 1,
+                    filters: vec![SubscriptionOptions {
+                        filter: "a/b".into(),
+                        qos: QoS::AtMostOnce,
+                        no_local: false,
+                        retain_as_published: false,
+                        retain_handling: RetainHandling::DoNotSend,
+                    }],
+                    properties: Properties::default(),
+                }),
+                Version::V5,
+            )
+            .await;
+            match read(&mut client, Version::V5).await {
+                Packet::SubAck(_) => {}
+                other => panic!("expected a subscription acknowledgement, got {other:?}"),
+            }
+
+            let metrics = shared.metrics();
+            assert_eq!(
+                metrics
+                    .packet_received(Version::V5, PacketKind::Subscribe)
+                    .get(),
+                1
+            );
+            assert_eq!(
+                metrics
+                    .packet_received(Version::V5, PacketKind::Publish)
+                    .get(),
+                0,
+                "a subscribe is not a publish"
+            );
+            assert_eq!(
+                metrics.packet_sent(Version::V5, PacketKind::SubAck).get(),
+                1
+            );
         }
     }
 }

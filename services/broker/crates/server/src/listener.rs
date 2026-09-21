@@ -237,6 +237,12 @@ async fn accept_loop(
         // client than a prompt refusal it can retry elsewhere.
         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
             tracing::warn!(%peer, "a connection was refused: at the connection limit");
+            // Counted separately from a socket that was served and
+            // then closed: this one never reached `serve`, so nothing
+            // there can see it, and an operator reading a flat count
+            // of endings would not be able to tell a node at its
+            // limit from a node with churn.
+            shared.metrics().socket_refused().inc();
             drop(socket);
             continue;
         };
