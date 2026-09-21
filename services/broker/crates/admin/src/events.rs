@@ -414,6 +414,16 @@ impl Events {
     pub fn next_id(&self) -> EventId {
         self.ring.lock().next
     }
+
+    /// How many live feeds are open.
+    ///
+    /// One per open stream: the handler takes a receiver and hands
+    /// it to the task that feeds the socket, so this counts the
+    /// tasks that have not finished. It is what lets a test see the
+    /// per-stream cleanup path happen rather than assume it.
+    pub fn live_readers(&self) -> usize {
+        self.live.receiver_count()
+    }
 }
 
 // ---------------------------------------------------------------
@@ -1129,6 +1139,64 @@ mod tests {
         );
 
         stream.close().await;
+        admin.shutdown().await;
+    }
+
+    /// A client that goes away takes its stream's task with it.
+    ///
+    /// **The path development cannot exercise.** `services/web`'s
+    /// readme records what was measured about the development
+    /// server; whatever a proxy does, this is the guard that says
+    /// the broker end is right, and it runs against the broker
+    /// directly rather than through anything.
+    ///
+    /// **The cleanup is discovered by writing, not by waiting.** A
+    /// closed socket is a half close: the server may still write to
+    /// it, and only the peer's reset on that write ends the
+    /// connection. So the task does not notice a departed browser
+    /// until it has frames to send, and it takes more than one — the
+    /// first is written to a socket that has not complained yet. The
+    /// loop below publishes until it notices, which is what the
+    /// sampler does for real every second. A broker with a browser
+    /// that left and nothing happening since keeps the task, which
+    /// is a wait bounded by the next event rather than a leak.
+    #[tokio::test]
+    async fn a_client_that_goes_away_ends_its_stream() {
+        // An interval long enough that the sampler cannot be what
+        // ends this, so the only thing that can is the client
+        // leaving.
+        let admin = serve(Duration::from_secs(3600)).await;
+        let events = Arc::clone(admin.events());
+        assert_eq!(events.live_readers(), 0, "nothing is watching yet");
+
+        let mut stream = TestStream::open(admin.address(), "/api/v1/events", None).await;
+        assert_eq!(stream.head().await.status, 200);
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        while events.live_readers() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the stream never registered a reader"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(events.live_readers(), 1, "exactly one, for the one socket");
+
+        drop(stream);
+
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        let mut published = 0;
+        while events.live_readers() > 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the stream's task outlived the client that asked for it by \
+                 {published} events, so every tab a person closes leaves one \
+                 behind"
+            );
+            events.publish(connected("after-the-browser-left"));
+            published += 1;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
         admin.shutdown().await;
     }
 

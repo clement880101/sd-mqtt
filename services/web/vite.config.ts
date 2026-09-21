@@ -372,12 +372,64 @@ function attribution(root: string, bundled: Dependency[]): Plugin {
   };
 }
 
+/**
+ * Where the broker's admin listener is, in development.
+ *
+ * `sdmqtt-admin`'s own default port. Overridable because a second
+ * broker on a second port is a normal thing to be running.
+ */
+const BROKER = process.env.SDMQTT_ADMIN ?? 'http://127.0.0.1:1884';
+
+/**
+ * What the development server hands to the broker.
+ *
+ * **This direction, and not the other.** An earlier draft had the
+ * broker proxying to the development server, which means a streaming
+ * reverse proxy with WebSocket upgrade forwarding living in the
+ * shipped binary for the benefit of development. This is the same
+ * thing in a few lines of somebody else's configuration.
+ *
+ * The hot-reload socket is left alone: it is served by this server at
+ * its own path and must not be forwarded anywhere.
+ */
+const PROXIED = {
+  // The API, and the events stream with it.
+  '/api': BROKER,
+  // Liveness, readiness and the cluster view.
+  '/health': BROKER,
+  // The exposition endpoint.
+  '/metrics': BROKER,
+};
+
 export default defineConfig(({ command }) => {
   const root = import.meta.dirname;
   // Filled by the licence plugin's output generator during
   // `generateBundle`, read by `attribution` during `writeBundle`.
   const bundled: Dependency[] = [];
   return {
+    server: {
+      proxy: Object.fromEntries(
+        Object.entries(PROXIED).map(([prefix, target]) => [
+          prefix,
+          {
+            target,
+            // The broker is on loopback and has no virtual hosts, so
+            // rewriting Host would only make its logs harder to read.
+            changeOrigin: false,
+            // **The events stream must arrive event by event.** A
+            // proxy that buffers turns a live interface into one
+            // that updates in clumps, which is miserable to
+            // diagnose months later. Nothing here compresses or
+            // collects the body, and the broker sends
+            // `X-Accel-Buffering: no` for the intermediaries that
+            // would.
+            ws: false,
+            timeout: 0,
+            proxyTimeout: 0,
+          },
+        ]),
+      ),
+    },
     build: {
       // The default, named so that the build script embedding it and
       // the budget script weighing it are both pointing at something
