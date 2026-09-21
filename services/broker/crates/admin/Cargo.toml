@@ -99,6 +99,15 @@ bytes.workspace = true
 sdmqtt-server = { path = "../server", version = "0.1.0", features = ["testing"] }
 # The writer and the in-memory backend the gated store wraps.
 storage = { path = "../storage", version = "0.1.0", default-features = false }
+# Reading this crate's own answers back. The other tests here assert
+# with `contains` on the body, which is enough for a flat object; a
+# tap answers a ring of messages with sequence numbers, counters and
+# a cursor, and `contains` on that is convention 2's "assert the
+# category, not the value" wearing a different hat. Already in the
+# lock file because axum's `json` feature is built on it, and a
+# dev-dependency is not distributed, so this is invisible to the
+# direct-dependency budget of section 15.
+serde_json = "1"
 
 [lints]
 workspace = true

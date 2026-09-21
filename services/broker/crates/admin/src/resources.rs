@@ -655,7 +655,7 @@ async fn subscriptions(
 /// them; a list endpoint that can return a hundred rows of arbitrary
 /// payload can return a response of arbitrary size. Anything larger
 /// is described rather than sent, and says which reason.
-const MAX_INLINE_PAYLOAD: usize = 1024;
+pub const MAX_INLINE_PAYLOAD: usize = 1024;
 
 /// A message held for future subscribers of a topic.
 #[derive(Debug, Serialize)]
@@ -742,7 +742,7 @@ async fn retained(State(state): State<AdminState>, paging: Paging) -> Json<Page<
 /// resources are not guarded, and the listener's real protection
 /// until milestone 7 is where it listens.
 #[derive(Debug)]
-struct Authorized;
+pub struct Authorized;
 
 impl FromRequestParts<AdminState> for Authorized {
     type Rejection = ApiError;

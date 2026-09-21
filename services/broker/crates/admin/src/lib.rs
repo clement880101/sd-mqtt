@@ -37,6 +37,7 @@ pub mod error;
 pub mod events;
 pub mod health;
 pub mod resources;
+pub mod taps;
 
 #[cfg(test)]
 mod testing;
@@ -47,6 +48,7 @@ pub use error::{ApiError, ErrorCode};
 pub use events::{EventBody, EventId, Events};
 pub use health::Readiness;
 pub use resources::{ListenerProtocol, ListenerView};
+pub use taps::{Tap, TapLimits, Taps, IDLE_TIMEOUT, MAX_TAPS, TAP_CAPACITY};
 
 /// How often the events stream's numbers are sampled.
 ///
@@ -122,6 +124,12 @@ pub struct AdminState {
     /// Behind an [`Arc`] because this whole struct is cloned per
     /// request and a secret is not worth an allocation each time.
     pub token: Option<Arc<Token>>,
+    /// The live subscribers the interface reads.
+    ///
+    /// See [`taps`]: a tap is a real session inside the broker, so
+    /// this is where the cap, the rings and the leases live. Empty
+    /// on a broker nobody has pointed a Topics page at.
+    pub taps: Arc<Taps>,
 }
 
 impl AdminState {
@@ -143,6 +151,7 @@ impl AdminState {
             listeners: Arc::new(Vec::new()),
             started: Instant::now(),
             token: None,
+            taps: Arc::new(Taps::new()),
         }
     }
 
@@ -238,7 +247,10 @@ impl AdminServer {
 
         let (stop, stopped) = oneshot::channel();
         let events = Arc::clone(&state.events);
+        let taps = Arc::clone(&state.taps);
+        let shared = Arc::clone(&state.shared);
         let sampler = events::spawn_sampler(state.clone(), state.events_interval);
+        let reaper = taps::spawn_reaper(state.clone(), taps::REAP_INTERVAL);
         let signal = state.shutdown.clone();
         let router = router(state);
         let serve = tokio::spawn(async move {
@@ -267,7 +279,10 @@ impl AdminServer {
             stop: Some(stop),
             serve,
             sampler,
+            reaper,
             events,
+            taps,
+            shared,
         })
     }
 }
@@ -293,6 +308,7 @@ fn router(state: AdminState) -> Router {
         .merge(health::routes())
         .merge(resources::routes())
         .merge(events::routes())
+        .merge(taps::routes())
         // The interface, and the one error shape for everything that
         // is neither a route above nor a document. See [`assets`]:
         // the set of documents is not known until the build script
@@ -308,7 +324,10 @@ pub struct AdminRunning {
     stop: Option<oneshot::Sender<()>>,
     serve: JoinHandle<()>,
     sampler: JoinHandle<()>,
+    reaper: JoinHandle<()>,
     events: Arc<Events>,
+    taps: Arc<Taps>,
+    shared: Arc<Shared>,
 }
 
 impl AdminRunning {
@@ -316,6 +335,14 @@ impl AdminRunning {
     /// chose when the configuration asked for zero.
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// The taps this listener is holding.
+    ///
+    /// A test reads it; nothing else needs to, because a tap is
+    /// reached through the API that created it.
+    pub fn taps(&self) -> &Arc<Taps> {
+        &self.taps
     }
 
     /// The events ring this listener is serving.
@@ -335,6 +362,15 @@ impl AdminRunning {
     /// hanging on a browser tab. Reaching it is a defect and says
     /// so.
     pub async fn shutdown(mut self) {
+        // **Before the server stops, not after.** A tap is a session
+        // the broker believes is attached, and a session that is
+        // still attached when the process stops never had its
+        // departure written down. The reaper is stopped first so
+        // that it cannot be halfway through a sweep of the list this
+        // is emptying.
+        self.reaper.abort();
+        let _ = (&mut self.reaper).await;
+        self.taps.close_all(&self.shared);
         // Dropping the sender is the signal; sending is the same thing
         // said explicitly.
         drop(self.stop.take());

@@ -1001,6 +1001,7 @@ dependencies = [
  "parking_lot",
  "sdmqtt-server",
  "serde",
+ "serde_json",
  "storage",
  "thiserror",
  "tokio",

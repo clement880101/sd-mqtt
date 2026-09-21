@@ -97,6 +97,15 @@ pub enum ErrorCode {
     /// rather than where it is first thrown, because the set is meant
     /// to be readable in one place.
     Unauthorized,
+    /// A bounded thing this broker holds a fixed number of is full.
+    ///
+    /// Today that is taps: [`crate::taps::MAX_TAPS`] of them exist at
+    /// most, and the request to open one more is refused rather than
+    /// queued. Distinct from [`ErrorCode::InvalidRequest`] on
+    /// purpose — the request was perfectly well formed and would
+    /// succeed unchanged a moment later, which is exactly what a
+    /// client needs to know to decide whether to retry.
+    ResourceExhausted,
     /// Something went wrong that is not the caller's fault.
     Internal,
 }
@@ -112,6 +121,11 @@ impl ErrorCode {
             ErrorCode::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             ErrorCode::NotAcceptable => StatusCode::NOT_ACCEPTABLE,
             ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
+            // 429 rather than 503. The broker is healthy and every
+            // other request is being served; what the caller is
+            // being told is "not this one, not now", which is the
+            // status a client already knows to retry after.
+            ErrorCode::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
