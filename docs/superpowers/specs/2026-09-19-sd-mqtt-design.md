@@ -886,6 +886,23 @@ they cannot reach logs or crash output. Repeated authentication failures from
 one address are slowed by the limiter in section 10.3. Dollar-prefixed topics
 are not publishable by clients.
 
+**Half of that last sentence is true, and the half that is not is deferred to
+milestone 7.** The admin publish endpoint refuses a dollar-prefixed topic,
+because milestone 3 added it and it is a new way to write a *retained* one,
+which stays in the broker until somebody finds it. An MQTT connection is
+still allowed to publish one. That is older than this milestone and is
+deferred rather than forgotten, for two reasons. It needs a refusal expressed
+per protocol version — a reason code on the acknowledgement for v5, and for
+v3.1.1 either a silent discard or a socket close, which is section 13's
+problem and not a line of validation. And it changes the conformance
+baseline: Eclipse Paho's `test_dollar_topics` publishes to a dollar topic at
+at-least-once and asserts the publication succeeds, with a comment saying a
+server may refuse it and the test should then be omitted. So refusing it
+means adding a classified line to `conformance/known-failures.txt`, which
+belongs with the authorization work in milestone 7 where
+`test_subscribe_failure` is already deferred, rather than beside a change
+that must leave the baseline alone.
+
 ## 13. Error handling
 
 One reason-code enum spans the whole system, encoded per protocol version.

@@ -981,6 +981,31 @@ async fn publish(
                 },
             )?;
 
+            // Section 12.3: dollar-prefixed topics are not publishable.
+            //
+            // **This endpoint, and not yet a connection.** The rule is
+            // written about clients and the MQTT publish path does not
+            // enforce it; that is older than this endpoint and is
+            // deferred to milestone 7, where the authorization work it
+            // belongs with lives. What is not deferred is this, because
+            // this endpoint is a new way to write one — and a retained
+            // one, which stays until somebody finds it. A reserved
+            // namespace an operator can fill by accident from a form is
+            // worse than one a client can fill, because the form is the
+            // thing that looks sanctioned.
+            //
+            // Only the first level. `a/$b` is an ordinary topic and the
+            // matching layer already treats it as one.
+            if request.topic.starts_with('$') {
+                return Err(ApiError::in_field(
+                    ErrorCode::InvalidRequest,
+                    "topic",
+                    "the dollar-prefixed namespace is reserved for the broker and \
+                     is not publishable, so this endpoint will not write one. \
+                     Publish to a topic outside it.",
+                ));
+            }
+
             let now = broker.clock().now();
             let mut message = Message::new(&request.topic, payload, qos, request.retain);
             // The same two lines a connection's publish uses, so the
@@ -1797,6 +1822,62 @@ mod tests {
             }
             other => panic!("expected the publication, got {other:?}"),
         }
+
+        both.stop().await;
+    }
+
+    /// Section 12.3's reserved namespace, through the new door to it.
+    ///
+    /// **Retained, and the store checked afterwards.** A refusal that
+    /// arrives after the publication has been made is a different
+    /// answer to the same request and not a refusal at all, and the
+    /// version of it that hurts is the retained one, which stays in
+    /// the broker until somebody finds it. `a/$b` is asserted beside
+    /// it because the rule is about the first level: a check written
+    /// as "contains a dollar" would pass every other assertion here.
+    #[tokio::test]
+    async fn a_publish_into_the_dollar_namespace_is_refused_and_writes_nothing() {
+        let both = Both::start().await;
+        let address = both.admin.address();
+
+        for topic in ["$SYS/broker/uptime", "$share/group/x", "$"] {
+            let refused = testing::post_json(
+                address,
+                "/api/v1/publish",
+                None,
+                &format!("{{\"topic\":\"{topic}\",\"payload\":\"x\",\"retain\":true}}"),
+            )
+            .await;
+            assert_eq!(refused.status, 400, "{topic}: {}", refused.body);
+            assert!(
+                refused.body.contains("\"code\":\"invalid_request\""),
+                "{topic}: {}",
+                refused.body
+            );
+            assert!(
+                refused.body.contains("\"field\":\"topic\""),
+                "a form can mark the input without reading the sentence: {}",
+                refused.body
+            );
+        }
+
+        let retained = both.get("/api/v1/retained").await;
+        assert!(
+            !retained.body.contains('$'),
+            "nothing was written: {}",
+            retained.body
+        );
+
+        // And a dollar below the first level is an ordinary topic,
+        // which is what the matching layer already believes.
+        let allowed = testing::post_json(
+            address,
+            "/api/v1/publish",
+            None,
+            "{\"topic\":\"ordinary/$below\",\"payload\":\"x\",\"retain\":true}",
+        )
+        .await;
+        assert_eq!(allowed.status, 200, "{}", allowed.body);
 
         both.stop().await;
     }
