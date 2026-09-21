@@ -686,6 +686,23 @@ answers whether listeners are bound and storage is open. A cluster endpoint
 answers whether this node's view of membership is complete, so an operator
 can choose which one gates traffic.
 
+**Until milestone 7 there are no API keys, and the admin listener is
+protected by where it listens.** It binds the loopback address by default.
+A static bearer token may be configured, and mutating requests need it when
+one is set.
+
+Binding a non-loopback address with no token configured is **refused at
+startup**, not warned about. The endpoints include publishing and, later,
+deleting; an open one on a network interface is not a degraded mode but a
+hole, and this project already refuses rather than reinterprets a
+configuration that cannot mean what it says. The refusal names both the
+address and the missing key.
+
+The token is an interim. It is one secret with no scopes, no rotation and no
+per-user identity, which is precisely what milestone 7 replaces. It exists
+so that milestone 3 can be used and demonstrated without shipping something
+unprotected, and the configuration documents it as temporary.
+
 The events stream pushes counter deltas, connect and disconnect events, and
 rule outcomes. Events carry identifiers so a reconnecting browser resumes
 with the last-event header.
@@ -826,6 +843,15 @@ publish volume.
 
 Budgets are checked in CI. Exceeding one fails the build and requires either
 a fix or an explicit, recorded decision to move the budget.
+
+**This was not true when it was written and is being made true in milestone
+3.** Milestones 1 and 2 shipped with no budget enforced, which convention 8's
+walk found. Three of the five are cheap to check and are checked from
+milestone 3: the binary's size, the count of direct dependencies, and the
+gzipped interface bundle. Idle resident memory is measurable but needs a
+process started and settled, so it is checked as a scheduled job rather than
+on every push. The connection target is a load test, not a build gate, and is
+milestone 7's to prove.
 
 ## 16. Milestones
 
