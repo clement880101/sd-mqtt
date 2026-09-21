@@ -716,7 +716,10 @@ address and the missing key.
 The token is an interim. It is one secret with no scopes, no rotation and no
 per-user identity, which is precisely what milestone 7 replaces. It exists
 so that milestone 3 can be used and demonstrated without shipping something
-unprotected, and the configuration documents it as temporary.
+unprotected, and the configuration documents it as temporary. An empty token
+is refused wherever it is written — the file and `SDMQTT_ADMIN_TOKEN` read it
+the same way, because one value meaning two things in one program is how an
+operator comes to believe a listener is guarded when it is not.
 
 **Where it listens is an answer to another host, not to a browser on this
 one.** An ordinary cross-origin request is already stopped: every mutating

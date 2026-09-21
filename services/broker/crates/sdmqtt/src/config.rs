@@ -749,13 +749,27 @@ impl Config {
             self.admin.enabled = parse("SDMQTT_ADMIN_ENABLED", &value, "true or false")?;
         }
         if let Some(value) = lookup("SDMQTT_ADMIN_TOKEN") {
-            // An empty value clears the token rather than configuring
-            // an empty one, for the same reason
-            // `SDMQTT_STORAGE_DIRECTORY` clears the directory: it is
-            // the only way an environment can undo what a file set.
-            // A token of "" would otherwise be a secret that every
-            // request knows.
-            self.admin.token = (!value.is_empty()).then(|| Token::new(value));
+            // **Kept, empty and all, so that `validate` refuses it.**
+            //
+            // This read it as absent, by analogy with
+            // `SDMQTT_STORAGE_DIRECTORY`. The analogy does not hold.
+            // An empty directory means "no store", which is a state
+            // the broker has and documents; an empty token means "a
+            // token is configured" while protecting nothing, and the
+            // file's reading of exactly the same characters already
+            // refuses to start over it. One value read two ways in
+            // one program is the thing the empty-store-path fix
+            // corrected, and the safe reading is the refusal: an
+            // operator whose `SDMQTT_ADMIN_TOKEN` expanded to nothing
+            // was told the listener was guarded by a listener that
+            // had quietly decided it was not.
+            //
+            // The cost is that an environment can no longer take away
+            // a token a file set. That is not a loss worth having:
+            // the only thing it could accomplish is making a
+            // protected listener unprotected, which is what
+            // `admin.enabled = false` and a loopback address are for.
+            self.admin.token = Some(Token::new(value));
         }
         if let Some(value) = lookup("SDMQTT_ADMIN_ALLOWED_HOSTS") {
             // Comma separated, because an environment holds strings
@@ -1668,21 +1682,50 @@ mod tests {
         assert!(!config.admin.enabled);
     }
 
-    /// An empty token clears one a file set, rather than configuring a
-    /// secret that every request already knows.
+    /// One value, one reading, whichever source it came from.
+    ///
+    /// An empty token in the file is refused. It used to be read as
+    /// absent when it came from the environment, which is the same
+    /// value meaning two things in one program — and the dangerous
+    /// one of the two, because an operator whose variable expanded to
+    /// nothing was told the listener was guarded by a listener that
+    /// had decided it was not.
     #[test]
-    fn an_empty_token_in_the_environment_clears_it() {
-        let mut config = Config {
+    fn an_empty_token_is_refused_wherever_it_came_from() {
+        let from_the_file = Config::from_toml("[admin]\ntoken = \"\"\n").expect(
+            "it parses; it is validate that \
+                                                                 refuses it",
+        );
+        let said = from_the_file
+            .validate()
+            .expect_err("an empty token protects nothing")
+            .to_string();
+        assert!(said.contains("empty string"), "{said}");
+
+        let mut from_the_environment = Config {
             admin: AdminConfig {
                 token: Some(Token::new("from-the-file")),
                 ..AdminConfig::default()
             },
             ..Config::default()
         };
-        config
+        from_the_environment
             .apply_env(|variable| (variable == "SDMQTT_ADMIN_TOKEN").then(String::new))
-            .expect("an empty value is not an error");
-        assert_eq!(config.admin.token, None);
+            .expect("reading it is not the error; what it says is");
+        assert_eq!(
+            from_the_environment.admin.token.as_ref().map(Token::expose),
+            Some(""),
+            "it is kept rather than dropped, so that validate can see it"
+        );
+        assert_eq!(
+            from_the_environment
+                .validate()
+                .expect_err("the same value, refused the same way")
+                .to_string(),
+            said,
+            "and refused with the same sentence, so an operator reading one \
+             log line learns the same thing either way"
+        );
     }
 
     /// `--no-admin` absent must not turn a disabled listener back on.
