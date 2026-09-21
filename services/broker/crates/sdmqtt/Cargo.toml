@@ -9,6 +9,7 @@ description = "A distributed MQTT broker"
 
 [dependencies]
 sdmqtt-server = { path = "../server", version = "0.1.0" }
+sdmqtt-admin = { path = "../admin", version = "0.1.0" }
 broker-core = { path = "../broker-core", version = "0.1.0" }
 mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
 # With its default features, which is the redb backend: this is the

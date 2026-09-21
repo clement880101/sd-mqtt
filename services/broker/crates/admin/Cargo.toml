@@ -1,0 +1,63 @@
+[package]
+name = "sdmqtt-admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The admin listener for sd-mqtt: health, metrics, and the read resources"
+
+[dependencies]
+broker-core = { path = "../broker-core", version = "0.1.0" }
+mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
+sdmqtt-server = { path = "../server", version = "0.1.0" }
+# Default features off, and not for weight: they cost two crates.
+# `tower-log` routes tower's internals through a second logging facade
+# beside the tracing this project standardised on, and the form
+# extractor widens the surface of a JSON-only API. See the "Verified
+# again before milestone 3" notes in docs/research/component-selection.md.
+#
+# What is kept: `http1` because section 11.1 says HTTP/2 is deliberately
+# absent until TLS lands, `tokio` for `axum::serve` and its graceful
+# shutdown, `json` for every response body, `query` for pagination,
+# `matched-path` so a route can be named in a log line without the
+# identifiers in it, and `tracing` because it costs nothing new.
+#
+# There is no feature for the events stream. It is unconditional.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "tokio",
+    "json",
+    "query",
+    "matched-path",
+    "tracing",
+] }
+serde = { version = "1", features = ["derive"] }
+thiserror.workspace = true
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "net",
+    "sync",
+    "time",
+    "macros",
+] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# The admin tests speak HTTP over a real socket rather than calling the
+# router as a service, because half of what this crate owes is what a
+# socket sees: a status line, a content type, and a body that ends.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "net",
+    "io-util",
+] }
+# `tests` drive a real MQTT listener and read what the admin API says
+# about it, which needs the codec a client speaks.
+bytes.workspace = true
+storage = { path = "../storage", version = "0.1.0", default-features = false }
+
+[lints]
+workspace = true

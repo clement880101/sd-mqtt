@@ -59,10 +59,23 @@ struct Serve {
     /// written down and a restart loses every session.
     #[arg(long, value_name = "PATH")]
     store_directory: Option<PathBuf>,
+    /// Bind the admin listener here, overriding the file and the
+    /// environment.
+    #[arg(long, value_name = "ADDRESS")]
+    admin_address: Option<std::net::SocketAddr>,
+    /// Do not serve the admin listener.
+    #[arg(long)]
+    no_admin: bool,
     /// One of error, warn, info, debug or trace.
     #[arg(long, value_name = "LEVEL")]
     log_level: Option<LogLevel>,
 }
+
+// There is deliberately no `--admin-token`. A command line is visible
+// in `ps` to every user on the host and is kept in a shell's history,
+// so a flag is the one source of the three that cannot hold a secret
+// safely. The token comes from the configuration file or from
+// `SDMQTT_ADMIN_TOKEN`.
 
 impl Serve {
     /// What this asks the configuration to change.
@@ -72,6 +85,8 @@ impl Serve {
             max_connections: self.max_connections,
             mountpoint: self.mountpoint.clone(),
             store_directory: self.store_directory.clone(),
+            admin_address: self.admin_address,
+            no_admin: self.no_admin,
             log_level: self.log_level,
         }
     }
