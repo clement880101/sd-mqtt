@@ -36,6 +36,7 @@ pub mod config;
 pub mod error;
 pub mod events;
 pub mod health;
+pub mod host;
 pub mod resources;
 pub mod taps;
 
@@ -124,6 +125,13 @@ pub struct AdminState {
     /// Behind an [`Arc`] because this whole struct is cloned per
     /// request and a secret is not worth an allocation each time.
     pub token: Option<Arc<Token>>,
+    /// The hostnames this listener answers to beyond an address
+    /// literal and `localhost`.
+    ///
+    /// Set by [`AdminServer::bind`] from the configuration, for the
+    /// same reason the token is: the value the guard reads and the
+    /// value the operator wrote must be one thing.
+    pub allowed_hosts: Arc<[String]>,
     /// The live subscribers the interface reads.
     ///
     /// See [`taps`]: a tap is a real session inside the broker, so
@@ -151,6 +159,7 @@ impl AdminState {
             listeners: Arc::new(Vec::new()),
             started: Instant::now(),
             token: None,
+            allowed_hosts: Arc::from(Vec::new()),
             taps: Arc::new(Taps::new()),
         }
     }
@@ -166,6 +175,13 @@ impl AdminState {
     #[must_use]
     pub fn with_token(mut self, token: Option<Token>) -> Self {
         self.token = token.map(Arc::new);
+        self
+    }
+
+    /// Also answer to these hostnames. See [`host`].
+    #[must_use]
+    pub fn with_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.allowed_hosts = Arc::from(hosts);
         self
     }
 
@@ -216,7 +232,9 @@ impl AdminServer {
         // at all by reading `config.token`, so the guard that runs
         // per request must read the same field or the two could
         // disagree about whether this listener is protected.
-        let state = state.with_token(config.token.clone());
+        let state = state
+            .with_token(config.token.clone())
+            .with_allowed_hosts(config.allowed_hosts.clone());
         let listener =
             TcpListener::bind(config.address)
                 .await
@@ -315,6 +333,19 @@ fn router(state: AdminState) -> Router {
         // has run, so they are matched here rather than registered.
         .fallback(assets::fallback)
         .method_not_allowed_fallback(error::method_not_allowed)
+        // **Outside everything, including the fallbacks.** Section
+        // 11.1 protects this listener by where it listens, which is
+        // an answer to a program on another host and not to a
+        // browser on this one: DNS rebinding makes a page's request
+        // same-origin, so no preflight stops it. [`host`] checks the
+        // name the request was made under, which is the one thing
+        // the attack cannot forge. A layer rather than an extractor
+        // per handler, because the rule has no exceptions and an
+        // extractor a new route forgets is a rule with one.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            host::guard,
+        ))
         .with_state(state)
 }
 

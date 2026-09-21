@@ -718,6 +718,20 @@ per-user identity, which is precisely what milestone 7 replaces. It exists
 so that milestone 3 can be used and demonstrated without shipping something
 unprotected, and the configuration documents it as temporary.
 
+**Where it listens is an answer to another host, not to a browser on this
+one.** An ordinary cross-origin request is already stopped: every mutating
+endpoint takes a JSON body, which forces a preflight, and nothing here
+answers a preflight. DNS rebinding goes around that by making the page's
+request same-origin, and against the default configuration — loopback, no
+token — a page could then publish and read every retained payload. So the
+listener checks the name the request was made under: an address literal is
+answered, because a browser can only send one for a page this listener
+served; `localhost` is answered, because RFC 6761 reserves it; and
+`admin.allowed_hosts` names anything else an operator reaches it through.
+The port is not checked, so the development proxy still works. This is
+milestone 3's to fix because milestone 3 is the first that makes the admin
+listener something a browser is pointed at.
+
 The events stream pushes counter deltas, connect and disconnect events, and
 rule outcomes. Events carry identifiers so a reconnecting browser resumes
 with the last-event header.

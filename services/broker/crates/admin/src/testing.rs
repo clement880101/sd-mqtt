@@ -120,6 +120,25 @@ pub(crate) async fn post_json(
     with_body(address, "POST", path, token, Some(body)).await
 }
 
+/// `GET path` claiming to have been reached under `host`.
+///
+/// The `Host` field is what the check in [`crate::host`] reads, and
+/// it is the one header this client would otherwise never let a test
+/// choose: everything above sends the address it connected to.
+pub(crate) async fn get_with_host(address: SocketAddr, path: &str, host: &str) -> Response {
+    with_host(address, "GET", path, Some(host), None, None).await
+}
+
+/// `POST path` as JSON, claiming to have been reached under `host`.
+pub(crate) async fn post_json_with_host(
+    address: SocketAddr,
+    path: &str,
+    host: &str,
+    body: &str,
+) -> Response {
+    with_host(address, "POST", path, Some(host), None, Some(body)).await
+}
+
 /// One request, and the whole of the response.
 pub(crate) async fn with_body(
     address: SocketAddr,
@@ -128,6 +147,23 @@ pub(crate) async fn with_body(
     token: Option<&str>,
     body: Option<&str>,
 ) -> Response {
+    with_host(address, method, path, None, token, body).await
+}
+
+/// The same, with the `Host` field spelled out.
+///
+/// `None` is the address that was connected to, which is what every
+/// other helper here sends and what a client that is not testing this
+/// would send.
+pub(crate) async fn with_host(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    host: Option<&str>,
+    token: Option<&str>,
+    body: Option<&str>,
+) -> Response {
+    let host = host.map_or_else(|| address.to_string(), ToOwned::to_owned);
     let mut stream = TcpStream::connect(address)
         .await
         .expect("the admin listener accepts");
@@ -146,7 +182,7 @@ pub(crate) async fn with_body(
         None => String::new(),
     };
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
          {authorization}{content}\r\n{}",
         body.unwrap_or_default()
     );

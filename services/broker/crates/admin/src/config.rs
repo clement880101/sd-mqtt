@@ -89,6 +89,21 @@ pub struct AdminConfig {
     /// milestone 3 can be used and demonstrated without shipping
     /// something unprotected.
     pub token: Option<Token>,
+    /// Hostnames this listener answers to, besides the ones it always
+    /// answers to.
+    ///
+    /// Empty by default, and that is a complete configuration: an
+    /// address literal and `localhost` are answered whatever is in
+    /// here, which is every way the listener is normally reached.
+    /// This is for an operator who reaches it through a name of their
+    /// own.
+    ///
+    /// See [`crate::host`] for why a name is checked at all. The
+    /// short version: an ordinary cross-origin request is already
+    /// stopped by a preflight nobody answers, and DNS rebinding goes
+    /// around that by making the request same-origin, so the name it
+    /// was made under is the one thing left to check.
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for AdminConfig {
@@ -97,6 +112,7 @@ impl Default for AdminConfig {
             enabled: true,
             address: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), DEFAULT_PORT),
             token: None,
+            allowed_hosts: Vec::new(),
         }
     }
 }

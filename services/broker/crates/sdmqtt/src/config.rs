@@ -757,6 +757,19 @@ impl Config {
             // request knows.
             self.admin.token = (!value.is_empty()).then(|| Token::new(value));
         }
+        if let Some(value) = lookup("SDMQTT_ADMIN_ALLOWED_HOSTS") {
+            // Comma separated, because an environment holds strings
+            // and this is the one key of the set that is a list. An
+            // empty value is an empty list, which is the default and
+            // is a working configuration: an address literal and
+            // `localhost` are answered whatever is in here.
+            self.admin.allowed_hosts = value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
         if let Some(value) = lookup("SDMQTT_LOG") {
             self.log.level = parse("SDMQTT_LOG", &value, "log level")?;
         }
@@ -1627,7 +1640,7 @@ mod tests {
             admin: AdminConfig {
                 enabled: false,
                 address: "0.0.0.0:1884".parse().expect("a valid address"),
-                token: None,
+                ..AdminConfig::default()
             },
             ..Config::default()
         };
