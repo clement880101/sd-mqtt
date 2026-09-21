@@ -1,0 +1,907 @@
+//! Every hook point, reached through the broker.
+//!
+//! **Reached through the broker, and that is the whole point of this
+//! file.** Convention 5's last entry: a unit test of a chain is not a
+//! test of the caller that was supposed to walk it. `hooks.rs` already
+//! proves that a chain of decisions resolves correctly; nothing in it
+//! would notice if the broker never asked. And a hook point that never
+//! fires is a connector that silently never runs — no metric moves, no
+//! log line appears, and the only symptom is that nothing happens.
+//!
+//! So there is one test per firing site, and each drives the broker the
+//! way a client would: connect, subscribe, publish, disconnect, tick.
+//! Deleting any one firing site fails the test named after it.
+
+use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use broker_core::broker::{Broker, BrokerConfig};
+use broker_core::hooks::{ClientInfo, Credentials, Decision, Defaults, Disposition, Hook};
+use broker_core::session::message::Message;
+use broker_core::session::queue::DropReason;
+use broker_core::session::Action;
+use broker_core::subscriptions::SubscriberId;
+use bytes::Bytes;
+use mqtt_codec::packet::{Connect, Publish, Subscribe, SubscriptionOptions};
+use mqtt_codec::{Packet, Properties, QoS, ReasonCode, Version};
+
+// ---------------------------------------------------------------------
+// The clients this file drives the broker with.
+// ---------------------------------------------------------------------
+
+fn connect_packet(client: &str) -> Connect {
+    Connect {
+        version: Version::V5,
+        client_id: client.to_string(),
+        clean_start: true,
+        keep_alive: 0,
+        username: None,
+        password: None,
+        will: None,
+        properties: Properties::default(),
+    }
+}
+
+/// A session that outlives its connection, so it has an expiry to reach.
+fn durable_connect(client: &str, expiry: u32) -> Connect {
+    Connect {
+        clean_start: false,
+        properties: Properties {
+            session_expiry_interval: Some(expiry),
+            ..Properties::default()
+        },
+        ..connect_packet(client)
+    }
+}
+
+fn subscribe_packet(filter: &str, qos: QoS) -> Packet {
+    Packet::Subscribe(Subscribe {
+        packet_id: 1,
+        filters: vec![SubscriptionOptions {
+            filter: filter.to_string(),
+            qos,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: mqtt_codec::packet::RetainHandling::SendAlways,
+        }],
+        properties: Properties::default(),
+    })
+}
+
+fn publish_packet(topic: &str, qos: QoS, packet_id: Option<u16>) -> Packet {
+    Packet::Publish(Publish {
+        dup: false,
+        qos,
+        retain: false,
+        topic: topic.to_string(),
+        packet_id,
+        payload: Bytes::from_static(b"payload"),
+        properties: Properties::default(),
+    })
+}
+
+/// Connect a client and return its handle.
+fn join(broker: &mut Broker, client: &str) -> SubscriberId {
+    let mut out = Vec::new();
+    broker
+        .connect("", &connect_packet(client), &mut out)
+        .expect("the default decision authenticates")
+        .subscriber
+}
+
+/// Every publish in `out`, as topic and payload.
+fn published(out: &[(SubscriberId, Action)]) -> Vec<(SubscriberId, String)> {
+    out.iter()
+        .filter_map(|(to, action)| match action {
+            Action::Send(Packet::Publish(publish)) => Some((*to, publish.topic.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every acknowledgement reason in `out`.
+fn ack_reasons(out: &[(SubscriberId, Action)]) -> Vec<ReasonCode> {
+    out.iter()
+        .filter_map(|(_, action)| match action {
+            Action::Send(Packet::PubAck(ack)) => Some(ack.reason),
+            Action::Send(Packet::PubRec(ack)) => Some(ack.reason),
+            _ => None,
+        })
+        .collect()
+}
+
+fn suback_reasons(out: &[(SubscriberId, Action)]) -> Vec<ReasonCode> {
+    out.iter()
+        .find_map(|(_, action)| match action {
+            Action::Send(Packet::SubAck(ack)) => Some(ack.reasons.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------
+// The hooks.
+// ---------------------------------------------------------------------
+
+/// Writes down which points it was told about, in order.
+///
+/// A list of strings rather than counters: the order two hooks fire in
+/// is part of what several of these tests are about, and a counter
+/// cannot say it.
+#[derive(Default)]
+struct Recorder {
+    seen: Mutex<Vec<String>>,
+}
+
+impl Recorder {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().expect("no test panics holding it").clone()
+    }
+
+    fn saw(&self, what: impl Into<String>) {
+        self.seen
+            .lock()
+            .expect("no test panics holding it")
+            .push(what.into());
+    }
+
+    fn count(&self, prefix: &str) -> usize {
+        self.seen()
+            .iter()
+            .filter(|entry| entry.starts_with(prefix))
+            .count()
+    }
+}
+
+impl Hook for Recorder {
+    fn name(&self) -> &str {
+        "recorder"
+    }
+
+    fn authenticate(&self, credentials: &Credentials<'_>) -> Decision {
+        self.saw(format!("authenticate {}", credentials.client_id));
+        Decision::Next
+    }
+
+    fn authorize_publish(&self, client: &ClientInfo<'_>, message: &Message) -> Decision {
+        self.saw(format!(
+            "authorize_publish {} {}",
+            client.client_id, message.topic
+        ));
+        Decision::Next
+    }
+
+    fn authorize_subscribe(&self, client: &ClientInfo<'_>, filter: &str, _qos: QoS) -> Decision {
+        self.saw(format!("authorize_subscribe {} {filter}", client.client_id));
+        Decision::Next
+    }
+
+    fn message_received(&self, client: &ClientInfo<'_>, message: &mut Message) -> Disposition {
+        self.saw(format!(
+            "message_received {} {}",
+            client.client_id, message.topic
+        ));
+        Disposition::Deliver
+    }
+
+    fn message_delivered(&self, to: &ClientInfo<'_>, publish: &Publish) {
+        self.saw(format!(
+            "message_delivered {} {}",
+            to.client_id, publish.topic
+        ));
+    }
+
+    fn message_dropped(&self, to: &ClientInfo<'_>, topic: &str, _qos: QoS, reason: DropReason) {
+        self.saw(format!(
+            "message_dropped {} {topic} {reason:?}",
+            to.client_id
+        ));
+    }
+
+    fn client_connected(&self, client: &ClientInfo<'_>) {
+        self.saw(format!("client_connected {}", client.client_id));
+    }
+
+    fn client_disconnected(&self, client: &ClientInfo<'_>) {
+        self.saw(format!("client_disconnected {}", client.client_id));
+    }
+
+    fn session_expired(&self, client: &ClientInfo<'_>) {
+        self.saw(format!("session_expired {}", client.client_id));
+    }
+}
+
+/// Answers one authorizing point with a canned decision and the rest
+/// with `Next`.
+struct Authorizer {
+    authenticate: Decision,
+    publish: Decision,
+    subscribe: Decision,
+    /// Set the moment this hook is asked anything, so a test can say
+    /// that a chain stopped before reaching it.
+    asked: AtomicBool,
+}
+
+impl Authorizer {
+    fn new() -> Self {
+        Self {
+            authenticate: Decision::Next,
+            publish: Decision::Next,
+            subscribe: Decision::Next,
+            asked: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Hook for Authorizer {
+    fn name(&self) -> &str {
+        "authorizer"
+    }
+
+    fn authenticate(&self, _credentials: &Credentials<'_>) -> Decision {
+        self.asked.store(true, Ordering::Relaxed);
+        self.authenticate
+    }
+
+    fn authorize_publish(&self, _client: &ClientInfo<'_>, _message: &Message) -> Decision {
+        self.asked.store(true, Ordering::Relaxed);
+        self.publish
+    }
+
+    fn authorize_subscribe(&self, _client: &ClientInfo<'_>, _filter: &str, _qos: QoS) -> Decision {
+        self.asked.store(true, Ordering::Relaxed);
+        self.subscribe
+    }
+}
+
+/// Moves every message from one topic to another.
+struct Mover {
+    from: &'static str,
+    to: &'static str,
+}
+
+impl Hook for Mover {
+    fn name(&self) -> &str {
+        "mover"
+    }
+
+    fn message_received(&self, _client: &ClientInfo<'_>, message: &mut Message) -> Disposition {
+        if &*message.topic == self.from {
+            message.topic = Arc::from(self.to);
+        }
+        Disposition::Deliver
+    }
+}
+
+struct Swallower;
+
+impl Hook for Swallower {
+    fn name(&self) -> &str {
+        "swallower"
+    }
+
+    fn message_received(&self, _client: &ClientInfo<'_>, _message: &mut Message) -> Disposition {
+        Disposition::Drop
+    }
+}
+
+// ---------------------------------------------------------------------
+// 1. authenticate
+// ---------------------------------------------------------------------
+
+#[test]
+fn the_authenticate_hook_fires_on_a_connect() {
+    let recorder = Recorder::new();
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(recorder.clone());
+
+    join(&mut broker, "c");
+    assert_eq!(recorder.seen()[0], "authenticate c");
+}
+
+#[test]
+fn a_denied_connect_registers_nothing() {
+    let mut denier = Authorizer::new();
+    denier.authenticate = Decision::Deny;
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(Arc::new(denier));
+
+    let mut out = Vec::new();
+    let refused = broker.connect("", &connect_packet("c"), &mut out);
+    assert_eq!(refused, Err(ReasonCode::NotAuthorized));
+    assert_eq!(broker.session_count(), 0, "nothing may be registered");
+    assert!(out.is_empty(), "and nothing may be owed");
+}
+
+#[test]
+fn a_denied_connect_does_not_displace_the_incumbent() {
+    // The reason the chain runs before anything else happens. A
+    // rejected connection that had already displaced the live one
+    // would let an unauthenticated client hang up anybody it could
+    // name.
+    let holder = Arc::new(Authorizer::new());
+    let mut broker = Broker::new(BrokerConfig::default());
+
+    let incumbent = join(&mut broker, "c");
+    broker.hooks_mut().install(holder);
+    let denier = {
+        let mut denier = Authorizer::new();
+        denier.authenticate = Decision::Deny;
+        Arc::new(denier)
+    };
+    broker.hooks_mut().install(denier);
+
+    let mut out = Vec::new();
+    assert_eq!(
+        broker.connect("", &connect_packet("c"), &mut out),
+        Err(ReasonCode::NotAuthorized)
+    );
+    assert!(out.is_empty(), "the incumbent was not told to close");
+    assert!(
+        broker
+            .session(incumbent)
+            .is_some_and(broker_core::session::Session::is_connected),
+        "the incumbent is still attached"
+    );
+}
+
+#[test]
+fn a_chain_of_nexts_reaches_the_connect_default_both_ways() {
+    // The default applied in the broker, not in the chain: a test of
+    // `Hooks` alone cannot say the broker consults it.
+    for (default, expected) in [(true, true), (false, false)] {
+        let mut broker = Broker::new(BrokerConfig::default());
+        broker.hooks_mut().install(Arc::new(Authorizer::new()));
+        broker.hooks_mut().set_defaults(Defaults {
+            authenticate: default,
+            ..Defaults::default()
+        });
+
+        let mut out = Vec::new();
+        let outcome = broker.connect("", &connect_packet("c"), &mut out);
+        assert_eq!(outcome.is_ok(), expected, "default {default}");
+    }
+}
+
+// ---------------------------------------------------------------------
+// 2. authorize publish
+// ---------------------------------------------------------------------
+
+#[test]
+fn the_authorize_publish_hook_fires_on_a_publish() {
+    let recorder = Recorder::new();
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(recorder.clone());
+
+    let publisher = join(&mut broker, "p");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            publisher,
+            &publish_packet("a/b", QoS::AtMostOnce, None),
+            &mut out,
+        )
+        .expect("a well formed publish");
+
+    assert_eq!(recorder.count("authorize_publish p a/b"), 1);
+}
+
+#[test]
+fn a_denied_publish_reaches_nobody_and_says_why() {
+    let mut denier = Authorizer::new();
+    denier.publish = Decision::Deny;
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(Arc::new(denier));
+
+    let subscriber = join(&mut broker, "s");
+    let publisher = join(&mut broker, "p");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+
+    out.clear();
+    broker
+        .handle(
+            publisher,
+            &publish_packet("a/b", QoS::AtLeastOnce, Some(7)),
+            &mut out,
+        )
+        .expect("a well formed publish");
+
+    assert!(published(&out).is_empty(), "nobody may receive it");
+    assert_eq!(
+        ack_reasons(&out),
+        vec![ReasonCode::NotAuthorized],
+        "and the publisher is told why, rather than told nobody listened"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 3. authorize subscribe
+// ---------------------------------------------------------------------
+
+#[test]
+fn the_authorize_subscribe_hook_fires_on_a_subscribe() {
+    let recorder = Recorder::new();
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(recorder.clone());
+
+    let subscriber = join(&mut broker, "s");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+
+    assert_eq!(recorder.count("authorize_subscribe s a/b"), 1);
+}
+
+#[test]
+fn a_denied_subscribe_leaves_nothing_behind() {
+    let mut denier = Authorizer::new();
+    denier.subscribe = Decision::Deny;
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(Arc::new(denier));
+
+    let subscriber = join(&mut broker, "s");
+    let publisher = join(&mut broker, "p");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+
+    assert_eq!(suback_reasons(&out), vec![ReasonCode::NotAuthorized]);
+    assert_eq!(broker.subscription_count(), 0, "nothing in the trie");
+
+    out.clear();
+    broker
+        .handle(
+            publisher,
+            &publish_packet("a/b", QoS::AtMostOnce, None),
+            &mut out,
+        )
+        .expect("a well formed publish");
+    assert!(
+        published(&out).is_empty(),
+        "a refused filter must not deliver"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 4 and 5. message received: rewriting, and dropping.
+// ---------------------------------------------------------------------
+
+#[test]
+fn the_message_received_hook_fires_before_matching() {
+    let recorder = Recorder::new();
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(recorder.clone());
+
+    let subscriber = join(&mut broker, "s");
+    let publisher = join(&mut broker, "p");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    broker
+        .handle(
+            publisher,
+            &publish_packet("a/b", QoS::AtMostOnce, None),
+            &mut out,
+        )
+        .expect("a well formed publish");
+
+    let seen = recorder.seen();
+    let received = seen
+        .iter()
+        .position(|entry| entry == "message_received p a/b")
+        .expect("the hook should have fired");
+    let delivered = seen
+        .iter()
+        .position(|entry| entry.starts_with("message_delivered"))
+        .expect("and the message should have gone out");
+    assert!(
+        received < delivered,
+        "the message hook runs before the message is matched: {seen:?}"
+    );
+}
+
+#[test]
+fn a_rewritten_topic_decides_where_the_message_goes() {
+    // The test that proves the rewrite happens before matching rather
+    // than after. A rewrite applied afterwards would route by the old
+    // topic and deliver the new one, and only a subscriber on each
+    // topic can tell the two apart.
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(Arc::new(Mover {
+        from: "raw/telemetry",
+        to: "cooked/telemetry",
+    }));
+
+    let on_old = join(&mut broker, "old");
+    let on_new = join(&mut broker, "new");
+    let publisher = join(&mut broker, "p");
+
+    let mut out = Vec::new();
+    broker
+        .handle(
+            on_old,
+            &subscribe_packet("raw/telemetry", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    broker
+        .handle(
+            on_new,
+            &subscribe_packet("cooked/telemetry", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+
+    out.clear();
+    broker
+        .handle(
+            publisher,
+            &publish_packet("raw/telemetry", QoS::AtMostOnce, None),
+            &mut out,
+        )
+        .expect("a well formed publish");
+
+    assert_eq!(
+        published(&out),
+        vec![(on_new, "cooked/telemetry".to_string())],
+        "the rewritten topic is what was matched and what was delivered"
+    );
+}
+
+#[test]
+fn a_dropped_message_reaches_nobody_and_is_counted() {
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(Arc::new(Swallower));
+
+    let subscriber = join(&mut broker, "s");
+    let publisher = join(&mut broker, "p");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+
+    out.clear();
+    broker
+        .handle(
+            publisher,
+            &publish_packet("a/b", QoS::AtLeastOnce, Some(3)),
+            &mut out,
+        )
+        .expect("a well formed publish");
+
+    assert!(published(&out).is_empty(), "no subscriber receives it");
+    assert_eq!(
+        ack_reasons(&out),
+        vec![ReasonCode::NoMatchingSubscribers],
+        "and the count of who received it is zero, which is what the \
+         acknowledgement carries"
+    );
+}
+
+#[test]
+fn a_dropped_message_is_not_retained() {
+    // A hook refused it, so leaving it on the topic for the next
+    // subscriber would deliver the thing that was refused, later.
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(Arc::new(Swallower));
+
+    let publisher = join(&mut broker, "p");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            publisher,
+            &Packet::Publish(Publish {
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: true,
+                topic: "a/b".to_string(),
+                packet_id: None,
+                payload: Bytes::from_static(b"payload"),
+                properties: Properties::default(),
+            }),
+            &mut out,
+        )
+        .expect("a well formed publish");
+
+    assert_eq!(broker.retained_count(), 0);
+}
+
+// ---------------------------------------------------------------------
+// 6 and 7. delivered, and dropped.
+// ---------------------------------------------------------------------
+
+#[test]
+fn the_message_delivered_hook_fires_on_a_delivery() {
+    let recorder = Recorder::new();
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(recorder.clone());
+
+    let subscriber = join(&mut broker, "s");
+    let publisher = join(&mut broker, "p");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    broker
+        .handle(
+            publisher,
+            &publish_packet("a/b", QoS::AtMostOnce, None),
+            &mut out,
+        )
+        .expect("a well formed publish");
+
+    assert_eq!(recorder.count("message_delivered s a/b"), 1);
+}
+
+#[test]
+fn the_message_dropped_hook_fires_on_a_discard() {
+    let recorder = Recorder::new();
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(recorder.clone());
+
+    // A fire-and-forget message to a session with nobody attached is
+    // discarded by its queue rather than held, and the client never
+    // learns of it: exactly the discard section 11.3 wants a hook on.
+    let subscriber = join(&mut broker, "s");
+    let publisher = join(&mut broker, "p");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    broker.disconnect(subscriber, &mut out);
+
+    broker
+        .handle(
+            publisher,
+            &publish_packet("a/b", QoS::AtMostOnce, None),
+            &mut out,
+        )
+        .expect("a well formed publish");
+
+    assert_eq!(
+        recorder.count("message_dropped s a/b QosZeroWhileOffline"),
+        1
+    );
+}
+
+// ---------------------------------------------------------------------
+// 8, 9 and 10. connected, disconnected, expired.
+// ---------------------------------------------------------------------
+
+#[test]
+fn the_client_connected_hook_fires_on_a_connect() {
+    let recorder = Recorder::new();
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(recorder.clone());
+
+    join(&mut broker, "c");
+    assert_eq!(recorder.count("client_connected c"), 1);
+}
+
+#[test]
+fn the_client_disconnected_hook_fires_when_the_connection_goes() {
+    let recorder = Recorder::new();
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(recorder.clone());
+
+    let client = join(&mut broker, "c");
+    let mut out = Vec::new();
+    broker.disconnect(client, &mut out);
+
+    assert_eq!(recorder.count("client_disconnected c"), 1);
+
+    // And not twice: a socket that closes after a disconnect packet
+    // reaches the same path a second time.
+    broker.disconnect(client, &mut out);
+    assert_eq!(recorder.count("client_disconnected c"), 1);
+}
+
+#[test]
+fn the_session_expired_hook_fires_when_the_session_goes() {
+    let recorder = Recorder::new();
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(recorder.clone());
+
+    let mut out = Vec::new();
+    let client = broker
+        .connect("", &durable_connect("c", 1), &mut out)
+        .expect("the default decision authenticates")
+        .subscriber;
+    broker.disconnect(client, &mut out);
+
+    for _ in 0..4 {
+        broker.tick(&mut out);
+    }
+
+    assert_eq!(recorder.count("session_expired c"), 1);
+    assert_eq!(broker.session_count(), 0);
+}
+
+#[test]
+fn a_session_destroyed_reports_what_it_was_holding_before_it_says_it_ended() {
+    // The expiry path takes the session out of the registry before it
+    // clears the queue, so the drops it owes have nothing left to look
+    // their owner up by. Guarded here because the symptom of getting
+    // it wrong is a connector that sees a session end and never learns
+    // what ending it discarded.
+    let recorder = Recorder::new();
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(recorder.clone());
+
+    let mut out = Vec::new();
+    let subscriber = broker
+        .connect("", &durable_connect("s", 1), &mut out)
+        .expect("the default decision authenticates")
+        .subscriber;
+    let publisher = join(&mut broker, "p");
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtLeastOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    broker.disconnect(subscriber, &mut out);
+    // Queued rather than sent: nobody is attached, and level one is
+    // held for the session rather than discarded.
+    broker
+        .handle(
+            publisher,
+            &publish_packet("a/b", QoS::AtLeastOnce, Some(1)),
+            &mut out,
+        )
+        .expect("a well formed publish");
+
+    for _ in 0..4 {
+        broker.tick(&mut out);
+    }
+
+    let seen = recorder.seen();
+    let dropped = seen
+        .iter()
+        .position(|entry| entry.starts_with("message_dropped s a/b SessionEnded"))
+        .expect("the queued message was discarded and must be reported");
+    let expired = seen
+        .iter()
+        .position(|entry| entry == "session_expired s")
+        .expect("and the session ended");
+    assert!(dropped < expired, "in that order: {seen:?}");
+}
+
+// ---------------------------------------------------------------------
+// All of them at once.
+// ---------------------------------------------------------------------
+
+#[test]
+fn every_one_of_the_nine_points_fires_in_one_history() {
+    // Section 9.3 lists nine. This drives a history that reaches all
+    // of them, so a point added to the trait and never wired up is one
+    // missing entry here rather than something nobody looks for.
+    let recorder = Recorder::new();
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(recorder.clone());
+
+    let mut out = Vec::new();
+    let subscriber = broker
+        .connect("", &durable_connect("s", 1), &mut out)
+        .expect("the default decision authenticates")
+        .subscriber;
+    let publisher = join(&mut broker, "p");
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtLeastOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    broker
+        .handle(
+            publisher,
+            &publish_packet("a/b", QoS::AtLeastOnce, Some(1)),
+            &mut out,
+        )
+        .expect("a well formed publish");
+    broker.disconnect(subscriber, &mut out);
+    // A fire-and-forget message to the now-offline session, which its
+    // queue discards.
+    broker
+        .handle(
+            publisher,
+            &publish_packet("a/b", QoS::AtMostOnce, None),
+            &mut out,
+        )
+        .expect("a well formed publish");
+    for _ in 0..4 {
+        broker.tick(&mut out);
+    }
+
+    for point in [
+        "authenticate",
+        "authorize_publish",
+        "authorize_subscribe",
+        "message_received",
+        "message_delivered",
+        "message_dropped",
+        "client_connected",
+        "client_disconnected",
+        "session_expired",
+    ] {
+        assert!(
+            recorder.count(point) > 0,
+            "{point} never fired: {:?}",
+            recorder.seen()
+        );
+    }
+}
+
+#[test]
+fn a_broker_with_no_hooks_behaves_exactly_as_it_did() {
+    // The upgrade guarantee. Nothing installed means every default
+    // applies and every path is the one that was there before.
+    let mut broker = Broker::new(BrokerConfig::default());
+    assert!(broker.hooks().is_empty());
+
+    let subscriber = join(&mut broker, "s");
+    let publisher = join(&mut broker, "p");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    assert_eq!(suback_reasons(&out), vec![ReasonCode::Success]);
+
+    out.clear();
+    broker
+        .handle(
+            publisher,
+            &publish_packet("a/b", QoS::AtLeastOnce, Some(1)),
+            &mut out,
+        )
+        .expect("a well formed publish");
+    assert_eq!(published(&out), vec![(subscriber, "a/b".to_string())]);
+    assert_eq!(ack_reasons(&out), vec![ReasonCode::Success]);
+}

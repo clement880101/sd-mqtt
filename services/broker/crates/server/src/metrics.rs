@@ -1086,8 +1086,11 @@ sdmqtt_packets_received_total{kind=\"unsubscribe\",version=\"5\"} 0
 
         let mut handles = Vec::new();
         for (at, name) in ["one", "two", "three"].iter().enumerate() {
-            let registration =
-                shared.with_broker(|broker| broker.connect("", &connect(name), &mut Vec::new()));
+            let registration = shared.with_broker(|broker| {
+                broker
+                    .connect("", &connect(name), &mut Vec::new())
+                    .expect("the default decision authenticates")
+            });
             // One subscription for the first, two for the second,
             // three for the third: six in total, which no count of
             // sessions can be mistaken for.
@@ -1174,23 +1177,25 @@ sdmqtt_packets_received_total{kind=\"unsubscribe\",version=\"5\"} 0
         shared.metrics().watch(&shared);
 
         let registration = shared.with_broker(|broker| {
-            broker.connect(
-                "",
-                &Connect {
-                    version: Version::V5,
-                    client_id: "waiting".into(),
-                    clean_start: false,
-                    keep_alive: 0,
-                    username: None,
-                    password: None,
-                    will: None,
-                    properties: Properties {
-                        session_expiry_interval: Some(3600),
-                        ..Properties::default()
+            broker
+                .connect(
+                    "",
+                    &Connect {
+                        version: Version::V5,
+                        client_id: "waiting".into(),
+                        clean_start: false,
+                        keep_alive: 0,
+                        username: None,
+                        password: None,
+                        will: None,
+                        properties: Properties {
+                            session_expiry_interval: Some(3600),
+                            ..Properties::default()
+                        },
                     },
-                },
-                &mut Vec::new(),
-            )
+                    &mut Vec::new(),
+                )
+                .expect("the default decision authenticates")
         });
         shared.with_broker(|broker| {
             broker
@@ -1233,20 +1238,22 @@ sdmqtt_packets_received_total{kind=\"unsubscribe\",version=\"5\"} 0
 
         // The session ends, and its queue with it.
         shared.with_broker(|broker| {
-            broker.connect(
-                "",
-                &Connect {
-                    version: Version::V5,
-                    client_id: "waiting".into(),
-                    clean_start: true,
-                    keep_alive: 0,
-                    username: None,
-                    password: None,
-                    will: None,
-                    properties: Properties::default(),
-                },
-                &mut Vec::new(),
-            )
+            broker
+                .connect(
+                    "",
+                    &Connect {
+                        version: Version::V5,
+                        client_id: "waiting".into(),
+                        clean_start: true,
+                        keep_alive: 0,
+                        username: None,
+                        password: None,
+                        will: None,
+                        properties: Properties::default(),
+                    },
+                    &mut Vec::new(),
+                )
+                .expect("the default decision authenticates")
         });
         assert_eq!(
             gauge(&shared.metrics().render(), "sdmqtt_queue_depth"),

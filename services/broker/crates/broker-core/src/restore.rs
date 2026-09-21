@@ -155,6 +155,16 @@ pub fn restore(broker: &mut Broker, restored: &Restored, now: u32) -> Restoratio
         .clock()
         .advance(now.saturating_sub(broker.clock().now()));
 
+    // **The hooks are taken out for the duration**, and the reason is
+    // the same as [`Broker::discard_journal`]'s. Restore walks the
+    // paths a live client walks, so a connector left installed would
+    // be told that every session in the store just connected and that
+    // every subscription in it was just made, and an outbound one
+    // would post a restart's worth of envelopes for events that
+    // happened before the broker stopped. Nothing here is new; it is
+    // being read back.
+    let hooks = std::mem::take(broker.hooks_mut());
+
     let mut report = Restoration::default();
     let mut actions = Vec::new();
 
@@ -195,6 +205,7 @@ pub fn restore(broker: &mut Broker, restored: &Restored, now: u32) -> Restoratio
     }
 
     broker.discard_journal();
+    *broker.hooks_mut() = hooks;
     report
 }
 
@@ -230,6 +241,7 @@ fn restore_session(
     actions.clear();
     let handle = broker
         .connect(&record.key.mountpoint, &connect, actions)
+        .expect("restore runs with no hooks installed, so nothing can refuse")
         .subscriber;
     actions.clear();
 
@@ -431,6 +443,7 @@ mod tests {
             let handle = self
                 .broker
                 .connect("", &connect, &mut self.actions)
+                .expect("the default decision authenticates")
                 .subscriber;
             self.commit();
             handle
@@ -522,7 +535,10 @@ mod tests {
             },
         };
         let mut actions = Vec::new();
-        broker.connect("", &connect, &mut actions).session_present
+        broker
+            .connect("", &connect, &mut actions)
+            .expect("the default decision authenticates")
+            .session_present
     }
 
     #[test]
@@ -599,6 +615,7 @@ mod tests {
                 },
                 &mut actions,
             )
+            .expect("the default decision authenticates")
             .subscriber;
         actions.clear();
         rebuilt
@@ -657,6 +674,7 @@ mod tests {
                 },
                 &mut actions,
             )
+            .expect("the default decision authenticates")
             .subscriber;
         actions.clear();
         rebuilt

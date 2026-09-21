@@ -114,7 +114,9 @@ fn with_will(connect: &mut Connect, delay: Option<u32>) {
 fn broker_with_a_watcher() -> (Broker, SubscriberId) {
     let mut broker = Broker::new(BrokerConfig::default());
     let mut out = Vec::new();
-    let watcher = broker.connect("", &connect_packet("watcher", 0), &mut out);
+    let watcher = broker
+        .connect("", &connect_packet("watcher", 0), &mut out)
+        .expect("the default decision authenticates");
     broker
         .handle(
             watcher.subscriber,
@@ -242,7 +244,7 @@ proptest! {
 
         for (index, filter) in filters.iter().enumerate() {
             let client = format!("c{index}");
-            let registration = broker.connect("", &connect_packet(&client, 0), &mut out);
+            let registration = broker.connect("", &connect_packet(&client, 0), &mut out).expect("the default decision authenticates");
             broker
                 .handle(
                     registration.subscriber,
@@ -286,7 +288,7 @@ proptest! {
         let mut broker = Broker::new(BrokerConfig::default());
         let mut out = Vec::new();
 
-        let registration = broker.connect("", &connect_packet("c", 0), &mut out);
+        let registration = broker.connect("", &connect_packet("c", 0), &mut out).expect("the default decision authenticates");
         for filter in &filters {
             broker
                 .handle(
@@ -330,7 +332,7 @@ proptest! {
         let mut out = Vec::new();
 
         // A watcher subscribed to the will topic.
-        let watcher = broker.connect("", &connect_packet("watcher", 0), &mut out);
+        let watcher = broker.connect("", &connect_packet("watcher", 0), &mut out).expect("the default decision authenticates");
         broker
             .handle(
                 watcher.subscriber,
@@ -350,7 +352,7 @@ proptest! {
                 ..Properties::default()
             },
         });
-        let device = broker.connect("", &connect, &mut out);
+        let device = broker.connect("", &connect, &mut out).expect("the default decision authenticates");
 
         out.clear();
         broker.disconnect(device.subscriber, &mut out);
@@ -358,7 +360,7 @@ proptest! {
         let mut fired = 0;
         for second in 1..=40u32 {
             if returns_after == Some(second) {
-                broker.connect("", &connect_packet("device", 0), &mut out);
+                broker.connect("", &connect_packet("device", 0), &mut out).expect("the default decision authenticates");
             }
             out.clear();
             broker.tick(&mut out);
@@ -392,7 +394,7 @@ proptest! {
         let mut broker = Broker::new(BrokerConfig::default());
         let mut out = Vec::new();
 
-        let registration = broker.connect("", &durable_connect("c", 5), &mut out);
+        let registration = broker.connect("", &durable_connect("c", 5), &mut out).expect("the default decision authenticates");
 
         for filter in &filters {
             broker
@@ -428,14 +430,14 @@ proptest! {
         let mut broker = Broker::new(BrokerConfig::default());
         let mut out = Vec::new();
 
-        let author = broker.connect("", &connect_packet("author", 0), &mut out);
+        let author = broker.connect("", &connect_packet("author", 0), &mut out).expect("the default decision authenticates");
         let mut request = subscribe_packet(&filter, QoS::AtMostOnce);
         request.filters[0].no_local = no_local;
         broker
             .handle(author.subscriber, &Packet::Subscribe(request), &mut out)
             .expect("a valid subscribe");
 
-        let bystander = broker.connect("", &connect_packet("bystander", 0), &mut out);
+        let bystander = broker.connect("", &connect_packet("bystander", 0), &mut out).expect("the default decision authenticates");
         broker
             .handle(
                 bystander.subscriber,
@@ -491,7 +493,7 @@ proptest! {
         let mut broker = Broker::new(BrokerConfig::default());
         let mut out = Vec::new();
 
-        let first = broker.connect("", &durable_connect("same", 600), &mut out);
+        let first = broker.connect("", &durable_connect("same", 600), &mut out).expect("the default decision authenticates");
         broker
             .handle(
                 first.subscriber,
@@ -506,7 +508,7 @@ proptest! {
         out.clear();
         let mut second = durable_connect("same", 600);
         second.clean_start = clean_start;
-        let taken_over = broker.connect("", &second, &mut out);
+        let taken_over = broker.connect("", &second, &mut out).expect("the default decision authenticates");
 
         prop_assert!(taken_over.took_over, "the incumbent was live");
         prop_assert_eq!(
@@ -580,14 +582,14 @@ proptest! {
         let mut broker = Broker::new(BrokerConfig::default());
         let mut out = Vec::new();
 
-        let watcher = broker.connect("", &connect_packet("watcher", 0), &mut out);
+        let watcher = broker.connect("", &connect_packet("watcher", 0), &mut out).expect("the default decision authenticates");
         let mut request = subscribe_packet(&filter, QoS::ExactlyOnce);
         request.filters[0].retain_as_published = retain_as_published;
         broker
             .handle(watcher.subscriber, &Packet::Subscribe(request), &mut out)
             .expect("a valid subscribe");
 
-        let author = broker.connect("", &connect_packet("author", 0), &mut out);
+        let author = broker.connect("", &connect_packet("author", 0), &mut out).expect("the default decision authenticates");
         let packet_id = (qos != QoS::AtMostOnce).then_some(9);
         let wanted = reference::matches(&filter, &topic);
 
@@ -682,7 +684,7 @@ proptest! {
         // The retained copy, which is the only way to see that the flag
         // reached the store rather than only the wire. Subscribed to the
         // exact topic, so this half does not depend on the match above.
-        let late = broker.connect("", &connect_packet("late", 0), &mut out);
+        let late = broker.connect("", &connect_packet("late", 0), &mut out).expect("the default decision authenticates");
         let mut late_request = subscribe_packet(&topic, QoS::AtMostOnce);
         late_request.filters[0].retain_handling = RetainHandling::SendAlways;
         out.clear();
@@ -711,7 +713,7 @@ proptest! {
         let mut out = Vec::new();
 
         let connect = durable_connect("sub", 600);
-        let subscriber = broker.connect("", &connect, &mut out);
+        let subscriber = broker.connect("", &connect, &mut out).expect("the default decision authenticates");
         broker
             .handle(
                 subscriber.subscriber,
@@ -721,7 +723,7 @@ proptest! {
             .expect("a valid subscribe");
         broker.disconnect(subscriber.subscriber, &mut out);
 
-        let author = broker.connect("", &connect_packet("author", 0), &mut out);
+        let author = broker.connect("", &connect_packet("author", 0), &mut out).expect("the default decision authenticates");
         out.clear();
         for attempt in 0..pending {
             let packet_id = u16::try_from(attempt).expect("a small count") + 1;
@@ -746,7 +748,7 @@ proptest! {
         );
 
         out.clear();
-        let resumed = broker.connect("", &connect, &mut out);
+        let resumed = broker.connect("", &connect, &mut out).expect("the default decision authenticates");
         prop_assert!(resumed.session_present, "the session was kept");
         prop_assert_eq!(
             copies(&out, "a/b", subscriber.subscriber),
@@ -776,11 +778,15 @@ fn a_takeover_disarms_the_incumbents_keep_alive() {
 
     let mut incumbent = durable_connect("same", 600);
     incumbent.keep_alive = 1;
-    broker.connect("", &incumbent, &mut out);
+    broker
+        .connect("", &incumbent, &mut out)
+        .expect("the default decision authenticates");
 
     let mut newcomer = durable_connect("same", 600);
     newcomer.keep_alive = TEN_SECOND_KEEP_ALIVE;
-    broker.connect("", &newcomer, &mut out);
+    broker
+        .connect("", &newcomer, &mut out)
+        .expect("the default decision authenticates");
 
     assert_eq!(
         first_timeout(&mut broker, 40),
@@ -827,7 +833,9 @@ fn a_client_that_pings_is_never_closed() {
 
     let mut connect = durable_connect("chatty", 600);
     connect.keep_alive = TEN_SECOND_KEEP_ALIVE;
-    let client = broker.connect("", &connect, &mut out);
+    let client = broker
+        .connect("", &connect, &mut out)
+        .expect("the default decision authenticates");
 
     for _ in 1..=(CLOSED_AT * 4) {
         out.clear();
@@ -861,7 +869,9 @@ fn a_silent_client_is_closed_when_its_keep_alive_runs_out() {
 
     let mut connect = durable_connect("silent", 600);
     connect.keep_alive = TEN_SECOND_KEEP_ALIVE;
-    let client = broker.connect("", &connect, &mut out);
+    let client = broker
+        .connect("", &connect, &mut out)
+        .expect("the default decision authenticates");
 
     assert_eq!(
         first_timeout(&mut broker, 60),
@@ -891,7 +901,9 @@ fn a_silent_client_fires_its_will() {
     let mut connect = durable_connect("device", 600);
     connect.keep_alive = TEN_SECOND_KEEP_ALIVE;
     with_will(&mut connect, Some(0));
-    broker.connect("", &connect, &mut out);
+    broker
+        .connect("", &connect, &mut out)
+        .expect("the default decision authenticates");
 
     let mut fired_at = None;
     for second in 1..=60u32 {
@@ -930,7 +942,9 @@ fn a_will_due_as_its_session_expires_still_goes_out() {
     // its interval has really passed.
     let mut connect = durable_connect("device", 5);
     with_will(&mut connect, Some(10));
-    let device = broker.connect("", &connect, &mut out);
+    let device = broker
+        .connect("", &connect, &mut out)
+        .expect("the default decision authenticates");
     broker.disconnect(device.subscriber, &mut out);
 
     let mut fired_at = None;
@@ -968,10 +982,14 @@ fn a_takeover_publishes_a_will_with_no_delay() {
 
     let mut incumbent = durable_connect("device", 600);
     with_will(&mut incumbent, Some(0));
-    broker.connect("", &incumbent, &mut out);
+    broker
+        .connect("", &incumbent, &mut out)
+        .expect("the default decision authenticates");
 
     out.clear();
-    broker.connect("", &durable_connect("device", 600), &mut out);
+    broker
+        .connect("", &durable_connect("device", 600), &mut out)
+        .expect("the default decision authenticates");
 
     assert_eq!(
         copies(&out, "gone/device", watcher),
@@ -987,10 +1005,14 @@ fn a_takeover_suppresses_a_will_that_is_still_delayed() {
 
     let mut incumbent = durable_connect("device", 600);
     with_will(&mut incumbent, Some(30));
-    broker.connect("", &incumbent, &mut out);
+    broker
+        .connect("", &incumbent, &mut out)
+        .expect("the default decision authenticates");
 
     out.clear();
-    broker.connect("", &durable_connect("device", 600), &mut out);
+    broker
+        .connect("", &durable_connect("device", 600), &mut out)
+        .expect("the default decision authenticates");
     assert_eq!(
         copies(&out, "gone/device", watcher),
         0,
@@ -1017,10 +1039,14 @@ fn a_takeover_publishes_a_will_under_protocol_3_1_1() {
     // A delay this long would suppress the will in MQTT 5. The version
     // is what must decide, not the number.
     with_will(&mut incumbent, Some(30));
-    broker.connect("", &incumbent, &mut out);
+    broker
+        .connect("", &incumbent, &mut out)
+        .expect("the default decision authenticates");
 
     out.clear();
-    broker.connect("", &durable_connect("device", 600), &mut out);
+    broker
+        .connect("", &durable_connect("device", 600), &mut out)
+        .expect("the default decision authenticates");
 
     assert_eq!(
         copies(&out, "gone/device", watcher),
@@ -1041,12 +1067,16 @@ fn a_clean_start_takeover_publishes_a_will_whatever_its_delay() {
 
     let mut incumbent = durable_connect("device", 600);
     with_will(&mut incumbent, Some(30));
-    broker.connect("", &incumbent, &mut out);
+    broker
+        .connect("", &incumbent, &mut out)
+        .expect("the default decision authenticates");
 
     let mut newcomer = durable_connect("device", 600);
     newcomer.clean_start = true;
     out.clear();
-    broker.connect("", &newcomer, &mut out);
+    broker
+        .connect("", &newcomer, &mut out)
+        .expect("the default decision authenticates");
 
     assert_eq!(
         copies(&out, "gone/device", watcher),
@@ -1066,13 +1096,17 @@ fn a_takeover_does_not_publish_the_newcomers_will() {
     let mut incumbent = durable_connect("device", 600);
     with_will(&mut incumbent, Some(0));
     incumbent.will.as_mut().expect("just set").payload = Bytes::from_static(b"the first");
-    broker.connect("", &incumbent, &mut out);
+    broker
+        .connect("", &incumbent, &mut out)
+        .expect("the default decision authenticates");
 
     let mut newcomer = durable_connect("device", 600);
     with_will(&mut newcomer, Some(0));
     newcomer.will.as_mut().expect("just set").payload = Bytes::from_static(b"the second");
     out.clear();
-    broker.connect("", &newcomer, &mut out);
+    broker
+        .connect("", &newcomer, &mut out)
+        .expect("the default decision authenticates");
 
     let payloads: Vec<Bytes> = out
         .iter()
@@ -1097,7 +1131,9 @@ fn a_takeover_does_not_publish_the_newcomers_will() {
 /// wait rather than being refused.
 fn a_session_holding(broker: &mut Broker, expiry: u32, count: usize) -> SubscriberId {
     let mut out = Vec::new();
-    let subscriber = broker.connect("", &durable_connect("holder", expiry), &mut out);
+    let subscriber = broker
+        .connect("", &durable_connect("holder", expiry), &mut out)
+        .expect("the default decision authenticates");
     broker
         .handle(
             subscriber.subscriber,
@@ -1107,7 +1143,9 @@ fn a_session_holding(broker: &mut Broker, expiry: u32, count: usize) -> Subscrib
         .expect("a valid subscribe");
     broker.disconnect(subscriber.subscriber, &mut out);
 
-    let author = broker.connect("", &connect_packet("author", 0), &mut out);
+    let author = broker
+        .connect("", &connect_packet("author", 0), &mut out)
+        .expect("the default decision authenticates");
     for attempt in 0..count {
         let packet_id = u16::try_from(attempt).expect("a small count") + 1;
         broker
@@ -1184,7 +1222,9 @@ fn a_clean_start_reports_what_it_discards() {
     let mut out = Vec::new();
     let mut fresh = durable_connect("holder", 600);
     fresh.clean_start = true;
-    broker.connect("", &fresh, &mut out);
+    broker
+        .connect("", &fresh, &mut out)
+        .expect("the default decision authenticates");
 
     assert_eq!(
         session_ended_drops(&out, holder).len(),
@@ -1228,7 +1268,9 @@ fn a_will_carries_its_properties_but_not_its_delay() {
             ..Properties::default()
         },
     });
-    let device = broker.connect("", &connect, &mut out);
+    let device = broker
+        .connect("", &connect, &mut out)
+        .expect("the default decision authenticates");
     broker.disconnect(device.subscriber, &mut out);
 
     out.clear();
@@ -1293,7 +1335,9 @@ fn a_retained_will_expires_on_the_interval_it_carries() {
             ..Properties::default()
         },
     });
-    let device = broker.connect("", &connect, &mut out);
+    let device = broker
+        .connect("", &connect, &mut out)
+        .expect("the default decision authenticates");
     broker.disconnect(device.subscriber, &mut out);
     broker.tick(&mut out);
 
@@ -1314,7 +1358,9 @@ fn a_retained_will_expires_on_the_interval_it_carries() {
 /// Whether a client subscribing now receives the retained will.
 fn late_subscriber_sees_the_retained_will(broker: &mut Broker, client: &str) -> bool {
     let mut out = Vec::new();
-    let late = broker.connect("", &connect_packet(client, 0), &mut out);
+    let late = broker
+        .connect("", &connect_packet(client, 0), &mut out)
+        .expect("the default decision authenticates");
     let mut request = subscribe_packet("gone/device", QoS::AtMostOnce);
     request.filters[0].retain_handling = RetainHandling::SendAlways;
     out.clear();
@@ -1333,7 +1379,9 @@ fn disconnects_with(reason: ReasonCode, version: Version) -> bool {
     let mut connect = durable_connect("device", 600);
     connect.version = version;
     with_will(&mut connect, Some(0));
-    let device = broker.connect("", &connect, &mut out);
+    let device = broker
+        .connect("", &connect, &mut out)
+        .expect("the default decision authenticates");
 
     broker
         .handle(

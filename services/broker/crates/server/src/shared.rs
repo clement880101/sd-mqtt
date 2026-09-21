@@ -1166,20 +1166,22 @@ mod tests {
         for id in 0..8 {
             shared.with_broker(|broker| {
                 let mut out = Vec::new();
-                broker.connect(
-                    "",
-                    &mqtt_codec::packet::Connect {
-                        version: mqtt_codec::Version::V5,
-                        client_id: format!("c{id}"),
-                        clean_start: false,
-                        keep_alive: 0,
-                        username: None,
-                        password: None,
-                        will: None,
-                        properties: mqtt_codec::Properties::default(),
-                    },
-                    &mut out,
-                );
+                broker
+                    .connect(
+                        "",
+                        &mqtt_codec::packet::Connect {
+                            version: mqtt_codec::Version::V5,
+                            client_id: format!("c{id}"),
+                            clean_start: false,
+                            keep_alive: 0,
+                            username: None,
+                            password: None,
+                            will: None,
+                            properties: mqtt_codec::Properties::default(),
+                        },
+                        &mut out,
+                    )
+                    .expect("the default decision authenticates");
             });
         }
         let left_behind = shared.with_broker(|broker| {
@@ -1361,20 +1363,22 @@ mod tests {
         let (_, committed) = shared.with_broker_committed(
             |broker| {
                 let mut out = Vec::new();
-                let registration = broker.connect(
-                    "",
-                    &Connect {
-                        version: Version::V5,
-                        client_id: format!("publisher-{n}"),
-                        clean_start: true,
-                        keep_alive: 0,
-                        username: None,
-                        password: None,
-                        will: None,
-                        properties: Properties::default(),
-                    },
-                    &mut out,
-                );
+                let registration = broker
+                    .connect(
+                        "",
+                        &Connect {
+                            version: Version::V5,
+                            client_id: format!("publisher-{n}"),
+                            clean_start: true,
+                            keep_alive: 0,
+                            username: None,
+                            password: None,
+                            will: None,
+                            properties: Properties::default(),
+                        },
+                        &mut out,
+                    )
+                    .expect("the default decision authenticates");
                 let publish = Packet::Publish(Publish {
                     dup: false,
                     qos: QoS::AtMostOnce,
@@ -1517,20 +1521,22 @@ mod tests {
         let (journalled, committed) = shared.with_broker_committed(
             |broker| {
                 let mut out = Vec::new();
-                broker.connect(
-                    "",
-                    &mqtt_codec::packet::Connect {
-                        version: mqtt_codec::Version::V5,
-                        client_id: "durable".to_owned(),
-                        clean_start: false,
-                        keep_alive: 0,
-                        username: None,
-                        password: None,
-                        will: None,
-                        properties: mqtt_codec::Properties::default(),
-                    },
-                    &mut out,
-                );
+                broker
+                    .connect(
+                        "",
+                        &mqtt_codec::packet::Connect {
+                            version: mqtt_codec::Version::V5,
+                            client_id: "durable".to_owned(),
+                            clean_start: false,
+                            keep_alive: 0,
+                            username: None,
+                            password: None,
+                            will: None,
+                            properties: mqtt_codec::Properties::default(),
+                        },
+                        &mut out,
+                    )
+                    .expect("the default decision authenticates");
                 broker.sessions_holding_records() == 0
             },
             // Asked for, so that a shell with no store is taking the

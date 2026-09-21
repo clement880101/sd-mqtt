@@ -12,6 +12,7 @@ use mqtt_codec::{Limits, Packet, Properties, QoS, ReasonCode, Version};
 use storage::record::Record;
 
 use crate::clock::CoarseClock;
+use crate::hooks::{ClientInfo, Credentials, Disposition, Hooks};
 use crate::journal::{self, DurableSession, DurableState};
 use crate::keepalive::{Activity, KeepAliveRing};
 use crate::registry::{Presence, Registration, Registry, SessionId};
@@ -84,6 +85,22 @@ impl Default for BrokerConfig {
 /// An action addressed to one session, for the caller to perform.
 pub type Addressed = (SubscriberId, Action);
 
+/// What the hooks said to do with an arriving message.
+///
+/// Three outcomes and not two, because a message a hook refused and a
+/// message a hook consumed are acknowledged differently: the first is
+/// "not authorized", which tells the client to stop, and the second is
+/// "no matching subscribers", which is the truth about where it went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Match it and deliver it.
+    Route,
+    /// A hook took it. Nobody else sees it.
+    Dropped,
+    /// The authorizing chain said no.
+    Refused,
+}
+
 /// The broker.
 ///
 /// It reads no clock and touches no socket. Time arrives through
@@ -106,6 +123,13 @@ pub struct Broker {
     keepalive: KeepAliveRing,
     activities: HashMap<SubscriberId, Activity, RandomState>,
     config: BrokerConfig,
+    /// The connectors, section 9.3, in the order they are asked.
+    ///
+    /// Held here rather than in [`BrokerConfig`] because installing
+    /// one is not configuration a shell can clone and pass around: a
+    /// hook is a live object with state of its own, and two brokers
+    /// sharing a configuration must not silently share it.
+    hooks: Hooks,
     /// Everything that changed durably and has not been handed over.
     ///
     /// Section 7.3: the broker does no I/O, so it says what happened
@@ -134,7 +158,55 @@ impl Broker {
             keepalive: KeepAliveRing::new(config.max_keep_alive),
             activities: HashMap::with_hasher(RandomState::default()),
             config,
+            hooks: Hooks::new(),
             journal: Vec::new(),
+        }
+    }
+
+    /// The hooks this broker fires, to install one or to read the
+    /// defaults.
+    ///
+    /// Section 9.3, and [`crate::hooks`] for what a hook may not do:
+    /// it is called synchronously, under whatever lock the shell holds
+    /// around this broker, and nothing enforces that it returns
+    /// promptly.
+    pub fn hooks_mut(&mut self) -> &mut Hooks {
+        &mut self.hooks
+    }
+
+    /// The hooks this broker fires.
+    pub fn hooks(&self) -> &Hooks {
+        &self.hooks
+    }
+
+    /// Who a handle belongs to, for a hook that has to name it.
+    ///
+    /// `None` once the session is gone, which is the ordinary case for
+    /// anything said about a session after it was removed.
+    fn client_of(&self, subscriber: SubscriberId) -> Option<&SessionId> {
+        self.registry.get(subscriber).map(Session::id)
+    }
+
+    /// Move a session's actions into the caller's list, telling the
+    /// hooks about the ones they asked to hear.
+    ///
+    /// **The one place actions leave a session**, so that the delivery
+    /// and discard hooks cannot be missed by a path that grew its own
+    /// loop. A retained message handed out on subscribe, a redelivery
+    /// on resume and a live fan-out all come through here.
+    fn emit(&self, subscriber: SubscriberId, actions: Vec<Action>, out: &mut Vec<Addressed>) {
+        if !self.hooks.is_empty() {
+            if let Some(id) = self.client_of(subscriber) {
+                let client = ClientInfo {
+                    subscriber,
+                    mountpoint: &id.mountpoint,
+                    client_id: &id.client_id,
+                };
+                tell_hooks(&self.hooks, &client, &actions);
+            }
+        }
+        for action in actions {
+            out.push((subscriber, action));
         }
     }
 
@@ -400,14 +472,42 @@ impl Broker {
     ///
     /// The rule that makes this tractable: everything before the close
     /// belongs to the incumbent, everything after it to the newcomer.
+    ///
+    /// # When it refuses
+    ///
+    /// The authenticate hook chain runs first, and an error is the
+    /// reason code to answer the connect with, the same shape
+    /// [`Broker::handle`] uses. **Nothing at all has happened when it
+    /// refuses**: no session is registered, no incumbent is displaced
+    /// and no will is armed, because a rejected connection must not be
+    /// able to end a session that is serving somebody else. That is
+    /// what puts the chain before [`Broker::displace_incumbent`]
+    /// rather than after it.
+    ///
+    /// [`Broker::displace_incumbent`]: Broker::displace_incumbent
     pub fn connect(
         &mut self,
         mountpoint: &str,
         connect: &Connect,
         out: &mut Vec<Addressed>,
-    ) -> Registration {
+    ) -> Result<Registration, ReasonCode> {
         let now = self.clock.now();
         let identity = SessionId::new(mountpoint, &connect.client_id);
+
+        if !self.hooks.authenticate(&Credentials {
+            mountpoint,
+            client_id: &connect.client_id,
+            username: connect.username.as_deref(),
+            password: connect.password.as_deref(),
+            version: connect.version,
+            clean_start: connect.clean_start,
+        }) {
+            // 3.2.2.2: "Not authorized" is the answer to a connect the
+            // server will not serve. [MQTT-3.1.4-6] requires the
+            // network connection to be closed after it, which is the
+            // caller's half.
+            return Err(ReasonCode::NotAuthorized);
+        }
 
         let displaced = self.displace_incumbent(&identity, connect.clean_start, now, out);
         if connect.clean_start {
@@ -415,9 +515,7 @@ impl Broker {
             // taking its queue and its window with it. What it was
             // holding is reported before it goes.
             if let Some(existing) = self.registry.subscriber_of(&identity) {
-                if let Some(session) = self.registry.get_mut(existing) {
-                    Self::discard_held(session, existing, out);
-                }
+                self.discard_held(existing, out);
                 // Said before the session is replaced, because the
                 // buffer holding it is part of the session and goes
                 // when it does. Everything the discard released must
@@ -480,9 +578,7 @@ impl Broker {
 
         let mut actions = Vec::new();
         session.outbound.on_resume(now, &mut actions);
-        for action in actions {
-            out.push((registration.subscriber, action));
-        }
+        self.emit(registration.subscriber, actions, out);
 
         let activity = Activity::new(now);
         self.activities
@@ -491,7 +587,23 @@ impl Broker {
             .insert(registration.subscriber, connect.keep_alive, activity, now);
 
         self.drain_session(registration.subscriber);
-        registration
+        // Last, because a hook told about a connection must be able to
+        // ask this broker's observers about it and find it there. A
+        // resumed session's redeliveries are already on their way by
+        // now, which is the same order a subscriber would see them in.
+        self.tell_connected(registration.subscriber);
+        Ok(registration)
+    }
+
+    /// Tell the hooks a connection was accepted.
+    fn tell_connected(&self, subscriber: SubscriberId) {
+        if let Some(id) = self.client_of(subscriber) {
+            self.hooks.client_connected(&ClientInfo {
+                subscriber,
+                mountpoint: &id.mountpoint,
+                client_id: &id.client_id,
+            });
+        }
     }
 
     /// End a live connection that a newcomer is taking over from, and
@@ -658,6 +770,25 @@ impl Broker {
             Packet::Publish(publish) => self.on_publish(subscriber, publish, now, out),
             Packet::Subscribe(request) => {
                 let mut actions = Vec::new();
+                // Cloned before the session is borrowed mutably, and
+                // it is two atomic increments: the chain has to be
+                // told who is asking, and who is asking lives in the
+                // session the subscribe is about to change.
+                let identity = self
+                    .registry
+                    .get(subscriber)
+                    .map(Session::id)
+                    .cloned()
+                    .ok_or(ReasonCode::ProtocolError)?;
+                let client = ClientInfo {
+                    subscriber,
+                    mountpoint: &identity.mountpoint,
+                    client_id: &identity.client_id,
+                };
+                // Borrowed from the field rather than through `self`,
+                // because the session below is a mutable borrow of a
+                // different one.
+                let hooks = &self.hooks;
                 let session = self
                     .registry
                     .get_mut(subscriber)
@@ -670,6 +801,7 @@ impl Broker {
                     request,
                     &self.config.limits,
                     now,
+                    &mut |filter: &str, qos| hooks.authorize_subscribe(&client, filter, qos),
                     &mut actions,
                 );
                 actions.push(Action::Send(Packet::SubAck(mqtt_codec::packet::SubAck {
@@ -677,9 +809,7 @@ impl Broker {
                     reasons,
                     properties: Default::default(),
                 })));
-                for action in actions {
-                    out.push((subscriber, action));
-                }
+                self.emit(subscriber, actions, out);
                 Ok(())
             }
             Packet::Unsubscribe(request) => {
@@ -773,9 +903,7 @@ impl Broker {
         // Drained before the result is returned, because a failing
         // acknowledgement may still have produced packets the peer is
         // waiting for.
-        for action in actions {
-            out.push((subscriber, action));
-        }
+        self.emit(subscriber, actions, out);
         result
     }
 
@@ -799,6 +927,7 @@ impl Broker {
 
         // `None` when the message was not dispatched, which is not the
         // same as reaching nobody.
+        let mut refused = false;
         let delivered = if received.dispatch {
             let mut message = Message::new(
                 &publish.topic,
@@ -809,7 +938,19 @@ impl Broker {
             message.properties = Arc::new(publish.properties.clone().into());
             message.expires_at = self.deadline(&publish.properties);
 
-            Some(self.publish(message, Some(from), now, out))
+            match self.judge(from, &mut message) {
+                Verdict::Route => Some(self.publish(message, Some(from), now, out)),
+                // Nobody received it, which is what the
+                // acknowledgement will say. The message is not
+                // retained either, because retaining it would leave
+                // the thing a hook refused sitting on the topic for
+                // the next subscriber.
+                Verdict::Dropped => Some(0),
+                Verdict::Refused => {
+                    refused = true;
+                    None
+                }
+            }
         } else {
             None
         };
@@ -819,8 +960,47 @@ impl Broker {
         // every path that got this far, including the one that dispatched
         // nothing: a slot the acknowledgement never frees throttles the
         // client to death with nothing reporting it.
-        self.acknowledge(from, &received, delivered, out);
+        self.acknowledge(from, &received, delivered, refused, out);
         Ok(())
+    }
+
+    /// What the authorizing and message hooks say should happen to an
+    /// arriving message.
+    ///
+    /// **Both before matching, and in that order.** Authorization
+    /// judges what the client actually asked to publish, so it is
+    /// asked first and sees the message unrewritten; a rewrite that
+    /// ran first would have the chain approving a topic the client
+    /// never sent. And a rewritten topic decides where the message
+    /// goes, so both have to be over before anything is matched: a
+    /// rewrite applied afterwards would route by the old topic and
+    /// deliver the new one.
+    fn judge(&mut self, from: SubscriberId, message: &mut Message) -> Verdict {
+        if self.hooks.is_empty() {
+            // The common case, and it must not pay for a clone of the
+            // identity. With no hooks installed the only thing left
+            // to consult is the default.
+            return if self.hooks.defaults().publish {
+                Verdict::Route
+            } else {
+                Verdict::Refused
+            };
+        }
+        let Some(identity) = self.client_of(from).cloned() else {
+            return Verdict::Refused;
+        };
+        let client = ClientInfo {
+            subscriber: from,
+            mountpoint: &identity.mountpoint,
+            client_id: &identity.client_id,
+        };
+        if !self.hooks.authorize_publish(&client, message) {
+            return Verdict::Refused;
+        }
+        match self.hooks.message_received(&client, message) {
+            Disposition::Deliver => Verdict::Route,
+            Disposition::Drop => Verdict::Dropped,
+        }
     }
 
     /// Pay what the receive path said was owed.
@@ -829,19 +1009,31 @@ impl Broker {
     /// when it was not dispatched at all. Only a dispatch that reached
     /// nobody may say so: a redelivery already held was dispatched once,
     /// and claiming nobody wanted it would be a lie about the first copy.
+    ///
+    /// `refused` is the authorizing chain's answer and outranks both,
+    /// because "you may not publish here" and "nobody was listening"
+    /// are different things to tell a client and only one of them is
+    /// worth changing its behaviour over.
     fn acknowledge(
         &mut self,
         subscriber: SubscriberId,
         received: &crate::session::Received,
         delivered: Option<usize>,
+        refused: bool,
         out: &mut Vec<Addressed>,
     ) {
         let Some(owed) = received.owed else {
             return;
         };
-        let reason = match delivered {
-            Some(0) => ReasonCode::NoMatchingSubscribers,
-            _ => ReasonCode::Success,
+        let reason = match (refused, delivered) {
+            // 3.4.2.1: "Not authorized" is a puback and a pubrec
+            // reason code. At level zero there is no acknowledgement
+            // to carry it, so the message is simply not routed —
+            // which is what [MQTT-3.3.5-2] permits, and less
+            // aggressive than closing the connection over one packet.
+            (true, _) => ReasonCode::NotAuthorized,
+            (false, Some(0)) => ReasonCode::NoMatchingSubscribers,
+            (false, _) => ReasonCode::Success,
         };
 
         let mut actions = Vec::new();
@@ -850,9 +1042,7 @@ impl Broker {
                 .inbound
                 .acknowledge(owed.packet_id, owed.qos, reason, &mut actions);
         }
-        for action in actions {
-            out.push((subscriber, action));
-        }
+        self.emit(subscriber, actions, out);
     }
 
     /// Route a message to every subscriber that wants it, updating the
@@ -946,9 +1136,7 @@ impl Broker {
                     &mut actions,
                 );
             }
-            for action in actions {
-                out.push((target.subscriber, action));
-            }
+            self.emit(target.subscriber, actions, out);
             self.drain_session(target.subscriber);
         }
 
@@ -985,9 +1173,7 @@ impl Broker {
         if let Some(session) = self.registry.get_mut(subscriber) {
             session.outbound.on_discarded(packet_id, now, &mut actions);
         }
-        for action in actions {
-            out.push((subscriber, action));
-        }
+        self.emit(subscriber, actions, out);
         self.drain_session(subscriber);
     }
 
@@ -1020,7 +1206,14 @@ impl Broker {
     /// ring to remove it again is the one call there that buys nothing.
     fn release(&mut self, subscriber: SubscriberId, packet: Option<ReasonCode>, now: u32) {
         self.activities.remove(&subscriber);
+        let mut departed = false;
         if let Some(session) = self.registry.get_mut(subscriber) {
+            // Only a session that was attached has a connection to
+            // lose. Without this, a second call — and there are two
+            // paths that can make one, a disconnect packet followed
+            // by the socket closing — would tell the hooks the same
+            // client left twice.
+            departed = session.is_connected();
             match packet {
                 Some(reason) => session.on_disconnect_packet(reason, now),
                 None => session.on_disconnected(false, now),
@@ -1029,6 +1222,15 @@ impl Broker {
         // A departure changes when the session expires and whether it
         // still owes a will, both of which must survive it.
         self.drain_session(subscriber);
+        if departed {
+            if let Some(id) = self.client_of(subscriber) {
+                self.hooks.client_disconnected(&ClientInfo {
+                    subscriber,
+                    mountpoint: &id.mountpoint,
+                    client_id: &id.client_id,
+                });
+            }
+        }
     }
 
     /// Report and discard everything a session still held.
@@ -1042,14 +1244,14 @@ impl Broker {
     /// for exactly this moment. Only the assembly knows when it arrives.
     ///
     /// [`Outbound::clear`]: crate::session::Outbound::clear
-    fn discard_held(session: &mut Session, subscriber: SubscriberId, out: &mut Vec<Addressed>) {
+    fn discard_held(&mut self, subscriber: SubscriberId, out: &mut Vec<Addressed>) {
         let mut actions = Vec::new();
-        session
-            .outbound
-            .clear(DropReason::SessionEnded, &mut actions);
-        for action in actions {
-            out.push((subscriber, action));
+        if let Some(session) = self.registry.get_mut(subscriber) {
+            session
+                .outbound
+                .clear(DropReason::SessionEnded, &mut actions);
         }
+        self.emit(subscriber, actions, out);
     }
 
     /// Advance one second and do everything that falls due.
@@ -1088,15 +1290,36 @@ impl Broker {
             .collect();
         for subscriber in gone {
             if let Some(mut session) = self.registry.remove(subscriber) {
-                let key = journal::key_of(session.id());
+                let identity = session.id().clone();
+                let key = journal::key_of(&identity);
+                let client = ClientInfo {
+                    subscriber,
+                    mountpoint: &identity.mountpoint,
+                    client_id: &identity.client_id,
+                };
                 subscribe::remove_all(&self.subscriptions, &self.shared, &mut session);
-                Self::discard_held(&mut session, subscriber, out);
+                // Not through `emit`: the session is already out of
+                // the registry, so there is nothing left there to
+                // look its identity up by. The drops it owes its
+                // hooks are owed all the same.
+                let mut actions = Vec::new();
+                session
+                    .outbound
+                    .clear(DropReason::SessionEnded, &mut actions);
+                tell_hooks(&self.hooks, &client, &actions);
+                for action in actions {
+                    out.push((subscriber, action));
+                }
                 // Taken out of the session before it is dropped, and
                 // before the record that ends it: the removal is what
                 // makes every one of these refer to a session the store
                 // no longer holds.
                 session.take_journal(&mut self.journal);
                 self.journal.push(Record::SessionRemoved { session: key });
+                // Last, and after the drops: a hook told a session
+                // ended must already have been told what ending it
+                // discarded.
+                self.hooks.session_expired(&client);
             }
             self.keepalive.remove(subscriber);
             self.activities.remove(&subscriber);
@@ -1202,6 +1425,28 @@ impl Broker {
     }
 }
 
+/// Tell the hooks what a batch of actions says happened.
+///
+/// A publish on its way to a session is a delivery; a discard is a
+/// drop. Everything else — acknowledgements, ping responses, closes —
+/// is protocol machinery no connector asked about.
+///
+/// Free rather than a method, because the one caller that matters most
+/// runs after the session has already been taken out of the registry:
+/// a session destroyed by expiry still owes its hooks the drops that
+/// destroying it caused, and there is nothing left to look it up by.
+fn tell_hooks(hooks: &Hooks, client: &ClientInfo<'_>, actions: &[Action]) {
+    for action in actions {
+        match action {
+            Action::Send(Packet::Publish(publish)) => hooks.message_delivered(client, publish),
+            Action::Dropped {
+                reason, qos, topic, ..
+            } => hooks.message_dropped(client, topic, *qos, *reason),
+            _ => {}
+        }
+    }
+}
+
 /// How long a session outlives its connection, in seconds.
 ///
 /// MQTT 5 states it as a property and defaults it to zero, 3.1.2.11.2.
@@ -1258,14 +1503,18 @@ mod tests {
 
         let mut connect = connect_v311("durable");
         connect.clean_start = false;
-        let first = broker.connect("", &connect, &mut out);
+        let first = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates");
         broker.disconnect(first.subscriber, &mut out);
 
         // Far past any plausible deadline.
         broker.clock().advance(1_000_000);
         broker.tick(&mut out);
 
-        let second = broker.connect("", &connect, &mut out);
+        let second = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates");
         assert!(
             second.session_present,
             "[MQTT-3.1.2-4]: a 3.1.1 session with CleanSession clear is stored"
@@ -1287,7 +1536,9 @@ mod tests {
 
         let mut connect = connect_v311("ephemeral");
         connect.clean_start = true;
-        let first = broker.connect("", &connect, &mut out);
+        let first = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates");
         broker.disconnect(first.subscriber, &mut out);
         broker.tick(&mut out);
 
@@ -1301,7 +1552,9 @@ mod tests {
         // resuming connect is what would find it if it were still there.
         let mut resuming = connect_v311("ephemeral");
         resuming.clean_start = false;
-        let second = broker.connect("", &resuming, &mut out);
+        let second = broker
+            .connect("", &resuming, &mut out)
+            .expect("the default decision authenticates");
         assert!(
             !second.session_present,
             "[MQTT-3.1.2-6]: there is nothing left to resume"
@@ -1324,11 +1577,15 @@ mod tests {
             connect.properties.session_expiry_interval.is_none(),
             "the point of this test is the absent property"
         );
-        let first = broker.connect("", &connect, &mut out);
+        let first = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates");
         broker.disconnect(first.subscriber, &mut out);
         broker.tick(&mut out);
 
-        let second = broker.connect("", &connect, &mut out);
+        let second = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates");
         assert!(
             !second.session_present,
             "3.1.2.11.2: an absent Session Expiry Interval is zero, not forever"
@@ -1349,7 +1606,9 @@ mod tests {
         let mut out = Vec::new();
         let mut connect = connect_v5("mover");
         connect.properties.session_expiry_interval = Some(1);
-        let first = broker.connect("", &connect, &mut out);
+        let first = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates");
 
         let goodbye = Packet::Disconnect(Disconnect {
             reason: ReasonCode::Success,
@@ -1363,7 +1622,9 @@ mod tests {
         // Past the interval the CONNECT asked for, inside the one the
         // DISCONNECT asked for.
         run_to(&mut broker, 60, &mut out);
-        let second = broker.connect("", &connect, &mut out);
+        let second = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates");
         assert!(
             second.session_present,
             "3.14.2.2.2: the DISCONNECT's interval stands"
@@ -1376,7 +1637,9 @@ mod tests {
         let mut out = Vec::new();
         let mut connect = connect_v5("liar");
         connect.properties.session_expiry_interval = Some(0);
-        let first = broker.connect("", &connect, &mut out);
+        let first = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates");
 
         let goodbye = Packet::Disconnect(Disconnect {
             reason: ReasonCode::Success,
@@ -1407,7 +1670,9 @@ mod tests {
         let mut out = Vec::new();
         let mut connect = connect_v5("plainspoken");
         connect.properties.session_expiry_interval = Some(0);
-        let first = broker.connect("", &connect, &mut out);
+        let first = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates");
 
         let goodbye = Packet::Disconnect(Disconnect {
             reason: ReasonCode::Success,
@@ -1424,7 +1689,9 @@ mod tests {
 
         // And it meant it: the session still ends with the connection.
         broker.tick(&mut out);
-        let second = broker.connect("", &connect, &mut out);
+        let second = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates");
         assert!(
             !second.session_present,
             "zero still means the session ends with its connection"
@@ -1443,7 +1710,9 @@ mod tests {
         let mut broker = Broker::new(BrokerConfig::default());
         let mut out = Vec::new();
 
-        let publisher = broker.connect("", &connect_v5("publisher"), &mut out);
+        let publisher = broker
+            .connect("", &connect_v5("publisher"), &mut out)
+            .expect("the default decision authenticates");
         let keepsake = Packet::Publish(Publish {
             dup: false,
             qos: QoS::AtMostOnce,
@@ -1461,7 +1730,9 @@ mod tests {
             .handle(publisher.subscriber, &keepsake, &mut out)
             .expect("the publish is accepted");
 
-        let newcomer = broker.connect("", &connect_v5("newcomer"), &mut out);
+        let newcomer = broker
+            .connect("", &connect_v5("newcomer"), &mut out)
+            .expect("the default decision authenticates");
         out.clear();
         broker
             .handle(newcomer.subscriber, &subscribe_to("retain/probe"), &mut out)
@@ -1500,7 +1771,9 @@ mod tests {
         let mut broker = Broker::new(BrokerConfig::default());
         let mut out = Vec::new();
 
-        let publisher = broker.connect("", &connect_v5("publisher"), &mut out);
+        let publisher = broker
+            .connect("", &connect_v5("publisher"), &mut out)
+            .expect("the default decision authenticates");
         let keepsake = Packet::Publish(Publish {
             dup: false,
             qos: QoS::AtMostOnce,
@@ -1520,7 +1793,9 @@ mod tests {
         // A hundred seconds pass with nobody subscribed.
         run_to(&mut broker, 100, &mut out);
 
-        let newcomer = broker.connect("", &connect_v5("newcomer"), &mut out);
+        let newcomer = broker
+            .connect("", &connect_v5("newcomer"), &mut out)
+            .expect("the default decision authenticates");
         out.clear();
         broker
             .handle(
@@ -1595,7 +1870,9 @@ mod tests {
         let mut broker = Broker::new(BrokerConfig::default());
         let mut out = Vec::new();
 
-        let publisher = broker.connect("", &connect_v5("publisher"), &mut out);
+        let publisher = broker
+            .connect("", &connect_v5("publisher"), &mut out)
+            .expect("the default decision authenticates");
         broker
             .handle(
                 publisher.subscriber,
@@ -1604,7 +1881,9 @@ mod tests {
             )
             .expect("the publish is accepted");
 
-        let sub = broker.connect("", &connect_v5("sub"), &mut out);
+        let sub = broker
+            .connect("", &connect_v5("sub"), &mut out)
+            .expect("the default decision authenticates");
         broker
             .handle(sub.subscriber, &subscribe_to("retain/+"), &mut out)
             .expect("the subscribe is accepted");
@@ -1646,7 +1925,9 @@ mod tests {
                 &mut out,
             )
             .expect("the publish is accepted");
-        let newcomer = broker.connect("", &connect_v5("newcomer"), &mut out);
+        let newcomer = broker
+            .connect("", &connect_v5("newcomer"), &mut out)
+            .expect("the default decision authenticates");
         out.clear();
         broker
             .handle(newcomer.subscriber, &subscribe_to("retain/+"), &mut out)
@@ -1672,7 +1953,9 @@ mod tests {
         // after its deadline, so second ten still holds it.
         let mut broker = Broker::new(BrokerConfig::default());
         let mut out = Vec::new();
-        let publisher = broker.connect("", &connect_v5("publisher"), &mut out);
+        let publisher = broker
+            .connect("", &connect_v5("publisher"), &mut out)
+            .expect("the default decision authenticates");
 
         broker
             .handle(
@@ -1717,7 +2000,9 @@ mod tests {
         let mut broker = Broker::new(BrokerConfig::default());
         let mut out = Vec::new();
 
-        let sub = broker.connect("", &connect_v5("sub"), &mut out);
+        let sub = broker
+            .connect("", &connect_v5("sub"), &mut out)
+            .expect("the default decision authenticates");
         broker
             .handle(
                 sub.subscriber,
@@ -1725,7 +2010,9 @@ mod tests {
                 &mut out,
             )
             .expect("the subscribe is accepted");
-        let publisher = broker.connect("", &connect_v5("publisher"), &mut out);
+        let publisher = broker
+            .connect("", &connect_v5("publisher"), &mut out)
+            .expect("the default decision authenticates");
         out.clear();
 
         broker
@@ -1800,7 +2087,9 @@ mod tests {
                 ..BrokerConfig::default()
             });
             let mut out = Vec::new();
-            let sub = broker.connect("", &connect_v5("sub"), &mut out);
+            let sub = broker
+                .connect("", &connect_v5("sub"), &mut out)
+                .expect("the default decision authenticates");
             broker
                 .handle(
                     sub.subscriber,
@@ -1846,7 +2135,10 @@ mod tests {
         broker: &mut Broker,
         out: &mut Vec<Addressed>,
     ) -> SubscriberId {
-        let sub = broker.connect("", &connect_v5("sub"), out).subscriber;
+        let sub = broker
+            .connect("", &connect_v5("sub"), out)
+            .expect("the default decision authenticates")
+            .subscriber;
         broker
             .handle(sub, &subscribe_at("a/b", QoS::AtLeastOnce), out)
             .expect("the subscribe is accepted");
@@ -1936,7 +2228,10 @@ mod tests {
     fn a_group_of_two(broker: &mut Broker, out: &mut Vec<Addressed>) -> [SubscriberId; 2] {
         let mut members = Vec::new();
         for name in ["first", "second"] {
-            let member = broker.connect("", &connect_v5(name), out).subscriber;
+            let member = broker
+                .connect("", &connect_v5(name), out)
+                .expect("the default decision authenticates")
+                .subscriber;
             broker
                 .handle(
                     member,
@@ -2135,7 +2430,10 @@ mod tests {
         for name in ["first", "second"] {
             let mut connect = connect_v5(name);
             connect.properties.session_expiry_interval = Some(300);
-            let member = broker.connect("", &connect, &mut out).subscriber;
+            let member = broker
+                .connect("", &connect, &mut out)
+                .expect("the default decision authenticates")
+                .subscriber;
             broker
                 .handle(
                     member,

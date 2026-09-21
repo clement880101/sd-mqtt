@@ -31,6 +31,7 @@ pub fn subscribe(
     packet: &Subscribe,
     limits: &Limits,
     now: u32,
+    authorize: &mut dyn FnMut(&str, QoS) -> bool,
     out: &mut Vec<Action>,
 ) -> Vec<ReasonCode> {
     let subscription_id = packet.properties.subscription_identifiers.first().copied();
@@ -44,6 +45,19 @@ pub fn subscribe(
                 continue;
             }
         };
+
+        // Section 9.3's authorize-subscribe chain, asked per filter
+        // for the same reason a bad filter refuses only itself, and
+        // before anything is inserted so that a refusal leaves
+        // nothing behind: no entry in the trie, no record in the
+        // session and no retained message on its way out.
+        //
+        // 3.9.3: "Not authorized" is one of the reason codes a
+        // suback may carry per filter.
+        if !authorize(&options.filter, options.qos) {
+            reasons.push(ReasonCode::NotAuthorized);
+            continue;
+        }
 
         let subscription = Subscription {
             subscriber: session.subscriber(),
@@ -183,6 +197,20 @@ pub fn remove_all(trie: &SubscriptionTrie, shared: &SharedSubscriptions, session
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The authorizing chain these tests are not about.
+    ///
+    /// A plain `|_, _| true` at every call site would be the same
+    /// thing written fifteen times; that the chain itself is asked
+    /// per filter, and what a refusal leaves behind, is tested
+    /// through the broker in `broker/mod.rs` and in
+    /// `tests/end_to_end.rs`, where a refusal can be seen to change
+    /// where a message goes.
+    #[allow(clippy::unnecessary_wraps)]
+    fn allow_everything(_filter: &str, _qos: QoS) -> bool {
+        true
+    }
+
     use crate::registry::SessionId;
     use crate::retained::{RetainedMessage, RetainedStore};
     use crate::session::state::Session;
@@ -265,6 +293,7 @@ mod tests {
             &request("x/y", RetainHandling::DoNotSend),
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
         assert_eq!(reasons, vec![ReasonCode::GrantedQos1]);
@@ -283,6 +312,7 @@ mod tests {
             &request("a/+", RetainHandling::SendAlways),
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
         assert_eq!(sent_topics(&out), vec!["a/b".to_string()]);
@@ -310,6 +340,7 @@ mod tests {
             &request("a/+", RetainHandling::SendAlways),
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
         let flags: Vec<bool> = out
@@ -336,6 +367,7 @@ mod tests {
             &request("a/+", RetainHandling::SendIfNew),
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
         assert_eq!(sent_topics(&out).len(), 1);
@@ -349,6 +381,7 @@ mod tests {
             &request("a/+", RetainHandling::SendIfNew),
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
         assert!(sent_topics(&out).is_empty(), "the subscription existed");
@@ -370,6 +403,7 @@ mod tests {
             &request("a/+", RetainHandling::SendAlways),
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
         assert_eq!(sent_topics(&out).len(), 1);
@@ -383,6 +417,7 @@ mod tests {
             &request("a/+", RetainHandling::SendAlways),
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
         assert_eq!(sent_topics(&out).len(), 1, "sent again, [MQTT-3.3.1-9]");
@@ -400,6 +435,7 @@ mod tests {
             &request("a/+", RetainHandling::DoNotSend),
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
         assert!(sent_topics(&out).is_empty());
@@ -417,6 +453,7 @@ mod tests {
             &request("$share/g/x/y", RetainHandling::DoNotSend),
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
         assert_eq!(f.shared.group_count(), 1);
@@ -436,6 +473,7 @@ mod tests {
             &request("$share/g/a/+", RetainHandling::SendAlways),
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
         assert!(sent_topics(&out).is_empty());
@@ -473,6 +511,7 @@ mod tests {
             &packet,
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
         assert_eq!(reasons.len(), 2);
@@ -507,6 +546,7 @@ mod tests {
             &packet,
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
         assert_eq!(f.session.filters().count(), 0);
@@ -526,6 +566,7 @@ mod tests {
             &packet,
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
         let ids: Vec<Vec<u32>> = out
@@ -562,6 +603,7 @@ mod tests {
             &request("a/+", RetainHandling::SendAlways),
             &Limits::default(),
             9,
+            &mut allow_everything,
             &mut out,
         );
         assert_eq!(sent_topics(&out), vec!["a/b".to_string()]);
@@ -579,6 +621,7 @@ mod tests {
             &request("x/y", RetainHandling::DoNotSend),
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
 
@@ -605,6 +648,7 @@ mod tests {
             &request("$share/g/x/y", RetainHandling::DoNotSend),
             &Limits::default(),
             0,
+            &mut allow_everything,
             &mut out,
         );
 
@@ -627,6 +671,7 @@ mod tests {
                 &request(filter, RetainHandling::DoNotSend),
                 &Limits::default(),
                 0,
+                &mut allow_everything,
                 &mut out,
             );
         }

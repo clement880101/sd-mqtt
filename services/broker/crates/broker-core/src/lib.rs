@@ -9,6 +9,7 @@
 
 pub mod broker;
 pub mod clock;
+pub mod hooks;
 pub mod journal;
 pub mod keepalive;
 pub mod properties;

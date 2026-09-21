@@ -668,7 +668,10 @@ impl Run {
                     },
                 };
                 let mut actions = std::mem::take(&mut self.actions);
-                let registration = self.broker.connect("", &connect, &mut actions);
+                let registration = self
+                    .broker
+                    .connect("", &connect, &mut actions)
+                    .expect("the default decision authenticates");
                 self.actions = actions;
 
                 // Exactly what `connection.rs` does, and in the same

@@ -1769,7 +1769,9 @@ mod tests {
                     },
                 };
                 connect.properties.session_expiry_interval = Some(3_600);
-                broker.connect("", &connect, &mut out);
+                broker
+                    .connect("", &connect, &mut out)
+                    .expect("the default decision authenticates");
             }
         });
         shared
@@ -1873,7 +1875,10 @@ mod tests {
                     },
                 };
                 let mut out = Vec::new();
-                let subscriber = broker.connect("", &connect, &mut out).subscriber;
+                let subscriber = broker
+                    .connect("", &connect, &mut out)
+                    .expect("the default decision authenticates")
+                    .subscriber;
 
                 let mut filters: Vec<String> = (0..each)
                     .rev()
@@ -2849,7 +2854,9 @@ mod tests {
                     },
                 };
                 let mut out = Vec::new();
-                let accepted = broker.connect("", &connect, &mut out);
+                let accepted = broker
+                    .connect("", &connect, &mut out)
+                    .expect("the default decision authenticates");
                 let subscriber = accepted.subscriber;
 
                 let subscribe = Packet::Subscribe(Subscribe {
