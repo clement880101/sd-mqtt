@@ -39,11 +39,19 @@
 //! the text so that a capital letter is a failure rather than a
 //! surprise in somebody's dashboard.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+
 use parking_lot::Mutex;
-use prometheus_client::metrics::counter::Counter;
+use prometheus_client::collector::Collector;
+use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
+use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
 
+use broker_core::session::DropReason;
+
+use crate::shared::Shared;
 use mqtt_codec::{PacketKind, ReasonCode, Version};
 
 /// The label set of every family in this module: a fixed number of
@@ -391,6 +399,115 @@ fn auth_index(outcome: AuthOutcome) -> usize {
     }
 }
 
+/// Declare a reason table and its label function from one list.
+///
+/// One list, because two would drift, and a reason that drifts out of
+/// the table is a message discarded against a counter that does not
+/// exist — which is precisely what section 11.3 forbids.
+///
+/// The match this expands to has no wildcard, so **a variant added to
+/// the enum does not compile** until it is added here, and adding it
+/// here adds it to the table, gives it a label and gives it a slot in
+/// one edit. That is the exhaustiveness mechanism: compilation, not a
+/// list somebody has to remember to extend.
+macro_rules! reason_table {
+    ($enum:ident, $all:ident, $label:ident, $index:ident, { $($variant:ident => $text:literal,)+ }) => {
+        /// Every variant, in the order the handles are indexed in.
+        pub(crate) const $all: &[$enum] = &[$($enum::$variant,)+];
+
+        /// The label value, lower case and written out by hand.
+        pub(crate) fn $label(reason: $enum) -> &'static str {
+            match reason {
+                $($enum::$variant => $text,)+
+            }
+        }
+
+        /// Where this variant's handle sits in the flat array.
+        ///
+        /// A scan of a table of single digits' length, and it is on
+        /// the discard path rather than the packet path: by the time
+        /// this is called a message has already been lost, which is
+        /// not a moment to be counting comparisons. Nothing here
+        /// hashes and nothing here locks, which is what the packet
+        /// path could not afford.
+        fn $index(reason: $enum) -> usize {
+            $all
+                .iter()
+                .position(|candidate| *candidate == reason)
+                .expect("the table and the match come from one list")
+        }
+    };
+}
+
+reason_table!(DropReason, ALL_DROP_REASONS, drop_label, drop_index, {
+    QueueFull => "queue_full",
+    ByteBudget => "byte_budget",
+    QosZeroWhileOffline => "qos0_while_offline",
+    Expired => "expired",
+    SessionEnded => "session_ended",
+    RejectedByPeer => "rejected_by_peer",
+    TooLargeForPeer => "too_large_for_peer",
+});
+
+/// Why the shell discarded something, where `broker-core` cannot see
+/// it.
+///
+/// The broker reports its own discards as an action carrying a
+/// [`DropReason`], and every one of those is counted. These are the
+/// ones that happen afterwards, in this crate, between the broker
+/// saying what to do and the socket taking the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellDrop {
+    /// The session's outbox was full. Its depth is derived from the
+    /// configured bounds and a configuration that breaks the relation
+    /// is refused at startup, so this should be unreachable; it is
+    /// counted rather than assumed away.
+    OutboxFull,
+    /// The session had no outbox, or its reader had already gone. An
+    /// ordinary teardown most of the time — and the path a drop
+    /// report for an *offline* session takes, which is why the report
+    /// itself is counted before this is.
+    NoReader,
+    /// The encoder refused a packet the broker produced. A fault in
+    /// this process rather than in the peer, and a message that goes
+    /// nowhere either way.
+    NotEncodable,
+    /// A packet was larger than the peer allows and carried nothing
+    /// the broker could be told to settle: an at-most-once
+    /// publication, which owes no acknowledgement and therefore gets
+    /// no `Action::Dropped` of its own.
+    TooLargeToReport,
+    /// This connection's own actions, discarded because the batch
+    /// that produced them could not be made durable and the client is
+    /// being closed instead.
+    NotDurable,
+}
+
+reason_table!(ShellDrop, ALL_SHELL_DROPS, shell_label, shell_index, {
+    OutboxFull => "outbox_full",
+    NoReader => "no_reader",
+    NotEncodable => "not_encodable",
+    TooLargeToReport => "too_large_to_report",
+    NotDurable => "not_durable",
+});
+
+/// Why a journal record went nowhere.
+///
+/// Records rather than messages, and a separate family for that
+/// reason: a message a subscriber did not get comes back when its
+/// session resumes, and a record the store never learnt does not come
+/// back at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordDrop {
+    /// The storage writer's thread has stopped. Nothing sent from
+    /// then on is written and nothing says so again.
+    WriterStopped,
+}
+
+reason_table!(RecordDrop, ALL_RECORD_DROPS, record_drop_label, record_drop_index, {
+    WriterStopped => "writer_stopped",
+});
+
 /// One counter per packet type per version, resolved at startup.
 #[derive(Debug)]
 struct PacketCounters([[Counter; PACKET_KINDS.len()]; VERSIONS.len()]);
@@ -436,6 +553,17 @@ pub struct Metrics {
     /// Registered and never incremented until milestone 7. See
     /// [`AUTH_OUTCOMES`].
     authentications: [Counter; AUTH_OUTCOMES.len()],
+    /// Section 11.3: a message never disappears without being
+    /// counted. One family, two tables — the broker's own reasons and
+    /// the shell's — because an operator wants one number for
+    /// "messages lost" broken down by why.
+    dropped_by_queue: Box<[Counter]>,
+    dropped_by_shell: Box<[Counter]>,
+    records_dropped: Box<[Counter]>,
+    /// Whether [`Metrics::watch`] has already run. A registry with
+    /// two collectors over the same numbers would render every one of
+    /// them twice, which a scraper reads as a duplicate series.
+    watched: AtomicBool,
 }
 
 impl Default for Metrics {
@@ -522,6 +650,32 @@ impl Metrics {
             auth.get_or_create_owned(&[("outcome", auth_label(AUTH_OUTCOMES[at]))])
         });
 
+        let dropped = Family::<[(&'static str, &'static str); 1], Counter>::default();
+        registry.register(
+            "messages_dropped",
+            "Messages discarded rather than delivered, by why",
+            dropped.clone(),
+        );
+        let dropped_by_queue = ALL_DROP_REASONS
+            .iter()
+            .map(|reason| dropped.get_or_create_owned(&[("reason", drop_label(*reason))]))
+            .collect();
+        let dropped_by_shell = ALL_SHELL_DROPS
+            .iter()
+            .map(|reason| dropped.get_or_create_owned(&[("reason", shell_label(*reason))]))
+            .collect();
+
+        let records = Family::<[(&'static str, &'static str); 1], Counter>::default();
+        registry.register(
+            "records_dropped",
+            "Journal records that were never written down, by why",
+            records.clone(),
+        );
+        let records_dropped = ALL_RECORD_DROPS
+            .iter()
+            .map(|reason| records.get_or_create_owned(&[("reason", record_drop_label(*reason))]))
+            .collect();
+
         Self {
             registry: Mutex::new(registry),
             packets_received,
@@ -533,7 +687,31 @@ impl Metrics {
             sockets_closed,
             reasons_sent,
             authentications,
+            dropped_by_queue,
+            dropped_by_shell,
+            records_dropped,
+            watched: AtomicBool::new(false),
         }
+    }
+
+    /// Register the numbers that are read from the structures that
+    /// already hold them, rather than copied into a metric.
+    ///
+    /// A [`Weak`] reference, because `shared` owns this. Nothing is
+    /// rendered by the collector once the broker it reads has gone,
+    /// which is correct: a scrape during shutdown should report that
+    /// it cannot see the numbers, not the last values somebody
+    /// remembered.
+    ///
+    /// Idempotent, so a second listener over the same broker does not
+    /// register a second collector.
+    pub fn watch(&self, shared: &Arc<Shared>) {
+        if self.watched.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.registry
+            .lock()
+            .register_collector(Box::new(Live(Arc::downgrade(shared))));
     }
 
     /// The counter for a packet read from a client.
@@ -593,12 +771,63 @@ impl Metrics {
         &self.authentications[auth_index(outcome)]
     }
 
+    /// A message the broker discarded, by the reason it reported.
+    pub fn message_dropped(&self, reason: DropReason) -> &Counter {
+        &self.dropped_by_queue[drop_index(reason)]
+    }
+
+    /// A message the shell discarded, where the broker cannot see it.
+    pub fn shell_dropped(&self, reason: ShellDrop) -> &Counter {
+        &self.dropped_by_shell[shell_index(reason)]
+    }
+
+    /// Journal records that went nowhere.
+    pub fn records_dropped(&self, reason: RecordDrop) -> &Counter {
+        &self.records_dropped[record_drop_index(reason)]
+    }
+
     /// Render the whole registry in the Prometheus text format.
     pub fn render(&self) -> String {
         let mut out = String::new();
         prometheus_client::encoding::text::encode(&mut out, &self.registry.lock())
             .expect("writing to a String cannot fail");
         out
+    }
+}
+
+/// The numbers the broker already maintains, read when a scraper
+/// asks.
+///
+/// **Not copied into a gauge.** A gauge holding a second copy of a
+/// count that has an authoritative home is two sources of truth and
+/// a drift bug waiting for the one path that forgets to update it.
+/// Everything here is read from the structure that owns it, at the
+/// moment of the scrape.
+#[derive(Debug)]
+struct Live(Weak<Shared>);
+
+impl Collector for Live {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        let Some(shared) = self.0.upgrade() else {
+            // The broker has gone. Rendering the last values anybody
+            // remembered would be worse than rendering nothing.
+            return Ok(());
+        };
+
+        // The store's own count. `Writer` maintains it because it is
+        // the only thing that can see a batch refused with nobody
+        // waiting to be told, so this reads it rather than keeping a
+        // second tally beside it.
+        let rejected = ConstCounter::new(shared.rejected_batches());
+        let descriptor = encoder.encode_descriptor(
+            "store_batches_rejected",
+            "Batches of records the store refused, which the broker and the store now disagree about",
+            None,
+            rejected.metric_type(),
+        )?;
+        rejected.encode(descriptor)?;
+
+        Ok(())
     }
 }
 

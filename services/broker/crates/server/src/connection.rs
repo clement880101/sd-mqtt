@@ -42,7 +42,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::framing::{FrameError, FrameReader};
-use crate::metrics::{Metrics, SocketOutcome};
+use crate::metrics::{Metrics, ShellDrop, SocketOutcome};
 use crate::shared::{promises_durability, Shared};
 
 /// What a client's receive maximum is when it does not say.
@@ -807,6 +807,7 @@ impl Attached {
         let limit = SizeLimit {
             limit: self.maximum_packet_size,
             shared: Arc::clone(&self.shared),
+            metrics: Arc::clone(&self.metrics),
             subscriber: self.subscriber,
             epoch: self.epoch,
         };
@@ -924,12 +925,18 @@ impl Attached {
                 // this connection is being closed, so the only thing
                 // left for it is the close below, and its own session
                 // resumes on the next connection.
-                self.shared.deliver(
-                    actions
-                        .into_iter()
-                        .filter(|(to, _)| *to != self.subscriber)
-                        .collect(),
-                );
+                let (theirs, mine): (Vec<_>, Vec<_>) = actions
+                    .into_iter()
+                    .partition(|(to, _)| *to != self.subscriber);
+                // Section 11.3. Ours are discarded on purpose, and
+                // "on purpose" is not the same as "for free": one of
+                // them is the acknowledgement this publisher will
+                // never get, and one of them may be a drop report its
+                // session will now never see.
+                self.metrics
+                    .shell_dropped(ShellDrop::NotDurable)
+                    .inc_by(mine.len() as u64);
+                self.shared.deliver(theirs);
                 self.close_with(NOT_DURABLE);
                 return Err(ConnectionError::NotDurable(error));
             }
@@ -1003,7 +1010,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
     let mut buf = BytesMut::new();
     while let Some(action) = outbox.recv().await {
         buf.clear();
-        let rendered = render(&action, version, &mut buf);
+        let rendered = render(&action, version, &mut buf, &metrics);
         if limit.exceeded(buf.len()) {
             // [MQTT-3.1.2-24]: not one byte of it goes out. The size
             // is checked here rather than in the broker because this
@@ -1061,6 +1068,7 @@ struct SizeLimit {
     /// What the client advertised, `None` when it advertised nothing.
     limit: Option<u32>,
     shared: Arc<Shared>,
+    metrics: Arc<Metrics>,
     subscriber: SubscriberId,
     /// Which claim on the session is ours. A writer can still be
     /// draining actions it was handed before a newcomer took the
@@ -1088,9 +1096,30 @@ impl SizeLimit {
     /// acknowledgement, and no other packet holds an inflight slot.
     fn discard(&self, action: &Action) {
         let Action::Send(Packet::Publish(publish)) = action else {
+            // Not a publication, so nothing was lost that a
+            // subscriber was waiting for — but something this broker
+            // meant to write did not go out, and section 11.3 counts
+            // that too.
+            self.metrics
+                .shell_dropped(ShellDrop::TooLargeToReport)
+                .inc();
             return;
         };
         let Some(packet_id) = publish.packet_id else {
+            // **An at-most-once publication, and the path the plan
+            // did not list.** It owes no acknowledgement and holds no
+            // inflight slot, so there is nothing for the broker to
+            // settle and no `Action::Dropped` comes back. The message
+            // is gone all the same, and until this line nothing said
+            // so: even the log below sits after this guard.
+            self.metrics
+                .shell_dropped(ShellDrop::TooLargeToReport)
+                .inc();
+            tracing::debug!(
+                topic = %publish.topic,
+                limit = self.limit,
+                "an at-most-once publication was larger than the client allows"
+            );
             return;
         };
         tracing::debug!(
@@ -1165,7 +1194,7 @@ impl Rendered {
 
 /// Turn one action into bytes, reporting whether it ends the
 /// connection and what it put in the buffer.
-fn render(action: &Action, version: Version, buf: &mut BytesMut) -> Rendered {
+fn render(action: &Action, version: Version, buf: &mut BytesMut, metrics: &Metrics) -> Rendered {
     match action {
         Action::Send(packet) => {
             if let Err(error) = encode(packet, version, buf) {
@@ -1174,6 +1203,13 @@ fn render(action: &Action, version: Version, buf: &mut BytesMut) -> Rendered {
                 // written packet would corrupt the stream.
                 tracing::error!(%error, kind = ?packet.kind(), "an outgoing packet was refused");
                 buf.clear();
+                // Section 11.3: this is a discard like any other.
+                // Nothing else will carry this packet — the writer
+                // has already taken it out of the outbox — so
+                // without this the one thing the broker itself
+                // refused to write would be the one thing nothing
+                // counted.
+                metrics.shell_dropped(ShellDrop::NotEncodable).inc();
                 return Rendered::nothing();
             }
             Rendered {
@@ -2354,6 +2390,7 @@ mod tests {
         let displaced = SizeLimit {
             limit: Some(1),
             shared: Arc::clone(&shared),
+            metrics: Arc::clone(shared.metrics()),
             subscriber: registration.subscriber,
             epoch: registration.epoch + 1,
         };
@@ -2367,6 +2404,7 @@ mod tests {
         let ours = SizeLimit {
             limit: Some(1),
             shared: Arc::clone(&shared),
+            metrics: Arc::clone(shared.metrics()),
             subscriber: registration.subscriber,
             epoch: registration.epoch,
         };
@@ -3538,6 +3576,7 @@ mod tests {
 
         use super::*;
         use broker_core::broker::BrokerConfig;
+        use bytes::BytesMut;
         use mqtt_codec::packet::{RetainHandling, Subscribe, SubscriptionOptions};
         use mqtt_codec::{PacketKind, Version};
         use std::sync::Arc;
@@ -3753,6 +3792,141 @@ mod tests {
             assert!(
                 metrics.bytes_sent().get() > 0,
                 "the refusal's bytes crossed the socket"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_oversize_publication_with_nothing_to_settle_is_still_counted() {
+            // The discard path the plan did not list. A publication too
+            // large for the peer is refused by the writer, and the broker
+            // is told to settle it — but only when it carries a packet
+            // identifier. An at-most-once publication owes no
+            // acknowledgement, so `SizeLimit::discard` returns before it
+            // reports anything, and until now the message vanished with no
+            // action, no counter and not even the log line, which sits
+            // after the guard that returns.
+            let shared = Arc::new(Shared::new(BrokerConfig::default()));
+            let mut subscriber = serve_one(Arc::clone(&shared));
+            let mut publisher = serve_one(Arc::clone(&shared));
+
+            // Small enough that a payload of a hundred bytes cannot fit,
+            // large enough for the two acknowledgements that precede it.
+            attach(
+                &mut subscriber,
+                "sub",
+                Properties {
+                    maximum_packet_size: Some(64),
+                    ..Properties::default()
+                },
+                QoS::AtMostOnce,
+            )
+            .await;
+            attach(
+                &mut publisher,
+                "pub",
+                Properties::default(),
+                QoS::AtMostOnce,
+            )
+            .await;
+
+            write(
+                &mut publisher,
+                &publication(&[b'x'; 100], QoS::AtMostOnce, None),
+                Version::V5,
+            )
+            .await;
+            // A small one behind it, so the assertion is made after the
+            // large one has been through the writer rather than after a
+            // timeout: convention 5's "a test asserting an absence".
+            write(
+                &mut publisher,
+                &publication(b"ok", QoS::AtMostOnce, None),
+                Version::V5,
+            )
+            .await;
+            let mut buf = BytesMut::new();
+            let arrived = next_publish(&mut subscriber, &mut buf).await;
+            assert_eq!(arrived.payload.len(), 2, "the small one arrived");
+
+            assert_eq!(
+                shared
+                    .metrics()
+                    .shell_dropped(crate::metrics::ShellDrop::TooLargeToReport)
+                    .get(),
+                1,
+                "the large one went, and something must say so"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_packet_the_encoder_refuses_is_counted_as_a_discard() {
+            // The other path the plan did not list. `render` logs when the
+            // encoder refuses what the broker produced and clears the
+            // buffer, and until now nothing counted it: a message the
+            // process itself would not write out disappeared as quietly as
+            // one nobody noticed.
+            //
+            // Reached by handing the writer a packet convention 1 says the
+            // encoder must refuse — a publish at at-most-once carrying a
+            // packet identifier — through the same outbox the broker
+            // delivers into, because no client can make the broker produce
+            // one and the path would otherwise be unreachable.
+            let shared = Arc::new(Shared::new(BrokerConfig::default()));
+            let mut client = serve_one(Arc::clone(&shared));
+            connect_v5(&mut client, "refused").await;
+
+            let subscriber = shared
+                .with_broker(|broker| {
+                    broker.subscriber_of(&broker_core::registry::SessionId::new("", "refused"))
+                })
+                .expect("the session exists");
+            shared.deliver(vec![(
+                subscriber,
+                Action::Send(publication(b"x", QoS::AtMostOnce, Some(1))),
+            )]);
+            // A ping answered afterwards, so the assertion follows the
+            // writer having dealt with it.
+            write(&mut client, &Packet::PingReq, Version::V5).await;
+            assert_eq!(read(&mut client, Version::V5).await, Packet::PingResp);
+
+            assert_eq!(
+                shared
+                    .metrics()
+                    .shell_dropped(crate::metrics::ShellDrop::NotEncodable)
+                    .get(),
+                1,
+                "the encoder refused it and nothing else will carry it"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_publishers_own_actions_are_counted_when_a_flush_fails() {
+            // The third path the plan did not list. When a publication
+            // cannot be made durable the connection keeps every action
+            // addressed to somebody else and throws its own away, because
+            // it is about to be closed. Throwing them away is right; doing
+            // it without counting is not.
+            let (shared, store) = with_gated_store();
+            let mut client = serve_one(Arc::clone(&shared));
+            connect_v5(&mut client, "publisher").await;
+            store.fail();
+
+            write(
+                &mut client,
+                &publication(b"x", QoS::AtLeastOnce, Some(1)),
+                Version::V5,
+            )
+            .await;
+            let disconnect = next_disconnect(&mut client).await;
+            assert_eq!(disconnect.reason, ReasonCode::ImplementationSpecificError);
+
+            assert!(
+                shared
+                    .metrics()
+                    .shell_dropped(crate::metrics::ShellDrop::NotDurable)
+                    .get()
+                    > 0,
+                "the acknowledgement this connection was about to send went nowhere"
             );
         }
 

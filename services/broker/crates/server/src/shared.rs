@@ -14,7 +14,7 @@ use parking_lot::{Mutex, RwLock};
 use storage::{Applied, Durable, NotDurable, Writer};
 use tokio::sync::mpsc;
 
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, RecordDrop, ShellDrop};
 
 /// Whether a batch of actions carries a promise that must be kept
 /// before it is delivered.
@@ -188,7 +188,6 @@ pub struct Shared {
     /// dropped.
     writer: Option<Arc<Writer>>,
     outboxes: RwLock<HashMap<SubscriberId, mpsc::Sender<Action>, RandomState>>,
-    dropped_for_slow_reader: AtomicU64,
     /// How often a caller was told the writer is behind. See
     /// [`Shared::report_pacing`].
     paced: AtomicU64,
@@ -232,7 +231,6 @@ impl Shared {
             broker: Mutex::new(broker),
             writer,
             outboxes: RwLock::new(HashMap::with_hasher(RandomState::default())),
-            dropped_for_slow_reader: AtomicU64::new(0),
             paced: AtomicU64::new(0),
             pacing_reported: AtomicU64::new(0),
             rejections_reported: AtomicU64::new(0),
@@ -364,6 +362,9 @@ impl Shared {
             if records.is_empty() {
                 return Committed::Nothing;
             }
+            // Read before the batch is handed over, because handing
+            // it over moves it.
+            let handed = records.len();
             return match writer.apply(records) {
                 Ok(Applied::Accepted) => Committed::Nothing,
                 // The writer is behind, so this caller waits for it
@@ -380,6 +381,14 @@ impl Shared {
                     // once per batch: a broker still serving clients
                     // while writing nothing down is the failure this
                     // whole milestone exists to prevent.
+                    //
+                    // Counted as well as logged, and counted in
+                    // records rather than batches: what is lost is
+                    // facts about durable state, and how many of them
+                    // is the number an operator has to act on.
+                    self.metrics
+                        .records_dropped(RecordDrop::WriterStopped)
+                        .inc_by(handed as u64);
                     tracing::error!(
                         "the storage writer has stopped; nothing the broker says is being written down"
                     );
@@ -440,9 +449,26 @@ impl Shared {
         }
         let outboxes = self.outboxes.read();
         for (subscriber, action) in actions {
+            // **Section 11.3, counted here and nowhere else.** Every
+            // discard the broker reports passes through this loop,
+            // and only some of them reach a writer: three of the
+            // seven reasons happen precisely because nothing is
+            // attached, so a session with no outbox is their normal
+            // state. Counting where the bytes are written would
+            // therefore report none of the drops that matter most.
+            //
+            // Before the send, so that a report discarded by a full
+            // or missing outbox has still been counted as the drop it
+            // reports. It is then counted a second time, under the
+            // reason the shell lost it for — which is two facts about
+            // two different things, not one thing counted twice.
+            if let Action::Dropped { reason, .. } = &action {
+                self.metrics.message_dropped(*reason).inc();
+            }
             let Some(sender) = outboxes.get(&subscriber) else {
                 // The session went away between the broker producing this
                 // and us delivering it. Ordinary, not an error.
+                self.metrics.shell_dropped(ShellDrop::NoReader).inc();
                 continue;
             };
             match sender.try_send(action) {
@@ -452,9 +478,11 @@ impl Shared {
                 // reached a moment later, and counting it as a slow
                 // reader would make the counter report routine
                 // disconnections as a capacity problem.
-                Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.metrics.shell_dropped(ShellDrop::NoReader).inc();
+                }
                 Err(mpsc::error::TrySendError::Full(action)) => {
-                    self.dropped_for_slow_reader.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.shell_dropped(ShellDrop::OutboxFull).inc();
                     tracing::warn!(
                         subscriber = subscriber.0,
                         kind = ?std::mem::discriminant(&action),
@@ -473,8 +501,12 @@ impl Shared {
     }
 
     /// How many actions were discarded because a reader could not keep up.
+    ///
+    /// Reads the metric rather than a counter of its own. This number
+    /// and the exposition's are the same event, and two counts of one
+    /// event are two numbers waiting to disagree.
     pub fn dropped_for_slow_reader(&self) -> u64 {
-        self.dropped_for_slow_reader.load(Ordering::Relaxed)
+        self.metrics.shell_dropped(ShellDrop::OutboxFull).get()
     }
 
     /// How often a batch that promised nothing found the writer's
@@ -778,9 +810,12 @@ pub(crate) mod gated {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use broker_core::session::{DropReason, MessageId};
     use broker_core::subscriptions::SubscriberId;
     use mqtt_codec::ReasonCode;
     use storage::Record;
+
+    use crate::metrics::{drop_label, shell_label, ShellDrop, ALL_DROP_REASONS, ALL_SHELL_DROPS};
 
     #[tokio::test]
     async fn an_outbox_receives_what_is_addressed_to_it() {
@@ -868,6 +903,218 @@ mod tests {
             0,
             "a closed outbox is a departure, not a capacity problem"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Section 11.3: a message never disappears without being counted.
+    // ----------------------------------------------------------------
+
+    /// A discard report for `reason`, addressed to `subscriber`.
+    fn discarded(reason: DropReason) -> Action {
+        Action::Dropped {
+            id: MessageId::new(),
+            reason,
+            qos: mqtt_codec::QoS::AtLeastOnce,
+            topic: std::sync::Arc::from("a/b"),
+        }
+    }
+
+    /// Every counter in the two message-drop tables, as a map from
+    /// label to value.
+    fn drop_counts(shared: &Shared) -> Vec<(&'static str, u64)> {
+        let metrics = shared.metrics();
+        ALL_DROP_REASONS
+            .iter()
+            .map(|reason| (drop_label(*reason), metrics.message_dropped(*reason).get()))
+            .chain(
+                ALL_SHELL_DROPS
+                    .iter()
+                    .map(|reason| (shell_label(*reason), metrics.shell_dropped(*reason).get())),
+            )
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_drop_reason_moves_a_counter_of_its_own() {
+        // Not a list of assertions: the table is walked, so a reason
+        // added to `DropReason` is carried into this test by the same
+        // edit that makes the crate compile again. Two reasons mapped
+        // onto one counter fails here, because every other counter is
+        // asserted to have stayed still.
+        //
+        // Driven through `deliver` rather than through the metric,
+        // because the thing that can be missing is the call. And
+        // through `deliver` rather than through the writer loop for a
+        // reason that is the whole shape of this: a session that is
+        // offline has no outbox, so a report of `qos0_while_offline`
+        // — which by definition only happens while it is offline —
+        // never reaches a writer at all. Counted where every action
+        // passes, or not counted for the cases that matter most.
+        for reason in ALL_DROP_REASONS.iter().copied() {
+            let shared = Shared::new(Default::default());
+            // With a reader attached, so that the only counter that
+            // can move is the reason's own: a session with nobody
+            // attached also counts a `no_reader` discard, which is a
+            // second true fact about a second thing and is asserted
+            // on its own below.
+            let _inbox = shared.register_outbox(SubscriberId(1), 8);
+            shared.deliver(vec![(SubscriberId(1), discarded(reason))]);
+
+            for (label, count) in drop_counts(&shared) {
+                let expected = u64::from(label == drop_label(reason));
+                assert_eq!(
+                    count, expected,
+                    "after one {reason:?}, the {label} counter reads {count}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_discard_for_a_session_with_nobody_attached_is_still_counted() {
+        // The case the writer loop cannot see. A session with no
+        // outbox is the normal state for three of the seven reasons,
+        // and a count taken where the bytes are written would report
+        // none of them.
+        let shared = Shared::new(Default::default());
+        shared.deliver(vec![(
+            SubscriberId(7),
+            discarded(DropReason::QosZeroWhileOffline),
+        )]);
+
+        assert_eq!(
+            shared
+                .metrics()
+                .message_dropped(DropReason::QosZeroWhileOffline)
+                .get(),
+            1,
+            "nobody was attached, and the message still went"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_action_for_a_session_with_no_reader_is_counted() {
+        // Convention 5, a test asserting an absence: the existing
+        // tests for this path assert that nothing panicked and that
+        // the slow-reader figure did not move, which a path that
+        // discarded everything silently would also satisfy.
+        let shared = Shared::new(Default::default());
+        shared.deliver(vec![(SubscriberId(99), Action::Close(ReasonCode::Success))]);
+
+        let gone = shared.register_outbox(SubscriberId(1), 8);
+        drop(gone);
+        shared.deliver(vec![(SubscriberId(1), Action::Close(ReasonCode::Success))]);
+
+        assert_eq!(
+            shared.metrics().shell_dropped(ShellDrop::NoReader).get(),
+            2,
+            "a missing outbox and a closed one are both nobody reading"
+        );
+        assert_eq!(
+            shared.metrics().shell_dropped(ShellDrop::OutboxFull).get(),
+            0,
+            "neither of them is a slow reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_slow_reader_figure_is_the_metric_and_not_a_second_copy() {
+        // One event, one number. The accessor existed before the
+        // metric did, and keeping both would be two counts of the
+        // same thing waiting to disagree.
+        let shared = Shared::new(Default::default());
+        let _inbox = shared.register_outbox(SubscriberId(1), 1);
+        for _ in 0..5 {
+            shared.deliver(vec![(SubscriberId(1), Action::Close(ReasonCode::Success))]);
+        }
+        assert_eq!(shared.dropped_for_slow_reader(), 4);
+        assert_eq!(
+            shared.metrics().shell_dropped(ShellDrop::OutboxFull).get(),
+            shared.dropped_for_slow_reader(),
+        );
+    }
+
+    #[tokio::test]
+    async fn the_refused_batches_in_the_exposition_are_the_stores_own_count() {
+        // Read at scrape time from the writer, which is the only
+        // thing that can see a batch refused with nobody waiting to
+        // be told. A counter of our own beside it would be a second
+        // tally of one event, and the two would disagree the first
+        // time a path forgot one of them.
+        //
+        // The refused batch is handed to the writer directly, for the
+        // reason `a_batch_the_store_refuses_is_reported_once_and_then_stays_quiet`
+        // gives: the shell's only door writes what the broker said,
+        // and the broker will not say this.
+        let store: Arc<dyn storage::Storage> = Arc::new(storage::MemoryStorage::new());
+        let writer = Arc::new(
+            Writer::spawn(store, storage::WriterConfig::default()).expect("a writer thread"),
+        );
+        let shared = Arc::new(Shared::with_store(
+            Broker::new(Default::default()),
+            Arc::clone(&writer),
+        ));
+        shared.metrics().watch(&shared);
+
+        assert!(
+            shared
+                .metrics()
+                .render()
+                .contains("sdmqtt_store_batches_rejected_total 0"),
+            "registered and zero before anything is refused"
+        );
+
+        let applied = writer.apply(vec![Record::QueuePushed {
+            session: storage::record::SessionKey::new("", "never-existed"),
+            entry: storage::record::QueueEntry {
+                sequence: 1,
+                packet_id: None,
+                delivery: storage::record::DeliveryRecord {
+                    body: storage::record::MessageId([0; 16]),
+                    qos: storage::record::Qos::AtLeastOnce,
+                    retain: false,
+                    subscription_ids: Vec::new(),
+                    dup: false,
+                },
+            },
+        }]);
+        assert!(applied.is_ok(), "the writer took it");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if shared.rejected_batches() > 0 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the refusal is noticed");
+
+        let rendered = shared.metrics().render();
+        assert!(
+            rendered.contains(&format!(
+                "sdmqtt_store_batches_rejected_total {}",
+                shared.rejected_batches()
+            )),
+            "the exposition reports the store's number, not one of ours: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_labels_of_the_two_drop_tables_do_not_collide() {
+        // Both tables feed one family, so a label used twice would
+        // resolve to one counter and two reasons would silently share
+        // it. The walk above would not see it: it compares by label.
+        let mut labels: Vec<&str> = ALL_DROP_REASONS
+            .iter()
+            .map(|reason| drop_label(*reason))
+            .chain(ALL_SHELL_DROPS.iter().map(|reason| shell_label(*reason)))
+            .collect();
+        let before = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(before, labels.len(), "a drop reason's label is used twice");
     }
 
     #[tokio::test]

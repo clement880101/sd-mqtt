@@ -120,6 +120,13 @@ impl Server {
         let listener = TcpListener::bind(config.address).await?;
         let address = listener.local_addr()?;
 
+        // The numbers that are read rather than copied need a
+        // reference to what holds them, and this is the first place
+        // in the process that has both a whole `Shared` and an `Arc`
+        // around it. Idempotent, so a second listener over the same
+        // broker registers nothing twice.
+        shared.metrics().watch(&shared);
+
         let (shutdown, _) = broadcast::channel(1);
         let ticker = spawn_ticker(Arc::clone(&shared), shutdown.subscribe());
         let permits = Arc::new(Semaphore::new(config.max_connections));
