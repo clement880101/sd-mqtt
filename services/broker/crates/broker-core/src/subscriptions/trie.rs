@@ -1,6 +1,7 @@
 //! The sharded subscription trie.
 
 use std::hash::BuildHasher;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use foldhash::fast::RandomState;
 use parking_lot::RwLock;
@@ -24,9 +25,14 @@ use crate::topic::levels::Interner;
 ///   root. A session being torn down concurrently can therefore be
 ///   observed half gone, with its shard subscriptions already removed and
 ///   its wildcard subscription still present, or the reverse.
-/// - [`len`], [`node_count`], [`is_empty`] and [`remove_subscriber`] take
+/// - [`node_count`], [`len_by_walking`] and [`remove_subscriber`] take
 ///   each lock in turn, so a total they return may correspond to no
 ///   single instant.
+/// - [`len`] and [`is_empty`] read the maintained count, which is
+///   adjusted just after the shard write that changed it. Under
+///   concurrent mutation they are a question about no single instant
+///   for the same reason. In this process they are exact, because
+///   every path into this type is behind the broker's one mutex.
 ///
 /// The session layer will reason about teardown ordering, so this is
 /// stated rather than left to be discovered: if a caller needs a session
@@ -34,8 +40,28 @@ use crate::topic::levels::Interner;
 /// type, for instance by marking the session dead where delivery checks
 /// it, and treating [`remove_subscriber`] as reclamation afterwards.
 ///
+/// # The count is maintained, not walked
+///
+/// [`len`] used to add up every shard and the wildcard root, which is
+/// a walk of every node in the trie. It is one of section 11.3's five
+/// gauges, so it was read once a second by the events sampler and
+/// again on every metrics scrape, both under the broker's one lock,
+/// and it measured 2.64 milliseconds with a hundred thousand
+/// subscriptions. It is now a counter adjusted at the three places a
+/// subscription arrives or leaves, which are all in this file.
+///
+/// [`len_by_walking`] is the same number the slow way.
+/// `the_maintained_subscription_count_agrees_with_a_walk` in
+/// `tests/differential.rs` asserts the two after every operation of
+/// every generated sequence, and `check` in `tests/journal.rs` does
+/// the same for the whole gauge after every generated history. See
+/// [`QueueTotal`], which is this answer written down the first time.
+///
+/// [`QueueTotal`]: crate::session::QueueTotal
+///
 /// [`matching`]: Self::matching
 /// [`len`]: Self::len
+/// [`len_by_walking`]: Self::len_by_walking
 /// [`node_count`]: Self::node_count
 /// [`is_empty`]: Self::is_empty
 /// [`remove_subscriber`]: Self::remove_subscriber
@@ -45,6 +71,13 @@ pub struct SubscriptionTrie {
     /// Filters beginning with `+` or `#`, which belong to no shard.
     wildcard: RwLock<Node>,
     hasher: RandomState,
+    /// How many subscriptions the shards and the wildcard root hold
+    /// between them.
+    ///
+    /// Maintained rather than counted, and adjusted at every one of
+    /// the three paths that can change it. A fourth path added later
+    /// that forgets it is what the drift property exists for.
+    count: AtomicUsize,
 }
 
 impl SubscriptionTrie {
@@ -56,6 +89,7 @@ impl SubscriptionTrie {
             shards: (0..shards).map(|_| RwLock::new(Node::default())).collect(),
             wildcard: RwLock::new(Node::default()),
             hasher: RandomState::default(),
+            count: AtomicUsize::new(0),
         }
     }
 
@@ -71,28 +105,38 @@ impl SubscriptionTrie {
     /// Add a subscription, replacing any the same subscriber held on this
     /// filter. Returns whether it replaced one.
     pub fn insert(&self, filter: &str, sub: Subscription) -> bool {
-        if Self::first_level_is_wildcard(filter) {
-            return self.wildcard.write().insert(&self.interner, filter, sub);
+        let replaced = if Self::first_level_is_wildcard(filter) {
+            self.wildcard.write().insert(&self.interner, filter, sub)
+        } else {
+            let first = filter.split('/').next().unwrap_or("");
+            self.shard_of(first)
+                .write()
+                .insert(&self.interner, filter, sub)
+        };
+        // A replacement is one subscription before and one after.
+        if !replaced {
+            self.count.fetch_add(1, Ordering::Relaxed);
         }
-        let first = filter.split('/').next().unwrap_or("");
-        self.shard_of(first)
-            .write()
-            .insert(&self.interner, filter, sub)
+        replaced
     }
 
     /// Remove one subscriber's subscription to one filter. Returns whether
     /// anything was removed.
     pub fn remove(&self, filter: &str, subscriber: SubscriberId) -> bool {
-        if Self::first_level_is_wildcard(filter) {
-            return self
-                .wildcard
+        let removed = if Self::first_level_is_wildcard(filter) {
+            self.wildcard
                 .write()
-                .remove(&self.interner, filter, subscriber);
+                .remove(&self.interner, filter, subscriber)
+        } else {
+            let first = filter.split('/').next().unwrap_or("");
+            self.shard_of(first)
+                .write()
+                .remove(&self.interner, filter, subscriber)
+        };
+        if removed {
+            self.count.fetch_sub(1, Ordering::Relaxed);
         }
-        let first = filter.split('/').next().unwrap_or("");
-        self.shard_of(first)
-            .write()
-            .remove(&self.interner, filter, subscriber)
+        removed
     }
 
     /// Append every subscription matching `topic` to `out`.
@@ -131,11 +175,22 @@ impl SubscriptionTrie {
         for shard in self.shards.iter() {
             removed += shard.write().remove_subscriber(subscriber);
         }
+        self.count.fetch_sub(removed, Ordering::Relaxed);
         removed
     }
 
     /// How many subscriptions the trie holds.
+    ///
+    /// Read rather than counted; see the note on the type for what
+    /// the walk cost and what keeps this honest.
     pub fn len(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// The same, by adding up every shard and the wildcard root. For
+    /// the test that keeps the maintained figure honest, and for
+    /// nothing else.
+    pub fn len_by_walking(&self) -> usize {
         self.wildcard.read().len()
             + self
                 .shards
@@ -145,14 +200,17 @@ impl SubscriptionTrie {
     }
 
     /// Whether the trie holds nothing.
-    ///
-    /// Stops at the first subscription found rather than counting them
-    /// all, because the name reads as cheap and callers will treat it
-    /// that way. Like [`len`], it takes each lock in turn rather than all
-    /// at once, so it is a question about no single instant.
-    ///
-    /// [`len`]: Self::len
     pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The same, by walking until it finds one. Beside
+    /// [`len_by_walking`] and for the same reason: a count that has
+    /// gone to zero over a trie that still matches everything is a
+    /// gauge saying the broker is idle while it is not.
+    ///
+    /// [`len_by_walking`]: Self::len_by_walking
+    pub fn is_empty_by_walking(&self) -> bool {
         !self.wildcard.read().holds_any()
             && !self.shards.iter().any(|shard| shard.read().holds_any())
     }

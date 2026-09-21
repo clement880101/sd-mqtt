@@ -1,6 +1,7 @@
 //! Shared subscription groups.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use foldhash::fast::RandomState;
 use parking_lot::RwLock;
@@ -26,10 +27,29 @@ use crate::subscriptions::trie::SubscriptionTrie;
 /// policy that is implemented, skipping a member whose queue is full,
 /// lives in the caller for that reason: it asks for a member, tries it,
 /// and asks again if that member cannot take the message.
+/// # The membership total is maintained, not walked
+///
+/// [`SharedSubscriptions::member_count`] is half of section 11.3's
+/// subscriptions gauge — the other half is [`SubscriptionTrie::len`]
+/// — and the gauge is read once a second by the events sampler and
+/// again on every metrics scrape, both under the broker's one lock.
+/// Adding up every group's members is a walk of every group that
+/// exists, and nothing bounds how many a client may create.
+///
+/// So it is a counter adjusted at the three paths that can change it,
+/// all of them in this file.
+/// [`SharedSubscriptions::member_count_by_walking`] is the same
+/// number the slow way. `tests/journal.rs` asserts the two after
+/// every generated history, and `shared_subscriptions_agree_with_a_map_model`
+/// in `tests/differential.rs` already compares this count against an
+/// independent model after every operation, which is the stronger
+/// check of the two.
 pub struct SharedSubscriptions {
     /// Keyed by a synthetic subscriber identifier standing for a group.
     trie: SubscriptionTrie,
     groups: RwLock<Groups>,
+    /// How many memberships exist across every group.
+    members: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -60,6 +80,7 @@ impl SharedSubscriptions {
                 by_id: HashMap::with_hasher(RandomState::default()),
                 next_id: 0,
             }),
+            members: AtomicUsize::new(0),
         }
     }
 
@@ -117,10 +138,12 @@ impl SharedSubscriptions {
             .iter_mut()
             .find(|m| m.subscriber == sub.subscriber)
         {
+            // A replacement is one membership before and one after.
             *slot = sub;
             true
         } else {
             entry.members.push(sub);
+            self.members.fetch_add(1, Ordering::Relaxed);
             false
         }
     }
@@ -143,6 +166,7 @@ impl SharedSubscriptions {
         if entry.members.len() == before {
             return false;
         }
+        self.members.fetch_sub(1, Ordering::Relaxed);
 
         if entry.members.is_empty() {
             groups.by_id.remove(&id);
@@ -175,6 +199,7 @@ impl SharedSubscriptions {
             }
         }
 
+        self.members.fetch_sub(removed, Ordering::Relaxed);
         removed
     }
 
@@ -239,7 +264,15 @@ impl SharedSubscriptions {
     }
 
     /// How many memberships exist across all groups.
+    ///
+    /// Read rather than counted; see the note on the type.
     pub fn member_count(&self) -> usize {
+        self.members.load(Ordering::Relaxed)
+    }
+
+    /// The same, by asking every group. For the test that keeps the
+    /// maintained figure honest, and for nothing else.
+    pub fn member_count_by_walking(&self) -> usize {
         self.groups
             .read()
             .by_id
