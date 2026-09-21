@@ -548,6 +548,10 @@ pub struct Metrics {
     bytes_sent: Counter,
     sockets_opened: Counter,
     sockets_refused: Counter,
+    /// Section 11.3, for the admin events stream: a reader that has
+    /// fallen behind loses events, and none of them may disappear
+    /// uncounted. See [`Metrics::admin_events_dropped`].
+    admin_events_dropped: Counter,
     sockets_closed: [Counter; SOCKET_OUTCOMES.len()],
     /// Indexed by [`REASON_KINDS`] then by [`ALL_REASONS`].
     reasons_sent: [[Counter; ALL_REASONS.len()]; REASON_KINDS.len()],
@@ -615,6 +619,19 @@ impl Metrics {
             "sockets_refused",
             "Client sockets closed without being served, at the connection limit",
             sockets_refused.clone(),
+        );
+        let admin_events_dropped = Counter::default();
+        registry.register(
+            "admin_events_dropped",
+            // Section 11.3 forbids anything disappearing uncounted,
+            // and an event a browser never saw is one of those. The
+            // reader is told to resynchronise rather than handed a
+            // gap, so this is a health signal rather than a loss;
+            // that is what the help text has to say, because a
+            // non-zero counter otherwise reads as data lost.
+            "Admin events a stream did not receive because its reader fell behind; \
+             each one is answered with a resynchronise rather than a gap",
+            admin_events_dropped.clone(),
         );
         let closed = Family::<[(&'static str, &'static str); 1], Counter>::default();
         registry.register(
@@ -688,6 +705,7 @@ impl Metrics {
             sockets_closed,
             reasons_sent,
             authentications,
+            admin_events_dropped,
             dropped_by_queue,
             dropped_by_shell,
             records_dropped,
@@ -744,6 +762,17 @@ impl Metrics {
     /// connection limit.
     pub fn socket_refused(&self) -> &Counter {
         &self.sockets_refused
+    }
+
+    /// Admin events a stream's reader was too slow to receive.
+    ///
+    /// Section 11.3: a message never disappears without being
+    /// counted, and section 11.1 applies that to the events stream in
+    /// as many words — "every dropped event is counted". The reader
+    /// is sent a resynchronise rather than a gap, so this counter is
+    /// how an operator sees that a browser is falling behind.
+    pub fn admin_events_dropped(&self) -> &Counter {
+        &self.admin_events_dropped
     }
 
     /// A socket that has finished, by how it ended.

@@ -23,16 +23,17 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use sdmqtt_server::shared::Shared;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 pub mod config;
 pub mod error;
+pub mod events;
 pub mod health;
 pub mod resources;
 
@@ -41,8 +42,27 @@ mod testing;
 
 pub use config::{AdminConfig, AdminStartError, Token};
 pub use error::{ApiError, ErrorCode};
+pub use events::{EventBody, EventId, Events};
 pub use health::Readiness;
 pub use resources::{ListenerProtocol, ListenerView};
+
+/// How often the events stream's numbers are sampled.
+///
+/// A second, which is the resolution the Overview page's rate charts
+/// draw at. Faster would be more numbers than a chart can show, and
+/// slower would make a connect take longer to appear than a person
+/// waits before reloading.
+pub const DEFAULT_EVENTS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long shutdown waits for open connections before giving up.
+///
+/// Section 11.1 asks for the whole admin server to be bounded by a
+/// timeout **as a backstop**. The mechanism that actually ends a
+/// stream is the signal every one of them selects on; this is what
+/// stops a bug in that mechanism from being an unkillable process,
+/// and it is generous because reaching it at all is a defect rather
+/// than a slow client.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// Everything a handler can reach.
 ///
@@ -70,6 +90,21 @@ pub struct AdminState {
     /// When this process started serving, for the uptime the
     /// Overview page shows.
     pub started: Instant,
+    /// The recent events, and the live feed of new ones.
+    ///
+    /// See [`events`]: the ring is what makes a reconnect honest,
+    /// and it is what the sampler publishes into.
+    pub events: Arc<Events>,
+    /// Set once, when this listener is stopping.
+    ///
+    /// Every open events stream selects on it, because graceful
+    /// shutdown waits for every open connection and an events body
+    /// never ends on its own. A [`watch`] rather than a broadcast so
+    /// that a stream opened *after* the signal sees it immediately
+    /// rather than waiting for one that will not come again.
+    pub shutdown: watch::Sender<bool>,
+    /// How often the sampler reads the broker.
+    pub events_interval: Duration,
     /// The interim bearer token a mutating request must present,
     /// when one is configured.
     ///
@@ -88,7 +123,12 @@ impl AdminState {
     /// ready is not. The caller opens them as startup passes each
     /// one, and fills in the listeners it bound.
     pub fn new(shared: Arc<Shared>) -> Self {
+        let events = Arc::new(Events::new(Arc::clone(shared.metrics())));
+        let (shutdown, _) = watch::channel(false);
         Self {
+            events,
+            shutdown,
+            events_interval: DEFAULT_EVENTS_INTERVAL,
             shared,
             readiness: Arc::new(Readiness::starting()),
             node_id: Arc::from("local"),
@@ -96,6 +136,13 @@ impl AdminState {
             started: Instant::now(),
             token: None,
         }
+    }
+
+    /// Sample the broker this often for the events stream.
+    #[must_use]
+    pub fn with_events_interval(mut self, interval: Duration) -> Self {
+        self.events_interval = interval;
+        self
     }
 
     /// Guard mutating requests with `token`.
@@ -168,6 +215,9 @@ impl AdminServer {
             })?;
 
         let (stop, stopped) = oneshot::channel();
+        let events = Arc::clone(&state.events);
+        let sampler = events::spawn_sampler(state.clone(), state.events_interval);
+        let signal = state.shutdown.clone();
         let router = router(state);
         let serve = tokio::spawn(async move {
             let served = axum::serve(listener, router)
@@ -175,6 +225,13 @@ impl AdminServer {
                     // An error is the sender dropped, which is the
                     // state we are waiting for.
                     let _ = stopped.await;
+                    // **Before returning, not after.** Returning
+                    // from here is what starts hyper waiting for
+                    // every open connection to finish, and an events
+                    // body does not finish on its own. Telling the
+                    // streams first is what makes that wait
+                    // terminate.
+                    let _ = signal.send(true);
                 })
                 .await;
             if let Err(error) = served {
@@ -187,6 +244,8 @@ impl AdminServer {
             address,
             stop: Some(stop),
             serve,
+            sampler,
+            events,
         })
     }
 }
@@ -200,9 +259,14 @@ impl AdminServer {
 /// served" is a failure a client has to be able to tell from a proxy
 /// that swallowed the request.
 fn router(state: AdminState) -> Router {
+    // **No compression layer, deliberately.** Section 11.1: a
+    // compression layer applied across this listener would turn the
+    // events stream into batch delivery. The events route is not
+    // exempted from one; there is none to be exempted from.
     Router::new()
         .merge(health::routes())
         .merge(resources::routes())
+        .merge(events::routes())
         .fallback(error::not_found)
         .method_not_allowed_fallback(error::method_not_allowed)
         .with_state(state)
@@ -213,6 +277,8 @@ pub struct AdminRunning {
     address: SocketAddr,
     stop: Option<oneshot::Sender<()>>,
     serve: JoinHandle<()>,
+    sampler: JoinHandle<()>,
+    events: Arc<Events>,
 }
 
 impl AdminRunning {
@@ -222,12 +288,38 @@ impl AdminRunning {
         self.address
     }
 
+    /// The events ring this listener is serving.
+    ///
+    /// Milestone 4's hooks publish into it; today the sampler does,
+    /// and a test does.
+    pub fn events(&self) -> &Arc<Events> {
+        &self.events
+    }
+
     /// Stop serving, and wait for the server to finish.
+    ///
+    /// Bounded, as section 11.1 asks. What actually ends an events
+    /// stream is the signal it selects on, sent by the graceful
+    /// shutdown future above; the timeout is the backstop for a
+    /// stream that does not, so that a broker stops rather than
+    /// hanging on a browser tab. Reaching it is a defect and says
+    /// so.
     pub async fn shutdown(mut self) {
         // Dropping the sender is the signal; sending is the same thing
         // said explicitly.
         drop(self.stop.take());
-        let _ = self.serve.await;
+        if tokio::time::timeout(SHUTDOWN_GRACE, self.serve)
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                grace = ?SHUTDOWN_GRACE,
+                "the admin listener did not finish within its grace period; \
+                 something held a connection open past the shutdown signal"
+            );
+        }
+        self.sampler.abort();
+        let _ = self.sampler.await;
     }
 }
 

@@ -37,6 +37,16 @@ axum = { version = "0.8", default-features = false, features = [
     "tracing",
 ] }
 serde = { version = "1", features = ["derive"] }
+# The `Stream` trait `axum::response::sse::Sse` is written against,
+# which is `futures_core`'s. One crate, already in the lock file
+# because axum depends on it, and nothing transitive: the alternative
+# was a generator crate for one `poll_next` that forwards to a
+# channel.
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+# The events ring's lock. The same lock this workspace uses
+# everywhere else, so that "never held across an await" is one habit
+# rather than two.
+parking_lot = "0.12"
 # A publish endpoint hands the broker a payload, and the broker holds
 # one as `Bytes` so that fan-out shares it rather than copying it.
 bytes.workspace = true
