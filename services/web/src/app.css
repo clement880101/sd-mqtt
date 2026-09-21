@@ -222,3 +222,114 @@ main {
   font-family: var(--font-sans);
   font-size: var(--font-size-0);
 }
+
+/* ------------------------------------------------------------------
+ * The Clients table, which is windowed: the scroller holds a sizer
+ * of the full height and a handful of absolutely placed rows.
+ * ---------------------------------------------------------------- */
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--size-3);
+  margin-block-end: var(--size-3);
+}
+
+.controls label {
+  display: flex;
+  align-items: center;
+  gap: var(--size-2);
+}
+
+input[type='search'],
+input[type='text'],
+input[type='number'],
+select,
+textarea {
+  padding: var(--size-1) var(--size-2);
+  border: var(--border-size-1) solid var(--edge);
+  border-radius: var(--radius-2);
+  background: var(--surface-raised);
+  color: var(--ink);
+  font: inherit;
+}
+
+button {
+  padding: var(--size-1) var(--size-3);
+  border: var(--border-size-1) solid var(--edge);
+  border-radius: var(--radius-2);
+  background: var(--surface-raised);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  color: var(--ink-quiet);
+  cursor: default;
+}
+
+.table {
+  border: var(--border-size-1) solid var(--edge);
+  border-radius: var(--radius-2);
+  background: var(--surface-raised);
+  overflow: hidden;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: minmax(8rem, 2fr) minmax(5rem, 1fr) 5rem 4rem 5rem 5rem 5rem;
+  gap: var(--size-2);
+  align-items: center;
+  padding-inline: var(--size-3);
+  border-block-end: var(--border-size-1) solid var(--edge);
+  font-size: var(--font-size-0);
+  font-variant-numeric: tabular-nums;
+}
+
+.row.head {
+  position: sticky;
+  inset-block-start: 0;
+  block-size: var(--size-7);
+  color: var(--ink-quiet);
+  text-transform: uppercase;
+  letter-spacing: var(--font-letterspacing-1);
+  font-size: var(--font-size-00);
+}
+
+.row.partial {
+  color: var(--ink-quiet);
+  font-style: italic;
+}
+
+.row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.scroller {
+  block-size: 60vh;
+  overflow: auto;
+  contain: strict;
+}
+
+.sizer {
+  position: relative;
+  inline-size: 100%;
+}
+
+.sizer .row {
+  position: absolute;
+  inset-inline: 0;
+  inset-block-start: 0;
+}
+
+.footer {
+  margin-block-start: var(--size-3);
+}

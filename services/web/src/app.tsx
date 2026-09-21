@@ -12,6 +12,7 @@ import { LocationProvider, Route, Router, useLocation } from 'preact-iso';
 import { useEffect } from 'preact/hooks';
 
 import { lastEventId, start, status } from './live.js';
+import { Clients } from './pages/clients.js';
 import { Overview } from './pages/overview.js';
 
 /** The pages section 11.2 names, in the order the navigation shows them. */
@@ -110,7 +111,7 @@ export function App() {
       <main>
         <Router onRouteChange={(url) => (section.value = labelFor(url))}>
           <Route path="/" component={Overview} />
-          <Route path="/clients" component={() => <Placeholder title="Clients" />} />
+          <Route path="/clients" component={Clients} />
           <Route path="/topics" component={() => <Placeholder title="Topics" />} />
           <Route default component={() => <Placeholder title="Not found" />} />
         </Router>
