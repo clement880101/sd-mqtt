@@ -333,3 +333,75 @@ button:disabled {
 .footer {
   margin-block-start: var(--size-3);
 }
+
+/* ------------------------------------------------------------------
+ * The Topics page: a publish form, the retained browser and the
+ * watcher.
+ * ---------------------------------------------------------------- */
+
+.page h2 {
+  margin-block: var(--size-5) var(--size-2);
+  font-size: var(--font-size-3);
+}
+
+.fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--size-3);
+}
+
+.fields label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-1);
+  font-size: var(--font-size-0);
+  color: var(--ink-quiet);
+}
+
+.fields label.inline {
+  flex-direction: row;
+  align-items: center;
+  padding-block-end: var(--size-2);
+}
+
+.fields textarea {
+  min-inline-size: 22rem;
+}
+
+.problem {
+  color: var(--bad);
+  max-inline-size: 22rem;
+}
+
+.hint {
+  color: var(--ink-quiet);
+  font-size: var(--font-size-0);
+}
+
+input[aria-invalid='true'] {
+  border-color: var(--bad);
+}
+
+.rows {
+  max-block-size: 40vh;
+  overflow: auto;
+}
+
+.retained-row {
+  grid-template-columns: minmax(10rem, 2fr) minmax(10rem, 3fr) 3rem 5rem 6rem;
+  min-block-size: var(--size-7);
+}
+
+.watch-row {
+  grid-template-columns: minmax(10rem, 2fr) minmax(10rem, 3fr) 6rem 9rem;
+  min-block-size: var(--size-7);
+}
+
+.row.fresh {
+  background: color-mix(in oklab, var(--series-b) 18%, transparent);
+}
+
+.rows .empty {
+  padding: var(--size-3);
+}

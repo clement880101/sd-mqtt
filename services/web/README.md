@@ -96,6 +96,56 @@ Either way, that path is guarded against the broker directly rather
 than by anyone noticing it here:
 `crates/admin/src/events.rs::a_client_that_goes_away_ends_its_stream`.
 
+## The subscribe tool, and the mechanism it does not have
+
+The Topics page has a publish form and a watcher. The watcher is the
+"subscribe" half, and it is **not** a subscription. This is the
+decision and what it costs.
+
+**The events stream carries no publications.** Section 11.1: it
+carries counter deltas, connect and disconnect events, and later rule
+outcomes. Nothing on the admin API lets a browser see a message pass.
+So the tool either needed a new broker mechanism or had to be built
+from what is there.
+
+**What is built.** The watcher takes an MQTT topic filter, pages the
+retained resource, matches each topic with the protocol's own rules
+(4.7, including that a leading wildcard does not match a `$` topic)
+and re-reads every two seconds, marking what changed.
+
+**What it costs.** It sees retained messages only. A publication
+without the retain flag never appears, so a filter over a topic
+published to a thousand times a second but never retained shows
+nothing at all. The page says this on screen, because a watcher that
+draws nothing is otherwise indistinguishable from a quiet broker. It
+also samples rather than streams: a value that changes twice between
+two passes is one change here.
+
+**Its limit.** A filter of `#` on a busy broker is the obvious abuse
+of anything that forwards matching messages. Here it is bounded by
+construction: one pass reads at most five pages of two hundred
+topics, so `#` costs exactly what one topic costs, and a store
+holding more than that is reported as partially watched rather than
+silently truncated. The cost to the broker is one request per
+interval per open tab, which is bounded and visible.
+
+**What was not built, and what it would take.** A *tap*: a real
+subscriber inside the broker whose deliveries a browser can read. It
+needs no new matching rules, because it can be a genuine session —
+`Broker::connect`, `Broker::handle` with a subscribe, and
+`Shared::register_outbox` are all public and are what a connection
+itself uses. What it needs beyond that is the part that makes it
+safe: a bounded ring per tap with a counted drop, a cap on how many
+taps exist, a payload cap, and an expiry for a tap nobody is polling
+— because a forgotten tap is a session that never leaves, and a
+session that never leaves is a client on the Clients page that
+nothing can explain. Polling rather than a second stream, because
+section 11.1 allows the interface exactly one.
+
+That is a change to the broker and to the admin API, with its own
+abuse surface and a session-creating code path, and it was not put
+inside a commit that writes three pages.
+
 ## Attribution
 
 `THIRD-PARTY-NOTICES.txt` is generated from the bundle, not from the

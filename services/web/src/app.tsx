@@ -14,6 +14,7 @@ import { useEffect } from 'preact/hooks';
 import { lastEventId, start, status } from './live.js';
 import { Clients } from './pages/clients.js';
 import { Overview } from './pages/overview.js';
+import { Topics } from './pages/topics.js';
 
 /** The pages section 11.2 names, in the order the navigation shows them. */
 const PAGES = [
@@ -112,7 +113,7 @@ export function App() {
         <Router onRouteChange={(url) => (section.value = labelFor(url))}>
           <Route path="/" component={Overview} />
           <Route path="/clients" component={Clients} />
-          <Route path="/topics" component={() => <Placeholder title="Topics" />} />
+          <Route path="/topics" component={Topics} />
           <Route default component={() => <Placeholder title="Not found" />} />
         </Router>
       </main>
