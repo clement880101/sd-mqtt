@@ -594,8 +594,21 @@ pub(crate) mod gated {
         /// answering does to the writer's whole channel rather than to
         /// one flush.
         holding_applies: bool,
+        /// When the hold gives up and lets everything through, set when
+        /// the hold begins. See [`GatedStore::LONGEST_HOLD`].
+        held_until: Option<std::time::Instant>,
         /// Flushes fail rather than succeed.
         failing: bool,
+    }
+
+    impl Gate {
+        /// How long the hold has left, and `None` once it is over.
+        fn remaining(&self) -> Option<Duration> {
+            let left = self
+                .held_until?
+                .saturating_duration_since(std::time::Instant::now());
+            (!left.is_zero()).then_some(left)
+        }
     }
 
     /// An in-memory store with a gate in front of its flush.
@@ -608,12 +621,18 @@ pub(crate) mod gated {
     }
 
     impl GatedStore {
-        /// How long a held flush waits before giving up and going
-        /// through anyway.
+        /// How long a hold lasts before it lets everything through.
         ///
         /// Far longer than any assertion window here, so it never
         /// decides a test's answer, and finite so that a failing
         /// assertion ends in a report rather than in a hang.
+        ///
+        /// **From the hold rather than from the call.** A bound applied
+        /// per call is no bound at all when a test has queued a
+        /// thousand batches behind the held one: the writer's thread
+        /// pays it once per batch, the join in `Writer::drop` waits for
+        /// all of them, and the suite hangs anyway. This is one
+        /// deadline for the whole hold.
         const LONGEST_HOLD: Duration = Duration::from_secs(20);
 
         /// A store that answers at once.
@@ -623,7 +642,9 @@ pub(crate) mod gated {
 
         /// Hold every flush from now on, until [`GatedStore::release`].
         pub(crate) fn hold(&self) {
-            self.gate.lock().held = true;
+            let mut gate = self.gate.lock();
+            gate.held = true;
+            gate.held_until = Some(std::time::Instant::now() + Self::LONGEST_HOLD);
         }
 
         /// Hold every apply as well, until [`GatedStore::release`].
@@ -636,6 +657,7 @@ pub(crate) mod gated {
             let mut gate = self.gate.lock();
             gate.held = true;
             gate.holding_applies = true;
+            gate.held_until = Some(std::time::Instant::now() + Self::LONGEST_HOLD);
         }
 
         /// Let held flushes and applies through, and the ones after
@@ -644,6 +666,7 @@ pub(crate) mod gated {
             let mut gate = self.gate.lock();
             gate.held = false;
             gate.holding_applies = false;
+            gate.held_until = None;
             drop(gate);
             self.opened.notify_all();
         }
@@ -663,13 +686,13 @@ pub(crate) mod gated {
     impl Storage for GatedStore {
         fn apply(&self, records: &[Record]) -> Result<(), StorageError> {
             let mut gate = self.gate.lock();
-            let deadline = std::time::Instant::now() + Self::LONGEST_HOLD;
+            // Until released, or until the hold's own deadline, for the
+            // reason on [`GatedStore::LONGEST_HOLD`].
             while gate.holding_applies {
-                // Let go rather than wait forever, for the reason on
-                // the flush below.
-                if self.opened.wait_until(&mut gate, deadline).timed_out() {
+                let Some(remaining) = gate.remaining() else {
                     break;
-                }
+                };
+                self.opened.wait_for(&mut gate, remaining);
             }
             drop(gate);
             self.inner.apply(records)
@@ -677,16 +700,16 @@ pub(crate) mod gated {
 
         fn flush(&self) -> Result<(), StorageError> {
             let mut gate = self.gate.lock();
-            let deadline = std::time::Instant::now() + Self::LONGEST_HOLD;
             while gate.held {
-                if self.opened.wait_until(&mut gate, deadline).timed_out() {
-                    // Let go rather than wait forever. Dropping a
-                    // `Writer` joins its thread, and the thread's last
-                    // act is a flush, so a test whose assertion fails
-                    // while the gate is shut would otherwise deadlock
-                    // in its own unwind and report nothing at all.
+                // Let go rather than wait forever. Dropping a `Writer`
+                // joins its thread, and the thread's last act is a
+                // flush, so a test whose assertion fails while the gate
+                // is shut would otherwise deadlock in its own unwind and
+                // report nothing at all.
+                let Some(remaining) = gate.remaining() else {
                     break;
-                }
+                };
+                self.opened.wait_for(&mut gate, remaining);
             }
             let failing = gate.failing;
             drop(gate);

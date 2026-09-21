@@ -142,8 +142,9 @@ enum Event {
 struct Fake {
     /// Every call, in order.
     events: Mutex<Vec<Event>>,
-    /// While true, `apply` blocks.
-    held: Mutex<bool>,
+    /// While set, `apply` blocks, and no later than this instant: see
+    /// [`Fake::LONGEST_HOLD`].
+    held: Mutex<Option<Instant>>,
     /// Signalled when `held` changes.
     released: Condvar,
     /// Set by `apply` when it finds itself held, so a test can know the
@@ -161,22 +162,30 @@ struct Fake {
 }
 
 impl Fake {
-    /// How long a held `apply` waits before giving up and going through
-    /// anyway.
+    /// How long a hold lasts before it lets everything through.
     ///
     /// Far longer than any assertion window here, so it never decides a
     /// test's answer, and finite so that a failing assertion ends in a
-    /// report rather than in a hang. The same bound, for the same
-    /// reason, as `GatedStore::LONGEST_HOLD` in `sdmqtt-server`.
+    /// report rather than in a hang: dropping a [`Writer`] joins its
+    /// thread, and a test that fails while the store is held would
+    /// otherwise deadlock in its own unwind.
+    ///
+    /// **From the hold rather than from the call.** A bound applied per
+    /// call is no bound at all when a test has queued a thousand
+    /// batches behind the held one: the thread pays it once per batch
+    /// and the suite hangs anyway. This is one deadline for the whole
+    /// hold, so once it passes every batch goes straight through.
     const LONGEST_HOLD: Duration = Duration::from_secs(20);
 
     fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
-    /// Hold the next `apply` until [`Fake::release`].
+    /// Hold `apply` until [`Fake::release`], or until
+    /// [`Fake::LONGEST_HOLD`] has passed.
     fn hold(&self) {
-        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        *self.held.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(Instant::now() + Self::LONGEST_HOLD);
     }
 
     /// Whether the thread is parked inside a held `apply`.
@@ -194,7 +203,7 @@ impl Fake {
 
     /// Let it go.
     fn release(&self) {
-        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = None;
         self.released.notify_all();
     }
 
@@ -252,29 +261,22 @@ impl Fake {
 impl Storage for Fake {
     fn apply(&self, records: &[Record]) -> Result<(), StorageError> {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        if *held {
+        if held.is_some() {
             self.caught.store(true, Ordering::SeqCst);
         }
-        let deadline = std::time::Instant::now() + Self::LONGEST_HOLD;
-        while *held {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            // Let go rather than wait forever. Dropping a [`Writer`]
-            // joins its thread, so a test whose assertion fails while
-            // the store is held would otherwise deadlock in its own
-            // unwind: the suite hangs, and a suite that hangs reports
-            // nothing at all — including, when this is run under
-            // mutation, that the mutation was caught.
+        // Until released, or until the hold's own deadline: see
+        // [`Fake::LONGEST_HOLD`] for why a hang here would report
+        // nothing at all.
+        while let Some(deadline) = *held {
+            let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            let (guard, timed_out) = self
+            let (guard, _) = self
                 .released
                 .wait_timeout(held, remaining)
                 .unwrap_or_else(PoisonError::into_inner);
             held = guard;
-            if timed_out.timed_out() {
-                break;
-            }
         }
         drop(held);
         assert!(
