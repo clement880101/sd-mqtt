@@ -602,8 +602,19 @@ impl<'txn> Tables<'txn> {
         Ok(())
     }
 
-    /// Write a session's counters, removing the row when there is nothing
-    /// left to say.
+    /// Write a session's counters.
+    ///
+    /// **The row is never removed, including for a queue that has
+    /// drained.** A depth of zero is not nothing left to say: the
+    /// high-water mark beside it is the highest sequence ever assigned,
+    /// and section 7.4 requires it to outlive every entry that carried
+    /// one. Removing the row would read back as zero and hand out
+    /// numbers the store has already spent, and every batch carrying
+    /// one would be refused as [`Rejection::SequenceReused`].
+    ///
+    /// What does remove it is [`Record::SessionRemoved`], because then
+    /// the mark is not owed to anybody: a client reconnecting under the
+    /// same identifier inherits nothing.
     fn write_queue_state(&mut self, prefix: &[u8], state: QueueState) -> Result<(), StorageError> {
         self.queue_state
             .insert(prefix, state.encode().as_slice())
