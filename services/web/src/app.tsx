@@ -1,14 +1,17 @@
 /**
- * The shell: a navigation bar, and a route per page with nothing in
- * it yet.
+ * The shell: a navigation bar, the one live connection, and a route
+ * per page.
  *
- * Deliberately empty. The pipeline that builds this, attributes it,
- * embeds it and serves it is proved before a page is written,
- * because every part of it fails in a way that is hard to see from
- * inside a page.
+ * The connection is started here and nowhere else. Section 11.1: the
+ * interface opens exactly one stream for the whole application,
+ * because the admin listener speaks HTTP/1.1 and a browser allows six
+ * connections to an origin. See `live.ts`.
  */
 import { signal, useSignalEffect } from '@preact/signals';
 import { LocationProvider, Route, Router, useLocation } from 'preact-iso';
+import { useEffect } from 'preact/hooks';
+
+import { lastEventId, start, status } from './live.js';
 
 /** The pages section 11.2 names, in the order the navigation shows them. */
 const PAGES = [
@@ -35,7 +38,7 @@ function labelFor(path: string): string {
  */
 const section = signal(labelFor(window.location.pathname));
 
-/** One page, with nothing on it. */
+/** One page that has not been written. */
 function Placeholder({ title }: { title: string }) {
   return (
     <section class="page">
@@ -60,7 +63,35 @@ function Navigation() {
           </li>
         ))}
       </ul>
+      <LiveStatus />
     </nav>
+  );
+}
+
+/** What each state of the connection says. */
+const SAID = {
+  connecting: 'Connecting to the broker',
+  live: 'Live',
+  lost: 'Lost the connection to the broker. Retrying.',
+} as const;
+
+/**
+ * Whether the live connection is up.
+ *
+ * Shown always rather than only when it breaks. A page whose data
+ * stopped arriving looks exactly like a quiet broker, and the whole
+ * point of this line is that an operator can tell the two apart
+ * without reloading to find out.
+ */
+function LiveStatus() {
+  const state = status.value;
+  const seen = lastEventId.value;
+  return (
+    <p class={`live live-${state}`} role="status" aria-live="polite">
+      <span class="live-dot" aria-hidden="true" />
+      {SAID[state]}
+      {state === 'live' && seen ? <span class="live-id"> · event {seen}</span> : null}
+    </p>
   );
 }
 
@@ -69,6 +100,9 @@ export function App() {
   useSignalEffect(() => {
     document.title = `${section.value} · sd-mqtt`;
   });
+  // One connection for the application, opened once the shell is
+  // mounted. `start` is idempotent so a remount costs nothing.
+  useEffect(() => start(), []);
   return (
     <LocationProvider>
       <Navigation />
