@@ -316,10 +316,13 @@ cannot tell the three apart, so the sentence now names all three.
    again. The repository has no browser test runner, and adding one
    is a decision with its own weight. **Still true of the pages, and
    no longer true of what they talk to**: the tap has twenty-five
-   tests in `crates/admin/src/taps.rs`, all of them against a real
-   broker over a real socket, and thirty deliberate mutations were
-   run against them. The browser half of the watcher is still
-   guarded by nothing but somebody doing it again.
+   tests in `crates/admin/src/taps.rs`, nearly all of them against a
+   real broker over a real socket, and thirty deliberate mutations
+   were run against them. Five survived their first run — the epoch
+   check in a tap's teardown, the counter for a discard the broker
+   reports, and three about the cap — and each one is a test or a
+   design change in the commits above. The browser half of the
+   watcher is still guarded by nothing but somebody doing it again.
 3. **The restart notice is late on an idle broker**, as described.
 4. **`queued` has no resource behind it.** Every other gauge can be
    fetched; queue depth arrives only on the events stream, so a
