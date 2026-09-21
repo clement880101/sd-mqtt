@@ -975,10 +975,20 @@ parameter at fault where one is at fault, and is absent otherwise, so a form
 can mark an input without reading the sentence.
 
 The codes today are `invalid_request`, `not_found`, `method_not_allowed`,
-`unauthorized` and `internal`. Adding one is a compatible change and renaming
-one is not; a client treats an unknown code as the class its HTTP status
-implies. The status is **derived from the code** rather than sent beside it,
-so the two cannot disagree.
+`not_acceptable`, `unauthorized`, `resource_exhausted` and `internal`.
+Adding one is a compatible change and renaming one is not; a client treats an
+unknown code as the class its HTTP status implies. The status is **derived
+from the code** rather than sent beside it, so the two cannot disagree.
+
+Two of those seven arrived with milestone 3 and this sentence did not follow
+them, which is the failure convention 8 is about in miniature: the section
+says "the codes today are", so a list that is merely compatible is still
+wrong. `not_acceptable` is a `406`, for an `Accept-Encoding` that excludes
+every encoding the interface is embedded in; `resource_exhausted` is a `429`,
+for a bounded thing that is full — today the live subscriber taps, whose cap
+is fixed. It is deliberately not `invalid_request`: the request was well
+formed and would succeed unchanged a moment later, which is exactly what a
+client needs in order to decide whether to retry.
 
 The body is nested under `error` so that a client which forgot to look at the
 status code still cannot confuse a failure with a success: no successful
