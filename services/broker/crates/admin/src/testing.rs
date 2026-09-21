@@ -48,12 +48,33 @@ pub(crate) async fn get(address: SocketAddr, path: &str) -> Response {
     request(address, "GET", path, None).await
 }
 
-/// One request, and the whole of the response.
+/// One request with no body, and the whole of the response.
 pub(crate) async fn request(
     address: SocketAddr,
     method: &str,
     path: &str,
     token: Option<&str>,
+) -> Response {
+    with_body(address, method, path, token, None).await
+}
+
+/// `POST path` carrying `body` as JSON.
+pub(crate) async fn post_json(
+    address: SocketAddr,
+    path: &str,
+    token: Option<&str>,
+    body: &str,
+) -> Response {
+    with_body(address, "POST", path, token, Some(body)).await
+}
+
+/// One request, and the whole of the response.
+pub(crate) async fn with_body(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&str>,
 ) -> Response {
     let mut stream = TcpStream::connect(address)
         .await
@@ -62,8 +83,20 @@ pub(crate) async fn request(
         Some(token) => format!("Authorization: Bearer {token}\r\n"),
         None => String::new(),
     };
+    // A content length rather than a chunked body, because the point
+    // of this client is to be small enough to read and hyper accepts
+    // both.
+    let content = match body {
+        Some(body) => format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        ),
+        None => String::new(),
+    };
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n{authorization}\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\
+         {authorization}{content}\r\n{}",
+        body.unwrap_or_default()
     );
     stream
         .write_all(head.as_bytes())

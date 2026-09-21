@@ -70,6 +70,15 @@ pub struct AdminState {
     /// When this process started serving, for the uptime the
     /// Overview page shows.
     pub started: Instant,
+    /// The interim bearer token a mutating request must present,
+    /// when one is configured.
+    ///
+    /// Set by [`AdminServer::bind`] from the configuration it is
+    /// given, so that the token the guard checks and the token the
+    /// startup refusal counted on cannot be two different things.
+    /// Behind an [`Arc`] because this whole struct is cloned per
+    /// request and a secret is not worth an allocation each time.
+    pub token: Option<Arc<Token>>,
 }
 
 impl AdminState {
@@ -85,7 +94,15 @@ impl AdminState {
             node_id: Arc::from("local"),
             listeners: Arc::new(Vec::new()),
             started: Instant::now(),
+            token: None,
         }
+    }
+
+    /// Guard mutating requests with `token`.
+    #[must_use]
+    pub fn with_token(mut self, token: Option<Token>) -> Self {
+        self.token = token.map(Arc::new);
+        self
     }
 
     /// Share readiness gates somebody else is holding.
@@ -129,6 +146,13 @@ impl AdminServer {
         state: AdminState,
     ) -> Result<AdminRunning, AdminStartError> {
         config.check()?;
+        // The configuration is the authority on the token, not
+        // whatever the caller happened to build into the state. The
+        // refusal above decided whether this listener may be started
+        // at all by reading `config.token`, so the guard that runs
+        // per request must read the same field or the two could
+        // disagree about whether this listener is protected.
+        let state = state.with_token(config.token.clone());
         let listener =
             TcpListener::bind(config.address)
                 .await

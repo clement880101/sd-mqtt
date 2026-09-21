@@ -624,8 +624,14 @@ impl Shared {
 /// dedicated operating system thread and calls it from there. Nothing
 /// on the runtime is parked by it, which is the same reason the real
 /// writer can afford a synchronous `fsync`.
-#[cfg(test)]
-pub(crate) mod gated {
+/// **Test scaffolding**, compiled by this crate's own tests and, under
+/// the `testing` feature, by another crate's. `sdmqtt-admin` needs it
+/// to make the same assertion about its publish endpoint that
+/// `connection` makes about a client's publish, and a second gated
+/// store there would be a second set of assumptions about what a
+/// device does. Nothing this crate ships turns the feature on.
+#[cfg(any(test, feature = "testing"))]
+pub mod gated {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
@@ -670,7 +676,7 @@ pub(crate) mod gated {
 
     /// An in-memory store with a gate in front of its flush.
     #[derive(Debug, Default)]
-    pub(crate) struct GatedStore {
+    pub struct GatedStore {
         inner: MemoryStorage,
         gate: Mutex<Gate>,
         opened: Condvar,
@@ -696,12 +702,12 @@ pub(crate) mod gated {
         const LONGEST_HOLD: Duration = Duration::from_secs(20);
 
         /// A store that answers at once.
-        pub(crate) fn new() -> Self {
+        pub fn new() -> Self {
             Self::default()
         }
 
         /// Hold every flush from now on, until [`GatedStore::release`].
-        pub(crate) fn hold(&self) {
+        pub fn hold(&self) {
             let mut gate = self.gate.lock();
             gate.held = true;
             gate.holding = true;
@@ -714,7 +720,7 @@ pub(crate) mod gated {
         /// the store and the channel in front of it stops draining,
         /// which is the only state in which a backlog can be observed at
         /// all.
-        pub(crate) fn hold_applies(&self) {
+        pub fn hold_applies(&self) {
             let mut gate = self.gate.lock();
             gate.held = true;
             gate.holding_applies = true;
@@ -724,7 +730,7 @@ pub(crate) mod gated {
 
         /// Let held flushes and applies through, and the ones after
         /// them.
-        pub(crate) fn release(&self) {
+        pub fn release(&self) {
             let mut gate = self.gate.lock();
             gate.held = false;
             gate.holding_applies = false;
@@ -735,13 +741,13 @@ pub(crate) mod gated {
         }
 
         /// Fail every flush from now on.
-        pub(crate) fn fail(&self) {
+        pub fn fail(&self) {
             self.gate.lock().failing = true;
         }
 
         /// How many flushes have been answered, held ones included
         /// once they were let through.
-        pub(crate) fn flushes(&self) -> u64 {
+        pub fn flushes(&self) -> u64 {
             self.flushes.load(Ordering::Relaxed)
         }
     }

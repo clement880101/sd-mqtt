@@ -84,14 +84,18 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequestParts, Query, State};
 use axum::http::request::Parts;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use broker_core::broker::Broker;
 use broker_core::retained::RetainedMessage;
-use mqtt_codec::{QoS, Version};
+use broker_core::session::message::Message;
+use bytes::Bytes;
+use mqtt_codec::{Properties, QoS, Version};
 use serde::{Deserialize, Serialize};
 use storage::record::{Qos, RetainHandling};
 
@@ -724,6 +728,311 @@ async fn retained(State(state): State<AdminState>, paging: Paging) -> Json<Page<
     }))
 }
 
+// ---------------------------------------------------------------
+// Publishing
+// ---------------------------------------------------------------
+
+/// Whether a request carried the token, when one is configured.
+///
+/// An extractor rather than a line at the top of the handler,
+/// because a second mutating endpoint added later gets the guard by
+/// naming it in its signature and cannot get it by forgetting to.
+///
+/// Section 11.1: only *mutating* requests need it. The read
+/// resources are not guarded, and the listener's real protection
+/// until milestone 7 is where it listens.
+#[derive(Debug)]
+struct Authorized;
+
+impl FromRequestParts<AdminState> for Authorized {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AdminState,
+    ) -> Result<Self, Self::Rejection> {
+        let Some(configured) = state.token.as_deref() else {
+            // Nothing to present. Section 11.1: a listener with no
+            // token is a loopback listener, which the startup
+            // refusal guarantees.
+            return Ok(Self);
+        };
+        let presented = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if secret_eq(presented, configured.expose()) {
+            Ok(Self)
+        } else {
+            // The same sentence whether the header was missing, the
+            // scheme was wrong or the secret was: which of the three
+            // it was is a fact about our configuration, and the
+            // caller has not earned it.
+            Err(ApiError::new(
+                ErrorCode::Unauthorized,
+                "this endpoint needs the configured admin token, presented as \
+                 `Authorization: Bearer <token>`",
+            ))
+        }
+    }
+}
+
+/// Compare a presented secret with the configured one without
+/// stopping at the first difference.
+///
+/// # The ruling, and why
+///
+/// An ordinary `==` on two `str`s compares lengths and then bytes,
+/// and returns at the first pair that differ. The time it takes
+/// therefore depends on how much of the secret the caller already
+/// has right, which over enough samples recovers the secret one byte
+/// at a time.
+///
+/// Three things could argue for `==` here anyway: the listener binds
+/// loopback by default, the timing difference is nanoseconds against
+/// milliseconds of network and scheduler noise, and there is no TLS
+/// yet for an attacker to be hiding behind. None of them survives
+/// being looked at.
+///
+/// The case for constant time is that **a token is configured
+/// precisely when the listener is not on loopback.** That is the
+/// whole of what [`AdminConfig::check`] enforces: no token means
+/// loopback, so every request this comparison ever runs against a
+/// real secret arrives from somewhere else on the network. The
+/// threat model for the ordinary comparison is exactly the
+/// configuration this comparison exists for. It also costs a
+/// handful of nanoseconds on a path that runs once per mutating
+/// request rather than once per packet, and an `==` on a secret is
+/// something a reviewer cannot tell from an oversight.
+///
+/// So: constant time, hand-written rather than a dependency, because
+/// it is six lines and a crate for six lines is a licence to audit.
+///
+/// # No test can tell the two apart, and that was checked
+///
+/// Convention 7: the plan's second mutation for this task is to put
+/// an ordinary early-returning `==` here, and it **survives the whole
+/// suite**. That is not a gap that can be closed. The two comparisons
+/// agree on every answer — the test below asserts exactly that, and
+/// would be wrong to assert anything else — and the only thing
+/// separating them is how long a wrong answer takes, which is
+/// convention 5's "test measuring the wrong dimension": nanoseconds,
+/// flaky on a loaded machine and green on a fast one with the bug
+/// present. What guards it is this comment and the shape of the
+/// function, which has no `return` in its loop for a reviewer to
+/// miss.
+///
+/// **What it does not hide is the length.** `presented.len()` is the
+/// caller's own, so the loop's length tells the caller nothing it
+/// did not supply; the length of the configured token is folded in
+/// as a value rather than branched on. Hiding the length entirely
+/// would mean comparing fixed-width digests, which would mean a hash
+/// function, and milestone 7 replaces this whole mechanism with API
+/// keys that have one.
+///
+/// [`AdminConfig::check`]: crate::config::AdminConfig::check
+fn secret_eq(presented: &str, configured: &str) -> bool {
+    let (presented, configured) = (presented.as_bytes(), configured.as_bytes());
+    // Folded in rather than returned on, so that a wrong length
+    // costs the same as a wrong byte.
+    let mut difference = presented.len() ^ configured.len();
+    for (index, byte) in presented.iter().enumerate() {
+        // The configured token may be shorter, and an index past its
+        // end would panic. Wrapping keeps the work per presented byte
+        // the same whichever is longer; the length term above is what
+        // makes the answer right.
+        let against = if configured.is_empty() {
+            0
+        } else {
+            configured[index % configured.len()]
+        };
+        difference |= usize::from(byte ^ against);
+    }
+    difference == 0
+}
+
+/// What a publish request may say.
+///
+/// The payload is text. This endpoint is what the Topics page's
+/// publish tool posts and what an operator reaches for with `curl`,
+/// and both of those type a string; a binary payload is what an MQTT
+/// client is for. Said here rather than left to be discovered,
+/// because "the API cannot express it" and "the API silently mangled
+/// it" look the same from outside.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishRequest {
+    /// Where to publish it. A topic name, so no wildcards.
+    topic: String,
+    /// What to publish, as text. Empty by default, which on a
+    /// retained publish is how a topic is cleared.
+    #[serde(default)]
+    payload: String,
+    /// The quality of service to publish at, as MQTT numbers it.
+    #[serde(default)]
+    qos: u8,
+    /// Whether to retain it.
+    #[serde(default)]
+    retain: bool,
+    /// How long the message stays deliverable, in seconds.
+    #[serde(default)]
+    message_expiry_interval: Option<u32>,
+}
+
+/// What a publish that was accepted answers.
+#[derive(Debug, Serialize)]
+struct PublishAccepted {
+    /// How many subscribers it reached. Zero is an ordinary answer:
+    /// a retained publish to a topic nobody holds reaches nobody and
+    /// is still kept.
+    delivered: usize,
+    /// Whether this answer waited for the store.
+    ///
+    /// Reported rather than implied, because the promise the caller
+    /// is entitled to read into a `200` differs between the levels
+    /// and an interface should not have to know the rule to say so.
+    durable: bool,
+}
+
+/// MQTT's numbering, on the way in.
+fn qos_of(number: u8) -> Result<QoS, ApiError> {
+    match number {
+        0 => Ok(QoS::AtMostOnce),
+        1 => Ok(QoS::AtLeastOnce),
+        2 => Ok(QoS::ExactlyOnce),
+        other => Err(ApiError::in_field(
+            ErrorCode::InvalidRequest,
+            "qos",
+            format!("qos must be 0, 1 or 2, not {other}"),
+        )),
+    }
+}
+
+/// Publish a message, through the path a connection publishes by.
+///
+/// # There is no second publish here
+///
+/// Retention, expiry, matching, shared-subscription selection, the
+/// per-session queue and its bounds are all rules, and a second set
+/// of them in this crate would drift from the first the day either
+/// was corrected. So this builds the same [`Message`] a connection's
+/// publish builds and hands it to the same [`Broker::publish`],
+/// under the same [`Shared::with_broker_committed`], and delivers
+/// what comes back with the same [`Shared::deliver`]. What is
+/// written here is the HTTP: a body to validate, and an answer.
+///
+/// # The response is the acknowledgement
+///
+/// Section 7.3: an acknowledgement of an at-least-once or
+/// exactly-once publication tells a publisher the broker has taken
+/// responsibility, so it must not be sent before the message is
+/// durable. A `200` here says the same thing to the same effect, so
+/// it waits for the same flush.
+///
+/// [`promises_durability`] is not what decides it. That function
+/// reads a batch's actions for a PUBACK, PUBREC or PUBCOMP, and
+/// there is no such packet here because there is no publishing
+/// session to send one to — the promise is the HTTP status. So the
+/// level is asked directly, and at-most-once, which promises nobody
+/// anything, waits for nothing.
+///
+/// [`Shared::with_broker_committed`]: sdmqtt_server::shared::Shared::with_broker_committed
+/// [`Shared::deliver`]: sdmqtt_server::shared::Shared::deliver
+/// [`promises_durability`]: sdmqtt_server::shared::promises_durability
+/// [`Message`]: broker_core::session::message::Message
+async fn publish(
+    State(state): State<AdminState>,
+    _authorized: Authorized,
+    body: Result<Json<PublishRequest>, JsonRejection>,
+) -> Result<Json<PublishAccepted>, ApiError> {
+    let Json(request) = body.map_err(|rejection| {
+        // Section 13: axum's own rejection is plain text, and this
+        // API answers one shape and no other.
+        ApiError::invalid_request(format!(
+            "the request body is not usable: {}",
+            rejection.body_text()
+        ))
+    })?;
+
+    let qos = qos_of(request.qos)?;
+    // Only at-most-once promises nobody anything. Both acknowledged
+    // levels are a promise, and both wait.
+    let promised = qos != QoS::AtMostOnce;
+    let properties = Properties {
+        message_expiry_interval: request.message_expiry_interval,
+        ..Properties::default()
+    };
+    let payload = Bytes::from(request.payload);
+
+    let (outcome, committed) = state.shared.with_broker_committed(
+        |broker| {
+            // Validated inside the lock only because the limits are
+            // the broker's: one acquisition rather than two, and the
+            // work is a scan of a short string.
+            mqtt_codec::topic::validate_name(&request.topic, &broker.config().limits).map_err(
+                |error| {
+                    ApiError::in_field(
+                        ErrorCode::InvalidRequest,
+                        "topic",
+                        format!("that is not a topic a message can be published to: {error}"),
+                    )
+                },
+            )?;
+
+            let now = broker.clock().now();
+            let mut message = Message::new(&request.topic, payload, qos, request.retain);
+            // The same two lines a connection's publish uses, so the
+            // properties a subscriber receives and the deadline the
+            // broker enforces come from one rule.
+            message.properties = Arc::new(properties.clone().into());
+            message.expires_at = properties
+                .message_expiry_interval
+                .map(|interval| broker.clock().deadline(interval));
+
+            let mut out = Vec::new();
+            // `None`: this publication has no publishing session, so
+            // no-local cannot apply to it and it is not any
+            // subscriber's own message.
+            let delivered = broker.publish(message, None, now, &mut out);
+            Ok((delivered, out))
+        },
+        // A batch that failed validation produced nothing and
+        // promised nothing.
+        |outcome: &Result<(usize, Vec<_>), ApiError>| promised && outcome.is_ok(),
+    );
+
+    let (delivered, actions) = outcome?;
+
+    if let Err(error) = committed.wait().await {
+        // The same partition a connection makes, with the easy half:
+        // nothing in this batch is addressed to the caller, because
+        // the caller has no session. So every action goes, exactly
+        // as it does for a publisher that is being closed — those
+        // subscribers are alive, were promised nothing, and have
+        // already had the delivery recorded against their windows.
+        // Leaving them undelivered would strand a window slot until
+        // the peer reconnected.
+        tracing::error!(
+            %error,
+            "a publication through the admin API could not be made durable; \
+             the caller is told so rather than answered"
+        );
+        state.shared.deliver(actions);
+        return Err(ApiError::new(
+            ErrorCode::Internal,
+            "the message could not be written to the store, so it is not acknowledged",
+        ));
+    }
+    state.shared.deliver(actions);
+
+    Ok(Json(PublishAccepted {
+        delivered,
+        durable: promised,
+    }))
+}
+
 /// The routes this module owns.
 pub(crate) fn routes() -> Router<AdminState> {
     Router::new()
@@ -733,6 +1042,7 @@ pub(crate) fn routes() -> Router<AdminState> {
         .route("/api/v1/sessions", get(sessions))
         .route("/api/v1/subscriptions", get(subscriptions))
         .route("/api/v1/retained", get(retained))
+        .route("/api/v1/publish", post(publish))
 }
 
 #[cfg(test)]
@@ -746,6 +1056,13 @@ mod tests {
     use mqtt_codec::packet::{Connect, Publish, Subscribe, SubscriptionOptions};
     use mqtt_codec::{decode, encode, Limits, Packet, Properties, ReasonCode};
     use sdmqtt_server::listener::{Running, Server, ServerConfig};
+    // The real writer over a store whose flush this crate's tests can
+    // hold open, exposed by `sdmqtt-server` under its `testing`
+    // feature rather than written again here. Section 7.3's ordering
+    // is only visible while a flush is in progress, and a second
+    // gated store would be a second set of assumptions about what a
+    // device does.
+    use sdmqtt_server::shared::gated::GatedStore;
     use sdmqtt_server::shared::Shared;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1398,6 +1715,413 @@ mod tests {
             }
         }
         out
+    }
+
+    // -----------------------------------------------------------
+    // Publishing
+    // -----------------------------------------------------------
+
+    /// An admin listener over `shared`, with `token` configured.
+    async fn admin_with_token(shared: Arc<Shared>, token: Option<&str>) -> AdminRunning {
+        let config = AdminConfig {
+            address: "127.0.0.1:0".parse().expect("a valid address"),
+            token: token.map(crate::Token::new),
+            ..AdminConfig::default()
+        };
+        AdminServer::bind(&config, AdminState::new(shared))
+            .await
+            .expect("loopback needs no token")
+    }
+
+    /// The body of a publish request.
+    fn publication(topic: &str, payload: &str, qos: u8) -> String {
+        format!("{{\"topic\":\"{topic}\",\"payload\":\"{payload}\",\"qos\":{qos}}}")
+    }
+
+    /// The test the whole task turns on.
+    ///
+    /// Convention 5: a handler that formatted a delivery itself and
+    /// pushed it at an outbox would satisfy any assertion about what
+    /// the API returned. The only thing that cannot be satisfied by a
+    /// parallel implementation is a subscriber on a real socket
+    /// receiving the message, because reaching it means going through
+    /// the matching, the retention and the queueing a connection's
+    /// publish goes through.
+    #[tokio::test]
+    async fn a_publish_through_the_api_reaches_a_subscriber_over_mqtt() {
+        let both = Both::start().await;
+        let (mut client, mut buf) = handshake(&both.mqtt, "listener").await;
+
+        send(
+            &mut client,
+            &Packet::Subscribe(Subscribe {
+                packet_id: 1,
+                filters: vec![SubscriptionOptions {
+                    filter: "from/+/api".into(),
+                    qos: QoS::AtLeastOnce,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: mqtt_codec::packet::RetainHandling::SendAlways,
+                }],
+                properties: Properties::default(),
+            }),
+        )
+        .await;
+        match next(&mut client, &mut buf).await {
+            Some(Packet::SubAck(ack)) => assert_eq!(ack.reasons, vec![ReasonCode::GrantedQos1]),
+            other => panic!("expected a subscribe acknowledgement, got {other:?}"),
+        }
+
+        let response = testing::post_json(
+            both.admin.address(),
+            "/api/v1/publish",
+            None,
+            &publication("from/the/api", "hello", 1),
+        )
+        .await;
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert!(
+            response.body.contains("\"delivered\":1"),
+            "the answer says how many subscribers it reached: {}",
+            response.body
+        );
+
+        match next(&mut client, &mut buf).await {
+            Some(Packet::Publish(publish)) => {
+                assert_eq!(publish.topic, "from/the/api");
+                assert_eq!(&publish.payload[..], b"hello");
+                // Delivered at the level the subscription granted,
+                // which is the matching layer's rule and not this
+                // module's.
+                assert_eq!(publish.qos, QoS::AtLeastOnce);
+            }
+            other => panic!("expected the publication, got {other:?}"),
+        }
+
+        both.stop().await;
+    }
+
+    /// Retention through the API is the store's rule, not a second one.
+    ///
+    /// A retained publish and then an empty one to the same topic,
+    /// because "an empty payload clears the topic" is exactly the
+    /// kind of rule a parallel implementation would not have.
+    #[tokio::test]
+    async fn a_retained_publish_through_the_api_obeys_the_retention_rules() {
+        let both = Both::start().await;
+        let address = both.admin.address();
+
+        let response = testing::post_json(
+            address,
+            "/api/v1/publish",
+            None,
+            "{\"topic\":\"kept/here\",\"payload\":\"first\",\"retain\":true}",
+        )
+        .await;
+        assert_eq!(response.status, 200, "{}", response.body);
+
+        let retained = both.get("/api/v1/retained").await;
+        assert!(
+            retained.body.contains("\"topic\":\"kept/here\""),
+            "{}",
+            retained.body
+        );
+        assert!(
+            retained.body.contains("\"text\":\"first\""),
+            "{}",
+            retained.body
+        );
+
+        let response = testing::post_json(
+            address,
+            "/api/v1/publish",
+            None,
+            "{\"topic\":\"kept/here\",\"payload\":\"\",\"retain\":true}",
+        )
+        .await;
+        assert_eq!(response.status, 200, "{}", response.body);
+
+        let retained = both.get("/api/v1/retained").await;
+        assert!(
+            !retained.body.contains("kept/here"),
+            "an empty retained payload clears the topic: {}",
+            retained.body
+        );
+
+        both.stop().await;
+    }
+
+    /// The three cases the token rule has, against one listener.
+    ///
+    /// Convention 5 again: each on its own passes against a guard
+    /// that refuses everything or nothing, so all three are asserted
+    /// together.
+    #[tokio::test]
+    async fn the_token_is_required_and_must_be_the_right_one() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let admin = admin_with_token(shared, Some("the-right-one")).await;
+        let body = publication("guarded/topic", "x", 0);
+
+        let refused = testing::post_json(admin.address(), "/api/v1/publish", None, &body).await;
+        assert_eq!(refused.status, 401, "{}", refused.body);
+        assert!(
+            refused.body.contains("\"code\":\"unauthorized\""),
+            "the one error shape, with a code: {}",
+            refused.body
+        );
+
+        let wrong = testing::post_json(
+            admin.address(),
+            "/api/v1/publish",
+            Some("the-wrong-one"),
+            &body,
+        )
+        .await;
+        assert_eq!(wrong.status, 401, "{}", wrong.body);
+
+        // A prefix of the right token, which is what a comparison
+        // that stopped at the first difference would be generous to
+        // in the one way that matters.
+        let prefix =
+            testing::post_json(admin.address(), "/api/v1/publish", Some("the-right"), &body).await;
+        assert_eq!(prefix.status, 401, "{}", prefix.body);
+
+        let accepted = testing::post_json(
+            admin.address(),
+            "/api/v1/publish",
+            Some("the-right-one"),
+            &body,
+        )
+        .await;
+        assert_eq!(accepted.status, 200, "{}", accepted.body);
+
+        admin.shutdown().await;
+    }
+
+    /// With no token configured there is nothing to present.
+    ///
+    /// The other half of the rule. Without it, a handler that
+    /// refused every request would pass the test above.
+    #[tokio::test]
+    async fn no_token_configured_means_none_is_asked_for() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let admin = admin_with_token(shared, None).await;
+        let response = testing::post_json(
+            admin.address(),
+            "/api/v1/publish",
+            None,
+            &publication("open/topic", "x", 0),
+        )
+        .await;
+        assert_eq!(response.status, 200, "{}", response.body);
+        admin.shutdown().await;
+    }
+
+    /// A reader is not a mutation and is not guarded by the token.
+    ///
+    /// Section 11.1: *mutating* requests need the key. Guarding the
+    /// readers too would be a different rule, and one the interface
+    /// is not written against.
+    #[tokio::test]
+    async fn a_read_needs_no_token_even_when_one_is_configured() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let admin = admin_with_token(shared, Some("a-secret")).await;
+        let response = testing::get(admin.address(), "/api/v1/sessions").await;
+        assert_eq!(response.status, 200, "{}", response.body);
+        admin.shutdown().await;
+    }
+
+    /// A broker whose store's flush this test controls, and an admin
+    /// listener over it.
+    async fn admin_over_a_gated_store() -> (AdminRunning, Arc<GatedStore>) {
+        let store = Arc::new(GatedStore::new());
+        let writer = storage::Writer::spawn(
+            Arc::clone(&store) as Arc<dyn storage::Storage>,
+            storage::WriterConfig::default(),
+        )
+        .expect("a writer thread");
+        let shared = Arc::new(Shared::with_store(
+            Broker::new(BrokerConfig::default()),
+            Arc::new(writer),
+        ));
+        (admin_with_token(shared, None).await, store)
+    }
+
+    /// Section 7.3, through the API: the response is the promise.
+    ///
+    /// The same shape as the connection's test and for the same
+    /// reason. An assertion that the response eventually arrives
+    /// passes against a handler that answers first and writes later,
+    /// so the only thing that can tell the two apart is a store that
+    /// has not answered yet.
+    #[tokio::test]
+    async fn an_at_least_once_publish_does_not_answer_until_it_is_durable() {
+        let (admin, store) = admin_over_a_gated_store().await;
+        store.hold();
+        let address = admin.address();
+
+        let mut asking = tokio::spawn(async move {
+            testing::post_json(
+                address,
+                "/api/v1/publish",
+                None,
+                &publication("durable/topic", "x", 1),
+            )
+            .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), &mut asking)
+                .await
+                .is_err(),
+            "the answer overtook the flush it is a promise about"
+        );
+
+        store.release();
+        let response = tokio::time::timeout(REPLY, asking)
+            .await
+            .expect("the answer arrives once the device does")
+            .expect("the request task did not panic");
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert!(
+            response.body.contains("\"durable\":true"),
+            "and says it waited: {}",
+            response.body
+        );
+        assert!(store.flushes() > 0, "the store was asked for a flush");
+
+        admin.shutdown().await;
+    }
+
+    /// The other side of the decision.
+    ///
+    /// At most once promises nobody anything, and section 7.3 names
+    /// that level as the one never waited on. A handler that waited
+    /// on everything would put every publish behind the device.
+    #[tokio::test]
+    async fn an_at_most_once_publish_is_not_held_up_by_the_store() {
+        let (admin, store) = admin_over_a_gated_store().await;
+        store.hold();
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(2_000),
+            testing::post_json(
+                admin.address(),
+                "/api/v1/publish",
+                None,
+                &publication("undurable/topic", "x", 0),
+            ),
+        )
+        .await
+        .expect("at most once waits for nothing");
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert!(
+            response.body.contains("\"durable\":false"),
+            "and says it did not wait: {}",
+            response.body
+        );
+
+        store.release();
+        admin.shutdown().await;
+    }
+
+    /// A publish that cannot mean what it says takes the one shape.
+    #[tokio::test]
+    async fn a_publish_that_will_not_do_answers_in_the_one_shape() {
+        let both = Both::start().await;
+        let address = both.admin.address();
+
+        let cases: [(&str, u16, &str, Option<&str>); 6] = [
+            // A wildcard is a filter, and a publish names a topic.
+            (
+                "{\"topic\":\"a/+/b\",\"payload\":\"x\"}",
+                400,
+                "invalid_request",
+                Some("topic"),
+            ),
+            (
+                "{\"topic\":\"a/#\",\"payload\":\"x\"}",
+                400,
+                "invalid_request",
+                Some("topic"),
+            ),
+            (
+                "{\"topic\":\"\",\"payload\":\"x\"}",
+                400,
+                "invalid_request",
+                Some("topic"),
+            ),
+            (
+                "{\"topic\":\"a/b\",\"payload\":\"x\",\"qos\":3}",
+                400,
+                "invalid_request",
+                Some("qos"),
+            ),
+            // Not JSON at all.
+            ("{", 400, "invalid_request", None),
+            // A key this endpoint does not know, which a client that
+            // misspelled one would otherwise read as honoured.
+            (
+                "{\"topic\":\"a/b\",\"paylod\":\"x\"}",
+                400,
+                "invalid_request",
+                None,
+            ),
+        ];
+        for (body, status, code, field) in cases {
+            let response = testing::post_json(address, "/api/v1/publish", None, body).await;
+            assert_eq!(response.status, status, "{body}: {}", response.body);
+            assert_eq!(
+                response.header("content-type"),
+                Some("application/json"),
+                "{body}"
+            );
+            assert!(
+                response.body.starts_with("{\"error\":"),
+                "{body} nests under `error`: {}",
+                response.body
+            );
+            assert!(
+                response.body.contains(&format!("\"code\":\"{code}\"")),
+                "{body}: {}",
+                response.body
+            );
+            if let Some(field) = field {
+                assert!(
+                    response.body.contains(&format!("\"field\":\"{field}\"")),
+                    "{body} names the parameter at fault: {}",
+                    response.body
+                );
+            }
+        }
+
+        // And a method the path does not accept.
+        let response = testing::request(address, "GET", "/api/v1/publish", None).await;
+        assert_eq!(response.status, 405, "{}", response.body);
+
+        both.stop().await;
+    }
+
+    /// The comparison the token is checked with.
+    ///
+    /// A unit test of the predicate, which convention 5 says is not
+    /// a test of the caller — the caller is covered by
+    /// [`the_token_is_required_and_must_be_the_right_one`] over a
+    /// socket. This is here for the cases a socket test would need a
+    /// server each for.
+    #[test]
+    fn the_secret_comparison_answers_what_equality_would() {
+        assert!(secret_eq("abc", "abc"));
+        assert!(!secret_eq("abc", "abd"));
+        assert!(!secret_eq("abc", "abcd"), "a prefix is not a match");
+        assert!(!secret_eq("abcd", "abc"), "nor is an extension");
+        assert!(!secret_eq("", "abc"));
+        assert!(!secret_eq("abc", ""));
+        assert!(secret_eq("", ""));
+        // Not a character comparison: a token is bytes, and two
+        // different strings that happen to share a prefix must not
+        // match on it.
+        assert!(!secret_eq("\u{00e9}", "e"));
     }
 
     /// The session identity the key is built from, kept honest.

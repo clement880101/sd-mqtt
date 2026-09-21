@@ -7,6 +7,15 @@ license.workspace = true
 repository.workspace = true
 description = "The listener and connection handling for sd-mqtt"
 
+[features]
+# Exposes `shared::gated`, a store whose flush a test can hold open.
+# Off by default and turned on by nothing this crate ships: it exists
+# so that `sdmqtt-admin`'s tests can make the same assertion about its
+# publish endpoint that `connection`'s tests make about a client's,
+# without a second gated store carrying a second set of assumptions
+# about what a device does.
+testing = []
+
 [dependencies]
 broker-core = { path = "../broker-core", version = "0.1.0" }
 mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
