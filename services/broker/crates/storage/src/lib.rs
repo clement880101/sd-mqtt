@@ -35,7 +35,7 @@ pub use record::{
     SessionKey, SessionRecord, SubscriptionRecord, WillRecord, FORMAT_MAGIC, FORMAT_VERSION,
 };
 pub use restore::{Restored, RestoredSession};
-pub use writer::{Durable, NotDurable, Writer, WriterConfig, WriterStopped};
+pub use writer::{Applied, Durable, NotDurable, Writer, WriterConfig, WriterStopped};
 
 /// How hard a flush tries.
 ///

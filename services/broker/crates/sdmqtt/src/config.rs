@@ -409,10 +409,17 @@ impl StorageSection {
     }
 
     /// How the batching writer should be configured.
+    ///
+    /// The two flush triggers come from here and the two high-water
+    /// marks do not: those bound the process's memory rather than trade
+    /// durability for throughput, which is the same reason section 7.2's
+    /// third flush trigger is not an operator's choice either. Their
+    /// defaults are on [`WriterConfig`].
     pub fn writer(&self) -> WriterConfig {
         WriterConfig {
             interval: Duration::from_millis(self.flush_interval_ms),
             records: self.flush_records,
+            ..WriterConfig::default()
         }
     }
 }

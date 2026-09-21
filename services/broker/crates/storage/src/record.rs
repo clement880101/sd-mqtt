@@ -504,6 +504,69 @@ impl Record {
     pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
         decode_exact(bytes)
     }
+
+    /// Roughly how much memory this record pins while it waits to be
+    /// written.
+    ///
+    /// For [`crate::WriterConfig::high_water_bytes`], which is a bound on
+    /// the process's memory rather than an accounting of it. Everything a
+    /// peer controls the size of is counted exactly — a payload, a
+    /// property block, a topic, a filter, a client identifier — and the
+    /// rest is the record's own footprint, which is a constant.
+    ///
+    /// **An estimate, deliberately.** The number it feeds is a choice of
+    /// bound, and being out by the header of a `Vec` per record moves
+    /// that bound by far less than choosing it differently would. What it
+    /// must not do is miss something unbounded, which is why every field
+    /// a peer can grow is added and no other field is.
+    pub fn weight(&self) -> usize {
+        let variable = match self {
+            Self::SessionPut(session) => {
+                weigh_key(&session.key)
+                    + session.will.as_ref().map_or(0, |will| {
+                        will.topic.len() + will.payload.len() + will.properties.len()
+                    })
+            }
+            Self::SessionRemoved { session }
+            | Self::InboundReserved { session, .. }
+            | Self::InboundReleased { session, .. }
+            | Self::InflightRemoved { session, .. }
+            | Self::QueuePopped { session, .. } => weigh_key(session),
+            Self::SubscriptionAdded {
+                session,
+                subscription,
+            } => weigh_key(session) + subscription.filter.len(),
+            Self::SubscriptionRemoved { session, filter } => weigh_key(session) + filter.len(),
+            Self::InflightPut { session, entry } => {
+                weigh_key(session) + weigh_delivery(&entry.delivery)
+            }
+            Self::QueuePushed { session, entry } => {
+                weigh_key(session) + weigh_delivery(&entry.delivery)
+            }
+            // The one record that carries an application payload, and so
+            // the one this whole estimate exists for.
+            Self::BodyPut { body, .. } => {
+                body.topic.len() + body.payload.len() + body.properties.len()
+            }
+            Self::BodyReleased { .. } => 0,
+            Self::RetainedPut { topic, message } => {
+                topic.len() + message.payload.len() + message.properties.len()
+            }
+            Self::RetainedRemoved { topic } => topic.len(),
+        };
+        std::mem::size_of::<Self>() + variable
+    }
+}
+
+/// What a session key's two strings hold.
+fn weigh_key(key: &SessionKey) -> usize {
+    key.mountpoint.len() + key.client_id.len()
+}
+
+/// What a delivery holds beyond its own fields, which is the subscription
+/// identifiers a client's own subscriptions put there.
+fn weigh_delivery(delivery: &DeliveryRecord) -> usize {
+    delivery.subscription_ids.len() * std::mem::size_of::<u32>()
 }
 
 #[cfg(test)]

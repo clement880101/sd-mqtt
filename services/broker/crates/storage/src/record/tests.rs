@@ -521,6 +521,189 @@ mod version {
     }
 }
 
+/// What [`Record::weight`] must count.
+///
+/// The writer's high-water mark in bytes is only a bound on memory if
+/// every part of a record that a peer can grow is in the figure. A term
+/// left out is a hole exactly the size of whatever a client puts there,
+/// which for a payload is the configured maximum packet size per record.
+///
+/// So this is not "the weight is about right": each case grows one field
+/// by a known amount and requires the weight to grow by exactly that.
+/// Deleting any term from the estimate fails the case that grows it, and
+/// nothing else.
+mod weight {
+    use super::*;
+
+    /// How much heavier the record is when one of its fields grows by
+    /// `grown`.
+    fn grew_by(small: &Record, large: &Record) -> usize {
+        large
+            .weight()
+            .checked_sub(small.weight())
+            .expect("growing a field cannot make a record lighter")
+    }
+
+    /// A body carrying `payload` bytes and `properties` bytes.
+    fn a_body(topic: &str, payload: usize, properties: usize) -> BodyRecord {
+        BodyRecord {
+            topic: topic.to_owned(),
+            payload: Bytes::from(vec![0xa5u8; payload]),
+            qos: Qos::AtLeastOnce,
+            retain: false,
+            expires_at: None,
+            properties: Bytes::from(vec![0x26u8; properties]),
+        }
+    }
+
+    #[test]
+    fn a_payload_is_counted_in_full() {
+        let small = Record::BodyPut {
+            id: MessageId([1; 16]),
+            body: a_body("sensor/a", 0, 0),
+        };
+        let large = Record::BodyPut {
+            id: MessageId([1; 16]),
+            body: a_body("sensor/a", 4_096, 0),
+        };
+        assert_eq!(grew_by(&small, &large), 4_096);
+    }
+
+    #[test]
+    fn a_property_block_is_counted() {
+        // Opaque bytes the publisher chose, and as unbounded as the
+        // payload beside it.
+        let small = Record::BodyPut {
+            id: MessageId([1; 16]),
+            body: a_body("sensor/a", 0, 0),
+        };
+        let large = Record::BodyPut {
+            id: MessageId([1; 16]),
+            body: a_body("sensor/a", 0, 300),
+        };
+        assert_eq!(grew_by(&small, &large), 300);
+    }
+
+    #[test]
+    fn a_topic_is_counted() {
+        let small = Record::BodyPut {
+            id: MessageId([1; 16]),
+            body: a_body("a", 0, 0),
+        };
+        let large = Record::BodyPut {
+            id: MessageId([1; 16]),
+            body: a_body(&"a".repeat(65), 0, 0),
+        };
+        assert_eq!(grew_by(&small, &large), 64);
+    }
+
+    #[test]
+    fn a_retained_payload_is_counted_in_full() {
+        // The one a fire-and-forget publisher can send in a loop
+        // without touching any quota, which is what the mark exists
+        // for.
+        let retained = |payload: usize| Record::RetainedPut {
+            topic: "sensor/a".to_owned(),
+            message: RetainedRecord {
+                payload: Bytes::from(vec![0xa5u8; payload]),
+                qos: Qos::AtMostOnce,
+                expires_at: None,
+                properties: Bytes::new(),
+            },
+        };
+        assert_eq!(grew_by(&retained(0), &retained(1_024)), 1_024);
+    }
+
+    #[test]
+    fn a_will_payload_is_counted() {
+        // A connect can carry one, and it is as large as any other
+        // payload.
+        let with_will = |payload: usize| {
+            Record::SessionPut(SessionRecord {
+                key: SessionKey::new("", "c"),
+                version: ProtocolVersion::V5,
+                expiry_interval: 0,
+                expires_at: None,
+                will: Some(WillRecord {
+                    topic: "bye".to_owned(),
+                    payload: Bytes::from(vec![0u8; payload]),
+                    qos: Qos::AtMostOnce,
+                    retain: false,
+                    delay: 0,
+                    properties: Bytes::new(),
+                }),
+                will_at: None,
+            })
+        };
+        assert_eq!(grew_by(&with_will(0), &with_will(512)), 512);
+    }
+
+    #[test]
+    fn a_session_key_is_counted() {
+        // Every per-session record carries one, and both halves of it
+        // are the client's own strings.
+        let removed = |client: &str| Record::SessionRemoved {
+            session: SessionKey::new("tenant-a", client),
+        };
+        assert_eq!(grew_by(&removed("c"), &removed(&"c".repeat(129))), 128);
+    }
+
+    #[test]
+    fn a_filter_is_counted() {
+        let added = |filter: &str| Record::SubscriptionAdded {
+            session: SessionKey::new("", "c"),
+            subscription: SubscriptionRecord {
+                filter: filter.to_owned(),
+                qos: Qos::AtLeastOnce,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: RetainHandling::SendAlways,
+                subscription_id: None,
+            },
+        };
+        assert_eq!(grew_by(&added("a"), &added(&"a".repeat(41))), 40);
+    }
+
+    #[test]
+    fn the_subscription_identifiers_of_a_delivery_are_counted() {
+        // A client with many overlapping subscriptions puts one of
+        // these on every delivery, so the vector is the client's to
+        // grow.
+        let queued = |ids: usize| Record::QueuePushed {
+            session: SessionKey::new("", "c"),
+            entry: QueueEntry {
+                sequence: 1,
+                packet_id: None,
+                delivery: DeliveryRecord {
+                    body: MessageId([0; 16]),
+                    qos: Qos::AtLeastOnce,
+                    retain: false,
+                    subscription_ids: (0..ids as u32).collect(),
+                    dup: false,
+                },
+            },
+        };
+        assert_eq!(
+            grew_by(&queued(0), &queued(16)),
+            16 * std::mem::size_of::<u32>()
+        );
+    }
+
+    #[test]
+    fn the_smallest_record_still_weighs_what_it_occupies() {
+        // Zero would be wrong: the mark in records is not the only one
+        // a flood of tiny records has to cross, and a record that
+        // weighed nothing would cross neither.
+        assert!(
+            Record::BodyReleased {
+                id: MessageId([0; 16])
+            }
+            .weight()
+                >= std::mem::size_of::<Record>()
+        );
+    }
+}
+
 /// Round trips over generated values.
 ///
 /// Not the guard: a round trip cannot see a layout that is consistently

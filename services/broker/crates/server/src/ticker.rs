@@ -44,8 +44,12 @@ pub fn spawn_ticker(shared: Arc<Shared>, mut shutdown: broadcast::Receiver<()>) 
                     shared.deliver(actions);
                     // Once a second, from the one task that runs
                     // whether or not anybody is connected. See
-                    // `Shared::report_rejections`.
+                    // `Shared::report_rejections` and
+                    // `Shared::report_pacing`: one says the store and
+                    // the broker disagree, the other says the device
+                    // cannot keep up, and an operator needs both.
                     shared.report_rejections();
+                    shared.report_pacing();
                 }
                 _ = shutdown.recv() => return,
             }

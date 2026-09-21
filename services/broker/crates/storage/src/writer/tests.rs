@@ -155,9 +155,21 @@ struct Fake {
     apply_fails_with: Mutex<Option<String>>,
     /// Flushes, so a test can wait for one without locking the log.
     flushes: AtomicU64,
+    /// When set, the next `apply` that is not held panics, which kills
+    /// the thread where a test can say when.
+    panic_on_apply: AtomicBool,
 }
 
 impl Fake {
+    /// How long a held `apply` waits before giving up and going through
+    /// anyway.
+    ///
+    /// Far longer than any assertion window here, so it never decides a
+    /// test's answer, and finite so that a failing assertion ends in a
+    /// report rather than in a hang. The same bound, for the same
+    /// reason, as `GatedStore::LONGEST_HOLD` in `sdmqtt-server`.
+    const LONGEST_HOLD: Duration = Duration::from_secs(20);
+
     fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -170,6 +182,14 @@ impl Fake {
     /// Whether the thread is parked inside a held `apply`.
     fn has_caught_the_thread(&self) -> bool {
         self.caught.load(Ordering::SeqCst)
+    }
+
+    /// Kill the thread on its next unheld `apply`.
+    ///
+    /// Set while the thread is held, so that a test can have batches
+    /// provably queued behind the one that kills it.
+    fn panic_on_next_apply(&self) {
+        self.panic_on_apply.store(true, Ordering::SeqCst);
     }
 
     /// Let it go.
@@ -235,13 +255,32 @@ impl Storage for Fake {
         if *held {
             self.caught.store(true, Ordering::SeqCst);
         }
+        let deadline = std::time::Instant::now() + Self::LONGEST_HOLD;
         while *held {
-            held = self
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            // Let go rather than wait forever. Dropping a [`Writer`]
+            // joins its thread, so a test whose assertion fails while
+            // the store is held would otherwise deadlock in its own
+            // unwind: the suite hangs, and a suite that hangs reports
+            // nothing at all — including, when this is run under
+            // mutation, that the mutation was caught.
+            if remaining.is_zero() {
+                break;
+            }
+            let (guard, timed_out) = self
                 .released
-                .wait(held)
+                .wait_timeout(held, remaining)
                 .unwrap_or_else(PoisonError::into_inner);
+            held = guard;
+            if timed_out.timed_out() {
+                break;
+            }
         }
         drop(held);
+        assert!(
+            !self.panic_on_apply.load(Ordering::SeqCst),
+            "deliberate: the storage writer thread is being killed on purpose"
+        );
         self.record(Event::Applied(records.len()));
         match self
             .apply_fails_with
@@ -329,7 +368,25 @@ fn only_waiters_flush() -> WriterConfig {
     WriterConfig {
         interval: Duration::from_secs(3_600),
         records: u64::MAX,
+        ..WriterConfig::default()
     }
+}
+
+/// Hand over a batch nobody waits on, and say that the backlog behind it
+/// is still under both marks.
+///
+/// Every test but the backlog ones sends a handful of small records, so
+/// [`Applied::Backlogged`] anywhere else would mean a mark was reached by
+/// accident and whatever that test is about is being measured against a
+/// paced writer.
+fn accepted(writer: &Writer, records: Vec<Record>) {
+    assert_eq!(
+        writer
+            .apply(records)
+            .expect("the writer must accept a batch"),
+        Applied::Accepted,
+        "a handful of small records reached a high-water mark"
+    );
 }
 
 // ---- waiting, without sleeping and hoping -------------------------------
@@ -376,9 +433,7 @@ async fn batches_without_waiters_are_not_flushed_one_by_one() {
         .expect("the writer must start");
 
     for n in 0..5 {
-        writer
-            .apply(vec![something(n)])
-            .expect("the writer must accept a batch");
+        accepted(&writer, vec![something(n)]);
     }
     let waiter = writer
         .apply_durable(vec![something(5)])
@@ -409,9 +464,7 @@ async fn many_waiters_arriving_together_are_woken_by_one_flush() {
     let writer = Writer::spawn(Arc::clone(&store) as Arc<dyn Storage>, only_waiters_flush())
         .expect("the writer must start");
 
-    writer
-        .apply(vec![something(0)])
-        .expect("the writer must accept a batch");
+    accepted(&writer, vec![something(0)]);
     eventually("the thread to be held inside apply", || {
         store.has_caught_the_thread()
     })
@@ -462,9 +515,7 @@ async fn a_flush_that_fails_reaches_every_waiter_it_should_have_covered() {
     let writer = Writer::spawn(Arc::clone(&store) as Arc<dyn Storage>, only_waiters_flush())
         .expect("the writer must start");
 
-    writer
-        .apply(vec![something(0)])
-        .expect("the writer must accept a batch");
+    accepted(&writer, vec![something(0)]);
     eventually("the thread to be held inside apply", || {
         store.has_caught_the_thread()
     })
@@ -592,13 +643,12 @@ async fn the_interval_flushes_a_batch_nobody_waited_for() {
         WriterConfig {
             interval: Duration::from_millis(2),
             records: u64::MAX,
+            ..WriterConfig::default()
         },
     )
     .expect("the writer must start");
 
-    writer
-        .apply(vec![something(0)])
-        .expect("the writer must accept a batch");
+    accepted(&writer, vec![something(0)]);
     eventually("the interval to flush", || store.flushes() >= 1).await;
 
     // Long enough for a hundred intervals, so an idle writer that kept
@@ -627,13 +677,12 @@ async fn the_record_count_flushes_a_batch_nobody_waited_for() {
         WriterConfig {
             interval: Duration::from_secs(3_600),
             records: 3,
+            ..WriterConfig::default()
         },
     )
     .expect("the writer must start");
 
-    writer
-        .apply(vec![something(0), something(1)])
-        .expect("the writer must accept a batch");
+    accepted(&writer, vec![something(0), something(1)]);
     eventually("the first batch to be applied", || {
         store.events() == vec![Event::Applied(2)]
     })
@@ -644,9 +693,7 @@ async fn the_record_count_flushes_a_batch_nobody_waited_for() {
         "two records reached the threshold of three"
     );
 
-    writer
-        .apply(vec![something(2)])
-        .expect("the writer must accept a batch");
+    accepted(&writer, vec![something(2)]);
     eventually("the count to flush", || store.flushes() >= 1).await;
     assert_eq!(
         store.events(),
@@ -678,13 +725,12 @@ async fn a_batch_the_store_refused_is_not_followed_by_a_write_to_the_device() {
         WriterConfig {
             interval: Duration::from_secs(3_600),
             records: 0,
+            ..WriterConfig::default()
         },
     )
     .expect("the writer must start");
 
-    writer
-        .apply(vec![something(0)])
-        .expect("the writer must accept a batch");
+    accepted(&writer, vec![something(0)]);
     eventually("the refusal to be counted", || {
         writer.rejected_batches() == 1
     })
@@ -761,9 +807,7 @@ async fn a_refused_batch_with_nobody_waiting_is_counted() {
     let writer = Writer::spawn(Arc::clone(&store) as Arc<dyn Storage>, only_waiters_flush())
         .expect("the writer must start");
 
-    writer
-        .apply(a_batch_the_store_refuses())
-        .expect("the writer must accept a batch");
+    accepted(&writer, a_batch_the_store_refuses());
     // Ordered behind it in the same channel, so when this returns the
     // refusal has been dealt with. No sleeping.
     let behind_it = writer
@@ -802,6 +846,177 @@ async fn a_waiter_learns_when_the_writer_has_died() {
     );
 }
 
+// ---- the backlog and what it does to a producer -------------------------
+
+/// A writer whose marks are `records` and `bytes`, and whose triggers
+/// cannot fire on their own.
+fn marked_at(records: u64, bytes: u64) -> WriterConfig {
+    WriterConfig {
+        high_water_records: records,
+        high_water_bytes: bytes,
+        ..only_waiters_flush()
+    }
+}
+
+/// A store held still, so that the backlog is whatever the test put
+/// there and not whatever the thread has got round to.
+///
+/// The batch that catches the thread stays on the backlog while it is
+/// held, because the thread is still holding those records: that is one
+/// record of every mark below.
+async fn held_writer(store: &Arc<Fake>, config: WriterConfig) -> Writer {
+    store.hold();
+    let writer = Writer::spawn(Arc::clone(store) as Arc<dyn Storage>, config)
+        .expect("the writer must start");
+    // This one is taken out of the channel and parked inside `apply`,
+    // which is what makes every later batch provably still in it.
+    //
+    // Not [`accepted`]: a mark of one is reached by this batch too, and
+    // a panic here would drop the writer, whose [`Drop`] joins a thread
+    // nothing has released. A test that deadlocks reports nothing.
+    let _ = writer.apply(vec![something(0)]);
+    eventually("the thread to be held inside apply", || {
+        store.has_caught_the_thread()
+    })
+    .await;
+    writer
+}
+
+/// Reaching the mark is reported, and the records are written anyway.
+///
+/// Both halves matter and the second is the point. A bound that answered
+/// by dropping the batch would pass the first assertion and lose a
+/// durable fact, which is the failure this milestone exists to prevent;
+/// the batch that reaches the mark must be in the store's log beside the
+/// others.
+#[tokio::test]
+async fn a_batch_that_reaches_the_mark_is_reported_and_written_anyway() {
+    let store = Fake::new();
+    let writer = held_writer(&store, marked_at(4, u64::MAX)).await;
+
+    assert_eq!(
+        writer.apply(vec![something(1)]).expect("it is accepted"),
+        Applied::Accepted,
+        "two records of four is not a backlog"
+    );
+    assert_eq!(
+        writer.apply(vec![something(2)]).expect("it is accepted"),
+        Applied::Accepted
+    );
+    assert_eq!(
+        writer.apply(vec![something(3)]).expect("it is accepted"),
+        Applied::Backlogged,
+        "the fourth record, counting the one the thread is holding, reaches a mark of four"
+    );
+
+    store.release();
+    // Dropping the handle applies and flushes everything outstanding,
+    // so by the time this returns the store has seen all of it.
+    drop(writer);
+    assert_eq!(
+        store
+            .events()
+            .iter()
+            .filter(|event| matches!(event, Event::Applied(_)))
+            .count(),
+        4,
+        "a batch was lost to the bound; the log was {:?}",
+        store.events()
+    );
+}
+
+/// The mark in bytes catches what the mark in records cannot.
+///
+/// One record may carry a payload of the configured maximum packet size,
+/// so a bound in records alone permits that size times the count. The
+/// control is the small record beside it: the same writer, the same
+/// mark, and no pacing.
+#[tokio::test]
+async fn one_large_payload_reaches_the_byte_mark_the_record_count_would_not() {
+    let store = Fake::new();
+    let writer = held_writer(&store, marked_at(u64::MAX, 8 * 1_024)).await;
+
+    assert_eq!(
+        writer.apply(vec![something(1)]).expect("it is accepted"),
+        Applied::Accepted,
+        "a small record is not 8 KiB"
+    );
+    let large = Record::BodyPut {
+        id: body_id(1),
+        body: BodyRecord {
+            payload: vec![0xa5u8; 16 * 1_024].into(),
+            ..body(1)
+        },
+    };
+    assert_eq!(
+        writer.apply(vec![large]).expect("it is accepted"),
+        Applied::Backlogged,
+        "16 KiB of payload did not reach a mark of 8 KiB, so the mark is not reading the payload"
+    );
+
+    store.release();
+    drop(writer);
+}
+
+/// Relief does not come while the writer is behind, and comes when it
+/// catches up.
+///
+/// The first half is what makes this a test of anything: a `relief` that
+/// returned at once would satisfy the second half perfectly and pace
+/// nobody. The thread is provably parked inside `apply` for the whole of
+/// it, so the backlog cannot come down while the first half is running
+/// and the wait is not a race.
+#[tokio::test]
+async fn relief_waits_for_a_backlog_to_come_down() {
+    let store = Fake::new();
+    let writer = held_writer(&store, marked_at(1, u64::MAX)).await;
+
+    assert_eq!(
+        writer.apply(vec![something(1)]).expect("it is accepted"),
+        Applied::Backlogged
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), writer.relief())
+            .await
+            .is_err(),
+        "relief came while the store was held and the backlog could not have drained"
+    );
+
+    store.release();
+    tokio::time::timeout(Duration::from_secs(10), writer.relief())
+        .await
+        .expect("relief must come once the writer has caught up");
+    assert_eq!(writer.outstanding_records(), 0);
+}
+
+/// A caller waiting on a writer that has died is woken.
+///
+/// The thread panics on purpose here, so a panic message and a backtrace
+/// on stderr during this test are expected. Without the wake, one dead
+/// thread with a full channel behind it parks every connection that asks
+/// for relief, permanently and with nothing said.
+#[tokio::test]
+async fn relief_comes_when_the_writer_has_died_and_will_never_drain() {
+    let store = Fake::new();
+    let writer = held_writer(&store, marked_at(1, u64::MAX)).await;
+
+    // Queued behind the held batch, so they are certainly in the channel
+    // when the thread dies on the first of them.
+    for n in 1..4 {
+        let _ = writer.apply(vec![something(n)]);
+    }
+    store.panic_on_next_apply();
+    store.release();
+
+    tokio::time::timeout(Duration::from_secs(10), writer.relief())
+        .await
+        .expect("a caller must not wait for a thread that will never drain anything again");
+    assert!(
+        writer.outstanding_records() > 0,
+        "the backlog came down on its own, so this proved nothing about a dead writer"
+    );
+}
+
 // ---- shutdown, against a store that can see it --------------------------
 
 /// Dropping the handle applies what is outstanding and flushes it.
@@ -821,9 +1036,7 @@ fn dropping_the_handle_applies_what_is_outstanding_and_flushes_it() {
         .expect("the writer must start");
 
     for n in 0..3 {
-        writer
-            .apply(vec![something(n)])
-            .expect("the writer must accept a batch");
+        accepted(&writer, vec![something(n)]);
     }
     drop(writer);
 
@@ -958,18 +1171,14 @@ fn child_writes_then_exits_abruptly() {
         }
         // Dropping the handle is what makes it durable.
         "shutdown" => {
-            writer
-                .apply(records)
-                .expect("the child's writer must accept the batch");
+            accepted(&writer, records);
             drop(writer);
         }
         // Nothing does, which is what makes the other two mean
         // something. The wait is long enough that the batch has
         // certainly been applied; it is the flush that is missing.
         _ => {
-            writer
-                .apply(records)
-                .expect("the child's writer must accept the batch");
+            accepted(&writer, records);
             std::thread::sleep(Duration::from_millis(200));
             std::mem::forget(writer);
         }
@@ -1088,9 +1297,7 @@ fn the_thread_is_named() {
     let store = Arc::new(Naming(Mutex::new(None)));
     let writer = Writer::spawn(Arc::clone(&store) as Arc<dyn Storage>, only_waiters_flush())
         .expect("the writer must start");
-    writer
-        .apply(vec![something(0)])
-        .expect("the writer must accept a batch");
+    accepted(&writer, vec![something(0)]);
     drop(writer);
 
     assert_eq!(

@@ -11,7 +11,7 @@ use broker_core::subscriptions::SubscriberId;
 use foldhash::fast::RandomState;
 use mqtt_codec::Packet;
 use parking_lot::{Mutex, RwLock};
-use storage::{Durable, NotDurable, Writer};
+use storage::{Applied, Durable, NotDurable, Writer};
 use tokio::sync::mpsc;
 
 /// Whether a batch of actions carries a promise that must be kept
@@ -74,6 +74,16 @@ pub enum Committed {
     /// A promise was made and the writer was already gone, so it will
     /// never be kept and nobody is left to report on it.
     Stopped,
+    /// Nothing was promised, and the writer is behind: the caller waits
+    /// for it to catch up before it does anything else.
+    ///
+    /// **This is back pressure and not a promise.** The records are in
+    /// the channel and will be written; what is waited for is the
+    /// backlog coming down, which is why it cannot fail and why a caller
+    /// that drops it is not breaking anything. See
+    /// [`Shared::hand_over`] for what reaching this means and
+    /// [`storage::Applied::Backlogged`] for what raises it.
+    Paced(Arc<Writer>),
 }
 
 impl Committed {
@@ -81,7 +91,9 @@ impl Committed {
     ///
     /// Returns at once when nothing was promised, which is every path
     /// into the broker except the one that answers a client's
-    /// publication.
+    /// publication — unless the writer is behind, in which case a caller
+    /// that promised nothing still waits for it to catch up, and that
+    /// wait succeeds.
     ///
     /// # Errors
     ///
@@ -93,6 +105,13 @@ impl Committed {
             Self::Nothing => Ok(()),
             Self::Waiting(durable) => durable.await,
             Self::Stopped => Err(NotDurable::WriterStopped),
+            // Not an error however it ends. Nothing was promised, so
+            // there is nothing to fail: this waited to pace a producer,
+            // and the producer has been paced.
+            Self::Paced(writer) => {
+                writer.relief().await;
+                Ok(())
+            }
         }
     }
 }
@@ -168,6 +187,12 @@ pub struct Shared {
     writer: Option<Arc<Writer>>,
     outboxes: RwLock<HashMap<SubscriberId, mpsc::Sender<Action>, RandomState>>,
     dropped_for_slow_reader: AtomicU64,
+    /// How often a caller was told the writer is behind. See
+    /// [`Shared::report_pacing`].
+    paced: AtomicU64,
+    /// The paced count as of the last line written about it, for the
+    /// same reason [`Shared::rejections_reported`] exists.
+    pacing_reported: AtomicU64,
     /// The rejected-batch count as of the last line written about it,
     /// so that a standing count is reported once rather than every
     /// second. See [`Shared::report_rejections`].
@@ -198,6 +223,8 @@ impl Shared {
             writer,
             outboxes: RwLock::new(HashMap::with_hasher(RandomState::default())),
             dropped_for_slow_reader: AtomicU64::new(0),
+            paced: AtomicU64::new(0),
+            pacing_reported: AtomicU64::new(0),
             rejections_reported: AtomicU64::new(0),
         }
     }
@@ -219,7 +246,9 @@ impl Shared {
     pub fn with_broker<T>(&self, f: impl FnOnce(&mut Broker) -> T) -> T {
         let (value, committed) = self.with_broker_committed(f, |_| false);
         // Nothing promised anything, so there is nothing to wait for.
-        // The records are on their way regardless.
+        // The records are on their way regardless. A writer that is
+        // behind would pace a caller here too, and this one declines to
+        // be paced: see the last paragraph of [`Shared::hand_over`].
         drop(committed);
         value
     }
@@ -268,6 +297,42 @@ impl Shared {
     /// Nothing here blocks. [`Writer::apply`] and
     /// [`Writer::apply_durable`] are channel sends; only awaiting the
     /// [`Durable`] they hand back waits on a device.
+    ///
+    /// # What a backlogged writer does to the caller
+    ///
+    /// [`Writer::apply`] never blocks and never drops, and says when the
+    /// backlog behind it has reached a high-water mark. **The answer
+    /// here is to pace the caller**: it is handed a [`Committed::Paced`]
+    /// and, because every caller awaits what this returns before it does
+    /// anything else, the connection that produced the records stops
+    /// reading its peer until the writer has caught up.
+    ///
+    /// Three answers were available and two are wrong.
+    ///
+    /// *Drop the records*, which is what [`Shared::deliver`] does to an
+    /// action when an outbox is full. It is right there and wrong here:
+    /// a discarded action is recovered when its peer reconnects and the
+    /// session resumes, while a discarded record is a fact the store
+    /// never learns — a retained message that vanishes at the next
+    /// restart, a subscription that does not come back. This milestone
+    /// exists to stop exactly that.
+    ///
+    /// *Close the connection*, which is honest but punishes a client for
+    /// a slow device, and does not help: the records it already
+    /// journalled are in the channel either way.
+    ///
+    /// *Pace the producer*, which costs the offending connection
+    /// latency and costs everything else nothing. A client that outruns
+    /// the device is held to the device's rate, which is the rate the
+    /// broker can actually keep, and the backlog stops growing because
+    /// nothing reads another packet from that socket while it is over
+    /// the mark.
+    ///
+    /// The one caller this does not reach is [`Shared::with_broker`],
+    /// which drops what this returns: the tick, a detach and an oversize
+    /// discard are not producers a peer can drive in a loop, and putting
+    /// the one task that drives every deadline in the process behind a
+    /// disk would be the stall this is trying to avoid.
     fn hand_over(&self, broker: &mut Broker, promised: bool) -> Committed {
         let mut records = Vec::new();
         broker.take_journal(&mut records);
@@ -283,17 +348,28 @@ impl Shared {
             if records.is_empty() {
                 return Committed::Nothing;
             }
-            if writer.apply(records).is_err() {
-                // The thread is gone, so nothing sent from here on is
-                // written and nothing will say so again. Loud, once per
-                // batch: a broker still serving clients while writing
-                // nothing down is the failure this whole milestone
-                // exists to prevent.
-                tracing::error!(
-                    "the storage writer has stopped; nothing the broker says is being written down"
-                );
-            }
-            return Committed::Nothing;
+            return match writer.apply(records) {
+                Ok(Applied::Accepted) => Committed::Nothing,
+                // The writer is behind, so this caller waits for it
+                // before it produces anything else. Counted here and
+                // reported by the ticker, because the interesting fact
+                // is that it happened at all rather than each time.
+                Ok(Applied::Backlogged) => {
+                    self.paced.fetch_add(1, Ordering::Relaxed);
+                    Committed::Paced(Arc::clone(writer))
+                }
+                Err(_) => {
+                    // The thread is gone, so nothing sent from here on
+                    // is written and nothing will say so again. Loud,
+                    // once per batch: a broker still serving clients
+                    // while writing nothing down is the failure this
+                    // whole milestone exists to prevent.
+                    tracing::error!(
+                        "the storage writer has stopped; nothing the broker says is being written down"
+                    );
+                    Committed::Nothing
+                }
+            };
         }
         // Empty records are meaningful here and are not skipped: a
         // connection acknowledging something another batch journalled
@@ -385,6 +461,56 @@ impl Shared {
         self.dropped_for_slow_reader.load(Ordering::Relaxed)
     }
 
+    /// How often a batch that promised nothing found the writer's
+    /// backlog at its high-water mark, and so paced the caller that
+    /// produced it.
+    ///
+    /// Zero on a broker whose store keeps up, which is every broker that
+    /// is not being outrun. Non-zero is not a defect: it is the bound
+    /// working, and it is the number that says a device cannot keep up
+    /// with the load being put on it.
+    pub fn paced_batches(&self) -> u64 {
+        self.paced.load(Ordering::Relaxed)
+    }
+
+    /// Say out loud that the writer has been behind, if it has since the
+    /// last time this was asked.
+    ///
+    /// A warning rather than an error, and the difference from
+    /// [`Shared::report_rejections`] is the point: a rejection means the
+    /// broker and the store disagree about what exists, which is a
+    /// defect, while this means the device cannot keep up with the load,
+    /// which is capacity. The same shape as the outbox's slow-reader
+    /// count one layer down, and for the same reason.
+    ///
+    /// Reported on the edge rather than every second, so that a standing
+    /// count does not bury the line that says it moved. Returns how many
+    /// this call reported, which a test needs because a method whose
+    /// only effect is a log line cannot be told from one that does
+    /// nothing.
+    pub fn report_pacing(&self) -> u64 {
+        let paced = self.paced_batches();
+        let reported = self.pacing_reported.swap(paced, Ordering::Relaxed);
+        let new = paced.saturating_sub(reported);
+        if new > 0 {
+            tracing::warn!(
+                paced,
+                new,
+                outstanding_records = self
+                    .writer
+                    .as_ref()
+                    .map_or(0, |writer| writer.outstanding_records()),
+                outstanding_bytes = self
+                    .writer
+                    .as_ref()
+                    .map_or(0, |writer| writer.outstanding_bytes()),
+                "the store is not keeping up with what the broker is telling it; \
+                 the connections producing it are being held to the device's rate"
+            );
+        }
+        new
+    }
+
     /// How many batches the store refused with nobody waiting to be
     /// told, and zero when there is no store.
     pub fn rejected_batches(&self) -> u64 {
@@ -464,6 +590,10 @@ pub(crate) mod gated {
     struct Gate {
         /// Flushes block until this is cleared.
         held: bool,
+        /// Applies block too, which is what a device that has stopped
+        /// answering does to the writer's whole channel rather than to
+        /// one flush.
+        holding_applies: bool,
         /// Flushes fail rather than succeed.
         failing: bool,
     }
@@ -496,9 +626,25 @@ pub(crate) mod gated {
             self.gate.lock().held = true;
         }
 
-        /// Let held flushes through, and the ones after them.
+        /// Hold every apply as well, until [`GatedStore::release`].
+        ///
+        /// What a stalled device does to the writer: the thread parks in
+        /// the store and the channel in front of it stops draining,
+        /// which is the only state in which a backlog can be observed at
+        /// all.
+        pub(crate) fn hold_applies(&self) {
+            let mut gate = self.gate.lock();
+            gate.held = true;
+            gate.holding_applies = true;
+        }
+
+        /// Let held flushes and applies through, and the ones after
+        /// them.
         pub(crate) fn release(&self) {
-            self.gate.lock().held = false;
+            let mut gate = self.gate.lock();
+            gate.held = false;
+            gate.holding_applies = false;
+            drop(gate);
             self.opened.notify_all();
         }
 
@@ -516,6 +662,16 @@ pub(crate) mod gated {
 
     impl Storage for GatedStore {
         fn apply(&self, records: &[Record]) -> Result<(), StorageError> {
+            let mut gate = self.gate.lock();
+            let deadline = std::time::Instant::now() + Self::LONGEST_HOLD;
+            while gate.holding_applies {
+                // Let go rather than wait forever, for the reason on
+                // the flush below.
+                if self.opened.wait_until(&mut gate, deadline).timed_out() {
+                    break;
+                }
+            }
+            drop(gate);
             self.inner.apply(records)
         }
 
@@ -853,6 +1009,191 @@ mod tests {
             0,
             "a count that has not moved is not news"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // The backlog: a peer that outruns the device is paced by it,
+    // rather than growing the writer's channel until the process dies.
+    // ----------------------------------------------------------------
+
+    /// A shell whose store is held and whose writer paces after `mark`
+    /// records, and the store and writer to drive it with.
+    #[cfg(test)]
+    fn a_stalled_shell(mark: u64) -> (Arc<Shared>, Arc<gated::GatedStore>, Arc<Writer>) {
+        let store = Arc::new(gated::GatedStore::new());
+        // Nothing drains while this holds, so the channel in front of
+        // the writer is exactly what the test put there.
+        store.hold_applies();
+        let writer = Arc::new(
+            Writer::spawn(
+                Arc::clone(&store) as Arc<dyn storage::Storage>,
+                storage::WriterConfig {
+                    high_water_records: mark,
+                    // One mark at a time: this is about the count.
+                    high_water_bytes: u64::MAX,
+                    ..storage::WriterConfig::default()
+                },
+            )
+            .expect("a writer thread"),
+        );
+        let shared = Arc::new(Shared::with_store(
+            Broker::new(Default::default()),
+            Arc::clone(&writer),
+        ));
+        (shared, store, writer)
+    }
+
+    /// One at-most-once retained publication: one record carrying the
+    /// whole payload, journalled for a client that is owed nothing and
+    /// waits for nothing. Finding 3's reproduction.
+    #[cfg(test)]
+    fn a_retained_publication(shared: &Shared, n: usize) -> Committed {
+        use mqtt_codec::packet::{Connect, Publish};
+        use mqtt_codec::{Properties, QoS, Version};
+
+        let (_, committed) = shared.with_broker_committed(
+            |broker| {
+                let mut out = Vec::new();
+                let registration = broker.connect(
+                    "",
+                    &Connect {
+                        version: Version::V5,
+                        client_id: format!("publisher-{n}"),
+                        clean_start: true,
+                        keep_alive: 0,
+                        username: None,
+                        password: None,
+                        will: None,
+                        properties: Properties::default(),
+                    },
+                    &mut out,
+                );
+                let publish = Packet::Publish(Publish {
+                    dup: false,
+                    qos: QoS::AtMostOnce,
+                    retain: true,
+                    topic: format!("sensor/{n}"),
+                    packet_id: None,
+                    payload: bytes::Bytes::from(vec![0xa5u8; 256]),
+                    properties: Properties::default(),
+                });
+                let _ = broker.handle(registration.subscriber, &publish, &mut out);
+            },
+            // A fire-and-forget publication promises nobody anything,
+            // which is exactly why nothing used to bound this.
+            |()| false,
+        );
+        committed
+    }
+
+    #[tokio::test]
+    async fn a_producer_that_outruns_the_store_is_paced_by_it() {
+        // Finding 3. An at-most-once retained publish touches no
+        // receive quota and is never waited on, so before the marks
+        // existed one client in a loop grew the writer's channel by a
+        // payload at a time until the process died.
+        let (shared, store, writer) = a_stalled_shell(4);
+
+        let mut paced = None;
+        for n in 0..64 {
+            let committed = a_retained_publication(&shared, n);
+            if matches!(committed, Committed::Paced(_)) {
+                paced = Some(committed);
+                break;
+            }
+        }
+        let paced = paced.expect("a producer against a stalled store reaches the mark");
+        assert_eq!(shared.paced_batches(), 1);
+
+        // The wait is the pacing. A `Paced` that returned at once would
+        // satisfy everything below it and bound nothing.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), paced.wait())
+                .await
+                .is_err(),
+            "the caller was let go while the store was still holding every apply"
+        );
+
+        store.release();
+        let relieved = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            a_retained_publication(&shared, 64).wait(),
+        )
+        .await
+        .expect("relief comes once the store catches up");
+        assert!(relieved.is_ok(), "being paced is not a failure");
+        assert!(writer.outstanding_records() < 4 * 64);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_backlog_of_a_producer_that_waits_is_bounded() {
+        // The same reproduction as a loop, which is the shape that
+        // exhausts memory: a thousand publications against a store that
+        // is answering nothing. What must be true afterwards is that
+        // the channel holds a bound rather than a thousand payloads.
+        //
+        // A multi-threaded runtime because the producer parks on relief
+        // and the storage thread is what wakes it.
+        let (shared, store, writer) = a_stalled_shell(8);
+
+        let producer = tokio::spawn({
+            let shared = Arc::clone(&shared);
+            async move {
+                for n in 0..1_000 {
+                    a_retained_publication(&shared, n)
+                        .wait()
+                        .await
+                        .expect("being paced is not a failure");
+                }
+            }
+        });
+
+        // Long enough that an unbounded producer would have journalled
+        // all thousand; it manages that in microseconds when nothing
+        // stops it.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let outstanding = writer.outstanding_records();
+        assert!(
+            !producer.is_finished(),
+            "the producer ran to the end against a store that answered nothing"
+        );
+        assert!(
+            outstanding < 64,
+            "the backlog reached {outstanding} records against a mark of 8, \
+             so nothing is pacing the producer"
+        );
+
+        store.release();
+        tokio::time::timeout(std::time::Duration::from_secs(30), producer)
+            .await
+            .expect("the producer finishes once the store answers")
+            .expect("it does not panic");
+    }
+
+    #[tokio::test]
+    async fn pacing_is_reported_once_and_then_stays_quiet() {
+        // The same edge-triggered shape as the rejection count beside
+        // it, and for the same reason: a standing figure reported every
+        // second buries the line that says it moved.
+        let (shared, store, _writer) = a_stalled_shell(2);
+        assert_eq!(shared.report_pacing(), 0, "nothing has been paced");
+
+        let mut committed = Vec::new();
+        for n in 0..32 {
+            committed.push(a_retained_publication(&shared, n));
+        }
+        assert!(shared.paced_batches() > 0, "the mark was never reached");
+        assert_eq!(shared.report_pacing(), shared.paced_batches());
+        assert_eq!(
+            shared.report_pacing(),
+            0,
+            "a count that has not moved is not news"
+        );
+
+        // Nothing here waits: the point is that dropping a `Paced` is
+        // allowed, because it promised nothing.
+        drop(committed);
+        store.release();
     }
 
     #[tokio::test]
