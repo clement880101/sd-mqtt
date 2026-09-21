@@ -134,6 +134,16 @@ the page gets them by not having an opinion.
 one events stream per document and it is spent. One request a second
 per open watcher, with a cursor, which is bounded and visible.
 
+**What was kept and what was dropped.** Kept: the filter box, the
+flash on a row that has just changed, and the habit of saying the
+limits on screen rather than in a comment. Dropped: the per-topic
+change counter, which counted how many times each matching retained
+topic had changed since the watch started. It is not missed, because
+it was an aggregate of what the old mechanism could not show you —
+a stream of every message, with its time, is strictly more than a
+count of them — but it was a real thing on the page and it going is
+a decision rather than an oversight.
+
 **The limits, which are the hard half and are the broker's.** A tap
 is a way for somebody holding this interface to make the broker do
 work, and a filter of `#` on a busy broker is the obvious abuse.
