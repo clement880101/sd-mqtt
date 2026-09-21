@@ -72,9 +72,13 @@
 //! those two the same way.
 //!
 //! **The one remaining pass is the Clients page**, which wants the
-//! connected sessions and skips the rest as it walks the order; see
-//! [`session_page`] for the bound that leaves and why a second
-//! ordered index is deliberately not here.
+//! connected sessions and skips the rest as it walks the order. The
+//! 4.8 µs in the table is that page over a population with every
+//! other session connected, which is the case the filter never has
+//! to skip far in; with ten of a hundred thousand connected the same
+//! page is 1.25 ms, and 3.7 ms at its worst. See [`session_page`]
+//! for what that buys and why a second ordered index is still
+//! deliberately not here.
 //!
 //! **How much of this a test can see, honestly.** The bounded
 //! selection is testable and is tested: a broker with far more
@@ -628,16 +632,67 @@ fn session_view(session: &Session) -> SessionView {
 /// sessions and the order does not know which those are, so it skips
 /// the rest as it walks. A page costs the page plus whatever is
 /// interleaved with it, and in the worst case — a hundred thousand
-/// sessions of which only the last hundred are connected — that is
-/// still a pass over the identity order. It is a much cheaper pass:
-/// a map lookup and a boolean per skipped session, against building
-/// an ordering key and pushing it into a heap. A second ordered
-/// index holding only the connected sessions would bound it
-/// properly, and it is deliberately not here: it would be a
-/// structure that can drift from the sessions it indexes, written
-/// for a case — a broker whose sessions are overwhelmingly offline
-/// *and* whose operator is paging the Clients table — that no
-/// measurement has shown.
+/// sessions of which only the last ten are connected — that is still
+/// a pass over the identity order.
+///
+/// # What that costs, measured rather than argued
+///
+/// It used to say the pass was "much cheaper" and leave it there,
+/// which is an argument and not a number, and the measurement beside
+/// it could not have produced one: its population had every other
+/// session connected, so the filter rejected one row for each row it
+/// took and the page cost a page. That is convention 5's "test
+/// measuring the wrong dimension" — the number that appeared to
+/// bound this page was taken on the population this page is not slow
+/// on. [`what_the_clients_page_costs_when_few_are_connected`] is the
+/// case that was missing, ten connected of the whole population and
+/// those ten last in the order:
+///
+/// | sessions | 10 connected | all connected |
+/// |---:|---:|---:|
+/// | 1 000 | 6.0 µs | 4.1 µs |
+/// | 10 000 | 54.2 µs | 5.0 µs |
+/// | 100 000 | 1.25 ms | 6.1 µs |
+///
+/// So it is linear in the population, as the paragraph above says,
+/// and the constant is small: 1.25 ms where the unbounded selection
+/// this replaced was 7.89 ms, and 3.7 ms at its worst of twenty
+/// runs. Still milliseconds of the process's one lock, on an
+/// endpoint section 11.1 leaves unauthenticated, and this is a
+/// realistic population rather than a contrived one — a fleet of
+/// persistent sessions that are mostly offline is the ordinary shape
+/// of an MQTT deployment, not an exotic one.
+///
+/// # And it is still not fixed here
+///
+/// A second ordered index holding only the connected sessions would
+/// bound it properly. It is deliberately not here, and the reason is
+/// no longer "no measurement has shown it" — one has — but what the
+/// index would cost to be right.
+///
+/// Connectedness changes on the session and not on the registry, so
+/// the index cannot live in `Registry` beside `by_identity`; it has
+/// to be a shared structure every session mutates, the shape
+/// `AttachedSessions` already has, and it has to be correct in five
+/// places: a clean start replacing a live session, a claim, a
+/// disconnect, a destroy, and the restore that rebuilds the registry
+/// from the store. It adds an owned `SessionId` and a tree operation
+/// to every connect and every disconnect, which is the path the
+/// design's hundred-thousand-connection target runs through. That is
+/// a structure that can drift and a cost on a hot path, against a
+/// millisecond on a page nobody has yet been measured asking for
+/// twice a second.
+///
+/// The bound that would not add a structure is to stop this walk
+/// after a fixed number of skipped rows and hand back a short page
+/// with a cursor. That bounds the lock properly and costs the
+/// caller round trips instead — but it changes what a page means for
+/// every resource that shares this envelope, which is a milestone's
+/// decision and not a follow-up's.
+///
+/// Deferred, then, and not forgotten: convention 8 says those two
+/// look identical in a codebase and opposite in a review, so the
+/// number is written down where the next person meets the code.
 fn session_page(broker: &Broker, paging: &Paging, connected_only: bool) -> Page<SessionView> {
     let after = paging.after.as_ref().map(identity_of);
     let mut rows = broker
@@ -2765,12 +2820,18 @@ mod tests {
     const WIDTH: usize = 6;
 
     /// A broker holding `count` sessions, `count` subscriptions and
-    /// `count` retained messages.
+    /// `count` retained messages, with `connected` saying which
+    /// sessions kept their connection.
     ///
-    /// Every session is connected except the even-numbered ones,
-    /// because the Clients page filters and a population that is
-    /// entirely connected would never make it skip a row.
-    fn a_broker_holding_everything(count: usize) -> Arc<Shared> {
+    /// A parameter rather than a rule, because which sessions are
+    /// connected is the only thing the Clients page's cost depends
+    /// on, and a builder that decides it for every measurement
+    /// decides what they can show. See
+    /// [`what_the_clients_page_costs_when_few_are_connected`].
+    fn a_broker_holding_everything_where(
+        count: usize,
+        connected: impl Fn(usize) -> bool,
+    ) -> Arc<Shared> {
         let shared = Arc::new(Shared::new(BrokerConfig::default()));
         shared.with_broker(|broker: &mut Broker| {
             for index in 0..count {
@@ -2815,7 +2876,7 @@ mod tests {
                     },
                 );
 
-                if index % 2 == 0 {
+                if !connected(index) {
                     if let Some(session) = broker.session_mut(subscriber) {
                         session.on_disconnected(false, 0);
                     }
@@ -2823,6 +2884,21 @@ mod tests {
             }
         });
         shared
+    }
+
+    /// The same broker with every other session connected.
+    ///
+    /// Every session is connected except the even-numbered ones,
+    /// because the Clients page filters and a population that is
+    /// entirely connected would never make it skip a row.
+    ///
+    /// It is **not** the Clients page's worst case either: a filter
+    /// that rejects every other row skips one for each row it takes,
+    /// so a page still costs a page. What that costs when it does
+    /// not is measured separately, by
+    /// [`what_the_clients_page_costs_when_few_are_connected`].
+    fn a_broker_holding_everything(count: usize) -> Arc<Shared> {
+        a_broker_holding_everything_where(count, |index| index % 2 != 0)
     }
 
     /// Run `body` twenty times and print the mean and the worst.
@@ -2913,6 +2989,63 @@ mod tests {
                     std::hint::black_box(entries);
                 });
             }
+        }
+    }
+
+    /// What the Clients page costs when few of many are connected.
+    ///
+    /// **The case [`what_a_page_costs_under_the_lock`] cannot
+    /// show.** Its population has every other session connected, so
+    /// the filter in [`session_page`] rejects one row for each row
+    /// it takes and a page still costs a page. The number it prints
+    /// beside "clients" is therefore a bound on the Clients page
+    /// only for the population on which the Clients page is not the
+    /// one that walks — convention 5's "test measuring the wrong
+    /// dimension", wearing a measurement's clothes rather than an
+    /// assertion's.
+    ///
+    /// Here ten sessions of the whole population are connected, and
+    /// they are the last ten in identity order. That is the worst
+    /// case [`session_page`]'s own documentation names: a page
+    /// cannot fill until the walk reaches the end, so it pays for
+    /// the population and not for the page. The same page over the
+    /// same population with everything connected is measured beside
+    /// it, because a number with nothing to compare it against says
+    /// how fast this machine is and not what the filter costs.
+    ///
+    ///     cargo test -p sdmqtt-admin --release -- --ignored --nocapture what_the_clients_page_costs
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn what_the_clients_page_costs_when_few_are_connected() {
+        /// How many of the population kept their connection.
+        const CONNECTED: usize = 10;
+
+        println!("one Clients page of {DEFAULT_LIMIT}, under the broker lock");
+        for population in [1_000usize, 10_000, 100_000] {
+            let paging = Paging {
+                limit: DEFAULT_LIMIT,
+                after: None,
+            };
+
+            let few = a_broker_holding_everything_where(population, |index| {
+                index >= population - CONNECTED
+            });
+            timed(
+                &format!("{CONNECTED} of them connected"),
+                population,
+                || {
+                    let page = few.with_broker(|broker| session_page(broker, &paging, true));
+                    std::hint::black_box(page);
+                },
+            );
+            drop(few);
+
+            let all = a_broker_holding_everything_where(population, |_| true);
+            timed("all of them connected", population, || {
+                let page = all.with_broker(|broker| session_page(broker, &paging, true));
+                std::hint::black_box(page);
+            });
+            drop(all);
         }
     }
 
