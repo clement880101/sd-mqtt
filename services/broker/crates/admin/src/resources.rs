@@ -33,18 +33,54 @@
 //!    There is nowhere in a handler for a serialiser to be called
 //!    from, which is a stronger guarantee than remembering not to.
 //!
-//! Step one is bounded too, which is more than the rule asks for. The
-//! selection keeps a heap of at most one page, so the work done under
-//! the lock is one cheap comparison per session plus one row built
-//! per row returned — not one row built per session in the broker.
-//! Without that, a page of ten out of a hundred thousand sessions
-//! would allocate a hundred thousand rows under the lock and throw
-//! away all but ten.
+//! # Step one is bounded by the page, not by the broker
+//!
+//! This was half true for a milestone and the half that was missing
+//! was the expensive one. The selection kept a heap of at most one
+//! page, so the *rows built* were bounded — but the pass was not. It
+//! looked at every session, every subscription and every retained
+//! message to decide which hundred to keep, and at a hundred
+//! thousand of each that was 13.5, 25.5 and 44.9 milliseconds with
+//! the process's one lock held and every MQTT client in it waiting.
+//! **Four of these six resources need no token**, by section 11.1's
+//! design, so on any listener a browser can reach that was an
+//! unauthenticated caller stalling the broker as fast as it could
+//! ask.
+//!
+//! What was missing was somewhere to seek to. A hash map has no
+//! order to resume from, so the only way to find the hundred rows
+//! after a cursor was to look at all of them. The two structures
+//! underneath keep an order now — the registry indexes its sessions
+//! by identity in a `BTreeMap`, and the retained store keeps its
+//! topics in a `BTreeSet` beside its tree — and each handler seeks
+//! into it and takes one page. Every total is a maintained number,
+//! so saying how large the collection is costs nothing either. One
+//! page of a hundred, at a hundred thousand of everything:
+//!
+//! | resource | before | after |
+//! |---|---:|---:|
+//! | sessions | 13.55 ms | 4.9 µs |
+//! | clients | 7.89 ms | 4.8 µs |
+//! | subscriptions | 25.49 ms | 8.8 µs |
+//! | retained | 44.93 ms | 8.5 µs |
+//!
+//! Flat across a thousand, ten thousand and a hundred thousand,
+//! which is the point: it is the page that is paid for and not the
+//! broker. `what_a_page_costs_under_the_lock` is the measurement,
+//! and it asks for a page from the middle of each collection as well
+//! as the first one, because only a structure that can seek answers
+//! those two the same way.
+//!
+//! **The one remaining pass is the Clients page**, which wants the
+//! connected sessions and skips the rest as it walks the order; see
+//! [`session_page`] for the bound that leaves and why a second
+//! ordered index is deliberately not here.
 //!
 //! **How much of this a test can see, honestly.** The bounded
 //! selection is testable and is tested: a broker with far more
-//! sessions than a page still answers a page, and removing the cap
-//! fails two tests. Where the serialising happens is **not**
+//! sessions than a page still answers a page, and each resource's
+//! page walk visits every row once and stops where the collection
+//! does. Where the serialising happens is **not**
 //! testable, and this was checked rather than assumed: the sessions
 //! handler was rewritten to format its whole body inside the closure
 //! and the entire suite still passed.
@@ -92,12 +128,14 @@ use axum::http::request::Parts;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use broker_core::broker::Broker;
+use broker_core::registry::SessionId;
 use broker_core::retained::RetainedMessage;
 use broker_core::session::message::Message;
+use broker_core::session::Session;
 use bytes::Bytes;
 use mqtt_codec::{Properties, QoS, Version};
 use serde::{Deserialize, Serialize};
-use storage::record::{Qos, RetainHandling};
+use storage::record::{Qos, RetainHandling, SubscriptionRecord};
 
 use crate::error::{ApiError, ErrorCode};
 use crate::AdminState;
@@ -149,6 +187,23 @@ pub struct Page<T> {
     /// How many rows the whole resource holds, not how many are on
     /// this page. The Clients page shows a count beside a virtualized
     /// table and would otherwise have to walk every page to find it.
+    ///
+    /// **Exact, and never an estimate or a cap.** Counting was the
+    /// one part of answering a page that still had to see everything
+    /// once the pages themselves could seek, and the answer is that
+    /// none of the four counts anything: every one is read from a
+    /// number the broker maintains where it changes — the session
+    /// count, the connected count, the subscriptions gauge and the
+    /// retained store's ordered index, which is its own length. So
+    /// this is the whole collection, at the instant the lock was
+    /// held, and a client can page to exactly this many rows.
+    ///
+    /// Two of them include something a reader might not expect, and
+    /// both are what they always were. A retained message past its
+    /// deadline that no sweep has reclaimed is still stored and is
+    /// still counted, and it is still on the page. A session is
+    /// counted whether or not anything is attached to it; the
+    /// connected ones are the Clients resource.
     pub total: usize,
     /// The cursor for the next page, or `null` when this is the last
     /// one.
@@ -515,25 +570,22 @@ fn version_text(version: Version) -> &'static str {
     }
 }
 
-/// Build the page of sessions that `connected_only` asks for.
+/// The session identity a cursor names.
 ///
-/// The closure it is called in holds the broker lock, and everything
-/// it returns is owned. See the module documentation.
-fn session_page(broker: &Broker, paging: &Paging, connected_only: bool) -> Page<SessionView> {
-    let selection = select(
-        broker
-            .sessions()
-            .filter(|(_, session)| !connected_only || session.is_connected())
-            .map(|(_, session)| {
-                let id = session.id();
-                ([&*id.mountpoint, &*id.client_id, ""], session)
-            }),
-        paging.after.as_ref(),
-        paging.limit,
-    );
-    page(selection, |key, session| SessionView {
-        mountpoint: key[0].to_owned(),
-        client_id: key[1].to_owned(),
+/// The first two parts of the key, which is the whole of what the
+/// broker orders sessions by. A cursor naming a session that has
+/// since gone is not an error: the range resumes at whatever now
+/// follows it, which is why the cursor is a key and not an offset.
+fn identity_of(after: &[String; PARTS]) -> SessionId {
+    SessionId::new(&after[0], &after[1])
+}
+
+/// One row of the sessions or clients page.
+fn session_view(session: &Session) -> SessionView {
+    let id = session.id();
+    SessionView {
+        mountpoint: id.mountpoint.to_string(),
+        client_id: id.client_id.to_string(),
         connected: session.is_connected(),
         protocol_version: version_text(session.version()),
         subscriptions: session.subscriptions().len(),
@@ -541,7 +593,72 @@ fn session_page(broker: &Broker, paging: &Paging, connected_only: bool) -> Page<
         inflight: session.outbound.inflight_len(),
         expiry_interval: session.expiry_interval(),
         expires_at: session.expires_at(),
-    })
+    }
+}
+
+/// Build the page of sessions that `connected_only` asks for.
+///
+/// The closure it is called in holds the broker lock, and everything
+/// it returns is owned. See the module documentation.
+///
+/// # What this looks at, and it is no longer everything
+///
+/// It used to keep a heap of one page over a pass across every
+/// session in the broker. The rows built were bounded and the pass
+/// was not, so a page of ten out of a hundred thousand cost 13.5
+/// milliseconds on the process's one lock — on an endpoint section
+/// 11.1 leaves unauthenticated. The registry keeps its sessions in
+/// identity order now, so this seeks to the cursor and takes what it
+/// needs; see [`Broker::sessions_after`].
+///
+/// **The Clients page is the one exception, and it is bounded by the
+/// population rather than by the page.** It wants the connected
+/// sessions and the order does not know which those are, so it skips
+/// the rest as it walks. A page costs the page plus whatever is
+/// interleaved with it, and in the worst case — a hundred thousand
+/// sessions of which only the last hundred are connected — that is
+/// still a pass over the identity order. It is a much cheaper pass:
+/// a map lookup and a boolean per skipped session, against building
+/// an ordering key and pushing it into a heap. A second ordered
+/// index holding only the connected sessions would bound it
+/// properly, and it is deliberately not here: it would be a
+/// structure that can drift from the sessions it indexes, written
+/// for a case — a broker whose sessions are overwhelmingly offline
+/// *and* whose operator is paging the Clients table — that no
+/// measurement has shown.
+fn session_page(broker: &Broker, paging: &Paging, connected_only: bool) -> Page<SessionView> {
+    let after = paging.after.as_ref().map(identity_of);
+    let mut rows = broker
+        .sessions_after(after.as_ref())
+        .filter(|(_, session)| !connected_only || session.is_connected());
+
+    let mut items: Vec<SessionView> = Vec::with_capacity(paging.limit);
+    for (_, session) in rows.by_ref().take(paging.limit) {
+        items.push(session_view(session));
+    }
+    // One row past the page, and no further. A page that is full but
+    // final must say `next: null`, or a client walks into an empty
+    // page and cannot tell it from a collection that shrank.
+    let more = rows.next().is_some();
+    let next = more
+        .then(|| {
+            items
+                .last()
+                .map(|row| encode_cursor([&row.mountpoint, &row.client_id, ""]))
+        })
+        .flatten();
+
+    Page {
+        items,
+        // Both are maintained counts, so the whole collection's size
+        // costs nothing to report beside a page of it.
+        total: if connected_only {
+            broker.connected_count()
+        } else {
+            broker.session_count()
+        },
+        next,
+    }
 }
 
 async fn sessions(State(state): State<AdminState>, paging: Paging) -> Json<Page<SessionView>> {
@@ -616,33 +733,81 @@ fn retain_handling_number(handling: RetainHandling) -> u8 {
 /// the measurement can time exactly what the lock is held for: see
 /// `what_a_page_costs_under_the_lock`.
 fn subscription_page(broker: &Broker, paging: &Paging) -> Page<SubscriptionView> {
-    let selection = select(
-        broker.sessions().flat_map(|(_, session)| {
+    // A subscription's key is its session's identity and then its
+    // filter, so a cursor resumes *inside* a session: at the filter
+    // after the one it names, in the session it names. That session
+    // has to be handed back, not skipped past, or every filter it
+    // holds after the cursor disappears.
+    let resume = paging
+        .after
+        .as_ref()
+        .map(|after| (identity_of(after), after[2].as_str()));
+    let mut items: Vec<SubscriptionView> = Vec::with_capacity(paging.limit);
+    let mut more = false;
+
+    'sessions: for (_, session) in broker.sessions_from(resume.as_ref().map(|(id, _)| id)) {
+        if session.subscriptions().is_empty() {
+            continue;
+        }
+        // Only for the session the cursor names. Any session after
+        // it starts at its first filter.
+        let after_filter = resume
+            .as_ref()
+            .filter(|(id, _)| id == session.id())
+            .map(|(_, filter)| *filter);
+
+        // A session's filters are held in the order they arrived,
+        // which is not the order this page is in. Sorted per session
+        // rather than across the broker: this is the subscriptions of
+        // the sessions a page touches, not of every session there is.
+        let mut held: Vec<&SubscriptionRecord> = session.subscriptions().iter().collect();
+        held.sort_unstable_by(|one, two| one.filter.cmp(&two.filter));
+
+        for record in held {
+            if after_filter.is_some_and(|filter| record.filter.as_str() <= filter) {
+                continue;
+            }
+            if items.len() == paging.limit {
+                more = true;
+                break 'sessions;
+            }
             let id = session.id();
-            session.subscriptions().iter().map(move |subscription| {
-                (
-                    [
-                        &*id.mountpoint,
-                        &*id.client_id,
-                        subscription.filter.as_str(),
-                    ],
-                    subscription,
-                )
+            items.push(SubscriptionView {
+                mountpoint: id.mountpoint.to_string(),
+                client_id: id.client_id.to_string(),
+                filter: record.filter.clone(),
+                qos: qos_number(record.qos),
+                no_local: record.no_local,
+                retain_as_published: record.retain_as_published,
+                retain_handling: retain_handling_number(record.retain_handling),
+                subscription_id: record.subscription_id,
+            });
+        }
+    }
+
+    let next = more
+        .then(|| {
+            items.last().map(|row| {
+                encode_cursor([
+                    row.mountpoint.as_str(),
+                    row.client_id.as_str(),
+                    row.filter.as_str(),
+                ])
             })
-        }),
-        paging.after.as_ref(),
-        paging.limit,
-    );
-    page(selection, |key, subscription| SubscriptionView {
-        mountpoint: key[0].to_owned(),
-        client_id: key[1].to_owned(),
-        filter: subscription.filter.clone(),
-        qos: qos_number(subscription.qos),
-        no_local: subscription.no_local,
-        retain_as_published: subscription.retain_as_published,
-        retain_handling: retain_handling_number(subscription.retain_handling),
-        subscription_id: subscription.subscription_id,
-    })
+        })
+        .flatten();
+
+    Page {
+        items,
+        // A maintained number, and the same one section 11.3's
+        // subscriptions gauge reports: every filter every session
+        // holds is in exactly one of the trie and the shared table.
+        // `the_subscriptions_total_is_what_paging_them_gives` says so
+        // from the outside, and `tests/journal.rs` says so from
+        // inside after every generated history.
+        total: broker.subscription_count(),
+        next,
+    }
 }
 
 async fn subscriptions(
@@ -1609,6 +1774,193 @@ mod tests {
         let here = client_ids(&response.body);
         assert_eq!(here, ["client-0000", "client-0001", "client-0002"]);
         assert!(response.body.contains("\"total\":500"), "{}", response.body);
+        admin.shutdown().await;
+    }
+
+    /// A broker holding `count` sessions, each with `each` filters,
+    /// with every other session disconnected and one shared
+    /// subscription on top.
+    ///
+    /// The filters are named so that their order is not the order
+    /// they were taken in, because a page that comes out sorted only
+    /// because it was written sorted proves nothing. The shared one
+    /// is there because a shared subscription is the only filter that
+    /// lives in the shared table rather than the trie, and the
+    /// subscriptions total adds the two: a page that counted one of
+    /// them twice, or neither, shows up nowhere else.
+    fn a_broker_subscribing(count: usize, each: usize) -> Arc<Shared> {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        shared.with_broker(|broker: &mut Broker| {
+            for index in 0..count {
+                let connect = Connect {
+                    version: mqtt_codec::Version::V5,
+                    client_id: format!("client-{index:04}"),
+                    clean_start: true,
+                    keep_alive: 0,
+                    username: None,
+                    password: None,
+                    will: None,
+                    properties: Properties {
+                        session_expiry_interval: Some(3_600),
+                        ..Properties::default()
+                    },
+                };
+                let mut out = Vec::new();
+                let subscriber = broker.connect("", &connect, &mut out).subscriber;
+
+                let mut filters: Vec<String> = (0..each)
+                    .rev()
+                    .map(|filter| format!("site/{filter:02}/telemetry"))
+                    .collect();
+                if index == 0 {
+                    filters.push("$share/g/shared/topic".to_owned());
+                }
+                for filter in filters {
+                    let packet = Packet::Subscribe(Subscribe {
+                        packet_id: 1,
+                        filters: vec![SubscriptionOptions {
+                            filter,
+                            qos: mqtt_codec::QoS::AtMostOnce,
+                            no_local: false,
+                            retain_as_published: false,
+                            retain_handling: mqtt_codec::packet::RetainHandling::SendAlways,
+                        }],
+                        properties: Properties::default(),
+                    });
+                    let mut out = Vec::new();
+                    let _ = broker.handle(subscriber, &packet, &mut out);
+                }
+
+                if index % 2 == 0 {
+                    if let Some(session) = broker.session_mut(subscriber) {
+                        session.on_disconnected(false, 0);
+                    }
+                }
+            }
+        });
+        shared
+    }
+
+    /// Walk every page of `resource`, asserting the total and that
+    /// no page after the first is empty. Returns the values of
+    /// `field`, in the order they came.
+    async fn walk(admin: &AdminRunning, resource: &str, field: &str, total: usize) -> Vec<String> {
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let path = match &cursor {
+                None => format!("/api/v1/{resource}?limit=3"),
+                Some(after) => format!("/api/v1/{resource}?limit=3&after={}", escape(after)),
+            };
+            let response = testing::get(admin.address(), &path).await;
+            assert_eq!(response.status, 200, "{}", response.body);
+            pages += 1;
+            assert!(
+                pages <= total + 2,
+                "the walk does not end: {}",
+                response.body
+            );
+
+            let body = &response.body;
+            assert!(
+                body.contains(&format!("\"total\":{total}")),
+                "every page carries the whole count: {body}"
+            );
+            let here = field_values(body, &format!("\"{field}\":\""));
+            assert!(here.len() <= 3, "a page holds at most what was asked");
+            if cursor.is_some() {
+                assert!(
+                    !here.is_empty(),
+                    "a cursor was handed out for a page with nothing on it: {body}"
+                );
+            }
+            seen.extend(here);
+            match next_cursor(body) {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        seen
+    }
+
+    /// Walking the subscriptions visits every filter of every
+    /// session once, in order, and the total is what the walk gives.
+    ///
+    /// This is the page whose cursor resumes *inside* a row's parent:
+    /// it names a session and a filter, and the session it names has
+    /// to be handed back rather than skipped past. Several filters
+    /// per session and pages of three make the boundary fall inside a
+    /// session rather than between two, which is the case that
+    /// distinguishes the two readings.
+    #[tokio::test]
+    async fn a_walk_of_the_subscriptions_pages_visits_every_row_once_and_then_stops() {
+        let sessions = 4;
+        let each = 3;
+        let total = sessions * each + 1;
+        let admin = admin_over(a_broker_subscribing(sessions, each), vec![]).await;
+
+        let filters = walk(&admin, "subscriptions", "filter", total).await;
+        let clients = walk(&admin, "subscriptions", "client_id", total).await;
+
+        let mut expected: Vec<(String, String)> = Vec::new();
+        for index in 0..sessions {
+            let client = format!("client-{index:04}");
+            if index == 0 {
+                expected.push((client.clone(), "$share/g/shared/topic".to_owned()));
+            }
+            for filter in 0..each {
+                expected.push((client.clone(), format!("site/{filter:02}/telemetry")));
+            }
+        }
+        let got: Vec<(String, String)> = clients.into_iter().zip(filters).collect();
+        assert_eq!(got, expected);
+        admin.shutdown().await;
+    }
+
+    /// The subscriptions total is what paging them gives.
+    ///
+    /// The total is read from the broker's maintained gauge, which
+    /// adds the trie and the shared table; the rows come from what
+    /// each session holds. Those are two different structures, and
+    /// nothing else here would notice them disagreeing — the page
+    /// would simply stop early against a total it never reaches, or
+    /// run past one.
+    #[tokio::test]
+    async fn the_subscriptions_total_is_what_paging_them_gives() {
+        let admin = admin_over(a_broker_subscribing(5, 2), vec![]).await;
+        let response = testing::get(admin.address(), "/api/v1/subscriptions?limit=1").await;
+        assert!(
+            response.body.contains("\"total\":11"),
+            "five sessions of two filters and one shared: {}",
+            response.body
+        );
+        let rows = walk(&admin, "subscriptions", "filter", 11).await;
+        assert_eq!(rows.len(), 11, "and the walk gives exactly that many");
+        admin.shutdown().await;
+    }
+
+    /// The Clients page shows the connected sessions and counts
+    /// them, with the disconnected ones interleaved.
+    ///
+    /// Every other session here is away, so the page has to skip as
+    /// it walks and the total has to be the connected ones rather
+    /// than all of them. A page that forgot the filter would show
+    /// the absent; a total that counted every session would tell an
+    /// operator there are twice as many clients as there are.
+    #[tokio::test]
+    async fn the_clients_page_is_the_connected_sessions_and_counts_them() {
+        let admin = admin_over(a_broker_subscribing(6, 1), vec![]).await;
+
+        let all = walk(&admin, "sessions", "client_id", 6).await;
+        assert_eq!(all.len(), 6);
+
+        let connected = walk(&admin, "clients", "client_id", 3).await;
+        assert_eq!(
+            connected,
+            ["client-0001", "client-0003", "client-0005"],
+            "the odd-numbered ones are the ones still here"
+        );
         admin.shutdown().await;
     }
 

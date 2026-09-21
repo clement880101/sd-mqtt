@@ -862,10 +862,19 @@ impl Collector for Live {
         //
         // One acquisition of the broker's lock for the four that live
         // behind it, and every one of the four is a read of a number
-        // the broker already maintains — including the queue depth,
-        // which used to mean walking every session. See
+        // the broker already maintains. Three of them used to mean a
+        // walk: the queue depth summed every session, the
+        // subscription count added up every shard of the trie, and
+        // the retained count walked the retained tree — 405
+        // microseconds, 2.64 milliseconds and 2.66 milliseconds
+        // respectively with a hundred thousand of each, on this
+        // lock, every time a scraper asked. See
         // [`broker_core::session::QueueTotal`] for the measurement
-        // that decided that.
+        // that decided the first, and the note on
+        // [`broker_core::subscriptions::SubscriptionTrie`] and
+        // [`broker_core::retained::RetainedStore`] for the other two.
+        // Each is guarded against drifting from what it counts by a
+        // property that walks.
         //
         // **Cluster members are milestone 5 and are deliberately not
         // registered at all.** An authentication outcome that will

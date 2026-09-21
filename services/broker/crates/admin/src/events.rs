@@ -698,12 +698,22 @@ struct Sample {
 /// rebuild the whole picture, which is what makes them correct
 /// rather than an optimisation with a hole in it.
 ///
-/// **The two gauges that are not O(1).** `subscription_count` walks
-/// the subscription trie and `retained_count` walks the retained
-/// tree, both under this lock and both on every tick. They are not
-/// this function's to fix — the metrics endpoint reads the same two
-/// — but the sentence that used to be here said all five gauges were
-/// maintained numbers, and that was not true.
+/// **All five gauges are maintained numbers now, and that sentence
+/// has been wrong before.** It was wrong when it was first written,
+/// and milestone three corrected the claim rather than the code
+/// because there was nothing else to read: `subscription_count`
+/// walked the subscription trie and `retained_count` walked the
+/// retained tree, both under this lock, both on every tick and both
+/// again on every metrics scrape, measured at 2.64 and 2.66
+/// milliseconds with a hundred thousand of each. Both are read from
+/// the structure that keeps them now — a counter on the trie and the
+/// length of the retained store's ordered index — and both are
+/// guarded against drifting from what they count by a property that
+/// walks. A whole sample over a hundred thousand sessions, a hundred
+/// thousand subscriptions and ten thousand retained topics went from
+/// 3.77 milliseconds to 1.24 microseconds;
+/// `what_a_whole_sample_costs` is the measurement, and it is the
+/// same broker on the same machine either side.
 ///
 /// [`Presence`]: broker_core::registry::Presence
 /// [`QueueTotal`]: broker_core::session::QueueTotal
@@ -1591,13 +1601,14 @@ mod tests {
     ///
     /// The measurement above isolates the thing this module changed,
     /// so its broker holds nothing else. This one is the whole tick,
-    /// and it is here because two of the five gauges are not the
-    /// maintained numbers the sampler's documentation used to claim:
-    /// `subscription_count` walks the subscription trie and
-    /// `retained_count` walks the retained tree, both on this lock
-    /// and both on every tick, and the metrics endpoint asks for the
-    /// same two. Neither is this module's to fix; what is this
-    /// module's is not to say they are free.
+    /// and it is here because two of the five gauges once were not
+    /// the maintained numbers the sampler's documentation claimed:
+    /// `subscription_count` walked the subscription trie and
+    /// `retained_count` walked the retained tree, both on this lock,
+    /// both on every tick, and the metrics endpoint asked for the
+    /// same two. Both are maintained now. The measurement stays,
+    /// because a gauge that goes back to walking is a change nothing
+    /// else here would notice — every answer would still be right.
     ///
     ///     cargo test -p sdmqtt-admin --release -- --ignored --nocapture what_a_whole_sample_costs
     #[test]
