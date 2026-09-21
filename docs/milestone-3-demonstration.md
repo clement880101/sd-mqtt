@@ -301,6 +301,19 @@ cannot tell the three apart, so the sentence now names all three.
   journalled like anybody else's, so opening and closing one costs a
   handful of records. Not its messages.
 
+One thing seen by accident and worth writing down, because it is not
+about taps at all. A second broker started on this host while the
+conformance suite was running refused to start —
+`cannot bind the admin listener to 127.0.0.1:1884: Address already
+in use` — and exited rather than serving MQTT with no admin
+listener. That is the right answer and it named the address, but the
+consequence is worth knowing: **two brokers on one host collide on
+the admin port before they collide on anything else**, because
+`--address` moves the MQTT listener and leaves the admin one on its
+default. `--admin-address` is the other half and has to be passed
+too. The browser pointed at 1884 meanwhile was talking to whichever
+broker held the port, which is how this was noticed at all.
+
 ## The things that are unfinished
 
 1. ~~**The subscribe tool cannot see live traffic.**~~ **Closed.**
