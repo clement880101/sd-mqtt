@@ -1,0 +1,88 @@
+/*
+ * Hand-written CSS over Open Props tokens.
+ *
+ * **Imported per module, not wholesale.** The tokens are custom
+ * properties on the root element, so nothing tree-shakes them: the
+ * single `open-props` import is about 7.7 KB gzipped whether or not
+ * anything reads a token, where the four modules below are 1.5 to 3.
+ * Adding a fifth is cheap; adding the whole set is not.
+ */
+@import 'open-props/sizes.min.css';
+@import 'open-props/gray.min.css';
+@import 'open-props/fonts.min.css';
+@import 'open-props/borders.min.css';
+
+:root {
+  --surface: var(--gray-0);
+  --surface-raised: #fff;
+  --ink: var(--gray-9);
+  --ink-quiet: var(--gray-6);
+  --edge: var(--gray-3);
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: var(--gray-10);
+    --surface-raised: var(--gray-9);
+    --ink: var(--gray-1);
+    --ink-quiet: var(--gray-5);
+    --edge: var(--gray-8);
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-1);
+  line-height: var(--font-lineheight-3);
+}
+
+.nav {
+  display: flex;
+  gap: var(--size-5);
+  align-items: baseline;
+  padding: var(--size-3) var(--size-5);
+  border-block-end: var(--border-size-1) solid var(--edge);
+  background: var(--surface-raised);
+}
+
+.nav .brand {
+  font-weight: var(--font-weight-7);
+  letter-spacing: var(--font-letterspacing-0);
+}
+
+.nav ul {
+  display: flex;
+  gap: var(--size-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nav a {
+  color: var(--ink-quiet);
+  text-decoration: none;
+  padding-block-end: var(--size-1);
+  border-block-end: var(--border-size-2) solid transparent;
+}
+
+.nav a[aria-current='page'] {
+  color: var(--ink);
+  border-block-end-color: currentColor;
+}
+
+main {
+  padding: var(--size-5);
+}
+
+.page h1 {
+  margin-block: 0 var(--size-3);
+  font-size: var(--font-size-4);
+}
+
+.empty {
+  color: var(--ink-quiet);
+}
