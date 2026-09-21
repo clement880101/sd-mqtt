@@ -221,8 +221,10 @@ mod tests {
                 Version::V5,
                 1,
                 0,
-                20,
-                crate::session::queue::QueueLimits::default(),
+                crate::session::state::SessionBounds {
+                    max_inflight: 20,
+                    ..Default::default()
+                },
             ),
         }
     }

@@ -1047,6 +1047,25 @@ impl Broker {
         self.subscriptions.len() + self.shared.member_count()
     }
 
+    /// How many messages are waiting in every session's queue.
+    ///
+    /// Read from a maintained total rather than summed over the
+    /// sessions, and the reason is on [`QueueTotal`]: the walk was
+    /// measured at 405 microseconds with a hundred thousand sessions,
+    /// and it would be held under this broker's one lock every time
+    /// a scraper asked.
+    ///
+    /// [`QueueTotal`]: crate::session::QueueTotal
+    pub fn queue_depth(&self) -> usize {
+        self.registry.queued()
+    }
+
+    /// The same number by walking every session, for the test that
+    /// keeps the maintained one honest.
+    pub fn queue_depth_by_walking(&self) -> usize {
+        self.registry.queued_by_walking()
+    }
+
     /// How many messages the retained store holds, expired or not.
     ///
     /// It exists so that the expiry sweep in [`Broker::tick`] can be

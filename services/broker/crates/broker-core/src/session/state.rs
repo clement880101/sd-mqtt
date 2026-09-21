@@ -10,7 +10,7 @@ use crate::journal::{self, Journal};
 use crate::registry::SessionId;
 use crate::session::inbound::Inbound;
 use crate::session::outbound::Outbound;
-use crate::session::queue::QueueLimits;
+use crate::session::queue::{QueueLimits, QueueTotal};
 use crate::subscriptions::SubscriberId;
 
 /// The version assumed before a connect has been decoded.
@@ -69,33 +69,49 @@ pub struct Session {
     journal: Journal,
 }
 
+/// The configured bounds every session is built with.
+///
+/// Together rather than one parameter each, because they travel
+/// together: the registry holds one of these and hands it to every
+/// session it makes, so a bound added later is added in one place.
+#[derive(Clone, Debug, Default)]
+pub struct SessionBounds {
+    /// The configured inflight window, which section 6 makes one half
+    /// of the lesser-of pair. The other half is the peer's receive
+    /// maximum, which the shell narrows this to once it has read the
+    /// connect packet; it is not known when a session is built, and a
+    /// session exists before any connection has advertised anything.
+    pub max_inflight: usize,
+    /// What bounds the queue waiting for one of those slots. Section
+    /// 6 calls both bounds configured, and this is the only path a
+    /// configured value can reach a session by.
+    pub queue: QueueLimits,
+    /// The process-wide count of queued messages this session's queue
+    /// counts into.
+    pub total: QueueTotal,
+}
+
 impl Session {
     /// A fresh session, connected.
-    ///
-    /// `max_inflight` is the configured window, which section 6 makes
-    /// one half of the lesser-of pair. The other half is the peer's
-    /// receive maximum, which the shell narrows this to once it has
-    /// read the connect packet; it is not known here, and a session
-    /// exists before any connection has advertised anything.
-    ///
-    /// `queue` bounds what waits for one of those slots. Section 6
-    /// calls both bounds configured, and this is the only path a
-    /// configured value can reach a session by.
     pub fn new(
         id: SessionId,
         subscriber: SubscriberId,
         version: Version,
         epoch: u64,
         _now: u32,
-        max_inflight: usize,
-        queue: QueueLimits,
+        bounds: SessionBounds,
     ) -> Self {
+        let SessionBounds {
+            max_inflight,
+            queue,
+            total,
+        } = bounds;
         // A fresh session has a connection attached, so its outbound path
         // does too. Leaving it offline would make `is_connected` lie and
         // silently discard every at-most-once delivery, which such a path
         // does not queue for an absent client.
         let key = journal::key_of(&id);
-        let mut outbound = Outbound::new(key.clone(), queue, max_inflight);
+        let mut outbound = Outbound::sharing(key.clone(), queue, max_inflight, total);
         outbound.set_online(true);
 
         let mut session = Self {
@@ -441,8 +457,10 @@ mod tests {
             version,
             1,
             0,
-            20,
-            QueueLimits::default(),
+            SessionBounds {
+                max_inflight: 20,
+                ..Default::default()
+            },
         )
     }
 

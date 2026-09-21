@@ -1145,6 +1145,23 @@ fn check(history: &[Op]) -> TestCaseResult {
 
     bodies_are_exactly_what_is_referenced(&restored).map_err(TestCaseError::fail)?;
 
+    // The maintained queue total, against the same number the slow
+    // way. It exists because summing every session's queue under the
+    // broker's one lock is too much to hold while a scraper asks, and
+    // a figure maintained at each of a queue's four mutation points
+    // is a figure that drifts the first time a path forgets one. This
+    // is where the drift would show: hundreds of generated histories,
+    // each pushing, popping, evicting, requeueing, expiring, taking
+    // over and clean-starting, and none of them written by whoever
+    // wrote the four increments.
+    if run.broker.queue_depth() != run.broker.queue_depth_by_walking() {
+        return Err(TestCaseError::fail(format!(
+            "the maintained queue total says {} and the sessions hold {}",
+            run.broker.queue_depth(),
+            run.broker.queue_depth_by_walking()
+        )));
+    }
+
     let now = run.broker.clock().now();
     let rebuilt = rebuild(&restored, now);
     let mut live = run.broker.durable_state();

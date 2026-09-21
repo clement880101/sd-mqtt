@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use foldhash::fast::RandomState;
 
-use crate::session::queue::QueueLimits;
+use crate::session::queue::{QueueLimits, QueueTotal};
 use crate::session::state::Session;
+use crate::session::state::SessionBounds;
 use crate::subscriptions::SubscriberId;
 
 /// What identifies a session.
@@ -62,12 +63,11 @@ pub struct Registry {
     sessions: HashMap<SubscriberId, Session, RandomState>,
     next_subscriber: u64,
     next_epoch: u64,
-    /// The configured inflight window every session it builds starts
-    /// with. Held rather than passed per call because a session is
-    /// also built by a clean start, which has nothing to hand it.
-    max_inflight: usize,
-    /// The configured queue bounds, held for the same reason.
-    queue: QueueLimits,
+    /// The bounds every session it builds starts with, the
+    /// process-wide queue total among them. Held rather than passed
+    /// per call because a session is also built by a clean start,
+    /// which has nothing to hand it.
+    bounds: SessionBounds,
 }
 
 impl Registry {
@@ -79,9 +79,29 @@ impl Registry {
             sessions: HashMap::default(),
             next_subscriber: 0,
             next_epoch: 0,
-            max_inflight,
-            queue,
+            bounds: SessionBounds {
+                max_inflight,
+                queue,
+                total: QueueTotal::default(),
+            },
         }
+    }
+
+    /// How many messages are waiting, across every session.
+    ///
+    /// Read rather than computed. [`Registry::queued_by_walking`] is
+    /// the same number the slow way, and a test asserts they agree.
+    pub fn queued(&self) -> usize {
+        self.bounds.total.get()
+    }
+
+    /// The same, by asking every session. For the test that keeps the
+    /// maintained figure honest, and for nothing else.
+    pub fn queued_by_walking(&self) -> usize {
+        self.sessions
+            .values()
+            .map(|session| session.outbound.queued_len())
+            .sum()
     }
 
     /// Claim a session for a connecting client.
@@ -103,15 +123,7 @@ impl Registry {
 
             if clean_start {
                 let version = existing.version();
-                *existing = Session::new(
-                    id,
-                    subscriber,
-                    version,
-                    epoch,
-                    now,
-                    self.max_inflight,
-                    self.queue,
-                );
+                *existing = Session::new(id, subscriber, version, epoch, now, self.bounds.clone());
                 return Registration {
                     subscriber,
                     session_present: false,
@@ -142,8 +154,7 @@ impl Registry {
                 crate::session::state::DEFAULT_VERSION,
                 epoch,
                 now,
-                self.max_inflight,
-                self.queue,
+                self.bounds.clone(),
             ),
         );
 

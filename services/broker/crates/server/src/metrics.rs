@@ -47,6 +47,7 @@ use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
 use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::ConstGauge;
 use prometheus_client::registry::Registry;
 
 use broker_core::session::DropReason;
@@ -827,6 +828,65 @@ impl Collector for Live {
         )?;
         rejected.encode(descriptor)?;
 
+        // Section 11.3's gauges. Every one of them is read from the
+        // structure that owns it, at the moment of the scrape.
+        //
+        // One acquisition of the broker's lock for the four that live
+        // behind it, and every one of the four is a read of a number
+        // the broker already maintains — including the queue depth,
+        // which used to mean walking every session. See
+        // [`broker_core::session::QueueTotal`] for the measurement
+        // that decided that.
+        //
+        // **Cluster members are milestone 5 and are deliberately not
+        // registered at all.** An authentication outcome that will
+        // always be zero until milestone 7 is still a true statement
+        // about this broker; a membership of zero is not, because
+        // this node is a member of its own cluster of one and
+        // reporting none would be wrong rather than empty.
+        let connections = shared.outbox_count();
+        let (sessions, subscriptions, retained, queued) = shared.with_broker(|broker| {
+            (
+                broker.session_count(),
+                broker.subscription_count(),
+                broker.retained_count(),
+                broker.queue_depth(),
+            )
+        });
+
+        for (name, help, value) in [
+            (
+                "connections",
+                "Sessions with a connection attached",
+                connections,
+            ),
+            (
+                "sessions",
+                "Sessions the broker holds, connected or not",
+                sessions,
+            ),
+            (
+                "subscriptions",
+                "Subscriptions held across every session",
+                subscriptions,
+            ),
+            (
+                "retained_messages",
+                "Messages the retained store holds",
+                retained,
+            ),
+            (
+                "queue_depth",
+                "Messages waiting in every session's queue",
+                queued,
+            ),
+        ] {
+            let value = i64::try_from(value).unwrap_or(i64::MAX);
+            let reading = ConstGauge::new(value);
+            let descriptor = encoder.encode_descriptor(name, help, None, reading.metric_type())?;
+            reading.encode(descriptor)?;
+        }
+
         Ok(())
     }
 }
@@ -922,6 +982,228 @@ sdmqtt_packets_received_total{kind=\"unsuback\",version=\"5\"} 0
 sdmqtt_packets_received_total{kind=\"unsubscribe\",version=\"3.1.1\"} 0
 sdmqtt_packets_received_total{kind=\"unsubscribe\",version=\"5\"} 0
 "
+        );
+    }
+
+    /// The value of one gauge in a rendered exposition.
+    fn gauge(rendered: &str, name: &str) -> i64 {
+        let line = rendered
+            .lines()
+            .find(|line| line.starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("no {name} in:\n{rendered}"));
+        line.rsplit(' ')
+            .next()
+            .expect("a value")
+            .parse()
+            .expect("a number")
+    }
+
+    #[tokio::test]
+    async fn the_gauges_read_the_broker_when_the_scraper_asks() {
+        use broker_core::broker::BrokerConfig;
+        use mqtt_codec::packet::{Connect, RetainHandling, Subscribe, SubscriptionOptions};
+        use mqtt_codec::{Packet, Properties, QoS};
+
+        use crate::shared::Shared;
+
+        fn connect(id: &str) -> Connect {
+            Connect {
+                version: Version::V5,
+                client_id: id.into(),
+                clean_start: true,
+                keep_alive: 0,
+                username: None,
+                password: None,
+                will: None,
+                properties: Properties::default(),
+            }
+        }
+
+        let shared = std::sync::Arc::new(Shared::new(BrokerConfig::default()));
+        shared.metrics().watch(&shared);
+
+        // Nothing yet, and registered rather than absent: a gauge
+        // that only appears once it is non-zero is a hole in a
+        // dashboard at exactly the moment it is meant to reassure.
+        let rendered = shared.metrics().render();
+        for name in [
+            "sdmqtt_connections",
+            "sdmqtt_sessions",
+            "sdmqtt_subscriptions",
+            "sdmqtt_retained_messages",
+            "sdmqtt_queue_depth",
+        ] {
+            assert_eq!(gauge(&rendered, name), 0, "{name} before anything exists");
+        }
+
+        let mut handles = Vec::new();
+        for (at, name) in ["one", "two", "three"].iter().enumerate() {
+            let registration =
+                shared.with_broker(|broker| broker.connect("", &connect(name), &mut Vec::new()));
+            // One subscription for the first, two for the second,
+            // three for the third: six in total, which no count of
+            // sessions can be mistaken for.
+            for filter in 0..=at {
+                shared.with_broker(|broker| {
+                    broker
+                        .handle(
+                            registration.subscriber,
+                            &Packet::Subscribe(Subscribe {
+                                packet_id: 1,
+                                filters: vec![SubscriptionOptions {
+                                    filter: format!("{name}/{filter}"),
+                                    qos: QoS::AtMostOnce,
+                                    no_local: false,
+                                    retain_as_published: false,
+                                    retain_handling: RetainHandling::DoNotSend,
+                                }],
+                                properties: Properties::default(),
+                            }),
+                            &mut Vec::new(),
+                        )
+                        .expect("the subscription is accepted");
+                });
+            }
+            let _outbox = shared.register_outbox(registration.subscriber, 8);
+            handles.push((registration.subscriber, _outbox));
+        }
+
+        // A retained message, so that its gauge is not zero either.
+        shared.with_broker(|broker| {
+            let now = broker.clock().now();
+            broker.publish(
+                broker_core::session::Message::new(
+                    "one/0",
+                    bytes::Bytes::from_static(b"kept"),
+                    QoS::AtMostOnce,
+                    true,
+                ),
+                None,
+                now,
+                &mut Vec::new(),
+            );
+        });
+
+        let rendered = shared.metrics().render();
+        assert_eq!(gauge(&rendered, "sdmqtt_connections"), 3);
+        assert_eq!(gauge(&rendered, "sdmqtt_sessions"), 3);
+        assert_eq!(gauge(&rendered, "sdmqtt_subscriptions"), 6);
+        assert_eq!(gauge(&rendered, "sdmqtt_retained_messages"), 1);
+
+        // **The half that catches a gauge which only ever rises.** A
+        // number reported once at registration, or copied into a
+        // gauge by the path that creates a session and by no path
+        // that destroys one, passes everything above.
+        let (subscriber, outbox) = handles.remove(0);
+        drop(outbox);
+        shared.remove_outbox(subscriber);
+        shared.with_broker(|broker| {
+            broker.disconnect(subscriber, &mut Vec::new());
+            // An expiry interval of zero, so the next tick takes the
+            // session and its one subscription with it.
+            broker.tick(&mut Vec::new());
+        });
+
+        let rendered = shared.metrics().render();
+        assert_eq!(gauge(&rendered, "sdmqtt_connections"), 2, "one went");
+        assert_eq!(gauge(&rendered, "sdmqtt_sessions"), 2, "and its session");
+        assert_eq!(
+            gauge(&rendered, "sdmqtt_subscriptions"),
+            5,
+            "and the subscription it held"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_queue_depth_gauge_falls_as_well_as_rises() {
+        use broker_core::broker::BrokerConfig;
+        use mqtt_codec::packet::{Connect, RetainHandling, Subscribe, SubscriptionOptions};
+        use mqtt_codec::{Packet, Properties, QoS};
+
+        use crate::shared::Shared;
+
+        let shared = std::sync::Arc::new(Shared::new(BrokerConfig::default()));
+        shared.metrics().watch(&shared);
+
+        let registration = shared.with_broker(|broker| {
+            broker.connect(
+                "",
+                &Connect {
+                    version: Version::V5,
+                    client_id: "waiting".into(),
+                    clean_start: false,
+                    keep_alive: 0,
+                    username: None,
+                    password: None,
+                    will: None,
+                    properties: Properties {
+                        session_expiry_interval: Some(3600),
+                        ..Properties::default()
+                    },
+                },
+                &mut Vec::new(),
+            )
+        });
+        shared.with_broker(|broker| {
+            broker
+                .handle(
+                    registration.subscriber,
+                    &Packet::Subscribe(Subscribe {
+                        packet_id: 1,
+                        filters: vec![SubscriptionOptions {
+                            filter: "a/b".into(),
+                            qos: QoS::AtLeastOnce,
+                            no_local: false,
+                            retain_as_published: false,
+                            retain_handling: RetainHandling::DoNotSend,
+                        }],
+                        properties: Properties::default(),
+                    }),
+                    &mut Vec::new(),
+                )
+                .expect("the subscription is accepted");
+            // Offline, so what is published waits in the queue rather
+            // than going out.
+            broker.disconnect(registration.subscriber, &mut Vec::new());
+            for _ in 0..4 {
+                let now = broker.clock().now();
+                broker.publish(
+                    broker_core::session::Message::new(
+                        "a/b",
+                        bytes::Bytes::from_static(b"waiting"),
+                        QoS::AtLeastOnce,
+                        false,
+                    ),
+                    None,
+                    now,
+                    &mut Vec::new(),
+                );
+            }
+        });
+
+        assert_eq!(gauge(&shared.metrics().render(), "sdmqtt_queue_depth"), 4);
+
+        // The session ends, and its queue with it.
+        shared.with_broker(|broker| {
+            broker.connect(
+                "",
+                &Connect {
+                    version: Version::V5,
+                    client_id: "waiting".into(),
+                    clean_start: true,
+                    keep_alive: 0,
+                    username: None,
+                    password: None,
+                    will: None,
+                    properties: Properties::default(),
+                },
+                &mut Vec::new(),
+            )
+        });
+        assert_eq!(
+            gauge(&shared.metrics().render(), "sdmqtt_queue_depth"),
+            0,
+            "a clean start took the queue with it"
         );
     }
 

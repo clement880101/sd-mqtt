@@ -1,6 +1,8 @@
 //! The outbound queue: what waits when the inflight window is full.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use mqtt_codec::QoS;
 
@@ -80,6 +82,19 @@ pub enum DropReason {
     TooLargeForPeer,
 }
 
+impl Drop for Queue {
+    /// Take whatever is still waiting off the shared total.
+    ///
+    /// Not every path out of a session clears its queue first: the
+    /// registry hands a removed session back and the caller drops it,
+    /// and a clean start replaces one outright. Without this, every
+    /// such departure would leave its messages on the total forever
+    /// and the gauge would only ever rise.
+    fn drop(&mut self) {
+        self.total.take(self.entries.len());
+    }
+}
+
 /// What to discard when the queue is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Overflow {
@@ -122,20 +137,66 @@ impl Default for QueueLimits {
     }
 }
 
+/// How many messages are waiting in every queue that shares this.
+///
+/// Maintained beside each queue's own length, and for one reason:
+/// summing the lengths means walking every session under the
+/// broker's one lock, measured at 405 microseconds with a hundred
+/// thousand sessions against 29 with ten thousand. A metrics endpoint
+/// a scraper hits every fifteen seconds must not stall every packet
+/// in the process for that, and this project has already called a
+/// forty microsecond sweep too long to hold.
+///
+/// Kept exactly where [`Queue::bytes`] is kept, which is the same
+/// discipline applied to a number one layer up, and a queue dropped
+/// with messages still in it takes them off this too — see the
+/// [`Drop`] below. That the two agree is asserted by walking, in
+/// `the_maintained_queue_total_agrees_with_a_walk`.
+///
+/// [`Queue::bytes`]: Queue::bytes
+#[derive(Clone, Debug, Default)]
+pub struct QueueTotal(Arc<AtomicUsize>);
+
+impl QueueTotal {
+    /// How many messages are waiting, across every queue sharing this.
+    pub fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn add(&self, messages: usize) {
+        self.0.fetch_add(messages, Ordering::Relaxed);
+    }
+
+    fn take(&self, messages: usize) {
+        self.0.fetch_sub(messages, Ordering::Relaxed);
+    }
+}
+
 /// Messages waiting for room in the inflight window.
 pub struct Queue {
     entries: VecDeque<Delivery>,
     bytes: usize,
     limits: QueueLimits,
+    total: QueueTotal,
 }
 
 impl Queue {
-    /// An empty queue with the given bounds.
+    /// An empty queue with the given bounds, counted only by itself.
+    ///
+    /// For a queue that is not part of a broker: a unit test, or a
+    /// property. A queue the registry makes is given the process's
+    /// total instead, through [`Queue::sharing`].
     pub fn new(limits: QueueLimits) -> Self {
+        Self::sharing(limits, QueueTotal::default())
+    }
+
+    /// The same, counted into `total` as well as by itself.
+    pub fn sharing(limits: QueueLimits, total: QueueTotal) -> Self {
         Self {
             entries: VecDeque::new(),
             bytes: 0,
             limits,
+            total,
         }
     }
 
@@ -170,6 +231,7 @@ impl Queue {
                 match self.entries.pop_front() {
                     Some(evicted) => {
                         self.bytes -= evicted.size_in_queue();
+                        self.total.take(1);
                         dropped.push((evicted, reason));
                     }
                     // Nothing left to evict, which the size check in
@@ -183,6 +245,7 @@ impl Queue {
         }
 
         self.bytes += size;
+        self.total.add(1);
         self.entries.push_back(item);
         true
     }
@@ -276,6 +339,7 @@ impl Queue {
     /// would be a lie to the subscriber.
     pub fn requeue(&mut self, item: Delivery) {
         self.bytes += item.size_in_queue();
+        self.total.add(1);
         self.entries.push_front(item);
     }
 
@@ -283,6 +347,7 @@ impl Queue {
     pub fn pop(&mut self, now: u32, dropped: &mut Vec<(Delivery, DropReason)>) -> Option<Delivery> {
         while let Some(item) = self.entries.pop_front() {
             self.bytes -= item.size_in_queue();
+            self.total.take(1);
             if item.message.is_expired(now) {
                 dropped.push((item, DropReason::Expired));
                 continue;
@@ -294,6 +359,7 @@ impl Queue {
 
     /// Discard everything, reporting each message with the given reason.
     pub fn clear(&mut self, reason: DropReason, dropped: &mut Vec<(Delivery, DropReason)>) {
+        self.total.take(self.entries.len());
         for item in self.entries.drain(..) {
             dropped.push((item, reason));
         }
@@ -334,6 +400,11 @@ impl Queue {
     /// How many messages are waiting.
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// The shared total this queue counts into.
+    pub fn total(&self) -> &QueueTotal {
+        &self.total
     }
 
     /// How many bytes they occupy.
@@ -661,5 +732,47 @@ mod tests {
             !first.dup,
             "a message that was never sent is not a duplicate"
         );
+    }
+
+    #[test]
+    fn a_queue_counts_its_messages_into_the_total_it_shares() {
+        let total = QueueTotal::default();
+        let mut first = Queue::sharing(QueueLimits::default(), total.clone());
+        let mut second = Queue::sharing(QueueLimits::default(), total.clone());
+        let mut dropped = Vec::new();
+
+        assert!(first.push(delivery(QoS::AtLeastOnce, b"x"), 0, true, &mut dropped));
+        assert!(first.push(delivery(QoS::AtLeastOnce, b"x"), 0, true, &mut dropped));
+        assert!(second.push(delivery(QoS::AtLeastOnce, b"x"), 0, true, &mut dropped));
+        assert_eq!(total.get(), 3, "three messages across two queues");
+
+        first.pop(0, &mut dropped);
+        assert_eq!(total.get(), 2, "one taken");
+
+        first.requeue(delivery(QoS::AtLeastOnce, b"x"));
+        assert_eq!(total.get(), 3, "one put back");
+
+        first.clear(DropReason::SessionEnded, &mut dropped);
+        assert_eq!(total.get(), 1, "a cleared queue holds nothing");
+    }
+
+    #[test]
+    fn a_queue_dropped_with_messages_in_it_takes_them_off_the_total() {
+        // The broker clears a session's queue before destroying it,
+        // so nothing in the broker reaches this today and the
+        // differential property cannot see it deleted. It is kept
+        // because the alternative is a total that only ever rises the
+        // first time a path removes a session without clearing it,
+        // and a gauge that only rises is the failure this whole task
+        // is about. Reached directly, since nothing else reaches it.
+        let total = QueueTotal::default();
+        let mut dropped = Vec::new();
+        {
+            let mut queue = Queue::sharing(QueueLimits::default(), total.clone());
+            assert!(queue.push(delivery(QoS::AtLeastOnce, b"x"), 0, true, &mut dropped));
+            assert!(queue.push(delivery(QoS::AtLeastOnce, b"x"), 0, true, &mut dropped));
+            assert_eq!(total.get(), 2);
+        }
+        assert_eq!(total.get(), 0, "the queue went and took its messages");
     }
 }
