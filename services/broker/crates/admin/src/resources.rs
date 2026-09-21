@@ -610,39 +610,50 @@ fn retain_handling_number(handling: RetainHandling) -> u8 {
     }
 }
 
+/// Build the page of subscriptions.
+///
+/// Named rather than written inside the handler's closure so that
+/// the measurement can time exactly what the lock is held for: see
+/// `what_a_page_costs_under_the_lock`.
+fn subscription_page(broker: &Broker, paging: &Paging) -> Page<SubscriptionView> {
+    let selection = select(
+        broker.sessions().flat_map(|(_, session)| {
+            let id = session.id();
+            session.subscriptions().iter().map(move |subscription| {
+                (
+                    [
+                        &*id.mountpoint,
+                        &*id.client_id,
+                        subscription.filter.as_str(),
+                    ],
+                    subscription,
+                )
+            })
+        }),
+        paging.after.as_ref(),
+        paging.limit,
+    );
+    page(selection, |key, subscription| SubscriptionView {
+        mountpoint: key[0].to_owned(),
+        client_id: key[1].to_owned(),
+        filter: subscription.filter.clone(),
+        qos: qos_number(subscription.qos),
+        no_local: subscription.no_local,
+        retain_as_published: subscription.retain_as_published,
+        retain_handling: retain_handling_number(subscription.retain_handling),
+        subscription_id: subscription.subscription_id,
+    })
+}
+
 async fn subscriptions(
     State(state): State<AdminState>,
     paging: Paging,
 ) -> Json<Page<SubscriptionView>> {
-    Json(state.shared.with_broker(|broker| {
-        let selection = select(
-            broker.sessions().flat_map(|(_, session)| {
-                let id = session.id();
-                session.subscriptions().iter().map(move |subscription| {
-                    (
-                        [
-                            &*id.mountpoint,
-                            &*id.client_id,
-                            subscription.filter.as_str(),
-                        ],
-                        subscription,
-                    )
-                })
-            }),
-            paging.after.as_ref(),
-            paging.limit,
-        );
-        page(selection, |key, subscription| SubscriptionView {
-            mountpoint: key[0].to_owned(),
-            client_id: key[1].to_owned(),
-            filter: subscription.filter.clone(),
-            qos: qos_number(subscription.qos),
-            no_local: subscription.no_local,
-            retain_as_published: subscription.retain_as_published,
-            retain_handling: retain_handling_number(subscription.retain_handling),
-            subscription_id: subscription.subscription_id,
-        })
-    }))
+    Json(
+        state
+            .shared
+            .with_broker(|broker| subscription_page(broker, &paging)),
+    )
 }
 
 // ---------------------------------------------------------------
@@ -697,18 +708,28 @@ fn payload_of(message: &RetainedMessage) -> (Option<String>, Option<&'static str
     }
 }
 
+/// What the retained handler copies out while it holds the lock.
+///
+/// The retained store enumerates by walking its trie and building a
+/// topic string per entry, which is the only enumeration it offers.
+/// That walk is O(the store) under the lock whatever this module
+/// does; what this module controls is that no payload is copied and
+/// nothing is formatted until the lock is gone. The selection still
+/// bounds the rows built to one page.
+///
+/// Named rather than written inside the handler's closure so that
+/// the measurement can time exactly what the lock is held for: see
+/// `what_a_page_costs_under_the_lock`.
+fn retained_held(broker: &Broker, _paging: &Paging) -> Vec<(String, RetainedMessage)> {
+    let mut entries = Vec::new();
+    broker.retained().entries(&mut entries);
+    entries
+}
+
 async fn retained(State(state): State<AdminState>, paging: Paging) -> Json<Page<RetainedView>> {
-    // The retained store enumerates by walking its trie and building
-    // a topic string per entry, which is the only enumeration it
-    // offers. That walk is O(the store) under the lock whatever this
-    // module does; what this module controls is that no payload is
-    // copied and nothing is formatted until the lock is gone. The
-    // selection still bounds the rows built to one page.
-    let held = state.shared.with_broker(|broker| {
-        let mut entries = Vec::new();
-        broker.retained().entries(&mut entries);
-        entries
-    });
+    let held = state
+        .shared
+        .with_broker(|broker| retained_held(broker, &paging));
     let selection = select(
         held.iter()
             .map(|(topic, message)| ([topic.as_str(), "", ""], message)),
@@ -2203,6 +2224,204 @@ mod tests {
         // different strings that happen to share a prefix must not
         // match on it.
         assert!(!secret_eq("\u{00e9}", "e"));
+    }
+
+    // -----------------------------------------------------------
+    // What a page costs the one lock in the process
+    // -----------------------------------------------------------
+
+    /// How wide the zero padding on a generated name is.
+    ///
+    /// Six digits, so that a hundred thousand of them sort in the
+    /// order they were made and a cursor into the middle of the
+    /// collection can be written down by hand.
+    const WIDTH: usize = 6;
+
+    /// A broker holding `count` sessions, `count` subscriptions and
+    /// `count` retained messages.
+    ///
+    /// Every session is connected except the even-numbered ones,
+    /// because the Clients page filters and a population that is
+    /// entirely connected would never make it skip a row.
+    fn a_broker_holding_everything(count: usize) -> Arc<Shared> {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        shared.with_broker(|broker: &mut Broker| {
+            for index in 0..count {
+                let connect = Connect {
+                    version: mqtt_codec::Version::V5,
+                    client_id: format!("client-{index:0WIDTH$}"),
+                    clean_start: true,
+                    keep_alive: 0,
+                    username: None,
+                    password: None,
+                    will: None,
+                    properties: Properties {
+                        session_expiry_interval: Some(3_600),
+                        ..Properties::default()
+                    },
+                };
+                let mut out = Vec::new();
+                let accepted = broker.connect("", &connect, &mut out);
+                let subscriber = accepted.subscriber;
+
+                let subscribe = Packet::Subscribe(Subscribe {
+                    packet_id: 1,
+                    filters: vec![SubscriptionOptions {
+                        filter: format!("site/{index:0WIDTH$}/telemetry"),
+                        qos: mqtt_codec::QoS::AtMostOnce,
+                        no_local: false,
+                        retain_as_published: false,
+                        retain_handling: mqtt_codec::packet::RetainHandling::SendAlways,
+                    }],
+                    properties: Properties::default(),
+                });
+                let mut out = Vec::new();
+                let _ = broker.handle(subscriber, &subscribe, &mut out);
+
+                broker.retained().set(
+                    &format!("site/{index:0WIDTH$}/state"),
+                    RetainedMessage {
+                        payload: Bytes::from_static(b"21.5"),
+                        qos: mqtt_codec::QoS::AtMostOnce,
+                        expires_at: None,
+                        properties: Arc::new(Properties::default().into()),
+                    },
+                );
+
+                if index % 2 == 0 {
+                    if let Some(session) = broker.session_mut(subscriber) {
+                        session.on_disconnected(false, 0);
+                    }
+                }
+            }
+        });
+        shared
+    }
+
+    /// Run `body` twenty times and print the mean and the worst.
+    fn timed(what: &str, population: usize, mut body: impl FnMut()) {
+        let runs = 20u32;
+        let mut worst = Duration::ZERO;
+        let mut total = Duration::ZERO;
+        for _ in 0..runs {
+            let started = std::time::Instant::now();
+            body();
+            let took = started.elapsed();
+            worst = worst.max(took);
+            total += took;
+        }
+        println!(
+            "  {population:>7}  {what:<26} {:>12?} mean, {:>12?} worst",
+            total / runs,
+            worst
+        );
+    }
+
+    /// What one page of each resource holds the broker's one lock
+    /// for, at the three populations the design targets.
+    ///
+    /// **A measurement, not an assertion**, which is why it is
+    /// ignored: a wall clock on a shared machine is not a thing to
+    /// gate a build on. What is asserted instead is the algorithm —
+    /// `a_page_of_a_large_broker_is_still_a_page` for the page, and
+    /// the drift properties in `broker-core` for the maintained
+    /// numbers a bounded page is built on.
+    ///
+    /// Two cursors per resource, because they are different
+    /// questions. The first page can be answered by whatever the
+    /// iteration order happens to be; a page from the middle can
+    /// only be answered cheaply by a structure that can seek.
+    ///
+    ///     cargo test -p sdmqtt-admin --release -- --ignored --nocapture what_a_page_costs
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn what_a_page_costs_under_the_lock() {
+        println!("one page of {DEFAULT_LIMIT}, under the broker lock");
+        for population in [1_000usize, 10_000, 100_000] {
+            let shared = a_broker_holding_everything(population);
+            let middle = population / 2;
+            let client = format!("client-{middle:0WIDTH$}");
+            let topic = format!("site/{middle:0WIDTH$}/state");
+            let filter = format!("site/{middle:0WIDTH$}/telemetry");
+
+            for (where_from, sessions_after, retained_after, subscriptions_after) in [
+                ("from the start", None, None, None),
+                (
+                    "from the middle",
+                    Some([String::new(), client.clone(), String::new()]),
+                    Some([topic.clone(), String::new(), String::new()]),
+                    Some([String::new(), client.clone(), filter.clone()]),
+                ),
+            ] {
+                let paging = |after: Option<[String; PARTS]>| Paging {
+                    limit: DEFAULT_LIMIT,
+                    after,
+                };
+
+                let sessions = paging(sessions_after);
+                timed(&format!("sessions, {where_from}"), population, || {
+                    let page = shared.with_broker(|broker| session_page(broker, &sessions, false));
+                    std::hint::black_box(page);
+                });
+
+                let clients = paging(
+                    where_from
+                        .ends_with("middle")
+                        .then(|| [String::new(), client.clone(), String::new()]),
+                );
+                timed(&format!("clients, {where_from}"), population, || {
+                    let page = shared.with_broker(|broker| session_page(broker, &clients, true));
+                    std::hint::black_box(page);
+                });
+
+                let subs = paging(subscriptions_after);
+                timed(&format!("subscriptions, {where_from}"), population, || {
+                    let page = shared.with_broker(|broker| subscription_page(broker, &subs));
+                    std::hint::black_box(page);
+                });
+
+                let held = paging(retained_after);
+                timed(&format!("retained, {where_from}"), population, || {
+                    let entries = shared.with_broker(|broker| retained_held(broker, &held));
+                    std::hint::black_box(entries);
+                });
+            }
+        }
+    }
+
+    /// What the two gauges that walk cost, beside the three that do
+    /// not.
+    ///
+    ///     cargo test -p sdmqtt-admin --release -- --ignored --nocapture what_the_gauges_cost
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn what_the_gauges_cost() {
+        println!("one read of each gauge, under the broker lock");
+        for population in [1_000usize, 10_000, 100_000] {
+            let shared = a_broker_holding_everything(population);
+            timed("session_count", population, || {
+                std::hint::black_box(shared.with_broker(|broker| broker.session_count()));
+            });
+            timed("queue_depth", population, || {
+                std::hint::black_box(shared.with_broker(|broker| broker.queue_depth()));
+            });
+            timed("subscription_count", population, || {
+                std::hint::black_box(shared.with_broker(|broker| broker.subscription_count()));
+            });
+            timed("retained_count", population, || {
+                std::hint::black_box(shared.with_broker(|broker| broker.retained_count()));
+            });
+            timed("all five gauges", population, || {
+                std::hint::black_box(shared.with_broker(|broker| {
+                    (
+                        broker.session_count(),
+                        broker.subscription_count(),
+                        broker.retained_count(),
+                        broker.queue_depth(),
+                    )
+                }));
+            });
+        }
     }
 
     /// The session identity the key is built from, kept honest.
