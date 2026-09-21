@@ -97,6 +97,30 @@ Either way, that path is guarded against the broker directly rather
 than by anyone noticing it here:
 `crates/admin/src/events.rs::a_client_that_goes_away_ends_its_stream`.
 
+## What the retained browser refetches on, and what it does not
+
+Three things: a resynchronise, a publish or a clear from this page,
+and the broker's retained gauge moving, which is how a message
+retained by somebody else reaches the list. Not a timer, and that is
+worth writing down because it was one by accident.
+
+`gauges` is a signal holding a freshly parsed object per counters
+event, so an effect that reads one field off it is subscribed to all
+five and re-runs whenever any of them moves — which, with one
+keep-alive on the broker, is about once a second for as long as the
+tab is open. Each of those re-runs copied the whole retained store
+under the broker's one lock. Measured in a browser against a running
+broker, with a client sending 2 messages a second: twenty requests
+in twenty seconds before, two after, both at load.
+
+The fix is a computed, `retainedCount` in `live.ts`, which notifies
+only when the number it yields changes. The second bug behind the
+first: the publish form's reload key was passed as a plain number,
+and a signal effect cannot see a prop change, so a publish refreshed
+the list only because the effect was firing anyway. It is a signal
+now, and a publish that retains nothing — which moves no gauge —
+refetches exactly once.
+
 ## The subscribe tool, which is a tap
 
 The Topics page has a publish form, a retained browser and a
@@ -147,11 +171,12 @@ a decision rather than an oversight.
 **The limits, which are the hard half and are the broker's.** A tap
 is a way for somebody holding this interface to make the broker do
 work, and a filter of `#` on a busy broker is the obvious abuse.
-`services/broker/crates/admin/src/taps.rs` records four numbers and
+`services/broker/crates/admin/src/taps.rs` records five numbers and
 the reason each is the number it is; in summary, eight taps at once,
 256 messages each with the oldest dropped, 1 KiB of payload carried
-and anything larger described, and 120 seconds unread before a tap
-closes itself. **This application hard-codes none of them.** Every
+and anything larger described, 120 seconds unread before a tap
+closes itself, and eight closed taps remembered so that their
+readers can still be told why they ended. **This application hard-codes none of them.** Every
 answer carries a `limits` object and the page renders what the
 broker said, so an interface older than the broker serving it cannot
 quote the wrong bounds — and the bounds are the whole point, because

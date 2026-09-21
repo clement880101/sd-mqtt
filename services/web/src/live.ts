@@ -90,7 +90,7 @@
  * drawn and deleting it would lose the very thing an operator is
  * looking at when a broker restarts.
  */
-import { signal } from '@preact/signals';
+import { computed, signal } from '@preact/signals';
 
 /** Where the stream is. */
 export const EVENTS = '/api/v1/events';
@@ -174,6 +174,25 @@ export const status = signal<Status>('connecting');
 
 /** The levels, from the most recent counters event. */
 export const gauges = signal<Gauges | null>(null);
+
+/**
+ * How many messages the broker is holding, on its own.
+ *
+ * **A computed, and that is the whole of why it exists.** {@link
+ * gauges} is replaced with a freshly parsed object on every counters
+ * event, so an effect that reads one field off it is subscribed to
+ * all five: a single keep-alive moving a byte counter re-runs it,
+ * about once a second, forever. The Topics page refetched the entire
+ * retained store on that schedule for as long as a tab was open. A
+ * computed only notifies when the value it yields changes, so an
+ * effect that depends on this one re-runs when a retained message is
+ * stored or cleared and not otherwise.
+ *
+ * Null until the first counters event, which is not zero: a broker
+ * that has said nothing yet and a broker holding nothing are
+ * different, and only one of them is worth refetching for.
+ */
+export const retainedCount = computed(() => gauges.value?.retained ?? null);
 
 /** The rate history the Overview page draws. */
 export const rates = signal<Rates>({ at: [], received: [], sent: [], opened: [] });

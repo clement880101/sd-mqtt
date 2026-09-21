@@ -47,7 +47,7 @@
  * by this reader — are on the page beside the rows rather than in a
  * log nobody reads.
  */
-import { useSignal, useSignalEffect } from '@preact/signals';
+import { useSignal, useSignalEffect, type Signal } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
 import * as v from 'valibot';
 
@@ -64,7 +64,7 @@ import {
   type TappedMessage,
   type TapView,
 } from '../api.js';
-import { gauges, generation } from '../live.js';
+import { generation, retainedCount } from '../live.js';
 
 /** How many retained rows the browser asks for at a time. */
 const PAGE = 200;
@@ -275,8 +275,19 @@ function payloadOf(row: RetainedView): string {
     : `(${row.size} bytes, too large to inline)`;
 }
 
-/** The retained browser, with a way to clear a topic. */
-function Retained({ reloadKey, onCleared }: { reloadKey: number; onCleared: () => void }) {
+/**
+ * The retained browser, with a way to clear a topic.
+ *
+ * `reload` is a signal and not a number, which is the difference
+ * between a page that refetches when this page publishes and one
+ * that only looks as if it does. The effect below is a signal
+ * effect: it re-runs when a signal it read changes, and a prop it
+ * was handed is not one. Passed as a plain number, a bump did
+ * nothing at all — and nothing noticed, because the effect was
+ * firing every second anyway for the other reason. Fixing one
+ * exposed the other.
+ */
+function Retained({ reload, onCleared }: { reload: Signal<number>; onCleared: () => void }) {
   const rows = useSignal<RetainedView[]>([]);
   const total = useSignal(0);
   const next = useSignal<string | null>(null);
@@ -288,9 +299,18 @@ function Retained({ reloadKey, onCleared }: { reloadKey: number; onCleared: () =
     // A resynchronise, a publish from this page, and the retained
     // gauge moving — which is how a message retained by somebody
     // else reaches this list.
+    //
+    // **The count and not the gauges.** `gauges` is a fresh object
+    // on every counters event, so reading one field off it here
+    // subscribes this effect to all five and re-runs it about once
+    // a second for as long as the tab is open: one keep-alive
+    // moving a byte counter is enough. That is one full copy of the
+    // retained store, built under the broker's one lock, per second
+    // per open tab. `retainedCount` is a computed, which notifies
+    // only when the number it yields changes.
     generation.value;
-    gauges.value?.retained;
-    void reloadKey;
+    retainedCount.value;
+    reload.value;
     let current = true;
     const load = async () => {
       try {
@@ -724,7 +744,7 @@ export function Topics() {
     <section class="page">
       <h1>Topics</h1>
       <Publisher onPublished={() => (reloadKey.value += 1)} />
-      <Retained reloadKey={reloadKey.value} onCleared={() => (reloadKey.value += 1)} />
+      <Retained reload={reloadKey} onCleared={() => (reloadKey.value += 1)} />
       <Watcher />
     </section>
   );
