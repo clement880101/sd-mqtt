@@ -165,7 +165,7 @@ inside the broker, made with `Broker::connect`, `Broker::handle` with
 a SUBSCRIBE packet and the outbox `Shared::register_outbox` hands it,
 collecting matching publications into a bounded ring the page polls
 once a second. `services/broker/crates/admin/src/taps.rs` has the
-mechanism and the reason behind each of its four limits.
+mechanism and the reason behind each of its five limits.
 
 ### The thing that could not be done before
 
