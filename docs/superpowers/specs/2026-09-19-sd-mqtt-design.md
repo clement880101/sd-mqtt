@@ -587,6 +587,17 @@ single-node broker's behaviour for the design.
 
 ### 9.2 Actions
 
+**The durable outbox is its own thing in the store, not a queue wearing a
+session's clothes.** Modelling each rule's outbox as a session would inherit
+the batching writer, the head cursor and the reference counting for free, and
+would cost phantom sessions that every client listing has to remember to
+filter out, an expiry that must be forced to never, and a drop-oldest
+overflow policy that is wrong for an outbox. The record type is extended
+instead, which moves the stored format version. That version is refused
+rather than migrated when it does not match exactly, so a broker built after
+this milestone will not open a store written before it. Nothing is released,
+so the cost is a line in the release notes rather than a migration.
+
 **http_out** posts a JSON envelope to a URL. The envelope carries the topic,
 the payload as a UTF-8 string when valid and base64 otherwise, QoS, the
 retain flag, the publishing client identifier, a timestamp, and v5 user
@@ -621,6 +632,23 @@ publishes them into the local broker where any rule can act on them. Reconnectio
 topic reports connectivity, with a will supplying the offline value. Loop
 prevention uses an origin identifier carried in a user property, and messages
 that have already traversed this bridge are not sent back.
+
+**That mechanism does not exist in MQTT 3.1.1**, which has no user
+properties, and a bridge to a 3.1.1 endpoint is exactly the bridge people
+build. So the marker is the second line of defence, not the first.
+
+The first is a configuration-time rule: **a bridge whose inbound and
+outbound filters intersect after rewriting is refused.** That catches a loop
+before a message does, it works on both versions, and it does not depend on
+an intermediary preserving a property it is free to strip. A bridge whose
+own state topic matches its outbound filter is refused for the same reason,
+because a bridge republishing its own liveness is a loop with a heartbeat.
+
+There is a third loop the marker cannot see at all. A bridge publishes
+inbound messages into the local broker so that rules can act on them, so an
+outbound rule feeding a system that posts back through an ingest rule is a
+cycle with no bridge in it. Every publication a connector originates carries
+a hop count, and one over the configured maximum is dropped and counted.
 
 Bridges and pollers are singletons. The owner is the live member with the
 lowest node identifier, recomputed on membership change. This is
