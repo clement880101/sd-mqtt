@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 
 import license, { type Dependency } from 'rollup-plugin-license';
 import { defineConfig, type Plugin } from 'vite';
@@ -144,6 +144,60 @@ function packageDirectoryFor(specifier: string, importer: string): string | null
 }
 
 /**
+ * The package a file belongs to, if it is inside one.
+ *
+ * The directory immediately below a `node_modules`, or below a scope
+ * directory inside one. Returns null for a file of this application,
+ * which belongs to nobody who needs attributing.
+ */
+function packageOwning(file: string): string | null {
+  let directory = dirname(file);
+  for (;;) {
+    const parent = dirname(directory);
+    if (parent === directory) {
+      return null;
+    }
+    const enclosing = basename(parent);
+    if (enclosing === 'node_modules') {
+      return directory;
+    }
+    if (enclosing.startsWith('@') && basename(dirname(parent)) === 'node_modules') {
+      return directory;
+    }
+    directory = parent;
+  }
+}
+
+/** One stylesheet on its way through the walk, and why it is in it. */
+interface Pending {
+  /** Where it is on disk. */
+  file: string;
+  /** How it reached the bundle, for a reader of the notices. */
+  why: string;
+}
+
+/** A package's notice, read from its manifest and its licence file. */
+function packageNotice(directory: string, fallbackName: string, why: string): Notice {
+  const manifest = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8')) as {
+    name?: string;
+    version?: string;
+    license?: string;
+    author?: unknown;
+  };
+  return {
+    name: manifest.name ?? fallbackName,
+    version: manifest.version ?? '(unversioned)',
+    licence: manifest.license ?? '(none declared)',
+    author:
+      typeof manifest.author === 'string'
+        ? manifest.author
+        : ((manifest.author as { name?: string } | undefined)?.name ?? null),
+    text: licenceTextIn(directory),
+    why,
+  };
+}
+
+/**
  * Every package whose stylesheet reached the bundle.
  *
  * **`rollup-plugin-license` cannot see these.** It reads the modules
@@ -153,17 +207,43 @@ function packageDirectoryFor(specifier: string, importer: string): string | null
  * no chunk. So the import graph is walked here, from the stylesheets
  * the bundle does name, following relative imports through files and
  * bare imports into packages.
+ *
+ * # Every file in the walk is attributed, not only the ones imported
+ *
+ * The first version of this attributed a package it reached *through*
+ * an `@import` and never the stylesheet it started from. A seed is a
+ * stylesheet the bundle named directly, which is exactly what a
+ * component's `import 'uplot/dist/uPlot.min.css'` produces: it is in
+ * `node_modules`, it contains no further `@import`, and it
+ * contributed nothing. uPlot survived that only because its
+ * JavaScript ships too and the licence plugin sees that. A package
+ * that is stylesheet-only — an icon set, a theme, a reset — would
+ * have shipped unattributed with no gate firing anywhere, which is
+ * the same class of hole one step along.
+ *
+ * So the owner of every file the walk visits is attributed, seeds
+ * included. A file of this application has no owner and is skipped.
  */
 function cssPackages(seeds: string[]): Map<string, Notice> {
   const found = new Map<string, Notice>();
   const seen = new Set<string>();
-  const queue = [...seeds];
+  const queue: Pending[] = seeds.map((file) => ({
+    file,
+    why: 'a stylesheet of it is imported straight into the bundle',
+  }));
   while (queue.length > 0) {
-    const file = queue.pop() as string;
+    const { file, why } = queue.pop() as Pending;
     if (seen.has(file) || !existsSync(file)) {
       continue;
     }
     seen.add(file);
+    const owner = packageOwning(file);
+    if (owner) {
+      const notice = packageNotice(owner, basename(owner), why);
+      if (!found.has(notice.name)) {
+        found.set(notice.name, notice);
+      }
+    }
     const source = readFileSync(file, 'utf8');
     const imports = source.matchAll(/@import\s+(?:url\(\s*)?["']([^"']+)["']/g);
     for (const [, raw] of imports) {
@@ -172,7 +252,9 @@ function cssPackages(seeds: string[]): Map<string, Notice> {
         continue;
       }
       if (specifier.startsWith('.') || isAbsolute(specifier)) {
-        queue.push(resolve(dirname(file), specifier));
+        // A relative import keeps its importer's reason: it is the
+        // same package, or a file of this application either way.
+        queue.push({ file: resolve(dirname(file), specifier), why });
         continue;
       }
       const directory = packageDirectoryFor(specifier, file);
@@ -182,26 +264,17 @@ function cssPackages(seeds: string[]): Map<string, Notice> {
             'name could be found to attribute it to',
         );
       }
-      const manifest = JSON.parse(
-        readFileSync(join(directory, 'package.json'), 'utf8'),
-      ) as { name?: string; version?: string; license?: string; author?: unknown };
-      const name = manifest.name ?? specifier;
-      if (!found.has(name)) {
-        found.set(name, {
-          name,
-          version: manifest.version ?? '(unversioned)',
-          licence: manifest.license ?? '(none declared)',
-          author:
-            typeof manifest.author === 'string'
-              ? manifest.author
-              : ((manifest.author as { name?: string } | undefined)?.name ?? null),
-          text: licenceTextIn(directory),
-          why: 'CSS inlined into the bundle by an @import',
-        });
+      const notice = packageNotice(
+        directory,
+        specifier,
+        'CSS inlined into the bundle by an @import',
+      );
+      if (!found.has(notice.name)) {
+        found.set(notice.name, notice);
       }
-      const subpath = specifier.split('/').slice(name.split('/').length).join('/');
+      const subpath = specifier.split('/').slice(notice.name.split('/').length).join('/');
       if (subpath) {
-        queue.push(join(directory, subpath));
+        queue.push({ file: join(directory, subpath), why: notice.why });
       }
     }
   }
@@ -328,21 +401,41 @@ function attribution(root: string, bundled: Dependency[]): Plugin {
         const notice = fromPlugin(dependency);
         notices.set(notice.name, notice);
       }
-      for (const [name, notice] of cssPackages(stylesheets)) {
-        // The licence plugin enforces the allow list on what it
-        // found; these it never saw, so the same rule is applied
-        // here rather than left to a reader of the file.
+      // The licence plugin enforces the allow list on what it found.
+      // Everything below it never saw, so the same rule is applied
+      // here rather than left to a reader of the file — **including
+      // the bundler's own helper**, which was exempt because its
+      // licence is hard-coded. A hard-coded value is not a checked
+      // one: it is read out of a manifest that a version bump can
+      // change, and the one thing in the bundle that no gate covered
+      // is not a distinction worth keeping.
+      //
+      // A package already named keeps its entry and gains the second
+      // reason rather than having the first replaced. uPlot is both:
+      // its JavaScript is in a chunk and its stylesheet is inlined,
+      // and a notice saying only one of those is a notice that would
+      // look unchanged the day the other stopped being true.
+      const gate = (notice: Notice) => {
         if (!licenceIsAllowed(notice.licence)) {
           this.error(
-            `${name}@${notice.version} ships in the bundle under "${notice.licence}", ` +
-              'which is not in the allow list in vite.config.ts',
+            `${notice.name}@${notice.version} ships in the bundle under ` +
+              `"${notice.licence}", which is not in the allow list in vite.config.ts`,
           );
         }
-        notices.set(name, notice);
+        const already = notices.get(notice.name);
+        if (already) {
+          if (!already.why.includes(notice.why)) {
+            already.why = `${already.why}; ${notice.why}`;
+          }
+          return;
+        }
+        notices.set(notice.name, notice);
+      };
+      for (const [, notice] of cssPackages(stylesheets)) {
+        gate(notice);
       }
       if (helperShips) {
-        const notice = viteHelperNotice(root);
-        notices.set(notice.name, notice);
+        gate(viteHelperNotice(root));
       }
 
       const ordered = [...notices.values()].sort((left, right) =>

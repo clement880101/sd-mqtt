@@ -182,7 +182,7 @@ SOFTWARE.
 uplot 1.6.32
 License: MIT
 Author: Leon Sorokin <leeoniya@gmail.com>
-Included as: JavaScript kept in the bundle after tree-shaking
+Included as: JavaScript kept in the bundle after tree-shaking; a stylesheet of it is imported straight into the bundle
 
 The MIT License (MIT)
 
