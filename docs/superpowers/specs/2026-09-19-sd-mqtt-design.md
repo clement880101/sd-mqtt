@@ -784,6 +784,20 @@ subscriptions, retained messages, queue depth and cluster members.
 Every discard path has both a metric and a hook. A message never disappears
 without being counted.
 
+Hooks are milestone 4. The metrics are milestone 3, and building them found
+five discard paths nobody had listed, one of which was a live violation of
+the sentence above: a fire-and-forget publication too large for its peer
+returned before anything recorded it, so it left no action, no counter and no
+log line. A new drop reason now fails to compile until it has a counter,
+rather than failing a test somebody has to remember to extend.
+
+**Router matches are deferred to milestone 5.** This section asks for them
+split local and remote. The remote half needs a cluster, and counting the
+local half needs the matching layer to report a number it does not currently
+return, which would put counting inside the crate that deliberately counts
+nothing. Both halves arrive together with clustering. Recorded here so that
+it stays a decision rather than becoming an omission.
+
 ## 12. Security
 
 ### 12.1 Authentication and access control
