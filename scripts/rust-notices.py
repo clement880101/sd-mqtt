@@ -2,12 +2,18 @@
 """Generate the attribution for the Rust code that ships in the binary.
 
 Section 11.2 says the browser half's attribution is generated from the
-bundle and not from the package list. This is the same rule applied to
-the other half, and it had no implementation at all: nothing in the
-repository named a single crate, while eighty-odd of them are linked
-into `sdmqtt`. Two of those are Apache-2.0 with no alternative branch
-on our allow list, and Apache-2.0 asks for the licence text to travel
-with the work.
+bundle and not from the package list. The other half had no
+implementation at all: nothing in the repository named a single crate,
+while eighty-odd of them are linked into `sdmqtt`. Two of those are
+Apache-2.0 with no alternative branch on our allow list, and Apache-2.0
+asks for the licence text to travel with the work.
+
+**This is not the same rule as the bundle's, and saying it was would
+be the flattering version.** A bundler's module graph is the artifact;
+a Cargo graph is a manifest, and the content below is derived entirely
+from the manifest. The binary is read afterwards, to assert one thing
+in one direction. That is weaker than what section 11.2 asks for the
+bundle, and it is what there is.
 
 # What "ships" means here, and how that is checked
 
@@ -38,9 +44,21 @@ audit is the binary.
 
 The binary also carries the Rust standard library and the crates the
 Rust project vendors into it, which arrive prebuilt from the sysroot
-and are in no Cargo graph. The check finds them under `/rust/deps/`
-and they are attributed in a section of their own; see
-`STANDARD_LIBRARY_TEXT` and `STANDARD_LIBRARY_VENDORED` below.
+and are in no Cargo graph. The check finds the ones that left a path
+string under `/rust/deps/`, and they are attributed in a section of
+their own; see `STANDARD_LIBRARY_TEXT` and [`sysroot_crates`] below.
+
+**That list is read from the toolchain, not written down.** It used
+to be twelve names in this file, asserted to be in the binary. Five
+of them are: the other seven leave no path string, three of them
+because their own prebuilt artifacts contain no such string at all,
+so no binary on any target could ever name them. Nothing could have
+caught that, because the only copy of the list a grep of the binary
+finds is the one embedded from this file — the artifact confirming
+the claim because the claim is inside the artifact. So the list is
+now the sysroot's own contents, which is a fact about the toolchain
+rather than a claim about the binary, and the file says which of the
+two it is saying.
 
 # Why not cargo-about
 
@@ -49,9 +67,9 @@ configured nowhere, and adopting it now would put a second tool in
 every contributor's path and in three CI jobs to produce a file this
 does in one script, with only `cargo` and `python3` — which is what
 `scripts/budgets.sh` already needs. What it would not do is read the
-binary, and reading the binary is the whole of section 11.2's rule.
-The research is updated to say so rather than left naming a tool
-nothing runs.
+binary at all, and the one-way assertion against the binary is the
+only part of this that a dependency graph cannot give. The research is
+updated to say so rather than left naming a tool nothing runs.
 
 # Usage
 
@@ -71,6 +89,7 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -172,29 +191,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
-# The crates the Rust project vendors into the standard library and
-# which this binary is therefore carrying. Checked against the binary
-# by `--check`: one that appears under `/rust/deps/` and is not named
-# here fails, so this list cannot quietly go stale.
-#
-# All of them are distributed by the Rust project under the same "MIT
-# OR Apache-2.0" as the library itself, which is the licence the
-# section above carries. The versions are the toolchain's and move
-# with it, so they are not pinned here; the audit matches on name.
-STANDARD_LIBRARY_VENDORED = (
-    "addr2line",
-    "adler2",
-    "compiler_builtins",
-    "gimli",
-    "hashbrown",
-    "libc",
-    "memchr",
-    "miniz_oxide",
-    "object",
-    "rustc-demangle",
-    "std_detect",
-    "unwind",
-)
+# `lib<name>-<hash>.rlib`, as the sysroot spells a prebuilt crate.
+SYSROOT_RLIB = re.compile(r"^lib(.+)-[0-9a-f]{8,}\.rlib$")
 
 
 def run(command: list[str]) -> str:
@@ -210,6 +208,82 @@ def run(command: list[str]) -> str:
         sys.stderr.write(finished.stderr)
         raise SystemExit(f"{command[0]} failed: {' '.join(command)}")
     return finished.stdout
+
+
+def toolchain() -> tuple[Path, str, str]:
+    """The sysroot, host target and version of the toolchain in use.
+
+    Asked of `rustc` with the broker's working directory, so
+    `rust-toolchain.toml` decides which toolchain answers. That
+    pinning is what makes everything derived from the sysroot the
+    same on every machine.
+    """
+    sysroot = Path(run(["rustc", "--print", "sysroot"]).strip())
+    host = ""
+    version = ""
+    for line in run(["rustc", "-vV"]).splitlines():
+        if line.startswith("host: "):
+            host = line[len("host: ") :].strip()
+        elif line.startswith("release: "):
+            version = line[len("release: ") :].strip()
+    if not host or not version:
+        raise SystemExit("`rustc -vV` did not say its host and release")
+    return sysroot, host, version
+
+
+def sysroot_crates() -> tuple[tuple[str, ...], str]:
+    """The crates the Rust project ships prebuilt in the sysroot.
+
+    **Read from the toolchain rather than written down here**, which
+    is the whole point: a list of names in this file is a claim
+    nothing checks, and the one thing that looked like checking it
+    was a grep of the binary, which finds the list because this file
+    is embedded in the binary.
+
+    # Why the sysroot and not the binary
+
+    The binary is the better evidence for the Cargo graph and the
+    worse evidence for this. A crate leaves a `/rust/deps/` path in
+    the bytes only if it has a panic site the optimiser kept, and
+    three of the standard library's prebuilt crates —
+    `compiler_builtins`, `unwind` and `std_detect` — carry no such
+    string in their own artifacts at all, so no binary could name
+    them however plainly they ship. Deriving the list from the binary
+    would trade over-claiming for under-claiming.
+
+    So this answers a different question, and the file says so: not
+    "which of these ship" but "what the toolchain ships", which is an
+    upper bound on the first and is a fact rather than an assertion.
+
+    # Why this is the same on every machine
+
+    The toolchain is pinned by `rust-toolchain.toml`, and the two
+    targets in [`TARGETS`] were compared under that pin: the rlibs
+    the sysroot holds for `x86_64-unknown-linux-gnu` and for
+    `aarch64-apple-darwin` are the same twenty-seven names. So the
+    host's directory is read, rather than requiring every contributor
+    to install the other target's standard library to regenerate a
+    file. If a future toolchain made the two differ, this would drift
+    between CI and a development machine — and it would drift loudly,
+    as a named crate in a diff, which is the right reason to fail and
+    is the reason this comment exists.
+    """
+    sysroot, host, version = toolchain()
+    directory = sysroot / "lib" / "rustlib" / host / "lib"
+    if not directory.is_dir():
+        raise SystemExit(
+            f"the toolchain has no prebuilt standard library at {directory}"
+        )
+    names = sorted(
+        {
+            match.group(1)
+            for entry in os.listdir(directory)
+            if (match := SYSROOT_RLIB.match(entry))
+        }
+    )
+    if not names:
+        raise SystemExit(f"{directory} holds no rlibs; the sysroot cannot be read")
+    return tuple(names), version
 
 
 def allowed_licences() -> set[str]:
@@ -438,7 +512,11 @@ def branch_of_spdx(identifier: str) -> str | None:
     return branch_of(identifier.replace("-", ""))
 
 
-def render(packages: dict[tuple[str, str], dict]) -> str:
+def render(
+    packages: dict[tuple[str, str], dict],
+    vendored: tuple[str, ...],
+    toolchain_version: str,
+) -> str:
     """The file."""
     ordered = [packages[key] for key in sorted(packages, key=lambda key: (key[0].lower(), key[1]))]
     lines: list[str] = [
@@ -455,12 +533,15 @@ def render(packages: dict[tuple[str, str], dict]) -> str:
         "macros are absent: none of them is linked into the binary, and running",
         "a tool to produce an artifact does not distribute the tool.",
         "",
-        "The list is audited against the binary rather than trusted. rustc",
-        "records the source path of every panic site, so the crates that ship",
-        "are named in the bytes a user receives; `scripts/rust-notices.py",
-        "--check` reads them out of the release binary and fails on any crate",
-        "the binary names and this file does not. CI fails on any difference",
-        "between the regenerated file and this one.",
+        *"""What is in this list comes from that graph. The binary is not read to
+build it; it is read to check it. rustc records the source path of every
+panic site, so a crate that ships is usually named in the bytes a user
+receives, and `scripts/rust-notices.py --check` fails on any crate the
+binary names that this file does not. That assertion runs one way only —
+a crate can be linked in and leave no path string, which `ryu` and
+`sync_wrapper` both do — so it can catch an omission and can never
+confirm the list is exactly right. CI fails on any difference between
+the regenerated file and this one.""".splitlines(),
         "",
         f"Packages: {len(ordered)}, plus the Rust standard library.",
         "",
@@ -563,22 +644,50 @@ def render(packages: dict[tuple[str, str], dict]) -> str:
     lines.append("-" * 70)
     lines.append("the Rust standard library (MIT)")
     lines.append("")
-    lines.append(
-        "Linked from the sysroot as a prebuilt artifact, so it is in no Cargo"
-    )
-    lines.append(
-        "graph and no manifest names it. It is in the binary all the same, and"
-    )
-    lines.append(
-        "so are the crates the Rust project vendors into it: "
+    lines.extend(
+        textwrap.wrap(
+            "Linked from the sysroot as a prebuilt artifact, so it is in no "
+            "Cargo graph and no manifest names it. It is in the binary all "
+            "the same, and the sysroot is not one crate: Rust "
+            f"{toolchain_version} ships the standard library as these, read "
+            "out of the toolchain rather than written down here.",
+            width=70,
+        )
     )
     lines.append("")
-    lines.append("  " + ", ".join(STANDARD_LIBRARY_VENDORED))
-    lines.append("")
-    lines.append(
-        "The Rust project distributes all of that under MIT OR Apache-2.0, and"
+    lines.extend(
+        textwrap.wrap(", ".join(vendored), width=68, initial_indent="  ",
+                      subsequent_indent="  ")
     )
-    lines.append("the MIT branch is the one taken.")
+    lines.append("")
+    lines.extend(
+        textwrap.wrap(
+            "**That is the directory's contents and not this binary's.** "
+            "A build links the crates it uses, and the list above is an "
+            "upper bound on which those are: it includes the test harness "
+            "and its helpers, which a release binary does not link at all. "
+            "Narrowing it is not something this file can honestly do. A "
+            "crate leaves its source path in the bytes only if it has a "
+            "panic site the optimiser kept, so the audit can prove a crate "
+            "is present and never that one is absent — three of the names "
+            "above carry no such path in their own artifacts at all, and "
+            "ship regardless. So the choice is between an upper bound that "
+            "names too much and a lower bound that would omit "
+            "compiler_builtins, and the upper bound is the one that cannot "
+            "leave an obligation unmet. An earlier version of this file "
+            "named twelve crates as being in the binary, which nothing "
+            "checked and of which the bytes showed five.",
+            width=70,
+        )
+    )
+    lines.append("")
+    lines.extend(
+        textwrap.wrap(
+            "The Rust project distributes all of that under MIT OR "
+            "Apache-2.0, and the MIT branch is the one taken.",
+            width=70,
+        )
+    )
     lines.append("")
     lines.extend(line.rstrip() for line in STANDARD_LIBRARY_TEXT.splitlines())
     lines.append("")
@@ -600,8 +709,25 @@ def in_the_binary() -> tuple[set[tuple[str, str]], set[str]]:
     return registry, sysroot
 
 
-def check(generated: str) -> int:
-    """Fail on drift, and on a crate the binary names and the file omits."""
+def check(generated: str, vendored: tuple[str, ...]) -> int:
+    """Fail on drift, and on a crate the binary names and the file omits.
+
+    **The drift comparison is the two-way check.** Everything in the
+    generated file is derived — the packages from the graph, the
+    standard library's crates from the sysroot — so comparing it
+    against the committed file fails on a name that appeared *and* on
+    a name that went away. That is the half the previous version of
+    this script did not have: its list of the standard library's
+    crates was written here by hand, and the only check on it fired
+    when the binary named something the list omitted, never when the
+    list named something nothing needed. Twelve names sat in it and
+    the binary named five.
+
+    The two assertions against the binary are still one-way, and for
+    the reason the module documentation gives: a crate can be linked
+    in and leave no path string, so the binary names a subset and
+    absence from it proves nothing.
+    """
     problems: list[str] = []
     if not OUTPUT.is_file():
         problems.append(f"{OUTPUT.relative_to(ROOT)} does not exist")
@@ -618,12 +744,17 @@ def check(generated: str) -> int:
             problems.append(
                 f"the binary carries {name} {version} and this file does not name it"
             )
-    vendored = set(STANDARD_LIBRARY_VENDORED)
+    # A crate the binary links from the sysroot and the toolchain does
+    # not ship there would mean this file's account of where the
+    # standard library comes from is wrong. Matched with hyphens folded
+    # to underscores: a recorded source path keeps the crate's own
+    # spelling, an rlib is always underscored.
+    shipped_there = {name.replace("-", "_") for name in vendored}
     for name in sorted(sysroot):
-        if name not in vendored:
+        if name.replace("-", "_") not in shipped_there:
             problems.append(
-                f"the binary carries {name} from the sysroot and "
-                "STANDARD_LIBRARY_VENDORED does not list it"
+                f"the binary carries {name} from the sysroot and the "
+                "toolchain does not ship it there"
             )
 
     if problems:
@@ -632,8 +763,15 @@ def check(generated: str) -> int:
         return 1
     print(
         f"  the notices name every one of the {len(registry)} crates the binary "
-        f"names, and every one of the {len(sysroot)} it links from the sysroot"
+        f"names, and the {len(sysroot)} it names from the sysroot are among the "
+        f"{len(vendored)} the toolchain ships there"
     )
+    # Printed rather than asserted. The binary naming fewer than the
+    # sysroot ships is the normal case and not a finding: a crate with
+    # no surviving panic site leaves nothing to find. Printing it is
+    # what stops the smaller number being mistaken for the whole of
+    # what is linked in.
+    print(f"    named in the binary: {', '.join(sorted(sysroot))}")
     return 0
 
 
@@ -646,9 +784,10 @@ def main() -> int:
     )
     arguments = parser.parse_args()
 
-    generated = render(shipped(allowed_licences()))
+    vendored, version = sysroot_crates()
+    generated = render(shipped(allowed_licences()), vendored, version)
     if arguments.check:
-        return check(generated)
+        return check(generated, vendored)
     OUTPUT.write_text(generated, encoding="utf-8")
     print(f"  wrote {OUTPUT.relative_to(ROOT)}")
     return 0

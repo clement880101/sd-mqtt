@@ -11,12 +11,15 @@ is built for. Dev-dependencies, build-dependencies and procedural
 macros are absent: none of them is linked into the binary, and running
 a tool to produce an artifact does not distribute the tool.
 
-The list is audited against the binary rather than trusted. rustc
-records the source path of every panic site, so the crates that ship
-are named in the bytes a user receives; `scripts/rust-notices.py
---check` reads them out of the release binary and fails on any crate
-the binary names and this file does not. CI fails on any difference
-between the regenerated file and this one.
+What is in this list comes from that graph. The binary is not read to
+build it; it is read to check it. rustc records the source path of every
+panic site, so a crate that ships is usually named in the bytes a user
+receives, and `scripts/rust-notices.py --check` fails on any crate the
+binary names that this file does not. That assertion runs one way only —
+a crate can be linked in and leave no path string, which `ryu` and
+`sync_wrapper` both do — so it can catch an omission and can never
+confirm the list is exactly right. CI fails on any difference between
+the regenerated file and this one.
 
 Packages: 71, plus the Rust standard library.
 
@@ -1612,9 +1615,29 @@ the Rust standard library (MIT)
 
 Linked from the sysroot as a prebuilt artifact, so it is in no Cargo
 graph and no manifest names it. It is in the binary all the same, and
-so are the crates the Rust project vendors into it: 
+the sysroot is not one crate: Rust 1.98.1 ships the standard library
+as these, read out of the toolchain rather than written down here.
 
-  addr2line, adler2, compiler_builtins, gimli, hashbrown, libc, memchr, miniz_oxide, object, rustc-demangle, std_detect, unwind
+  addr2line, adler2, alloc, cfg_if, compiler_builtins, core,
+  getopts, gimli, hashbrown, libc, memchr, miniz_oxide, object,
+  panic_abort, panic_unwind, proc_macro, profiler_builtins,
+  rustc_demangle, rustc_literal_escaper, rustc_std_workspace_alloc,
+  rustc_std_workspace_core, rustc_std_workspace_std, std,
+  std_detect, sysroot, test, unwind
+
+**That is the directory's contents and not this binary's.** A build
+links the crates it uses, and the list above is an upper bound on
+which those are: it includes the test harness and its helpers, which a
+release binary does not link at all. Narrowing it is not something
+this file can honestly do. A crate leaves its source path in the bytes
+only if it has a panic site the optimiser kept, so the audit can prove
+a crate is present and never that one is absent — three of the names
+above carry no such path in their own artifacts at all, and ship
+regardless. So the choice is between an upper bound that names too
+much and a lower bound that would omit compiler_builtins, and the
+upper bound is the one that cannot leave an obligation unmet. An
+earlier version of this file named twelve crates as being in the
+binary, which nothing checked and of which the bytes showed five.
 
 The Rust project distributes all of that under MIT OR Apache-2.0, and
 the MIT branch is the one taken.
