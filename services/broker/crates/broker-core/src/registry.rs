@@ -97,6 +97,15 @@ pub struct PresenceChange {
 /// [`Presence::take`] says so, which is the reader's signal to walk
 /// the sessions itself rather than to carry on with a set that has
 /// quietly lost entries.
+///
+/// **There is one reader.** A read takes the changes away, so two
+/// readers would each see the half the other did not, and both
+/// would draw a broker that is not there. One is what exists: the
+/// process has one admin listener and it has one sampler. A second
+/// observer wants its own log — this type behind another handle —
+/// and not a second [`Presence::take`] on this one. Said here
+/// because the shape does not refuse it and the failure would be
+/// silent.
 #[derive(Clone, Debug, Default)]
 pub struct Presence(Arc<PresenceLog>);
 
