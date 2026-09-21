@@ -971,6 +971,7 @@ name = "sdmqtt"
 version = "0.1.0"
 dependencies = [
  "broker-core",
+ "brotli",
  "bytes",
  "clap",
  "mqtt-codec",

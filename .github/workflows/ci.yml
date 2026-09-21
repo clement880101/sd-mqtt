@@ -40,6 +40,21 @@ jobs:
         run: cargo nextest run --all-features
       - name: Doc tests
         run: cargo test --doc --all-features
+      # Everything above ran in a tree with no built interface, which
+      # is the path every Rust-only contributor takes and the one
+      # nobody would notice breaking. `tests/interface.rs` skips there
+      # and says so, so the interface is built here and it is run
+      # again, with the two states covered by one job.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: services/web/package-lock.json
+      - name: Build the interface
+        working-directory: services/web
+        run: npm ci && npm run build
+      - name: The interface reaches a browser from the binary
+        run: cargo nextest run --all-features -p sdmqtt --test interface
 
   # The interface. Its build is also its licence gate: an unapproved
   # licence, or one a package stopped declaring, fails `npm run build`
