@@ -107,6 +107,12 @@ jobs:
       - uses: taiki-e/install-action@cargo-deny
       - name: License and advisory gate
         run: cargo deny --manifest-path services/broker/Cargo.toml --config deny.toml check
+      # The generator's own tests. The drift check below compares the
+      # file against what the generator produces, so a generator that
+      # resolves a licence expression wrongly agrees with itself and
+      # the drift check is silent. This is the half that is not.
+      - name: The notices generator resolves an expression correctly
+        run: python3 scripts/test_rust_notices.py
       # The same release build the budgets job measures, because the
       # audit reads the crate paths rustc recorded in it.
       - name: Build the binary the notices are audited against
