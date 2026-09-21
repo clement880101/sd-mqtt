@@ -454,6 +454,16 @@ function Watcher() {
   const timer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   /** What to close on the way out, read from an unmount handler. */
   const openTapId = useRef<number | null>(null);
+  /**
+   * Which watch a poll belongs to.
+   *
+   * A poll in flight when the watch is stopped comes back to a tap
+   * that has just been deleted, and without this it would report
+   * "there is no tap 3" at somebody who had only pressed Stop. The
+   * same shape the Clients table uses for a fetch a resynchronise
+   * abandoned.
+   */
+  const watch = useRef(0);
 
   const stopPolling = () => {
     clearInterval(timer.current);
@@ -463,6 +473,7 @@ function Watcher() {
 
   /** Give the tap back to the broker. */
   const release = () => {
+    watch.current += 1;
     stopPolling();
     if (openTapId.current !== null) {
       closeTap(openTapId.current);
@@ -475,8 +486,12 @@ function Watcher() {
     if (!current) {
       return;
     }
+    const mine = watch.current;
     try {
       const read = await readTap(current.view.id, cursor.current);
+      if (mine !== watch.current) {
+        return;
+      }
       cursor.current = read.next;
       if (read.messages.length > 0) {
         // Newest first, because that is where a person looks, and
@@ -488,7 +503,12 @@ function Watcher() {
       }
       missed.value += read.missed;
       polls.value += 1;
-      held.value = { view: read, limits: read.limits };
+      // Destructured rather than stored whole: a `TapRead` carries
+      // the page of messages that has just been folded into `rows`,
+      // and keeping a second copy of up to a ring's worth of them
+      // on every poll is a duplicate nothing reads.
+      const { limits: _limits, messages: _messages, next: _next, missed: _missed, ...view } = read;
+      held.value = { view, limits: read.limits };
       failure.value = null;
       if (read.closed !== null) {
         // The broker ended it: something took its session over.
@@ -499,6 +519,9 @@ function Watcher() {
         note.value = `${read.closed} Nothing more will arrive. Start another watch.`;
       }
     } catch (error) {
+      if (mine !== watch.current) {
+        return;
+      }
       if (error instanceof ApiError && error.code === 'not_found') {
         openTapId.current = null;
         stopPolling();
