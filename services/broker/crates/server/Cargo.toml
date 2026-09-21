@@ -29,6 +29,11 @@ tokio = { version = "1", default-features = false, features = [
     "io-util",
 ] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+# Its default feature set is empty, so there is nothing to turn off:
+# the protobuf exposition formats are the only features it has and
+# nothing here wants them. Three crates in total, measured by diffing
+# the lock file: itself, its encode derive, and `dtoa`.
+prometheus-client = "0.25"
 
 [dev-dependencies]
 # The redb backend, for `tests/throughput.rs` alone. What a store costs

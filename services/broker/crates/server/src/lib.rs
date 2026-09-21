@@ -11,5 +11,6 @@
 pub mod connection;
 pub mod framing;
 pub mod listener;
+pub mod metrics;
 pub mod shared;
 pub mod ticker;
