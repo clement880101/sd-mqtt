@@ -13,6 +13,21 @@
 //! a complaint as confirmation. The same argument makes an unreadable
 //! environment value an error rather than a fallback.
 //!
+//! # The admin token comes from two of the three sources
+//!
+//! `admin.token` can be set in the file or in `SDMQTT_ADMIN_TOKEN`,
+//! and there is deliberately no flag for it. A command line is
+//! visible in `ps` to every user on the host and is kept in a shell's
+//! history, so it is the one source of the three that cannot hold a
+//! secret. Section 12.3 keeps the value itself out of logs by holding
+//! it in a wrapper that refuses to print; see
+//! [`sdmqtt_admin::Token`].
+//!
+//! The token is an interim that milestone 7 replaces with API keys.
+//! Until then the admin listener is protected by where it listens, and
+//! [`Config::validate`] refuses a configuration that binds it further
+//! than loopback with no token set.
+//!
 //! # No store directory means no store
 //!
 //! `storage.directory` has **no default**, and a configuration that
@@ -47,6 +62,7 @@ use std::time::Duration;
 
 use broker_core::broker::BrokerConfig;
 use mqtt_codec::Limits;
+use sdmqtt_admin::config::{AdminConfig, AdminStartError, Token};
 use sdmqtt_server::connection::{outbox_depth_for, ConnectionConfig};
 use sdmqtt_server::listener::{ServerConfig, DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT};
 use serde::Deserialize;
@@ -128,6 +144,16 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// The admin listener refused the configuration it was given.
+    ///
+    /// Carried verbatim rather than reworded. Section 11.1 says the
+    /// refusal names the address and the missing key, and
+    /// [`AdminStartError::Unprotected`] already does; wrapping it in a
+    /// sentence of our own would be a second copy of that promise,
+    /// free to drift from the one the admin crate enforces when
+    /// nothing goes through this file.
+    #[error("{0}")]
+    Admin(#[from] AdminStartError),
     /// The store itself could not be opened.
     ///
     /// Separate from the directory failing, because the answers are
@@ -477,6 +503,15 @@ pub struct Config {
     pub broker: BrokerSection,
     /// The storage section.
     pub storage: StorageSection,
+    /// The admin listener's section.
+    ///
+    /// The admin crate's own type rather than a copy of it here. A
+    /// second struct would be a second set of defaults, and the one
+    /// that matters is the default address: `[admin]` absent from a
+    /// file and `[admin]` present but empty must mean the same
+    /// loopback address, or the refusal in `AdminConfig::check` guards
+    /// a different configuration from the one that is served.
+    pub admin: AdminConfig,
     /// The log section.
     pub log: Log,
 }
@@ -496,6 +531,16 @@ pub struct Overrides {
     pub mountpoint: Option<String>,
     /// Where the store lives.
     pub store_directory: Option<PathBuf>,
+    /// Where the admin listener binds.
+    pub admin_address: Option<SocketAddr>,
+    /// Do not serve the admin listener at all.
+    ///
+    /// A flag rather than a `bool`, because `false` from a command
+    /// line that did not mention it would override a file that turned
+    /// the listener off. There is deliberately no flag that turns it
+    /// back *on*: the default is on, so the only thing a command line
+    /// has to be able to say is "not this time".
+    pub no_admin: bool,
     /// How much to log.
     pub log_level: Option<LogLevel>,
 }
@@ -636,6 +681,25 @@ impl Config {
                 why: "name a directory, or leave the key out entirely to run with no store",
             });
         }
+
+        // Section 11.1: a non-loopback admin address with no token is
+        // refused at startup, not warned about.
+        //
+        // **Here, and not only where the listener binds.** This runs
+        // before the store is opened and before anything is bound, so
+        // an operator who asked for an unprotected listener is told so
+        // by a process that has touched nothing, rather than by one
+        // that has already taken the store's file lock. `AdminServer::
+        // bind` checks again for the caller that never came through
+        // this file.
+        //
+        // Only when it is going to be served. A listener that is
+        // turned off exposes nothing, so refusing to start the broker
+        // over the address it would not have bound would be a refusal
+        // with nothing behind it.
+        if self.admin.enabled {
+            self.admin.check()?;
+        }
         Ok(())
     }
 
@@ -678,6 +742,48 @@ impl Config {
             self.storage.flush_records =
                 parse("SDMQTT_STORAGE_FLUSH_RECORDS", &value, "record count")?;
         }
+        if let Some(value) = lookup("SDMQTT_ADMIN_ADDRESS") {
+            self.admin.address = parse("SDMQTT_ADMIN_ADDRESS", &value, "socket address")?;
+        }
+        if let Some(value) = lookup("SDMQTT_ADMIN_ENABLED") {
+            self.admin.enabled = parse("SDMQTT_ADMIN_ENABLED", &value, "true or false")?;
+        }
+        if let Some(value) = lookup("SDMQTT_ADMIN_TOKEN") {
+            // **Kept, empty and all, so that `validate` refuses it.**
+            //
+            // This read it as absent, by analogy with
+            // `SDMQTT_STORAGE_DIRECTORY`. The analogy does not hold.
+            // An empty directory means "no store", which is a state
+            // the broker has and documents; an empty token means "a
+            // token is configured" while protecting nothing, and the
+            // file's reading of exactly the same characters already
+            // refuses to start over it. One value read two ways in
+            // one program is the thing the empty-store-path fix
+            // corrected, and the safe reading is the refusal: an
+            // operator whose `SDMQTT_ADMIN_TOKEN` expanded to nothing
+            // was told the listener was guarded by a listener that
+            // had quietly decided it was not.
+            //
+            // The cost is that an environment can no longer take away
+            // a token a file set. That is not a loss worth having:
+            // the only thing it could accomplish is making a
+            // protected listener unprotected, which is what
+            // `admin.enabled = false` and a loopback address are for.
+            self.admin.token = Some(Token::new(value));
+        }
+        if let Some(value) = lookup("SDMQTT_ADMIN_ALLOWED_HOSTS") {
+            // Comma separated, because an environment holds strings
+            // and this is the one key of the set that is a list. An
+            // empty value is an empty list, which is the default and
+            // is a working configuration: an address literal and
+            // `localhost` are answered whatever is in here.
+            self.admin.allowed_hosts = value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
         if let Some(value) = lookup("SDMQTT_LOG") {
             self.log.level = parse("SDMQTT_LOG", &value, "log level")?;
         }
@@ -697,6 +803,12 @@ impl Config {
         }
         if let Some(directory) = &overrides.store_directory {
             self.storage.directory = Some(directory.clone());
+        }
+        if let Some(address) = overrides.admin_address {
+            self.admin.address = address;
+        }
+        if overrides.no_admin {
+            self.admin.enabled = false;
         }
         if let Some(level) = overrides.log_level {
             self.log.level = level;
@@ -791,6 +903,11 @@ mod tests {
             max_queue_messages = 5
             max_queue_bytes = 8192
 
+            [admin]
+            enabled = true
+            address = "127.0.0.1:18840"
+            token = "a-secret"
+
             [log]
             level = "debug"
         "#;
@@ -808,6 +925,12 @@ mod tests {
         assert_eq!(config.broker.max_queue_messages, 5);
         assert_eq!(config.broker.max_queue_bytes, 8192);
         assert_eq!(config.log.level, LogLevel::Debug);
+        assert!(config.admin.enabled);
+        assert_eq!(config.admin.address.to_string(), "127.0.0.1:18840");
+        assert_eq!(
+            config.admin.token.as_ref().map(Token::expose),
+            Some("a-secret")
+        );
 
         // Parsed is not the same as applied. A field read into this
         // struct and then never handed to the server is a setting that
@@ -952,6 +1075,8 @@ mod tests {
             max_connections: Some(13),
             mountpoint: Some("tenant-c".to_owned()),
             store_directory: Some(PathBuf::from("/var/lib/sdmqtt")),
+            admin_address: Some("127.0.0.1:12345".parse().unwrap()),
+            no_admin: true,
             log_level: Some(LogLevel::Warn),
         });
 
@@ -963,6 +1088,8 @@ mod tests {
             Some(Path::new("/var/lib/sdmqtt"))
         );
         assert_eq!(config.log.level, LogLevel::Warn);
+        assert_eq!(config.admin.address.to_string(), "127.0.0.1:12345");
+        assert!(!config.admin.enabled);
     }
 
     #[test]
@@ -1476,6 +1603,145 @@ mod tests {
         assert!(
             "Immediate".parse::<Sync>().is_err(),
             "the spelling is exact"
+        );
+    }
+
+    /// Section 11.1, at the earliest place it can be enforced.
+    ///
+    /// The refusal belongs to the admin crate and is tested there
+    /// against a real `bind`. What is tested here is that it reaches
+    /// the binary: a configuration that assembles cleanly and is then
+    /// served would refuse only once the store had been opened.
+    #[test]
+    fn a_non_loopback_admin_address_with_no_token_is_refused_by_validate() {
+        let config = Config {
+            admin: AdminConfig {
+                address: "0.0.0.0:1884".parse().expect("a valid address"),
+                token: None,
+                ..AdminConfig::default()
+            },
+            ..Config::default()
+        };
+        let error = config
+            .validate()
+            .expect_err("an unprotected admin listener is refused");
+        assert!(matches!(error, ConfigError::Admin(_)), "{error:?}");
+        let said = error.to_string();
+        assert!(
+            said.contains("0.0.0.0:1884"),
+            "it names the address: {said}"
+        );
+        assert!(said.contains("admin.token"), "and the key: {said}");
+    }
+
+    #[test]
+    fn a_token_makes_the_same_address_acceptable() {
+        let config = Config {
+            admin: AdminConfig {
+                address: "0.0.0.0:1884".parse().expect("a valid address"),
+                token: Some(Token::new("a-secret")),
+                ..AdminConfig::default()
+            },
+            ..Config::default()
+        };
+        config.validate().expect("a token protects it");
+    }
+
+    /// A listener that is not served exposes nothing.
+    #[test]
+    fn a_disabled_admin_listener_is_not_held_to_the_rule() {
+        let config = Config {
+            admin: AdminConfig {
+                enabled: false,
+                address: "0.0.0.0:1884".parse().expect("a valid address"),
+                ..AdminConfig::default()
+            },
+            ..Config::default()
+        };
+        config
+            .validate()
+            .expect("nothing is bound, so there is nothing to protect");
+    }
+
+    #[test]
+    fn the_environment_configures_the_admin_listener() {
+        let mut config = Config::default();
+        config
+            .apply_env(|variable| match variable {
+                "SDMQTT_ADMIN_ADDRESS" => Some("127.0.0.1:19999".to_owned()),
+                "SDMQTT_ADMIN_TOKEN" => Some("from-the-environment".to_owned()),
+                "SDMQTT_ADMIN_ENABLED" => Some("false".to_owned()),
+                _ => None,
+            })
+            .expect("all three parse");
+        assert_eq!(config.admin.address.to_string(), "127.0.0.1:19999");
+        assert_eq!(
+            config.admin.token.as_ref().map(Token::expose),
+            Some("from-the-environment")
+        );
+        assert!(!config.admin.enabled);
+    }
+
+    /// One value, one reading, whichever source it came from.
+    ///
+    /// An empty token in the file is refused. It used to be read as
+    /// absent when it came from the environment, which is the same
+    /// value meaning two things in one program — and the dangerous
+    /// one of the two, because an operator whose variable expanded to
+    /// nothing was told the listener was guarded by a listener that
+    /// had decided it was not.
+    #[test]
+    fn an_empty_token_is_refused_wherever_it_came_from() {
+        let from_the_file = Config::from_toml("[admin]\ntoken = \"\"\n").expect(
+            "it parses; it is validate that \
+                                                                 refuses it",
+        );
+        let said = from_the_file
+            .validate()
+            .expect_err("an empty token protects nothing")
+            .to_string();
+        assert!(said.contains("empty string"), "{said}");
+
+        let mut from_the_environment = Config {
+            admin: AdminConfig {
+                token: Some(Token::new("from-the-file")),
+                ..AdminConfig::default()
+            },
+            ..Config::default()
+        };
+        from_the_environment
+            .apply_env(|variable| (variable == "SDMQTT_ADMIN_TOKEN").then(String::new))
+            .expect("reading it is not the error; what it says is");
+        assert_eq!(
+            from_the_environment.admin.token.as_ref().map(Token::expose),
+            Some(""),
+            "it is kept rather than dropped, so that validate can see it"
+        );
+        assert_eq!(
+            from_the_environment
+                .validate()
+                .expect_err("the same value, refused the same way")
+                .to_string(),
+            said,
+            "and refused with the same sentence, so an operator reading one \
+             log line learns the same thing either way"
+        );
+    }
+
+    /// `--no-admin` absent must not turn a disabled listener back on.
+    #[test]
+    fn an_absent_flag_does_not_re_enable_the_admin_listener() {
+        let mut config = Config {
+            admin: AdminConfig {
+                enabled: false,
+                ..AdminConfig::default()
+            },
+            ..Config::default()
+        };
+        config.apply(&Overrides::default());
+        assert!(
+            !config.admin.enabled,
+            "the file said no and the command line said nothing"
         );
     }
 }

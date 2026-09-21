@@ -112,6 +112,28 @@ fn oracle(filters: &[String], topic: &str) -> Vec<u64> {
     ids
 }
 
+/// One mutating call on [`SubscriptionTrie`].
+#[derive(Debug, Clone)]
+enum TrieOp {
+    Insert { filter: String, subscriber: u64 },
+    Remove { filter: String, subscriber: u64 },
+    RemoveSubscriber { subscriber: u64 },
+}
+
+/// A small space of subscribers, so that a sequence collides on the same
+/// filter and the same subscriber often rather than by luck. A replacement
+/// and a remove of something absent are the two cases the count gets wrong
+/// if it is adjusted before the structure is asked what actually happened.
+fn any_trie_op() -> impl Strategy<Value = TrieOp> {
+    prop_oneof![
+        6 => (any_filter(), 0u64..4)
+            .prop_map(|(filter, subscriber)| TrieOp::Insert { filter, subscriber }),
+        3 => (any_filter(), 0u64..4)
+            .prop_map(|(filter, subscriber)| TrieOp::Remove { filter, subscriber }),
+        1 => (0u64..4).prop_map(|subscriber| TrieOp::RemoveSubscriber { subscriber }),
+    ]
+}
+
 /// One mutating call on [`SharedSubscriptions`].
 #[derive(Debug, Clone)]
 enum Op {
@@ -187,6 +209,53 @@ proptest! {
         }
         prop_assert_eq!(trie.len(), 0);
         prop_assert_eq!(trie.node_count(), baseline, "an empty branch was left behind");
+    }
+
+    /// The maintained subscription count, against the same number by
+    /// walking the shards.
+    ///
+    /// `len` is section 11.3's subscriptions gauge and is read once a
+    /// second by the events sampler and again on every metrics scrape.
+    /// It used to add up every shard, which is a walk of the trie
+    /// measured at 2.64 milliseconds with a hundred thousand
+    /// subscriptions; it is now a counter adjusted at three places.
+    /// That is the shape that drifts the first time a path forgets
+    /// one, and a wrong gauge is silent — every other answer the trie
+    /// gives is still right.
+    ///
+    /// The two cases to get wrong are here on purpose: an insert that
+    /// replaces a subscription the same subscriber already held, which
+    /// must not add, and a remove of something that was not there,
+    /// which must not subtract. A count adjusted before asking the
+    /// structure what actually happened gets both wrong, and neither
+    /// shows up in a matching assertion.
+    #[test]
+    fn the_maintained_subscription_count_agrees_with_a_walk(
+        ops in prop::collection::vec(any_trie_op(), 1..40),
+        shards in 1usize..8,
+    ) {
+        let trie = SubscriptionTrie::new(shards);
+        for (index, op) in ops.iter().enumerate() {
+            match op {
+                TrieOp::Insert { filter, subscriber } => {
+                    trie.insert(filter, sub(*subscriber));
+                }
+                TrieOp::Remove { filter, subscriber } => {
+                    trie.remove(filter, SubscriberId(*subscriber));
+                }
+                TrieOp::RemoveSubscriber { subscriber } => {
+                    trie.remove_subscriber(SubscriberId(*subscriber));
+                }
+            }
+            prop_assert_eq!(
+                trie.len(),
+                trie.len_by_walking(),
+                "after operation {} ({:?})",
+                index,
+                op
+            );
+            prop_assert_eq!(trie.is_empty(), trie.is_empty_by_walking());
+        }
     }
 
     /// Tearing down one session must not disturb another's subscriptions.

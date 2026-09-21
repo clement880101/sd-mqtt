@@ -1118,6 +1118,73 @@ fn bodies_are_exactly_what_is_referenced(restored: &Restored) -> Result<(), Stri
     Ok(())
 }
 
+/// The retained store's ordered index, against the tree it indexes.
+///
+/// The store keeps its topics twice: once in the tree that answers a
+/// filter, and once in order so that a page can be taken without
+/// collecting the whole store. The second is maintained at every
+/// mutation, which is the shape that drifts the first time a path
+/// forgets one — and the failure is silent, because every reader
+/// except the pages goes through the tree.
+///
+/// Both halves are checked, because they fail differently. The count
+/// catches an index that gained or lost a topic. Walking the pages
+/// catches one holding a *different* topic of the same number, which
+/// the count cannot see, and it is also how a page's ordering and its
+/// cursor are exercised against something other than the handful of
+/// topics a unit test writes.
+fn the_retained_index_agrees_with_a_walk(run: &Run) -> Result<(), String> {
+    if run.broker.retained_count() != run.broker.retained_count_by_walking() {
+        return Err(format!(
+            "the retained index says {} topics and the tree holds {}",
+            run.broker.retained_count(),
+            run.broker.retained_count_by_walking()
+        ));
+    }
+
+    let mut walked = Vec::new();
+    run.broker.retained().entries(&mut walked);
+    let mut walked: Vec<String> = walked.into_iter().map(|(topic, _)| topic).collect();
+    walked.sort();
+
+    // Pages of one, because the cursor is what this is here to
+    // exercise and a page wide enough to hold the whole store never
+    // uses it. Convention 5's "a generator that cannot produce a
+    // case": these histories retain a handful of topics at most, so
+    // pages of three took one page and a mutation making the cursor
+    // inclusive — which repeats a row on every page boundary —
+    // survived this property while the unit test caught it.
+    let mut paged: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut here = Vec::new();
+        let more = run.broker.retained().page(cursor.as_deref(), 1, &mut here);
+        let here: Vec<String> = here.into_iter().map(|(topic, _)| topic).collect();
+        if here.is_empty() && more {
+            return Err("a page came back empty and said there was more".to_string());
+        }
+        cursor = here.last().cloned();
+        paged.extend(here);
+        if !more {
+            break;
+        }
+        if paged.len() > walked.len() {
+            return Err(format!(
+                "the pages do not end: {} rows over a store of {}",
+                paged.len(),
+                walked.len()
+            ));
+        }
+    }
+
+    if paged != walked {
+        return Err(format!(
+            "paging the index gives {paged:?} and the tree holds {walked:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn drive(history: &[Op]) -> Result<(Run, Restored), String> {
     let mut run = Run::new();
     for (index, op) in history.iter().enumerate() {
@@ -1144,6 +1211,120 @@ fn check(history: &[Op]) -> TestCaseResult {
         drive(history).map_err(|why| TestCaseError::fail(format!("driving failed: {why}")))?;
 
     bodies_are_exactly_what_is_referenced(&restored).map_err(TestCaseError::fail)?;
+
+    // The maintained queue total, against the same number the slow
+    // way. It exists because summing every session's queue under the
+    // broker's one lock is too much to hold while a scraper asks, and
+    // a figure maintained at each of a queue's four mutation points
+    // is a figure that drifts the first time a path forgets one. This
+    // is where the drift would show: hundreds of generated histories,
+    // each pushing, popping, evicting, requeueing, expiring, taking
+    // over and clean-starting, and none of them written by whoever
+    // wrote the four increments.
+    if run.broker.queue_depth() != run.broker.queue_depth_by_walking() {
+        return Err(TestCaseError::fail(format!(
+            "the maintained queue total says {} and the sessions hold {}",
+            run.broker.queue_depth(),
+            run.broker.queue_depth_by_walking()
+        )));
+    }
+
+    the_retained_index_agrees_with_a_walk(&run).map_err(TestCaseError::fail)?;
+
+    // How many sessions have a connection attached, against the same
+    // number by asking every one of them. It is what the Clients
+    // page's total is, and it is maintained at the three places
+    // connectedness moves plus the one place a connected session
+    // ceases to exist. These histories connect, disconnect, take a
+    // session over, clean-start one over a live connection and let
+    // one expire while it is away, which is every one of the four.
+    if run.broker.connected_count() != run.broker.connected_count_by_walking() {
+        return Err(TestCaseError::fail(format!(
+            "the maintained count says {} sessions are connected and {} are",
+            run.broker.connected_count(),
+            run.broker.connected_count_by_walking()
+        )));
+    }
+
+    // Every session is reachable in identity order exactly once. The
+    // ordered index is the same map the broker looks an identity up
+    // in, so it cannot hold a session the broker does not — but it
+    // can be walked wrongly, and a page that skips or repeats a
+    // session is invisible to everything else here.
+    let mut ordered: Vec<SessionId> = run
+        .broker
+        .sessions_after(None)
+        .map(|(_, session)| session.id().clone())
+        .collect();
+    let mut walked: Vec<SessionId> = run
+        .broker
+        .sessions()
+        .map(|(_, session)| session.id().clone())
+        .collect();
+    let in_order = ordered.clone();
+    ordered.sort();
+    walked.sort();
+    if ordered != walked {
+        return Err(TestCaseError::fail(format!(
+            "walking the identity order gives {ordered:?} and the broker holds {walked:?}"
+        )));
+    }
+    if in_order != ordered {
+        return Err(TestCaseError::fail(format!(
+            "the identity order is not in identity order: {in_order:?}"
+        )));
+    }
+    // And resuming after each one gives exactly the rest of it,
+    // which is what a cursor does.
+    for (index, id) in in_order.iter().enumerate() {
+        let rest: Vec<SessionId> = run
+            .broker
+            .sessions_after(Some(id))
+            .map(|(_, session)| session.id().clone())
+            .collect();
+        if rest != in_order[index + 1..] {
+            return Err(TestCaseError::fail(format!(
+                "resuming after {id:?} gives {rest:?} and not {:?}",
+                &in_order[index + 1..]
+            )));
+        }
+    }
+
+    // The subscriptions gauge, against the same number the slow way.
+    // Two counters stand behind it — the trie's and the shared
+    // table's — and between them they are adjusted at six places: an
+    // insert that is new, an insert that replaces, a remove, a
+    // teardown, and the same three for a group. A history here
+    // subscribes, resubscribes to the same filter, unsubscribes,
+    // takes a session over, clean-starts one and lets one expire,
+    // and none of it was written by whoever wrote the six.
+    if run.broker.subscription_count() != run.broker.subscription_count_by_walking() {
+        return Err(TestCaseError::fail(format!(
+            "the maintained subscription count says {} and the structures hold {}",
+            run.broker.subscription_count(),
+            run.broker.subscription_count_by_walking()
+        )));
+    }
+
+    // And the same number counted a third way, from the sessions.
+    // The admin API's subscriptions page reports the gauge as the
+    // total of a collection whose rows it reads out of the sessions,
+    // so the two have to be the same collection: every filter a
+    // session holds is in exactly one of the trie and the shared
+    // table. That is true by construction in `subscribe`, and it is
+    // the kind of construction a later special case breaks quietly —
+    // the page would stop short of a total it can never reach.
+    let held: usize = run
+        .broker
+        .sessions()
+        .map(|(_, session)| session.subscriptions().len())
+        .sum();
+    if run.broker.subscription_count() != held {
+        return Err(TestCaseError::fail(format!(
+            "the gauge says {} subscriptions and the sessions hold {held}",
+            run.broker.subscription_count()
+        )));
+    }
 
     let now = run.broker.clock().now();
     let rebuilt = rebuild(&restored, now);

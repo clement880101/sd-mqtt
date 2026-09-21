@@ -1,5 +1,6 @@
 //! A session's lifetime: connect, disconnect, expiry and the will.
 
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -7,10 +8,10 @@ use mqtt_codec::{Properties, QoS, ReasonCode, Version};
 use storage::record::{ProtocolVersion, Record, SessionRecord, SubscriptionRecord, WillRecord};
 
 use crate::journal::{self, Journal};
-use crate::registry::SessionId;
+use crate::registry::{Presence, SessionId};
 use crate::session::inbound::Inbound;
 use crate::session::outbound::Outbound;
-use crate::session::queue::QueueLimits;
+use crate::session::queue::{QueueLimits, QueueTotal};
 use crate::subscriptions::SubscriberId;
 
 /// The version assumed before a connect has been decoded.
@@ -67,37 +68,154 @@ pub struct Session {
     /// handed over. The queue, the window and the inbound identifiers
     /// keep their own; this one is for the fields above.
     journal: Journal,
+    /// Where a gained or lost connection is written down.
+    ///
+    /// Held by the session rather than asked of it, for the reason
+    /// the queue's total is: connectedness changes in three methods
+    /// here and a caller that has to remember to report each of them
+    /// is a caller that will forget one. Free until somebody is
+    /// reading; see [`Presence`].
+    presence: Presence,
+    /// The process-wide count of sessions with a connection
+    /// attached, which this session counts into while it has one.
+    ///
+    /// Held here for exactly the reason [`Presence`] is, and kept in
+    /// step by the same three methods plus the [`Drop`] below.
+    attached: AttachedSessions,
+}
+
+/// How many sessions sharing this have a connection attached.
+///
+/// # Why it is not counted when it is asked for
+///
+/// The Clients page is the Sessions page filtered to the connected
+/// ones, and its envelope carries the whole collection's size so that
+/// a virtualized table can show a count beside a page of it. Counting
+/// meant walking every session under the broker's one lock, on an
+/// endpoint section 11.1 leaves unauthenticated: 7.89 milliseconds
+/// with a hundred thousand sessions. This is the same answer
+/// [`QueueTotal`] is, kept the same way.
+///
+/// # Where it is kept in step
+///
+/// Connectedness changes in exactly three places, all in this file —
+/// [`Session::new`], [`Session::claim`] and
+/// [`Session::on_disconnected`] — and each of them goes through
+/// [`Session::set_connected`], which adjusts this only on a real
+/// transition. A session already connected being claimed again is
+/// takeover, which is not an arrival.
+///
+/// The fourth place is a session that simply ceases to exist: the
+/// registry hands a removed session back and the caller drops it, and
+/// a clean start replaces one outright. Without the [`Drop`] below,
+/// every such departure would leave its connection on the count
+/// forever and the gauge would only ever rise — which is word for
+/// word why [`Queue`] has one.
+///
+/// **What it does not depend on is the order at the one place a
+/// session is replaced in place.** `*slot = Session::new(..)` looked
+/// as though it might: the arrival is counted while the session it
+/// replaces is still on the count. It is safe, because an assignment
+/// evaluates its right-hand side and then drops what was in the
+/// place, so the departure follows the arrival and the two net out —
+/// and destroying the old session first would net out the same way.
+/// Checked rather than reasoned about: the mutation that swaps the
+/// two survives the whole suite, which is convention 7's "report what
+/// happened". What the case does need is the [`Drop`] itself, and
+/// `a_clean_start_over_a_live_session_is_still_one_connection` fails
+/// without it.
+///
+/// [`QueueTotal`]: crate::session::QueueTotal
+/// [`Queue`]: crate::session::Queue
+/// [`Registry::register`]: crate::registry::Registry::register
+#[derive(Clone, Debug, Default)]
+pub struct AttachedSessions(Arc<AtomicUsize>);
+
+impl AttachedSessions {
+    /// How many sessions sharing this have a connection attached.
+    pub fn get(&self) -> usize {
+        self.0.load(AtomicOrdering::Relaxed)
+    }
+
+    fn arrived(&self) {
+        self.0.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn departed(&self) {
+        self.0.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+}
+
+impl Drop for Session {
+    /// A session that ceases to exist while it is still connected
+    /// takes its connection off the count.
+    ///
+    /// Not every path out of a session disconnects it first. See the
+    /// note on [`AttachedSessions`], and [`Queue`]'s own `Drop`,
+    /// which exists for the identical reason one layer down.
+    ///
+    /// [`Queue`]: crate::session::Queue
+    fn drop(&mut self) {
+        if self.connected {
+            self.attached.departed();
+        }
+    }
+}
+
+/// The configured bounds every session is built with.
+///
+/// Together rather than one parameter each, because they travel
+/// together: the registry holds one of these and hands it to every
+/// session it makes, so a bound added later is added in one place.
+#[derive(Clone, Debug, Default)]
+pub struct SessionBounds {
+    /// The configured inflight window, which section 6 makes one half
+    /// of the lesser-of pair. The other half is the peer's receive
+    /// maximum, which the shell narrows this to once it has read the
+    /// connect packet; it is not known when a session is built, and a
+    /// session exists before any connection has advertised anything.
+    pub max_inflight: usize,
+    /// What bounds the queue waiting for one of those slots. Section
+    /// 6 calls both bounds configured, and this is the only path a
+    /// configured value can reach a session by.
+    pub queue: QueueLimits,
+    /// The process-wide count of queued messages this session's queue
+    /// counts into.
+    pub total: QueueTotal,
+    /// Where this session records gaining or losing a connection.
+    pub presence: Presence,
+    /// The process-wide count of connected sessions this session
+    /// counts into while it has a connection.
+    pub attached: AttachedSessions,
 }
 
 impl Session {
     /// A fresh session, connected.
-    ///
-    /// `max_inflight` is the configured window, which section 6 makes
-    /// one half of the lesser-of pair. The other half is the peer's
-    /// receive maximum, which the shell narrows this to once it has
-    /// read the connect packet; it is not known here, and a session
-    /// exists before any connection has advertised anything.
-    ///
-    /// `queue` bounds what waits for one of those slots. Section 6
-    /// calls both bounds configured, and this is the only path a
-    /// configured value can reach a session by.
     pub fn new(
         id: SessionId,
         subscriber: SubscriberId,
         version: Version,
         epoch: u64,
         _now: u32,
-        max_inflight: usize,
-        queue: QueueLimits,
+        bounds: SessionBounds,
     ) -> Self {
+        let SessionBounds {
+            max_inflight,
+            queue,
+            total,
+            presence,
+            attached,
+        } = bounds;
         // A fresh session has a connection attached, so its outbound path
         // does too. Leaving it offline would make `is_connected` lie and
         // silently discard every at-most-once delivery, which such a path
         // does not queue for an absent client.
         let key = journal::key_of(&id);
-        let mut outbound = Outbound::new(key.clone(), queue, max_inflight);
+        let mut outbound = Outbound::sharing(key.clone(), queue, max_inflight, total);
         outbound.set_online(true);
 
+        presence.record(subscriber, &id, true);
+        attached.arrived();
         let mut session = Self {
             id,
             subscriber,
@@ -112,6 +230,8 @@ impl Session {
             expiry_interval: 0,
             expires_at: None,
             journal: Journal::new(),
+            presence,
+            attached,
         };
         // A session exists the moment it is made, and nothing else will
         // say so: every record that follows names it, and the store
@@ -180,7 +300,8 @@ impl Session {
     /// Cancels any owed will: the client came back, so it was never gone.
     pub fn claim(&mut self, epoch: u64, _now: u32) {
         self.epoch = epoch;
-        self.connected = true;
+        self.set_connected(true);
+        self.presence.record(self.subscriber, &self.id, true);
         self.will_at = None;
         self.expires_at = None;
         self.outbound.set_online(true);
@@ -199,7 +320,8 @@ impl Session {
     /// A graceful departure discards the will; an abrupt one owes it,
     /// after the delay in MQTT 5 and at once in 3.1.1.
     pub fn on_disconnected(&mut self, graceful: bool, now: u32) {
-        self.connected = false;
+        self.set_connected(false);
+        self.presence.record(self.subscriber, &self.id, false);
         self.outbound.on_disconnect();
         self.inbound.on_disconnect();
 
@@ -362,6 +484,29 @@ impl Session {
         self.connected
     }
 
+    /// Move to connected or disconnected, keeping the process-wide
+    /// count in step.
+    ///
+    /// Only a real transition is counted. Claiming a session that is
+    /// already connected is takeover, which displaces one connection
+    /// with another and is not an arrival; disconnecting one that is
+    /// already gone is not a departure. The presence log is
+    /// deliberately not folded in here: it is written on every call
+    /// whether or not the state moved, which is what makes a reader's
+    /// picture right after an overflow, and merging the two would
+    /// quietly change that.
+    fn set_connected(&mut self, connected: bool) {
+        if self.connected == connected {
+            return;
+        }
+        self.connected = connected;
+        if connected {
+            self.attached.arrived();
+        } else {
+            self.attached.departed();
+        }
+    }
+
     /// Which protocol version the client speaks.
     pub fn version(&self) -> Version {
         self.version
@@ -441,8 +586,10 @@ mod tests {
             version,
             1,
             0,
-            20,
-            QueueLimits::default(),
+            SessionBounds {
+                max_inflight: 20,
+                ..Default::default()
+            },
         )
     }
 

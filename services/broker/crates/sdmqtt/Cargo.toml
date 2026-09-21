@@ -9,6 +9,7 @@ description = "A distributed MQTT broker"
 
 [dependencies]
 sdmqtt-server = { path = "../server", version = "0.1.0" }
+sdmqtt-admin = { path = "../admin", version = "0.1.0" }
 broker-core = { path = "../broker-core", version = "0.1.0" }
 mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
 # With its default features, which is the redb backend: this is the
@@ -30,6 +31,10 @@ tempfile.workspace = true
 # `tests/restart.rs` speaks MQTT to the binary over a real socket, and
 # the codec reads and writes through `BytesMut`.
 bytes.workspace = true
+# `tests/interface.rs` asks the binary for the interface as brotli and
+# has to prove the bytes really are brotli. A decoder says so; a
+# content-encoding header does not. Dev only, so nothing of it ships.
+brotli = { version = "8", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

@@ -120,6 +120,13 @@ impl Server {
         let listener = TcpListener::bind(config.address).await?;
         let address = listener.local_addr()?;
 
+        // The numbers that are read rather than copied need a
+        // reference to what holds them, and this is the first place
+        // in the process that has both a whole `Shared` and an `Arc`
+        // around it. Idempotent, so a second listener over the same
+        // broker registers nothing twice.
+        shared.metrics().watch(&shared);
+
         let (shutdown, _) = broadcast::channel(1);
         let ticker = spawn_ticker(Arc::clone(&shared), shutdown.subscribe());
         let permits = Arc::new(Semaphore::new(config.max_connections));
@@ -237,6 +244,12 @@ async fn accept_loop(
         // client than a prompt refusal it can retry elsewhere.
         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
             tracing::warn!(%peer, "a connection was refused: at the connection limit");
+            // Counted separately from a socket that was served and
+            // then closed: this one never reached `serve`, so nothing
+            // there can see it, and an operator reading a flat count
+            // of endings would not be able to tell a node at its
+            // limit from a node with churn.
+            shared.metrics().socket_refused().inc();
             drop(socket);
             continue;
         };

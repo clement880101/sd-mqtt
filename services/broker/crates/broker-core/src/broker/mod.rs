@@ -14,7 +14,7 @@ use storage::record::Record;
 use crate::clock::CoarseClock;
 use crate::journal::{self, DurableSession, DurableState};
 use crate::keepalive::{Activity, KeepAliveRing};
-use crate::registry::{Registration, Registry, SessionId};
+use crate::registry::{Presence, Registration, Registry, SessionId};
 use crate::retained::{RetainedMessage, RetainedStore};
 use crate::session::message::Message;
 use crate::session::queue::{Delivery, DropReason, QueueLimits};
@@ -302,6 +302,81 @@ impl Broker {
     /// One session, for a metric or an assertion.
     pub fn session(&self, subscriber: SubscriberId) -> Option<&Session> {
         self.registry.get(subscriber)
+    }
+
+    /// Every session, connected or not, for a report.
+    ///
+    /// Immutable and in no particular order, because the registry is
+    /// a hash map. A caller that needs an order must impose one, and
+    /// the admin API does.
+    ///
+    /// **Whoever calls this is holding the process's one lock.** It
+    /// walks every session, so a caller that does anything per
+    /// session beyond reading a field is doing that work with every
+    /// connection in the process waiting behind it. The admin API
+    /// takes what it needs here and builds its answer afterwards; see
+    /// `sdmqtt-admin`'s `resources` module for why the shape is what
+    /// it is.
+    pub fn sessions(&self) -> impl Iterator<Item = (SubscriberId, &Session)> {
+        self.registry.iter().map(|(id, session)| (*id, session))
+    }
+
+    /// Every session in identity order, starting strictly after
+    /// `after`.
+    ///
+    /// **Whoever calls this is holding the process's one lock**, as
+    /// with [`Broker::sessions`] — but this one can be stopped. The
+    /// iterator is lazy over an ordered index, so a caller taking a
+    /// page of a hundred looks at a hundred sessions rather than at
+    /// every session in the broker. That is what the admin API's
+    /// pages are built on; see `sdmqtt-admin`'s `resources` module.
+    pub fn sessions_after(
+        &self,
+        after: Option<&SessionId>,
+    ) -> impl Iterator<Item = (SubscriberId, &Session)> {
+        self.registry.iter_after(after)
+    }
+
+    /// The same, including the session `from` names rather than
+    /// starting past it.
+    ///
+    /// For a reader resuming *inside* a session — the admin API's
+    /// subscriptions page, whose cursor names a filter within one.
+    /// See [`Registry::iter_from`].
+    ///
+    /// [`Registry::iter_from`]: crate::registry::Registry::iter_from
+    pub fn sessions_from(
+        &self,
+        from: Option<&SessionId>,
+    ) -> impl Iterator<Item = (SubscriberId, &Session)> {
+        self.registry.iter_from(match from {
+            Some(from) => std::ops::Bound::Included(from),
+            None => std::ops::Bound::Unbounded,
+        })
+    }
+
+    /// How many sessions have a connection attached.
+    ///
+    /// Read from a maintained count rather than by filtering every
+    /// session, which measured 7.89 milliseconds with a hundred
+    /// thousand of them under this broker's one lock. See
+    /// [`AttachedSessions`].
+    ///
+    /// This is the broker's count and not the shell's. `Shared`'s
+    /// outbox count is how many connections the server is writing
+    /// to, which is a different question with a different answer
+    /// during a takeover, and section 11.3's `connections` gauge is
+    /// deliberately the shell's.
+    ///
+    /// [`AttachedSessions`]: crate::session::AttachedSessions
+    pub fn connected_count(&self) -> usize {
+        self.registry.attached()
+    }
+
+    /// The same number by asking every session, for the test that
+    /// keeps the maintained one honest.
+    pub fn connected_count_by_walking(&self) -> usize {
+        self.registry.attached_by_walking()
     }
 
     /// Accept a connection.
@@ -1042,9 +1117,58 @@ impl Broker {
         self.registry.len()
     }
 
+    /// Which sessions have gained or lost a connection since a reader
+    /// last looked.
+    ///
+    /// For an observer that would otherwise walk every session to
+    /// find out, which is what the events stream did: see
+    /// [`Presence`]. Nothing is recorded until a reader arms it, and
+    /// arming it and taking a first picture belong under one
+    /// acquisition of this broker's lock.
+    ///
+    /// [`Presence`]: crate::registry::Presence
+    pub fn presence(&self) -> &Presence {
+        self.registry.presence()
+    }
+
     /// How many subscriptions are held, for a metric and for tests.
+    ///
+    /// Both halves are read from a maintained number rather than
+    /// walked. The trie's own walk measured 2.64 milliseconds with a
+    /// hundred thousand subscriptions, and this is one of section
+    /// 11.3's gauges: the events sampler reads it once a second and
+    /// every metrics scrape reads it again, both under this broker's
+    /// one lock. See [`QueueTotal`], which is the same answer to the
+    /// same question one milestone earlier.
+    ///
+    /// [`QueueTotal`]: crate::session::QueueTotal
     pub fn subscription_count(&self) -> usize {
         self.subscriptions.len() + self.shared.member_count()
+    }
+
+    /// The same number by walking the trie and every group, for the
+    /// test that keeps the maintained one honest.
+    pub fn subscription_count_by_walking(&self) -> usize {
+        self.subscriptions.len_by_walking() + self.shared.member_count_by_walking()
+    }
+
+    /// How many messages are waiting in every session's queue.
+    ///
+    /// Read from a maintained total rather than summed over the
+    /// sessions, and the reason is on [`QueueTotal`]: the walk was
+    /// measured at 405 microseconds with a hundred thousand sessions,
+    /// and it would be held under this broker's one lock every time
+    /// a scraper asked.
+    ///
+    /// [`QueueTotal`]: crate::session::QueueTotal
+    pub fn queue_depth(&self) -> usize {
+        self.registry.queued()
+    }
+
+    /// The same number by walking every session, for the test that
+    /// keeps the maintained one honest.
+    pub fn queue_depth_by_walking(&self) -> usize {
+        self.registry.queued_by_walking()
     }
 
     /// How many messages the retained store holds, expired or not.
@@ -1059,6 +1183,22 @@ impl Broker {
     /// which is also why this must not skip expired messages.
     pub fn retained_count(&self) -> usize {
         self.retained.len()
+    }
+
+    /// The same number by walking the tree, for the test that keeps
+    /// the maintained one honest.
+    ///
+    /// [`RetainedStore::len`] reads the length of the ordered index
+    /// the store keeps beside its tree, because the walk was measured
+    /// at 2.66 milliseconds with a hundred thousand topics and this
+    /// number is read once a second by the sampler and again on every
+    /// scrape. An index that drifts from the tree is worse than a slow
+    /// walk, so the two are compared after every history
+    /// `tests/journal.rs` generates.
+    ///
+    /// [`RetainedStore::len`]: crate::retained::RetainedStore::len
+    pub fn retained_count_by_walking(&self) -> usize {
+        self.retained.count_by_walking()
     }
 }
 

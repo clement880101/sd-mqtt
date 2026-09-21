@@ -1,0 +1,113 @@
+[package]
+name = "sdmqtt-admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The admin listener for sd-mqtt: health, metrics, and the read resources"
+# Precompresses the built interface and embeds it. See build.rs: with
+# no `services/web/dist` present it embeds a page saying so instead,
+# because section 11.2 says a build of the binary must not require
+# Node.
+build = "build.rs"
+
+[dependencies]
+broker-core = { path = "../broker-core", version = "0.1.0" }
+mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
+sdmqtt-server = { path = "../server", version = "0.1.0" }
+# Default features off, as `sdmqtt-server` does and for the same
+# reason: this crate needs the record vocabulary a session's
+# subscriptions are held in, and has no use for a disk.
+storage = { path = "../storage", version = "0.1.0", default-features = false }
+# Default features off, and not for weight: they cost two crates.
+# `tower-log` routes tower's internals through a second logging facade
+# beside the tracing this project standardised on, and the form
+# extractor widens the surface of a JSON-only API. See the "Verified
+# again before milestone 3" notes in docs/research/component-selection.md.
+#
+# What is kept: `http1` because section 11.1 says HTTP/2 is deliberately
+# absent until TLS lands, `tokio` for `axum::serve` and its graceful
+# shutdown, `json` for every response body, `query` for pagination,
+# `matched-path` so a route can be named in a log line without the
+# identifiers in it, and `tracing` because it costs nothing new.
+#
+# There is no feature for the events stream. It is unconditional.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "tokio",
+    "json",
+    "query",
+    "matched-path",
+    "tracing",
+] }
+serde = { version = "1", features = ["derive"] }
+# The `Stream` trait `axum::response::sse::Sse` is written against,
+# which is `futures_core`'s. One crate, already in the lock file
+# because axum depends on it, and nothing transitive: the alternative
+# was a generator crate for one `poll_next` that forwards to a
+# channel.
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+# The events ring's lock. The same lock this workspace uses
+# everywhere else, so that "never held across an await" is one habit
+# rather than two.
+parking_lot = "0.12"
+# A publish endpoint hands the broker a payload, and the broker holds
+# one as `Bytes` so that fan-out shares it rather than copying it.
+bytes.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "net",
+    "sync",
+    "time",
+    "macros",
+] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+# Build-time only, and so not distributed: these run to produce an
+# artifact and never reach a user. They are also invisible to the
+# direct-dependency budget of section 15, which counts what ships.
+[build-dependencies]
+# gzip. The `rust_backend` feature keeps it to miniz_oxide rather than
+# linking a C zlib, which is one fewer thing for a cross build to
+# find.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# brotli, at quality 11. Pure Rust, and the decompressor is a browser's
+# problem rather than ours.
+brotli = { version = "8", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# The admin tests speak HTTP over a real socket rather than calling the
+# router as a service, because half of what this crate owes is what a
+# socket sees: a status line, a content type, and a body that ends.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "net",
+    "io-util",
+] }
+# `tests` drive a real MQTT listener and read what the admin API says
+# about it, which needs the codec a client speaks.
+bytes.workspace = true
+# The gated store, for the one assertion that needs a flush held open:
+# section 7.3 says an at-least-once publish is not answered until it is
+# durable, and that is only visible while a flush is in progress. The
+# real writer over a store this crate's tests control, rather than a
+# second one written here.
+sdmqtt-server = { path = "../server", version = "0.1.0", features = ["testing"] }
+# The writer and the in-memory backend the gated store wraps.
+storage = { path = "../storage", version = "0.1.0", default-features = false }
+# Reading this crate's own answers back. The other tests here assert
+# with `contains` on the body, which is enough for a flat object; a
+# tap answers a ring of messages with sequence numbers, counters and
+# a cursor, and `contains` on that is convention 2's "assert the
+# category, not the value" wearing a different hat. Already in the
+# lock file because axum's `json` feature is built on it, and a
+# dev-dependency is not distributed, so this is invisible to the
+# direct-dependency budget of section 15.
+serde_json = "1"
+
+[lints]
+workspace = true

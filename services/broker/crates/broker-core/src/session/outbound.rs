@@ -10,7 +10,7 @@ use crate::journal::{self, Journal};
 use crate::session::inflight::{Inflight, InflightEntry, InflightState};
 use crate::session::message::Message;
 use crate::session::packet_ids::PacketIds;
-use crate::session::queue::{Delivery, DropReason, Queue, QueueLimits};
+use crate::session::queue::{Delivery, DropReason, Queue, QueueLimits, QueueTotal};
 use crate::session::Action;
 
 /// Decides what goes on the wire to one client, and when.
@@ -43,11 +43,22 @@ pub struct Outbound {
 }
 
 impl Outbound {
-    /// A new outbound path with the given queue bounds and window size.
+    /// A new outbound path with the given queue bounds and window
+    /// size, whose queue is counted only by itself.
     pub fn new(session: SessionKey, limits: QueueLimits, inflight_limit: usize) -> Self {
+        Self::sharing(session, limits, inflight_limit, QueueTotal::default())
+    }
+
+    /// The same, with its queue counted into a shared total.
+    pub fn sharing(
+        session: SessionKey,
+        limits: QueueLimits,
+        inflight_limit: usize,
+        total: QueueTotal,
+    ) -> Self {
         Self {
             session,
-            queue: Queue::new(limits),
+            queue: Queue::sharing(limits, total),
             inflight: Inflight::new(inflight_limit),
             packet_ids: PacketIds::default(),
             online: false,

@@ -40,15 +40,80 @@ jobs:
         run: cargo nextest run --all-features
       - name: Doc tests
         run: cargo test --doc --all-features
+      # Everything above ran in a tree with no built interface, which
+      # is the path every Rust-only contributor takes and the one
+      # nobody would notice breaking. `tests/interface.rs` skips there
+      # and says so, so the interface is built here and it is run
+      # again, with the two states covered by one job.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: services/web/package-lock.json
+      - name: Build the interface
+        working-directory: services/web
+        run: npm ci && npm run build
+      - name: The interface reaches a browser from the binary
+        run: cargo nextest run --all-features -p sdmqtt --test interface
 
+  # The interface. Its build is also its licence gate: an unapproved
+  # licence, or one a package stopped declaring, fails `npm run build`
+  # itself, and a dependency that entered or left the bundle fails the
+  # diff below. Section 11.2: the notices are generated from the
+  # bundle, so they cannot drift from it.
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/web
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: services/web/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Types
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: The notices may not drift from the bundle
+        run: |
+          if ! git diff --exit-code -- THIRD-PARTY-NOTICES.txt; then
+            echo "::error::THIRD-PARTY-NOTICES.txt is not what this bundle produces."
+            echo "Run 'npm run build' in services/web and commit the result."
+            exit 1
+          fi
+
+  # The licence gate is a gate. It says a crate's licence is one we
+  # accept; it says nothing about whether we attributed it, and for two
+  # milestones nothing did. The attribution check below is the other
+  # half, and it is checked against the built binary rather than
+  # against the dependency graph, for the reason the script's own
+  # documentation gives.
   licenses:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/broker
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: taiki-e/install-action@cargo-deny
       - name: License and advisory gate
         run: cargo deny --manifest-path services/broker/Cargo.toml --config deny.toml check
+      # The same release build the budgets job measures, because the
+      # audit reads the crate paths rustc recorded in it.
+      - name: Build the binary the notices are audited against
+        working-directory: services/broker
+        run: cargo build --release --all-features -p sdmqtt
+      - name: The notices may not drift from what ships
+        run: scripts/rust-notices.py --check
 
   devcontainer:
     runs-on: ubuntu-latest
@@ -102,6 +167,36 @@ jobs:
           name: conformance-output
           path: services/broker/conformance/.work/*.out
           if-no-files-found: ignore
+
+  # Section 15 says budgets are checked in CI and that exceeding one
+  # fails the build. Two milestones went by with that untrue, which
+  # convention 8's walk found. Three of the five are checked here; the
+  # script says which and why the other two are not. The interface
+  # bundle is one of the three now that there is an interface, which
+  # is why this job builds it.
+  budgets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/broker
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: services/web/package-lock.json
+      # The bundle is one of the budgets, and an unbuilt one is an
+      # error rather than a budget quietly met.
+      - name: Build the interface
+        working-directory: services/web
+        run: npm ci && npm run build
+      - name: Budgets
+        run: scripts/budgets.sh
 
   fuzz:
     runs-on: ubuntu-latest

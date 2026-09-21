@@ -56,5 +56,5 @@ pub use inflight::{Inflight, InflightEntry, InflightState};
 pub use message::{Message, MessageId};
 pub use outbound::Outbound;
 pub use packet_ids::PacketIds;
-pub use queue::{Delivery, DropReason, Overflow, Queue, QueueLimits};
-pub use state::{Session, StoredWill};
+pub use queue::{Delivery, DropReason, Overflow, Queue, QueueLimits, QueueTotal};
+pub use state::{AttachedSessions, Session, StoredWill};

@@ -18,7 +18,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use broker_core::broker::Broker;
 use clap::{Args, Parser, Subcommand};
 use config::{Config, ConfigError, LogLevel, Overrides};
-use sdmqtt_server::listener::Server;
+use sdmqtt_admin::{
+    AdminRunning, AdminServer, AdminStartError, AdminState, ListenerProtocol, ListenerView,
+    Readiness,
+};
+use sdmqtt_server::listener::{Running, Server};
 use sdmqtt_server::shared::Shared;
 use storage::record::Record;
 use storage::{Storage, StorageError, Writer};
@@ -38,6 +42,20 @@ struct Cli {
 enum Command {
     /// Serve MQTT over TCP.
     Serve(Serve),
+    /// Print the third-party notices for everything in this binary.
+    ///
+    /// Section 3 and the licence policy in
+    /// `docs/research/component-selection.md`: the code compiled into
+    /// this binary is not all MIT, and the licences it is under ask
+    /// for their text to travel with it. Until this existed nothing
+    /// in the repository carried a single one of them, and the readme
+    /// pointed at a file in a release artifact that has never been
+    /// built.
+    ///
+    /// A subcommand rather than only a URL, because the admin
+    /// listener can be turned off and a user who has the binary must
+    /// still be able to read what is in it.
+    Licenses,
 }
 
 /// What `serve` accepts, every one of it optional.
@@ -59,10 +77,23 @@ struct Serve {
     /// written down and a restart loses every session.
     #[arg(long, value_name = "PATH")]
     store_directory: Option<PathBuf>,
+    /// Bind the admin listener here, overriding the file and the
+    /// environment.
+    #[arg(long, value_name = "ADDRESS")]
+    admin_address: Option<std::net::SocketAddr>,
+    /// Do not serve the admin listener.
+    #[arg(long)]
+    no_admin: bool,
     /// One of error, warn, info, debug or trace.
     #[arg(long, value_name = "LEVEL")]
     log_level: Option<LogLevel>,
 }
+
+// There is deliberately no `--admin-token`. A command line is visible
+// in `ps` to every user on the host and is kept in a shell's history,
+// so a flag is the one source of the three that cannot hold a secret
+// safely. The token comes from the configuration file or from
+// `SDMQTT_ADMIN_TOKEN`.
 
 impl Serve {
     /// What this asks the configuration to change.
@@ -72,6 +103,8 @@ impl Serve {
             max_connections: self.max_connections,
             mountpoint: self.mountpoint.clone(),
             store_directory: self.store_directory.clone(),
+            admin_address: self.admin_address,
+            no_admin: self.no_admin,
             log_level: self.log_level,
         }
     }
@@ -82,6 +115,14 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let serve = match cli.command {
         Some(Command::Serve(serve)) => serve,
+        Some(Command::Licenses) => {
+            // Straight to standard output, so that `sdmqtt licenses >
+            // THIRD-PARTY.txt` and a pipe into a pager both do the
+            // obvious thing. Nothing is logged around it: this is not
+            // the broker starting.
+            print!("{}", sdmqtt_admin::NOTICES);
+            return ExitCode::SUCCESS;
+        }
         None => Serve::default(),
     };
 
@@ -125,6 +166,16 @@ enum StartupError {
     /// every connection that worker was driving.
     #[error("cannot start the storage writer: {0}")]
     Writer(#[source] std::io::Error),
+    /// The admin listener would not start.
+    ///
+    /// Its refusal to bind an unprotected address is checked by
+    /// `Config::validate` before anything happens, so what reaches
+    /// here is the socket: something else on the port. Fatal rather
+    /// than degraded, because a broker with no metrics and no health
+    /// endpoints is not a broker anything should be routing traffic
+    /// to, and an operator who wanted one without them can say so.
+    #[error("{0}")]
+    Admin(#[from] AdminStartError),
 }
 
 /// Wait for whichever stop signal comes first, and name it.
@@ -332,6 +383,48 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Arc<Shared>,
     Ok(Arc::new(Shared::with_store(broker, writer)))
 }
 
+/// Start the admin listener beside the MQTT one.
+///
+/// **After restore and beside the listener**, which is the order
+/// section 11.1 asks for: nothing answers a readiness probe until
+/// the store has been read, and liveness answers the moment this
+/// binds. `Ok(None)` is an operator who turned it off.
+///
+/// It is given the readiness gates rather than its own, because what
+/// readiness reports is what *startup* did and startup is here.
+async fn start_admin(
+    config: &Config,
+    running: &Running,
+    readiness: Arc<Readiness>,
+) -> Result<Option<AdminRunning>, StartupError> {
+    if !config.admin.enabled {
+        tracing::warn!(
+            "the admin listener is disabled, so this node serves no health endpoints, \
+             no metrics and no API"
+        );
+        return Ok(None);
+    }
+    let state = AdminState::new(Arc::clone(running.shared()))
+        .with_readiness(readiness)
+        // What this process bound, which nothing can discover: a
+        // socket does not know what it is for and the broker does
+        // not know a listener exists. The admin listener adds its
+        // own row once it knows its port.
+        .with_listeners(vec![ListenerView {
+            name: "mqtt".to_owned(),
+            protocol: ListenerProtocol::Mqtt,
+            address: running.address(),
+            mountpoint: config.listener.mountpoint.clone(),
+            max_connections: Some(config.listener.max_connections),
+        }]);
+    let admin = AdminServer::bind(&config.admin, state).await?;
+    tracing::info!(
+        address = %admin.address(),
+        "the admin API, metrics and health endpoints are serving"
+    );
+    Ok(Some(admin))
+}
+
 /// Configure, restore, bind, and serve until told to stop.
 async fn run(serve: Serve) -> Result<(), StartupError> {
     let config = Config::load(serve.config.as_deref(), &serve.overrides())?;
@@ -343,10 +436,19 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         .with_writer(std::io::stderr)
         .init();
 
+    // The gates a readiness probe reads. They start shut and are
+    // opened below as startup passes each one; liveness reads none of
+    // them, deliberately, so that a probe cannot kill a broker in the
+    // middle of a restore.
+    let readiness = Arc::new(Readiness::starting());
+
     // Section 7.2 and 7.5: the store is opened and the broker rebuilt
     // from it before anything binds.
     let shared = match restore_broker(&config)? {
-        Some(shared) => shared,
+        Some(shared) => {
+            readiness.storage_is_open();
+            shared
+        }
         None => {
             // Loud, because the alternative to a default is silence
             // and silence is what would make this dangerous. An
@@ -358,6 +460,10 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
                  sessions, their subscriptions and their queued messages last as \
                  long as this process and no longer"
             );
+            // A distinct call although it opens the same gate:
+            // running with no store is a supported mode, not a node
+            // that is forever unready.
+            readiness.storage_is_not_configured();
             Arc::new(Shared::new(config.server().broker))
         }
     };
@@ -370,6 +476,12 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         "sdmqtt is serving MQTT over TCP"
     );
 
+    let admin = start_admin(&config, &running, Arc::clone(&readiness)).await?;
+    // Both of them, and only once both are bound. A node that said
+    // it was ready with one listener up would be sent traffic for
+    // the other.
+    readiness.listeners_are_bound();
+
     // A signal is the ordinary way this process ends, so it is an
     // ending rather than an error: the listener stops accepting, the
     // port is released, and the exit status says nothing went wrong.
@@ -380,6 +492,17 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         Err(error) => tracing::error!(%error, "cannot listen for a stop signal; stopping"),
     }
 
+    // **Both stop on the same signal**, and the admin listener stops
+    // first. It is the one with a mutating endpoint, so nothing can
+    // publish into a broker that is being torn down, and it is the
+    // one holding connections that do not end on their own: section
+    // 11.1's events stream. Its shutdown is bounded, so a stream
+    // that ignored the signal delays this by its grace period rather
+    // than forever.
+    if let Some(admin) = admin {
+        admin.shutdown().await;
+        tracing::info!("the admin listener has stopped");
+    }
     running.shutdown().await;
     tracing::info!("stopped");
     Ok(())

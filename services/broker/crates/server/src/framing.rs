@@ -2,6 +2,7 @@
 
 use bytes::BytesMut;
 use mqtt_codec::{decode, CodecError, Limits, Packet, Version};
+use prometheus_client::metrics::counter::Counter;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -33,15 +34,25 @@ pub struct FrameReader<R> {
     inner: R,
     buffer: BytesMut,
     limits: Limits,
+    /// Bytes are counted here, where the socket hands them over.
+    ///
+    /// Not by adding up what the packets that came out should have
+    /// weighed: the whole use of a byte counter is that the two can
+    /// differ, by a half-received frame, by bytes read and then
+    /// rejected, or by a framing bug. An owned handle, so the
+    /// increment is an atomic add and not a lock; see
+    /// [`crate::metrics`].
+    bytes: Counter,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
-    /// A reader over `inner`.
-    pub fn new(inner: R, limits: Limits) -> Self {
+    /// A reader over `inner`, counting what it reads into `bytes`.
+    pub fn new(inner: R, limits: Limits, bytes: Counter) -> Self {
         Self {
             inner,
             buffer: BytesMut::with_capacity(READ_CHUNK),
             limits,
+            bytes,
         }
     }
 
@@ -59,6 +70,11 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 
             self.buffer.reserve(READ_CHUNK);
             let read = self.inner.read_buf(&mut self.buffer).await?;
+            // Counted before anything is decided about it. A frame
+            // that turns out to be malformed still cost the bytes it
+            // arrived in, and a counter that only counts what parsed
+            // cannot be compared against what the interface saw.
+            self.bytes.inc_by(read as u64);
             if read == 0 {
                 if self.buffer.is_empty() {
                     return Ok(None);
@@ -92,7 +108,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut reader = FrameReader::new(server, Limits::default());
+        let mut reader = FrameReader::new(server, Limits::default(), Counter::default());
         let packet = reader.next(Version::V311).await.unwrap().expect("a packet");
         assert_eq!(packet, Packet::PingReq);
     }
@@ -106,7 +122,7 @@ mod tests {
             encode(&ping(), Version::V311, &mut whole).unwrap();
         }
 
-        let mut reader = FrameReader::new(server, Limits::default());
+        let mut reader = FrameReader::new(server, Limits::default(), Counter::default());
         let handle = tokio::spawn(async move {
             for byte in whole.iter().copied() {
                 tokio::io::AsyncWriteExt::write_all(&mut client, &[byte])
@@ -130,7 +146,7 @@ mod tests {
         let (client, server) = duplex(1024);
         drop(client);
 
-        let mut reader = FrameReader::new(server, Limits::default());
+        let mut reader = FrameReader::new(server, Limits::default(), Counter::default());
         assert_eq!(reader.next(Version::V311).await.unwrap(), None);
     }
 
@@ -144,7 +160,7 @@ mod tests {
             .unwrap();
         drop(client);
 
-        let mut reader = FrameReader::new(server, Limits::default());
+        let mut reader = FrameReader::new(server, Limits::default(), Counter::default());
         assert!(reader.next(Version::V311).await.is_err());
     }
 
@@ -156,7 +172,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut reader = FrameReader::new(server, Limits::default());
+        let mut reader = FrameReader::new(server, Limits::default(), Counter::default());
         let error = reader.next(Version::V311).await.unwrap_err();
         assert!(matches!(error, FrameError::Protocol(_)));
     }
@@ -175,9 +191,44 @@ mod tests {
             .await
             .unwrap();
 
-        let mut reader = FrameReader::new(server, limits);
+        let mut reader = FrameReader::new(server, limits, Counter::default());
         let error = reader.next(Version::V311).await.unwrap_err();
         assert!(matches!(error, FrameError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn every_byte_the_socket_hands_over_is_counted() {
+        // The exact number, and read off the socket rather than off
+        // the packets: a counter that added up what the decoded
+        // packets should have weighed would agree with a
+        // greater-than-zero assertion and disagree with this one the
+        // moment a byte arrives that does not decode.
+        let (mut client, server) = duplex(1024);
+        let mut whole = BytesMut::new();
+        for _ in 0..4 {
+            encode(&ping(), Version::V311, &mut whole).unwrap();
+        }
+        // A fifth packet's first byte and nothing more, so the count
+        // is one greater than the four whole packets weigh.
+        whole.extend_from_slice(&[0xC0]);
+        let expected = whole.len() as u64;
+        tokio::io::AsyncWriteExt::write_all(&mut client, &whole)
+            .await
+            .unwrap();
+
+        let bytes = Counter::default();
+        let mut reader = FrameReader::new(server, Limits::default(), bytes.clone());
+        for _ in 0..4 {
+            assert_eq!(
+                reader.next(Version::V311).await.unwrap(),
+                Some(Packet::PingReq)
+            );
+        }
+        assert_eq!(
+            bytes.get(),
+            expected,
+            "the half packet's byte was read and must be counted"
+        );
     }
 
     #[tokio::test]
@@ -192,7 +243,7 @@ mod tests {
             .unwrap();
         drop(client);
 
-        let mut reader = FrameReader::new(server, Limits::default());
+        let mut reader = FrameReader::new(server, Limits::default(), Counter::default());
         for _ in 0..5 {
             assert_eq!(
                 reader.next(Version::V311).await.unwrap(),

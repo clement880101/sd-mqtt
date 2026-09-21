@@ -1,0 +1,29 @@
+{
+  "name": "@sd-mqtt/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The browser interface for sd-mqtt.",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@preact/signals": "^2.11.2",
+    "@tanstack/virtual-core": "^3.17.11",
+    "open-props": "^1.7.23",
+    "preact": "^10.29.8",
+    "preact-iso": "^2.12.2",
+    "uplot": "^1.6.32",
+    "valibot": "^1.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "rollup-plugin-license": "3.7.1",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.0"
+  }
+}

@@ -187,6 +187,72 @@ the rustls default, the fastest provider on every platform they benchmark,
 and the only one with a FIPS path. Non-FIPS builds need a C compiler but not
 cmake. graviola is the pure-Rust option worth revisiting once it matures.
 
+## Verified again before milestone 3
+
+Checked by building against them rather than by reading tables, because the
+storage entry in this document was confidently wrong until it was measured.
+Everything below was kept; what changed is what we know about it.
+
+**axum is not nearly free, and this document implied it was.** The entry says
+it reuses "the same hyper and tokio the broker already runs". The broker does
+not run hyper: the lock file has no hyper, no http and no rustls, because TLS
+is milestone 7. axum at milestone 3 pays for the whole stack up front, **22
+new crates**, measured by diffing dependency trees. It is still the right
+choice, because milestone 7 needs hyper regardless and the alternative is
+writing HTTP by hand, but the reasoning was wrong. Measured cost to the
+binary, with the project's release profile: **365 KB**, or 2.4% of the budget.
+
+**Two new Apache-2.0 obligations enter the shipped binary with it.**
+`sync_wrapper` is Apache-2.0 with no alternative in its expression. `ryu` is
+`Apache-2.0 OR BSL-1.0`, and because BSL-1.0 is not on our allow list the
+resolution is forced to Apache-2.0. Both are permissive and both pass
+`cargo deny` unchanged, but the attribution file must carry Apache-2.0 for
+them. This document previously listed `prometheus-client` as Apache-2.0; it
+is `Apache-2.0 OR MIT` and may be taken as MIT.
+
+**axum's default features cost two crates, not many.** The argument for
+turning them off is therefore not weight. It is that `tower-log` routes
+tower's internals through a second logging facade beside the tracing this
+project standardised on, and that the form extractor widens the surface of a
+JSON-only API. Keep the tracing feature; it costs nothing new.
+
+**`prometheus-client`'s obvious update call takes a lock.** A metric family
+is a read-write-locked map and the guard is held across the increment, so
+incrementing on the packet path would put a shared lock acquisition on every
+packet. The counter behind it is an atomic behind a reference count, so
+resolving every label combination to an owned handle at startup makes the
+increment a bare atomic add. The label cross-product is bounded and static,
+so this costs nothing but saying so.
+
+**Vite 8 is still current**, six months more mature, now bundling with
+Rolldown by default. `build.rollupOptions` is renamed. Precompression is
+still not built in, and is cheaper done in the build script that already
+embeds the bundle than as a twelfth npm dependency.
+
+**uPlot is the one thing to decide deliberately.** Its npm artifact is
+eighteen months old while its repository had commits this week. It is not
+abandoned; it has stopped publishing. We pin the published version and record
+that any fix since is unreachable without pinning a commit, which is worse
+for a shipped dependency because it has no version to audit.
+
+**Preact 11 is at a release candidate.** We start on 10, which is stable and
+what both the signals and routing packages resolve against.
+
+**Attribution comes from `rollup-plugin-license` 3.7.1, MIT, pinned exactly.**
+It reads the post-tree-shaking module graph, so a package installed but never
+imported is correctly absent, which is the thing a node_modules walker cannot
+do. Its declared peer range names Rollup and not Vite, so the compatibility
+is empirical: pinned, with a build assertion that the notices file is
+non-empty and names a package we know is in the bundle. The build fails on a
+licence outside the allow list, and a separate step fails on any difference
+between the regenerated file and the committed one.
+
+Its one gap is that the bundler's own injected runtime helper has no package
+to attribute, so a small companion emits the bundler's own notice when that
+helper is present. Vite's full licence file is not copied, because most of it
+covers Node-side tooling we do not distribute and copying it would
+misrepresent what ships.
+
 ## Rejected outright
 
 | Component | Reason |
@@ -255,16 +321,74 @@ an NCSA component, and aws-lc-rs is ISC AND Apache-2.0 OR ISC.
 
 ### Attribution artifact
 
-`THIRD-PARTY-LICENSES.md` is generated at release time, covering the
-distributed category only, and ships alongside the binary and inside the
-container image. `cargo-about` produces the Rust half from the actual
-dependency graph of the release build, so it reflects enabled features
-rather than a hand-maintained list. A small script produces the JavaScript
-half from the UI's production bundle inputs. The file records each
-component, its license identifier, its copyright line, and the full license
-text once per distinct license. Build-time dependencies are listed in a
-separate appendix marked as not distributed, for auditors who ask.
+**This section described a release artifact that was never built.** It
+said `THIRD-PARTY-LICENSES.md` was generated at release time by
+`cargo-about`; that tool was configured nowhere, there is no release
+workflow, the filename was in `.gitignore`, and the README pointed
+readers at it. So the project shipped eighty-odd crates and five
+browser libraries with no attribution of any kind, which milestone 3
+made worse rather than better: `sync_wrapper` and `ryu` arrive through
+axum, the only branch of either that this project's allow list accepts
+is Apache-2.0, and Apache-2.0 asks for the license text to travel with
+the work. Rewritten below to describe what exists.
+
+**Nothing waits for a release.** The attribution is compiled into the
+binary, because the binary is the artifact a user receives and a
+release tarball is not the only way they receive it. `sdmqtt licenses`
+prints it and the admin listener serves it at
+`/third-party-notices.txt`; both are the same embedded bytes, put there
+by `crates/admin/build.rs`.
+
+Two halves, each generated from what actually ships, each committed so
+that a reader can see it without building anything, and each checked in
+CI against the thing it was generated from:
+
+- **The crates.** `scripts/rust-notices.py` writes
+  `services/broker/THIRD-PARTY-NOTICES.txt` from the packages reachable
+  from `sdmqtt` along normal dependency edges, resolved per target and
+  unioned over the targets this project builds for. Dev-dependencies,
+  build-dependencies and procedural macros are absent: none of them is
+  linked in. Each package's own license file is copied verbatim,
+  deduplicated by text, so the one Apache-2.0 text appears once and a
+  per-crate MIT copyright line keeps its own block. Where a package
+  offers a choice, the branch taken is the cheapest one on `deny.toml`'s
+  allow list — read from `deny.toml` rather than restated — which is
+  what makes `ryu` an Apache-2.0 crate here.
+- **The bundle.** `rollup-plugin-license` and the companion in
+  `services/web/vite.config.ts`, unchanged in principle from what
+  section 11.2 always asked for: generated from the post-tree-shaking
+  module graph plus the stylesheets the bundler inlined.
+
+**`cargo-about` is not used, and this is the deviation.** It would have
+produced the first half from the same dependency graph, at the cost of a
+second tool in every contributor's path and in three CI jobs. The script
+needs only `cargo` and `python3`, which `scripts/budgets.sh` already
+needs. What `cargo-about` would not do is the part that matters most:
+
+**The list is audited against the binary, not trusted.** A dependency
+graph is a manifest, and section 11.2's rule is that the attribution
+comes from the artifact. rustc records the source path of every panic
+site, so the crates that ship are named in the bytes a user receives.
+`scripts/rust-notices.py --check` reads them out of the release binary
+and fails on any crate the binary names that the file does not. The
+converse is deliberately not asserted: a crate can be linked in and
+leave no path string, which `ryu` and `sync_wrapper` both do, so the
+binary names a subset and the graph is what generates the list.
+
+That audit is also what found the piece a manifest cannot: the binary
+carries the Rust standard library and the crates the Rust project
+vendors into it — addr2line, gimli, object, rustc-demangle, hashbrown —
+which arrive prebuilt from the sysroot and appear in no Cargo graph.
+They are attributed in a section of their own, under the MIT branch of
+the Rust project's MIT OR Apache-2.0.
+
+Build-time dependencies are not listed. The category above says why:
+running a tool to produce an artifact does not distribute the tool. An
+appendix naming them was in the original of this section and is dropped
+rather than written, because it would be a list nothing generates and
+nothing checks, which is what the rest of this section is about.
 
 The README states that sd-mqtt is MIT licensed and that it includes
-third-party components under other permissive licenses, with a pointer to
-the attribution file. It does not say that every dependency is MIT.
+third-party components under other permissive licenses, with a pointer
+to both files and to the two ways of reading them out of the binary. It
+does not say that every dependency is MIT.

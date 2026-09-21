@@ -1,0 +1,408 @@
+/*
+ * Hand-written CSS over Open Props tokens.
+ *
+ * **Imported per module, not wholesale.** The tokens are custom
+ * properties on the root element, so nothing tree-shakes them: the
+ * single `open-props` import is about 7.7 KB gzipped whether or not
+ * anything reads a token, where the four modules below are 1.5 to 3.
+ * Adding a fifth is cheap; adding the whole set is not.
+ */
+@import 'open-props/sizes.min.css';
+@import 'open-props/gray.min.css';
+@import 'open-props/fonts.min.css';
+@import 'open-props/borders.min.css';
+
+:root {
+  --surface: var(--gray-0);
+  --surface-raised: #fff;
+  --ink: var(--gray-9);
+  --ink-quiet: var(--gray-6);
+  --edge: var(--gray-3);
+  /*
+   * Two states the interface has to distinguish at a glance: the
+   * connection is up, and it is not. Hand-written rather than
+   * imported, because the two open-props hue modules that would
+   * supply them are 1.5 KB each for two values.
+   */
+  --good: #2f9e44;
+  --bad: #e03131;
+  /*
+   * Chart series. Three, because the widest chart here has two and
+   * a third keeps the second chart from repeating the first's
+   * colour. Chosen for a legible contrast against both surfaces
+   * rather than taken from a palette module that would cost 1.5 KB
+   * a hue.
+   */
+  --series-a: #1c7ed6;
+  --series-b: #f08c00;
+  --series-c: #9c36b5;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: var(--gray-10);
+    --surface-raised: var(--gray-9);
+    --ink: var(--gray-1);
+    --ink-quiet: var(--gray-5);
+    --edge: var(--gray-8);
+    --good: #51cf66;
+    --bad: #ff6b6b;
+    --series-a: #4dabf7;
+    --series-b: #ffc078;
+    --series-c: #da77f2;
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-1);
+  line-height: var(--font-lineheight-3);
+}
+
+.nav {
+  display: flex;
+  gap: var(--size-5);
+  align-items: baseline;
+  padding: var(--size-3) var(--size-5);
+  border-block-end: var(--border-size-1) solid var(--edge);
+  background: var(--surface-raised);
+}
+
+.nav .brand {
+  font-weight: var(--font-weight-7);
+  letter-spacing: var(--font-letterspacing-0);
+}
+
+.nav ul {
+  display: flex;
+  gap: var(--size-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nav a {
+  color: var(--ink-quiet);
+  text-decoration: none;
+  padding-block-end: var(--size-1);
+  border-block-end: var(--border-size-2) solid transparent;
+}
+
+.nav a[aria-current='page'] {
+  color: var(--ink);
+  border-block-end-color: currentColor;
+}
+
+main {
+  padding: var(--size-5);
+}
+
+.page h1 {
+  margin-block: 0 var(--size-3);
+  font-size: var(--font-size-4);
+}
+
+.empty {
+  color: var(--ink-quiet);
+}
+
+/* ------------------------------------------------------------------
+ * The live connection's state, in the navigation bar.
+ * ---------------------------------------------------------------- */
+
+.live {
+  margin: 0;
+  margin-inline-start: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--size-2);
+  color: var(--ink-quiet);
+  font-size: var(--font-size-0);
+}
+
+.live-dot {
+  inline-size: var(--size-2);
+  block-size: var(--size-2);
+  border-radius: var(--radius-round);
+  background: currentColor;
+}
+
+.live-live .live-dot {
+  color: var(--good);
+}
+
+.live-lost {
+  color: var(--bad);
+  font-weight: var(--font-weight-6);
+}
+
+.live-connecting .live-dot {
+  color: var(--ink-quiet);
+}
+
+.live-id {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------------
+ * The Overview page.
+ * ---------------------------------------------------------------- */
+
+.gauges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-3);
+  margin-block-end: var(--size-4);
+}
+
+.gauge {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: var(--size-11);
+  padding: var(--size-3);
+  border: var(--border-size-1) solid var(--edge);
+  border-radius: var(--radius-2);
+  background: var(--surface-raised);
+}
+
+.gauge-value {
+  font-size: var(--font-size-5);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+
+.gauge-label {
+  color: var(--ink-quiet);
+  font-size: var(--font-size-0);
+}
+
+.charts {
+  display: grid;
+  gap: var(--size-4);
+  grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr));
+}
+
+.chart {
+  inline-size: 100%;
+  padding: var(--size-2);
+  border: var(--border-size-1) solid var(--edge);
+  border-radius: var(--radius-2);
+  background: var(--surface-raised);
+}
+
+.quiet {
+  color: var(--ink-quiet);
+  font-size: var(--font-size-0);
+}
+
+.notice {
+  padding: var(--size-2) var(--size-3);
+  border-inline-start: var(--border-size-3) solid var(--series-b);
+  background: var(--surface-raised);
+}
+
+.failure {
+  padding: var(--size-2) var(--size-3);
+  border-inline-start: var(--border-size-3) solid var(--bad);
+  background: var(--surface-raised);
+  color: var(--bad);
+}
+
+/*
+ * uPlot draws its own text in its own colours. These are the two
+ * that are not set through its options.
+ */
+.u-title,
+.u-legend {
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-0);
+}
+
+/* ------------------------------------------------------------------
+ * The Clients table, which is windowed: the scroller holds a sizer
+ * of the full height and a handful of absolutely placed rows.
+ * ---------------------------------------------------------------- */
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--size-3);
+  margin-block-end: var(--size-3);
+}
+
+.controls label {
+  display: flex;
+  align-items: center;
+  gap: var(--size-2);
+}
+
+input[type='search'],
+input[type='text'],
+input[type='number'],
+select,
+textarea {
+  padding: var(--size-1) var(--size-2);
+  border: var(--border-size-1) solid var(--edge);
+  border-radius: var(--radius-2);
+  background: var(--surface-raised);
+  color: var(--ink);
+  font: inherit;
+}
+
+button {
+  padding: var(--size-1) var(--size-3);
+  border: var(--border-size-1) solid var(--edge);
+  border-radius: var(--radius-2);
+  background: var(--surface-raised);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  color: var(--ink-quiet);
+  cursor: default;
+}
+
+.table {
+  border: var(--border-size-1) solid var(--edge);
+  border-radius: var(--radius-2);
+  background: var(--surface-raised);
+  overflow: hidden;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: minmax(8rem, 2fr) minmax(5rem, 1fr) 5rem 4rem 5rem 5rem 5rem;
+  gap: var(--size-2);
+  align-items: center;
+  padding-inline: var(--size-3);
+  border-block-end: var(--border-size-1) solid var(--edge);
+  font-size: var(--font-size-0);
+  font-variant-numeric: tabular-nums;
+}
+
+.row.head {
+  position: sticky;
+  inset-block-start: 0;
+  block-size: var(--size-7);
+  color: var(--ink-quiet);
+  text-transform: uppercase;
+  letter-spacing: var(--font-letterspacing-1);
+  font-size: var(--font-size-00);
+}
+
+.row.partial {
+  color: var(--ink-quiet);
+  font-style: italic;
+}
+
+.row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.scroller {
+  block-size: 60vh;
+  overflow: auto;
+  contain: strict;
+}
+
+.sizer {
+  position: relative;
+  inline-size: 100%;
+}
+
+.sizer .row {
+  position: absolute;
+  inset-inline: 0;
+  inset-block-start: 0;
+}
+
+.footer {
+  margin-block-start: var(--size-3);
+}
+
+/* ------------------------------------------------------------------
+ * The Topics page: a publish form, the retained browser and the
+ * watcher.
+ * ---------------------------------------------------------------- */
+
+.page h2 {
+  margin-block: var(--size-5) var(--size-2);
+  font-size: var(--font-size-3);
+}
+
+.fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--size-3);
+}
+
+.fields label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-1);
+  font-size: var(--font-size-0);
+  color: var(--ink-quiet);
+}
+
+.fields label.inline {
+  flex-direction: row;
+  align-items: center;
+  padding-block-end: var(--size-2);
+}
+
+.fields textarea {
+  min-inline-size: 22rem;
+}
+
+.problem {
+  color: var(--bad);
+  max-inline-size: 22rem;
+}
+
+.hint {
+  color: var(--ink-quiet);
+  font-size: var(--font-size-0);
+}
+
+input[aria-invalid='true'] {
+  border-color: var(--bad);
+}
+
+.rows {
+  max-block-size: 40vh;
+  overflow: auto;
+}
+
+.retained-row {
+  grid-template-columns: minmax(10rem, 2fr) minmax(10rem, 3fr) 3rem 5rem 6rem;
+  min-block-size: var(--size-7);
+}
+
+/* A tapped message: when, where, what, and how it was published. */
+.tap-row {
+  grid-template-columns: 7rem minmax(10rem, 2fr) minmax(10rem, 3fr) 3rem 4rem;
+  min-block-size: var(--size-7);
+}
+
+.row.fresh {
+  background: color-mix(in oklab, var(--series-b) 18%, transparent);
+}
+
+.rows .empty {
+  padding: var(--size-3);
+}
