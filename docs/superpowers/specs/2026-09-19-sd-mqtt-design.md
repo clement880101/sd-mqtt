@@ -937,7 +937,7 @@ in CI, not when the code is written.
 |---|---|---|---|
 | Release binary, all features, stripped, link-time optimized | under 15 MB | 2.52 MB | every push |
 | Idle resident memory, single node, no clients | under 30 MB | not yet measured | scheduled |
-| UI bundle, gzipped | under 150 KB | no interface yet | reported as skipped |
+| UI bundle, gzipped | under 150 KB | 13.3 KB | every push |
 | Direct dependencies across broker crates | under 35 | 14 | every push |
 | Concurrent connections per node, target hardware | 100,000 | not yet measured | milestone 7 |
 
@@ -970,10 +970,17 @@ milestone 7's to prove.
 `scripts/budgets.sh` is what does it, from the `budgets` job. It prints
 every budget's measurement and its headroom whether or not the budget
 is met, because a green tick cannot tell 94% from 4%. The interface
-bundle cannot be measured until there is an interface, so that line
-reports **skipped, and why**, rather than passing: a check that
-quietly passes when it cannot measure is worse than no check, and
-would report three budgets met having looked at two.
+bundle reported **skipped, and why** until there was an interface to
+weigh; the pipeline of section 11.2 built one, and the shell measured
+13.3 KB across three documents. The rule that line was an instance of
+stands: a check that quietly passes when it cannot measure is worse
+than no check, so an unbuilt interface now fails the script naming
+what to run rather than passing it having looked at two budgets.
+
+The bundle is summed per file rather than compressed as one stream,
+because each document is compressed and served on its own. Gzipping
+the concatenation reads several kilobytes lower by sharing a
+dictionary across files that never travel together.
 
 ## 16. Milestones
 

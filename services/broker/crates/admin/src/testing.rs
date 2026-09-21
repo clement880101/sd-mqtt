@@ -48,6 +48,58 @@ pub(crate) async fn get(address: SocketAddr, path: &str) -> Response {
     request(address, "GET", path, None).await
 }
 
+/// What came back, before anything decided it was text.
+///
+/// The interface is served precompressed, so half of what this crate
+/// answers with is not UTF-8 and reading it as a string would panic
+/// on the bytes the test is about.
+#[derive(Debug)]
+pub(crate) struct Raw {
+    /// The status code from the status line.
+    pub status: u16,
+    /// The headers, lowercased names, in the order they arrived.
+    pub headers: Vec<(String, String)>,
+    /// The body exactly as it arrived.
+    pub body: Vec<u8>,
+}
+
+impl Raw {
+    /// One header's value, by lowercased name.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(had, _)| had == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// `GET path` carrying `headers`, keeping the body as bytes.
+pub(crate) async fn get_raw(address: SocketAddr, path: &str, headers: &[(&str, &str)]) -> Raw {
+    let mut stream = TcpStream::connect(address)
+        .await
+        .expect("the admin listener accepts");
+    let mut head = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("the request is written");
+    stream.flush().await.expect("and flushed");
+
+    let mut raw = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read_to_end(&mut raw),
+    )
+    .await
+    .expect("the response ends")
+    .expect("the socket is readable");
+    split(&raw)
+}
+
 /// One request with no body, and the whole of the response.
 pub(crate) async fn request(
     address: SocketAddr,
@@ -120,8 +172,19 @@ pub(crate) async fn with_body(
     parse(&raw)
 }
 
-/// Split a response into its status, its headers and its body.
+/// Split a response into its status, its headers and its body,
+/// insisting the body is text.
 fn parse(raw: &[u8]) -> Response {
+    let split = split(raw);
+    Response {
+        status: split.status,
+        headers: split.headers,
+        body: String::from_utf8(split.body).expect("the body is text"),
+    }
+}
+
+/// Split a response into its status, its headers and its body.
+fn split(raw: &[u8]) -> Raw {
     let split = raw
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -152,10 +215,10 @@ fn parse(raw: &[u8]) -> Response {
         body.to_vec()
     };
 
-    Response {
+    Raw {
         status,
         headers,
-        body: String::from_utf8(body).expect("the body is text"),
+        body,
     }
 }
 

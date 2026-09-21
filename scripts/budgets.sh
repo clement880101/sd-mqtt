@@ -22,10 +22,11 @@
 #
 # # A budget that cannot be measured says so
 #
-# The interface bundle does not exist yet. A check that quietly passes
-# when it cannot measure is worse than no check, because it reports
-# three budgets met when it looked at two. That line prints SKIPPED and
-# says why, and the summary counts it separately.
+# This said the interface bundle did not exist yet and printed SKIPPED
+# for it. It exists now and is measured. The rule it was an instance of
+# stands: a check that quietly passes when it cannot measure is worse
+# than no check, so an unbuilt interface is an error naming what to run
+# rather than a budget quietly met.
 #
 # # Usage
 #
@@ -59,12 +60,11 @@ BUDGET_BINARY_BYTES=15000000
 # to the suite it downloads.
 BUDGET_DIRECT_DEPS=35
 
-# "UI bundle, gzipped: under 150 KB". Not measurable yet; see below.
+# "UI bundle, gzipped: under 150 KB".
 BUDGET_BUNDLE_BYTES=150000
 
 checked=0
 over=0
-skipped=0
 failures=()
 
 # Print one budget's line, and remember it if it is over.
@@ -90,14 +90,6 @@ report() {
         printf '  %-32s %13s of %-12s %3d%% headroom   ok\n' \
             "$name" "$shown" "$allowed" "$(((limit - measured) * 100 / limit))"
     fi
-}
-
-# Print one budget that could not be measured, and why.
-skip() {
-    local name="$1" why="$2"
-    skipped=$((skipped + 1))
-    printf '  %-32s %13s %-12s   SKIPPED\n' "$name" "not" "measured"
-    printf '      %s\n' "$why"
 }
 
 megabytes() {
@@ -174,24 +166,45 @@ printf '      %s\n' "$direct_names"
 # The interface bundle.
 # ---------------------------------------------------------------------
 
-# Vite's default output directory, in the service the interface is
-# scaffolded in. Empty but for a dev container today.
+# Vite's default output directory, named by `services/web/vite.config.ts`.
+#
+# **Summed per file, not gzipped as one stream.** Every document is
+# compressed on its own by `crates/admin/build.rs` and served on its
+# own, so the sum of the individual compressed sizes is what a browser
+# downloads and what the binary carries. Concatenating first and
+# compressing once reads several kilobytes lower, because the
+# compressor gets to share a dictionary across files that never travel
+# together, and a budget that flatters itself is not a budget.
+#
+# Everything in the directory counts, not only scripts and styles:
+# fonts, icons and images are embedded and served too, and a budget
+# that looks at half of what ships is the same mistake in a different
+# place.
 bundle_dir="$here/services/web/dist"
-if [ -d "$bundle_dir" ]; then
-    bundle_bytes=$(
-        find "$bundle_dir" -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' \) \
-            -exec cat {} + | gzip -9 -c | wc -c | tr -d ' '
-    )
-    report "interface bundle, gzipped" "$bundle_bytes" "$BUDGET_BUNDLE_BYTES" kilobytes
-else
-    skip "interface bundle, gzipped" \
-        "there is no interface yet. services/web holds nothing but a dev container, so there is no services/web/dist to weigh; milestone 3 builds it. Printed rather than omitted: a check that quietly passes when it cannot measure reports three budgets met having looked at two."
+if [ ! -d "$bundle_dir" ]; then
+    # Not skipped. It was skipped while there was no interface to
+    # weigh; there is one now, and a check that quietly passes when it
+    # cannot measure is worse than no check.
+    echo "  the interface bundle is not built, so it cannot be weighed" >&2
+    echo "  build it first:  (cd services/web && npm ci && npm run build)" >&2
+    exit 2
 fi
+bundle_bytes=$(
+    find "$bundle_dir" -type f -exec gzip -9 -c {} + 2>/dev/null |
+        wc -c | tr -d ' '
+)
+if [ -z "$bundle_bytes" ] || [ "$bundle_bytes" -eq 0 ]; then
+    echo "  $bundle_dir holds no files; the interface build produced nothing" >&2
+    exit 2
+fi
+report "interface bundle, gzipped" "$bundle_bytes" "$BUDGET_BUNDLE_BYTES" kilobytes
+bundle_files=$(find "$bundle_dir" -type f | wc -l | tr -d ' ')
+printf '      %s documents, each compressed and embedded on its own\n' "$bundle_files"
 
 # ---------------------------------------------------------------------
 
 echo
-printf '  %d measured, %d over budget, %d skipped\n' "$checked" "$over" "$skipped"
+printf '  %d measured, %d over budget\n' "$checked" "$over"
 if [ "$over" -gt 0 ]; then
     echo
     for failure in "${failures[@]}"; do

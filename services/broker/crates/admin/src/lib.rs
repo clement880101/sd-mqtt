@@ -31,6 +31,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
+pub mod assets;
 pub mod config;
 pub mod error;
 pub mod events;
@@ -40,6 +41,7 @@ pub mod resources;
 #[cfg(test)]
 mod testing;
 
+pub use assets::INTERFACE_BUILT;
 pub use config::{AdminConfig, AdminStartError, Token};
 pub use error::{ApiError, ErrorCode};
 pub use events::{EventBody, EventId, Events};
@@ -278,6 +280,10 @@ impl AdminServer {
 /// returns has the one shape, and "the path you asked for is not
 /// served" is a failure a client has to be able to tell from a proxy
 /// that swallowed the request.
+///
+/// The `404` half of that now lives in [`assets`], because the same
+/// fallback has to decide whether the path is a document of the
+/// interface first.
 fn router(state: AdminState) -> Router {
     // **No compression layer, deliberately.** Section 11.1: a
     // compression layer applied across this listener would turn the
@@ -287,7 +293,11 @@ fn router(state: AdminState) -> Router {
         .merge(health::routes())
         .merge(resources::routes())
         .merge(events::routes())
-        .fallback(error::not_found)
+        // The interface, and the one error shape for everything that
+        // is neither a route above nor a document. See [`assets`]:
+        // the set of documents is not known until the build script
+        // has run, so they are matched here rather than registered.
+        .fallback(assets::fallback)
         .method_not_allowed_fallback(error::method_not_allowed)
         .with_state(state)
 }

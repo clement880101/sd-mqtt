@@ -137,9 +137,9 @@ jobs:
   # Section 15 says budgets are checked in CI and that exceeding one
   # fails the build. Two milestones went by with that untrue, which
   # convention 8's walk found. Three of the five are checked here; the
-  # script says which and why the other two are not, and says out loud
-  # that the interface bundle cannot be measured yet rather than
-  # counting it as passed.
+  # script says which and why the other two are not. The interface
+  # bundle is one of the three now that there is an interface, which
+  # is why this job builds it.
   budgets:
     runs-on: ubuntu-latest
     steps:
@@ -151,6 +151,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: services/web/package-lock.json
+      # The bundle is one of the budgets, and an unbuilt one is an
+      # error rather than a budget quietly met.
+      - name: Build the interface
+        working-directory: services/web
+        run: npm ci && npm run build
       - name: Budgets
         run: scripts/budgets.sh
 

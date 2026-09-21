@@ -81,6 +81,15 @@ pub enum ErrorCode {
     NotFound,
     /// That path does not accept that method.
     MethodNotAllowed,
+    /// The representations this resource has are all excluded by what
+    /// the request said it would accept.
+    ///
+    /// Today this is content **coding**: `Accept-Encoding` naming
+    /// every encoding the interface is embedded in at a quality of
+    /// zero. A quality of zero means not acceptable, so answering
+    /// with one of them anyway is answering with something the client
+    /// said it cannot use.
+    NotAcceptable,
     /// A token is configured and the request did not present the
     /// right one.
     ///
@@ -101,6 +110,7 @@ impl ErrorCode {
             ErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
             ErrorCode::NotFound => StatusCode::NOT_FOUND,
             ErrorCode::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
+            ErrorCode::NotAcceptable => StatusCode::NOT_ACCEPTABLE,
             ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -169,16 +179,6 @@ impl IntoResponse for ApiError {
         // The status comes from the code and from nowhere else.
         (self.error.code.status(), Json(self)).into_response()
     }
-}
-
-/// What answers a path this API does not serve.
-///
-/// Registered as the router's fallback rather than left to axum's
-/// default, which is an empty `404` with no body at all. A client
-/// that gets one of those cannot tell a path it spelled wrong from a
-/// proxy that swallowed the request.
-pub(crate) async fn not_found() -> ApiError {
-    ApiError::not_found("no such resource on this listener")
 }
 
 /// What answers a method a served path does not accept.

@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "The admin listener for sd-mqtt: health, metrics, and the read resources"
+# Precompresses the built interface and embeds it. See build.rs: with
+# no `services/web/dist` present it embeds a page saying so instead,
+# because section 11.2 says a build of the binary must not require
+# Node.
+build = "build.rs"
 
 [dependencies]
 broker-core = { path = "../broker-core", version = "0.1.0" }
@@ -59,6 +64,18 @@ tokio = { version = "1", default-features = false, features = [
     "macros",
 ] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+# Build-time only, and so not distributed: these run to produce an
+# artifact and never reach a user. They are also invisible to the
+# direct-dependency budget of section 15, which counts what ships.
+[build-dependencies]
+# gzip. The `rust_backend` feature keeps it to miniz_oxide rather than
+# linking a C zlib, which is one fewer thing for a cross build to
+# find.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# brotli, at quality 11. Pure Rust, and the decompressor is a browser's
+# problem rather than ours.
+brotli = { version = "8", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # The admin tests speak HTTP over a real socket rather than calling the
