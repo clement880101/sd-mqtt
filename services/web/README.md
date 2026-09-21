@@ -158,6 +158,15 @@ with history that is already visible. So a topic retained an hour
 ago and not published to since is in the list above the watcher, not
 in it.
 
+**Every tap route needs the token**, reads included, which is not
+the rule the read resources follow. Reading a tap renews its lease,
+and a lease is how long a session lives inside the broker, so a read
+here changes broker state in the only sense that matters. The
+practical consequence is the one publishing already has: on a broker
+with `admin.token` configured, this application cannot open a tap,
+because it has nowhere to put a bearer token yet. Milestone 7's API
+keys are what fixes that, for both.
+
 **What it costs.** A tap is a client. It appears on the Clients page
 as `$admin-tap-<n>`, which is deliberate — a session the Clients
 page cannot explain is worse than one with an odd name — and its
