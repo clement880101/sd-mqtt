@@ -23,7 +23,7 @@
 //! per-session queue bounds are therefore all the broker's, already
 //! tested where they live.
 //!
-//! # The four limits, and why each is the number it is
+//! # The five limits, and why each is the number it is
 //!
 //! A tap is a way for somebody holding the interface to make the
 //! broker do work, and a filter of `#` on a busy broker is the
@@ -43,7 +43,24 @@
 //! tap somebody is watching, and a watcher that goes quiet for a
 //! reason it is not told is the failure this whole feature exists to
 //! stop. A tap the broker has closed does not count, because it holds
-//! no broker resources any more; see [`Taps::reserve`].
+//! no broker resources any more; see [`Taps::reserve`]. That
+//! exemption is only sound because a closed tap really does give
+//! everything back — see [`Inner::close`], which drops its ring —
+//! and because the list it stays in is itself bounded by
+//! [`MAX_CLOSED_KEPT`]. It was neither: a closed tap kept a ring of
+//! up to 256 messages and counted against nothing, and a caller
+//! holding the token and an MQTT connection could close one on
+//! demand by connecting a real client under its identifier and then
+//! open another, for as long as it liked.
+//!
+//! **[`MAX_CLOSED_KEPT`], how many closed taps are remembered: 8.**
+//! A closed tap still answers, so that a reader learns why rather
+//! than meeting a `404` it cannot explain, and that is worth
+//! keeping — for a while. Eight is [`MAX_TAPS`], which covers every
+//! open tap being closed at once; past it the oldest is forgotten
+//! and its reader is answered by [`gone`], which already names
+//! "somebody closed it" as one of the three things a missing tap
+//! means.
 //!
 //! **[`TAP_CAPACITY`], how many messages one tap holds: 256, and the
 //! oldest goes.** The page renders the ring as a plain list and is
@@ -124,7 +141,9 @@
 //!    epoch check in `Tap::teardown` is what stops it then
 //!    detaching the newcomer.
 //! 7. **A full ring drops; it never pushes back.** There is no path
-//!    from this module to anything the broker waits on.
+//!    from this module to anything the broker waits on. And a ring
+//!    whose tap has been closed is not held at all; see
+//!    [`Inner::close`].
 //!
 //! **How much of that a test can see**, because the list is worth
 //! less if it is seven assertions. Four, five and six have tests of
@@ -197,6 +216,27 @@ pub const MAX_PAYLOAD_BYTES: usize = MAX_INLINE_PAYLOAD;
 
 /// How long a tap survives with nobody reading it.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How many taps the broker has closed are kept so that their
+/// readers can still be told why.
+///
+/// [`MAX_TAPS`], because the situation it covers is every open tap
+/// being closed at once — a restart of whatever was publishing
+/// under their identifiers — and every one of those readers is owed
+/// the sentence that explains it. Past that the oldest closed tap is
+/// forgotten, and a reader that comes back to it is answered by
+/// [`gone`], which already says that "somebody closed it" is one of
+/// the three things a missing tap can mean.
+///
+/// **Why it needs a bound at all.** A closed tap does not count
+/// against [`MAX_TAPS`], which is right — it holds nothing the
+/// broker has to do anything about — but it was held in a list
+/// pruned only by an explicit delete, by the idle sweep and by
+/// shutdown. Displacing a tap's session with a real client of the
+/// same name closes it without touching that list, and it can be
+/// done again immediately. The cap was therefore not a cap on
+/// anything a caller could not walk around.
+pub const MAX_CLOSED_KEPT: usize = MAX_TAPS;
 
 /// How often the sweep looks for one that has.
 ///
@@ -420,6 +460,38 @@ impl Inner {
             self.dropped += 1;
         }
     }
+
+    /// The broker has ended this tap's session: say why, and let the
+    /// ring go.
+    ///
+    /// **The ring is freed here and not left to the reaper.** A
+    /// closed tap holds no broker resources, which is why it stops
+    /// counting against [`MAX_TAPS`] — and the whole of that
+    /// sentence has to be true. A ring of up to
+    /// [`TAP_CAPACITY`] messages, each carrying up to
+    /// [`MAX_PAYLOAD_BYTES`] of payload, is a quarter of a megabyte
+    /// that counted against nothing: a caller with the token and an
+    /// MQTT connection could displace a tap's session with a real
+    /// client of the same name, open another, and do it again, for
+    /// as long as it liked.
+    ///
+    /// What a reader loses is what it had not read yet, and it is
+    /// told: with the ring empty, the oldest sequence it could have
+    /// been given is the next one, so [`Tap::read`] reports
+    /// everything between the reader's cursor and the end as
+    /// `missed`. The counters — delivered, dropped, lost — are
+    /// kept, because they are what the tap is still asked about.
+    ///
+    /// The first reason wins. A tap is closed once; a second call
+    /// would be a later cause overwriting the one that actually
+    /// ended it.
+    fn close(&mut self, reason: String) {
+        if self.closed.is_none() {
+            self.closed = Some(reason);
+        }
+        self.held.clear();
+        self.held.shrink_to_fit();
+    }
 }
 
 /// The part of a tap the drain task shares with the handlers.
@@ -634,9 +706,44 @@ impl Held {
     ///
     /// A **closed** tap is not counted. It holds nothing the broker
     /// has to do anything about, and refusing a new tap because of
-    /// one would be capping history rather than work.
+    /// one would be capping history rather than work. That is only
+    /// true because a closed tap gives up its ring — see
+    /// [`Inner::close`] — and because there are only ever
+    /// [`MAX_CLOSED_KEPT`] of them; the exemption and the two bounds
+    /// that make it honest belong together.
+    ///
+    /// Guarded by `a_closed_tap_does_not_take_the_next_one_s_slot`,
+    /// which fails if this counts them.
     fn taken(&self) -> usize {
         self.taps.iter().filter(|tap| tap.is_live()).count() + self.reserved
+    }
+
+    /// Take the oldest closed taps out, down to [`MAX_CLOSED_KEPT`].
+    ///
+    /// Returns them so the caller can hand back whatever they still
+    /// hold **outside** this lock, which is the same rule
+    /// [`Taps::take`] follows and for the same reason: teardown
+    /// takes the broker lock.
+    fn overflowing_closed(&mut self) -> Vec<Arc<Tap>> {
+        let mut over = self.taps.iter().filter(|tap| !tap.is_live()).count();
+        if over <= MAX_CLOSED_KEPT {
+            return Vec::new();
+        }
+        over -= MAX_CLOSED_KEPT;
+        let mut forgotten = Vec::new();
+        // `retain` visits in order, so the ones forgotten are the
+        // oldest: a reader is most likely to come back for the tap
+        // that has just ended.
+        self.taps.retain(|tap| {
+            if over > 0 && !tap.is_live() {
+                over -= 1;
+                forgotten.push(Arc::clone(tap));
+                false
+            } else {
+                true
+            }
+        });
+        forgotten
     }
 }
 
@@ -749,6 +856,10 @@ impl Taps {
     /// one that did nothing. Convention 5: the assertion that a tap
     /// expired must be able to fail for the right reason.
     pub fn reap(&self, shared: &Shared, now: Instant) -> usize {
+        // Closed taps first, so that a list nobody is opening into
+        // is still bounded: the sweep runs every [`REAP_INTERVAL`]
+        // whether or not anybody opens a tap again.
+        self.prune(shared);
         let expired: Vec<Arc<Tap>> = {
             let mut held = self.held.lock();
             let mut expired = Vec::new();
@@ -771,6 +882,32 @@ impl Taps {
             tap.teardown(shared);
         }
         expired.len()
+    }
+
+    /// Forget closed taps past [`MAX_CLOSED_KEPT`].
+    ///
+    /// Returns how many were forgotten, for the same reason
+    /// [`Taps::reap`] does: a sweep whose only effect is that
+    /// something is gone cannot otherwise be told from one that did
+    /// nothing.
+    ///
+    /// Each is torn down on the way out even though the broker has
+    /// already closed its session. Teardown is the one place that
+    /// knows whether the session is still ours — the epoch check —
+    /// and a tap closed by something other than a takeover may still
+    /// have a subscription in the trie and an outbox in the shell.
+    /// Dropping the last handle to it would leave both.
+    pub fn prune(&self, shared: &Shared) -> usize {
+        let forgotten = self.held.lock().overflowing_closed();
+        for tap in &forgotten {
+            tracing::debug!(
+                tap = tap.id,
+                filter = %tap.filter,
+                "a closed tap was forgotten to keep the list bounded"
+            );
+            tap.teardown(shared);
+        }
+        forgotten.len()
     }
 
     /// Close and forget every tap, whatever its lease says.
@@ -944,6 +1081,11 @@ pub fn open(state: &AdminState, filter: &str) -> Result<Arc<Tap>, ApiError> {
     let task = tokio::spawn(drain(Arc::clone(&state_inner), outbox));
     *tap.task.lock() = Some(task);
     slot.fill(Arc::clone(&tap));
+    // Here as well as in the sweep, because this is the path the
+    // cycle walks: close a tap by displacing its session, open
+    // another, repeat. Waiting for the sweep would let that run for
+    // [`REAP_INTERVAL`] unbounded.
+    state.taps.prune(&state.shared);
     tracing::info!(tap = id, %filter, "a tap was opened");
     Ok(tap)
 }
@@ -1046,18 +1188,20 @@ async fn drain(state: Arc<TapState>, mut outbox: mpsc::Receiver<Action>) {
                 state.inner.lock().lost += 1;
             }
             Action::Close(reason) => {
-                state.inner.lock().closed =
-                    Some(format!("the broker closed this tap's session: {reason:?}"));
+                state
+                    .inner
+                    .lock()
+                    .close(format!("the broker closed this tap's session: {reason:?}"));
                 return;
             }
             // A SUBACK, an UNSUBACK, a PINGRESP. Nothing a tap shows.
             Action::Send(_) => {}
         }
     }
-    let mut inner = state.inner.lock();
-    if inner.closed.is_none() {
-        inner.closed = Some("this tap's session went away".to_owned());
-    }
+    state
+        .inner
+        .lock()
+        .close("this tap's session went away".to_owned());
 }
 
 /// Sweep expired taps until this listener stops.
@@ -2296,6 +2440,138 @@ mod tests {
     ///
     /// A session still attached when the process stops never had its
     /// departure written down.
+    /// A closed tap is not holding the next one's slot.
+    ///
+    /// **This is the test the exemption did not have.** A closed tap
+    /// deliberately does not count against [`MAX_TAPS`], said twice
+    /// in the documentation and guarded by nothing: changing
+    /// [`Held::taken`] to count closed taps as well passed the whole
+    /// suite, which made it a rule no test could see. It fails here.
+    #[tokio::test]
+    async fn a_closed_tap_does_not_take_the_next_ones_slot() {
+        let both = Both::start().await;
+        for index in 0..MAX_TAPS {
+            let answer = both.open(&format!("a/{index}")).await;
+            assert_eq!(answer.status, 200, "tap {index}: {}", answer.body);
+        }
+        let full = both.open("one/too/many").await;
+        assert_eq!(full.status, 429, "the cap is real: {}", full.body);
+
+        // Close one the way a caller who does not own it can: by
+        // connecting a real client under its identifier, which the
+        // broker hands the session to.
+        let first = both.read(1, None).await;
+        let name = first["client_id"].as_str().expect("a name").to_owned();
+        let (_displacing, _buf) = handshake(&both.mqtt, &name).await;
+        both.until(1, |read| !read["closed"].is_null()).await;
+
+        let list = json(
+            &testing::get(both.admin.address(), "/api/v1/taps")
+                .await
+                .body,
+        );
+        assert_eq!(list["live"], MAX_TAPS - 1, "{list}");
+        let allowed = both.open("one/too/many").await;
+        assert_eq!(
+            allowed.status, 200,
+            "a tap the broker has closed holds nothing, so it holds no slot: {}",
+            allowed.body
+        );
+        both.stop().await;
+    }
+
+    /// A closed tap gives its ring back, and says what that cost
+    /// whoever was reading it.
+    #[tokio::test]
+    async fn a_closed_tap_gives_up_its_ring() {
+        let both = Both::start().await;
+        let opened = both.tap("ring/#").await;
+        let name = opened["client_id"].as_str().expect("a name").to_owned();
+
+        let (mut publisher, _buf) = handshake(&both.mqtt, "publisher").await;
+        for index in 0..3 {
+            send(
+                &mut publisher,
+                &publication("ring/one", index.to_string().as_bytes(), false),
+            )
+            .await;
+        }
+        let filled = both.until(1, |read| count(read) == 3).await;
+        assert_eq!(number(&filled, "delivered"), 3);
+
+        // The takeover, which is the close a caller can cause.
+        let (_displacing, _buf) = handshake(&both.mqtt, &name).await;
+        let closed = both.until(1, |read| !read["closed"].is_null()).await;
+        assert_eq!(
+            count(&closed),
+            0,
+            "the ring went with the session: {closed}"
+        );
+        assert_eq!(
+            number(&closed, "delivered"),
+            3,
+            "and what it caught is still reported: {closed}"
+        );
+
+        // A reader whose cursor was behind is told what it lost,
+        // rather than finding an empty list that looks like a quiet
+        // filter.
+        let behind = both.read(1, Some(0)).await;
+        assert_eq!(number(&behind, "missed"), 3, "{behind}");
+        both.stop().await;
+    }
+
+    /// Closed taps do not pile up.
+    ///
+    /// The list they sit in was pruned only by an explicit delete,
+    /// by the idle sweep and by shutdown, and none of those is on
+    /// the path a caller cycling taps walks: displace a tap's
+    /// session with a real client of the same name, open another,
+    /// again. Every one of them kept its ring.
+    #[tokio::test]
+    async fn closed_taps_do_not_pile_up() {
+        let both = Both::start().await;
+        let cycles = MAX_CLOSED_KEPT + 4;
+        // The displacing clients are kept alive: a socket that
+        // closes takes its session with it, and the point here is
+        // the tap it closed, not the client that closed it.
+        let mut clients = Vec::new();
+        for cycle in 0..cycles {
+            let opened = both.tap(&format!("cycle/{cycle}")).await;
+            let id = number(&opened, "id");
+            let name = opened["client_id"].as_str().expect("a name").to_owned();
+            clients.push(handshake(&both.mqtt, &name).await);
+            both.until(id, |read| !read["closed"].is_null()).await;
+        }
+
+        // One more open, which is what prunes: the sweep would do it
+        // too, on its own five second tick.
+        both.tap("last/one").await;
+
+        let list = json(
+            &testing::get(both.admin.address(), "/api/v1/taps")
+                .await
+                .body,
+        );
+        let items = list["items"].as_array().expect("a list");
+        assert_eq!(list["live"], 1, "{list}");
+        assert_eq!(
+            items.len(),
+            MAX_CLOSED_KEPT + 1,
+            "{cycles} closed taps, of which the {MAX_CLOSED_KEPT} most recent are kept, \
+             and the one that is still open: {list}"
+        );
+        // The ones kept are the most recent, because a reader is
+        // most likely to come back for the tap that has just ended.
+        let oldest_kept = number(&json(&items[0].to_string()), "id");
+        assert_eq!(
+            oldest_kept,
+            (cycles - MAX_CLOSED_KEPT + 1) as u64,
+            "the oldest closed taps are the ones forgotten: {list}"
+        );
+        both.stop().await;
+    }
+
     #[tokio::test]
     async fn shutting_down_closes_every_tap() {
         let both = Both::start().await;
