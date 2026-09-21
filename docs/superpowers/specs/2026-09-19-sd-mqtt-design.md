@@ -707,6 +707,30 @@ The events stream pushes counter deltas, connect and disconnect events, and
 rule outcomes. Events carry identifiers so a reconnecting browser resumes
 with the last-event header.
 
+**The header is not the mechanism; a ring of recent events is.** A broadcast
+channel drops messages for a receiver that falls behind and reports the drop
+as an error the idiomatic stream combinator discards, which would be a
+message vanishing uncounted in the one section that forbids it. So recent
+events are kept in a bounded ring keyed by identifier, a reconnecting browser
+is replayed from the ring, and a browser asking for an identifier that has
+fallen out of it is sent a resynchronise event telling it to refetch rather
+than a quiet gap. Every dropped event is counted.
+
+**A stream must end when the broker stops.** Graceful shutdown waits for
+every open connection, and the body of an events stream never ends on its
+own, so one browser tab left open on the Overview page would stop the broker
+exiting. Since a clean stop is how sessions reach disk, that is not a
+cosmetic bug. Each stream selects on the same shutdown signal the listener
+does, and the whole admin server is bounded by a timeout as a backstop.
+
+**The admin listener speaks HTTP/1.1, and the stream costs a connection.**
+Browsers allow six per origin and an events stream holds one for the life of
+the tab, so a seventh tab's ordinary requests would stall. HTTP/2 would fix
+it and is deliberately not enabled: browsers negotiate it only over TLS, TLS
+is milestone 7, and ten crates bought now would buy nothing until then. The
+interface therefore opens exactly one stream for the whole application
+rather than one per page, and the limit is revisited when TLS lands.
+
 ### 11.2 UI
 
 Pages: Overview with live rate charts, Clients with a filterable virtualized
@@ -722,8 +746,32 @@ hand-written CSS over Open Props tokens. Live data arrives over the events
 stream.
 
 The production bundle is precompressed at build time and embedded into the
-binary by a build script, served with content negotiation. In development
-the broker proxies to the Vite dev server.
+binary by a build script, served with content negotiation: brotli, gzip and
+identity from three embedded blobs, chosen by a parsed `Accept-Encoding`
+including its quality values, answered with a `Vary` header and a distinct
+entity tag per encoding.
+
+**In development Vite proxies to the broker, not the other way round.** An
+earlier draft had the broker proxying to the Vite development server, which
+would mean a streaming reverse proxy with WebSocket upgrade forwarding,
+living in the shipped binary and existing only for development. Vite does it
+natively in a few lines of its own configuration. The one thing the broker
+owes is a header telling intermediaries not to buffer the events stream, and
+never compressing it, which it owes to production proxies anyway.
+
+**A build of the binary must not require Node.** The embedding is gated, so
+a clone with no interface built compiles and serves a placeholder that says
+so. Otherwise every Rust-only contributor and the whole test matrix depends
+on an npm install.
+
+**Attribution is generated from the bundle, not from the package list.**
+What ships is what the bundler kept after tree-shaking, so the notice file is
+produced by a plugin reading the built module graph, checked into the
+repository, and regenerated in the build. The build fails on a licence
+outside the allow list and on any difference between the regenerated file and
+the committed one, so the notices cannot drift from the bundle. Build tooling
+is excluded because it is not distributed; the small runtime helpers the
+bundler injects are included, because they are.
 
 ### 11.3 Metrics
 
