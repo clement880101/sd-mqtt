@@ -185,8 +185,8 @@ Within one poll the page showed two rows, freshly highlighted:
 with retain `no`. `devices/lamp/state` was not among them, because it
 does not match the filter. `/api/v1/retained` still said `"total": 6`
 throughout, and the retained browser on the same screen still showed
-`sensors/kitchen/temp = 21.5` — the value from an hour of retention
-ago, beside the live 24.75 the tap had just caught. Those two numbers
+`sensors/kitchen/temp = 21.5` — the value retained at the start of
+this run, sitting beside the live 24.75 the tap had just caught. Those two numbers
 on one screen are the whole difference between the two mechanisms.
 
 ### Under real traffic
@@ -209,7 +209,7 @@ narrow it to see everything."* The document held exactly 256 rows
 throughout, counted in the DOM. **Nothing was lost by the broker**:
 the `lost` counter, which is what the tap's own session queue
 overflowing would move, stayed at zero for the whole run, and the
-broker's log has no warning in it — fifteen lines, none above info.
+broker's log holds no line at warning or error level for any of it.
 
 That is the ring doing its job rather than failing: a tap on `#`
 against a broker doing three hundred a second is the abuse case, and
@@ -228,9 +228,10 @@ what it costs is one subscriber's fan-out and one request a second.
   `(2000 bytes, over the tap's payload cap)` with its real size, not
   as a truncated string pretending to be the payload.
 - **120 seconds unread.** A tap was opened on `forgotten/#` and left.
-  It disappeared from `/api/v1/taps` 2 minutes and 5 seconds later —
-  the 120-second lease plus the five-second sweep, which is the
-  latest the sweep can be. Reading it then answered `404` in the one
+  It disappeared from `/api/v1/taps` 2 minutes and 5 seconds later,
+  measured by polling the list every two seconds: the 120-second
+  lease plus a sweep that runs every five, which is within a sweep
+  of the earliest it could go. Reading it then answered `404` in the one
   error shape, `/api/v1/subscriptions` was empty, and
   `/api/v1/sessions` was empty: the broker had the whole session
   back.
