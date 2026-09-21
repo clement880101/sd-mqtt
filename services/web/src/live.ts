@@ -47,11 +47,30 @@
  * — the deltas add up to less than what happened and the chart
  * quietly under-reports.
  *
- * So the rate is `(totals now − totals then) / (the browser's own
- * elapsed time)`. Across a gap that is the true average over the gap
- * rather than a hole. The elapsed time comes from
- * `performance.now()`, which is monotonic, rather than from the wall
- * clock, which a time step can move backwards.
+ * So the rate is `(totals now − totals then) / elapsed`, and the
+ * interesting part is which elapsed.
+ *
+ * - The browser's own clock — `performance.now()`, which is
+ *   monotonic where the wall clock is not — is right when events
+ *   were **lost**: the difference of two totals across a gap over
+ *   the real time the gap took is the true average over it, rather
+ *   than a hole.
+ * - It is wrong when events were **replayed**. A reconnect is
+ *   answered from the server's ring, so several seconds of events
+ *   arrive in one burst; the browser's clock says they were
+ *   microseconds apart, and dividing a second's worth of bytes by a
+ *   microsecond draws a spike taller than anything real.
+ * - The server's own `over_ms` is exactly the other way round. It
+ *   always covers the interval its `deltas` were measured over, so
+ *   it is right for a replayed burst — and too short across a gap,
+ *   because it measures the server's last interval and not the
+ *   browser's absence.
+ *
+ * So the elapsed time is **the greater of the two**. Each is right
+ * where the other is wrong, and the larger is the conservative
+ * reading in the case neither covers: a rate that is too low is a
+ * chart that under-draws, and a rate that is too high is a spike an
+ * operator goes looking for.
  *
  * **When a total goes backwards, the broker restarted.** The
  * counters are process totals: they only rise within a run and start
@@ -239,7 +258,13 @@ function wentBackwards(now: CounterTotals, then: CounterTotals): boolean {
  * Exported for the tests, which is also the only way to reach the
  * restart decision without restarting a broker.
  */
-export function onCounters(totals: CounterTotals, levels: Gauges, monotonic: number, wall: number) {
+export function onCounters(
+  totals: CounterTotals,
+  levels: Gauges,
+  overMs: number,
+  monotonic: number,
+  wall: number,
+) {
   gauges.value = levels;
   const previous = baseline;
   baseline = { totals, monotonic };
@@ -256,10 +281,15 @@ export function onCounters(totals: CounterTotals, levels: Gauges, monotonic: num
     push(wall, null, null, null);
     return;
   }
-  const seconds = (monotonic - previous.monotonic) / 1000;
+  // The greater of the browser's elapsed time and the server's own
+  // interval. See the module documentation: a replayed burst makes
+  // the first far too small, and a gap makes the second far too
+  // small, and they are never both wrong at once.
+  const seconds = Math.max((monotonic - previous.monotonic) / 1000, overMs / 1000);
   if (seconds <= 0) {
-    // Two events in the same millisecond. A division by zero is an
-    // infinity that would rescale the whole chart.
+    // Two events in the same millisecond, from a server that also
+    // reported no interval. A division by zero is an infinity that
+    // would rescale the whole chart.
     return;
   }
   push(
@@ -325,9 +355,9 @@ function connect() {
 
   stream.addEventListener('counters', (event) => {
     lastEventId.value = event.lastEventId || lastEventId.value;
-    const body = bodyOf<{ totals: CounterTotals; gauges: Gauges }>(event);
+    const body = bodyOf<{ totals: CounterTotals; gauges: Gauges; over_ms: number }>(event);
     if (body) {
-      onCounters(body.totals, body.gauges, performance.now(), Date.now() / 1000);
+      onCounters(body.totals, body.gauges, body.over_ms, performance.now(), Date.now() / 1000);
     }
   });
 

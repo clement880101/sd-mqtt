@@ -26,6 +26,16 @@
    */
   --good: #2f9e44;
   --bad: #e03131;
+  /*
+   * Chart series. Three, because the widest chart here has two and
+   * a third keeps the second chart from repeating the first's
+   * colour. Chosen for a legible contrast against both surfaces
+   * rather than taken from a palette module that would cost 1.5 KB
+   * a hue.
+   */
+  --series-a: #1c7ed6;
+  --series-b: #f08c00;
+  --series-c: #9c36b5;
   color-scheme: light dark;
 }
 
@@ -38,6 +48,9 @@
     --edge: var(--gray-8);
     --good: #51cf66;
     --bad: #ff6b6b;
+    --series-a: #4dabf7;
+    --series-b: #ffc078;
+    --series-c: #da77f2;
   }
 }
 
@@ -133,4 +146,79 @@ main {
 
 .live-id {
   font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------------
+ * The Overview page.
+ * ---------------------------------------------------------------- */
+
+.gauges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-3);
+  margin-block-end: var(--size-4);
+}
+
+.gauge {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: var(--size-11);
+  padding: var(--size-3);
+  border: var(--border-size-1) solid var(--edge);
+  border-radius: var(--radius-2);
+  background: var(--surface-raised);
+}
+
+.gauge-value {
+  font-size: var(--font-size-5);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+
+.gauge-label {
+  color: var(--ink-quiet);
+  font-size: var(--font-size-0);
+}
+
+.charts {
+  display: grid;
+  gap: var(--size-4);
+  grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr));
+}
+
+.chart {
+  inline-size: 100%;
+  padding: var(--size-2);
+  border: var(--border-size-1) solid var(--edge);
+  border-radius: var(--radius-2);
+  background: var(--surface-raised);
+}
+
+.quiet {
+  color: var(--ink-quiet);
+  font-size: var(--font-size-0);
+}
+
+.notice {
+  padding: var(--size-2) var(--size-3);
+  border-inline-start: var(--border-size-3) solid var(--series-b);
+  background: var(--surface-raised);
+}
+
+.failure {
+  padding: var(--size-2) var(--size-3);
+  border-inline-start: var(--border-size-3) solid var(--bad);
+  background: var(--surface-raised);
+  color: var(--bad);
+}
+
+/*
+ * uPlot draws its own text in its own colours. These are the two
+ * that are not set through its options.
+ */
+.u-title,
+.u-legend {
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-0);
 }

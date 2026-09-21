@@ -13,9 +13,12 @@
   },
   "dependencies": {
     "@preact/signals": "^2.11.2",
+    "@tanstack/virtual-core": "^3.17.11",
     "open-props": "^1.7.23",
     "preact": "^10.29.8",
-    "preact-iso": "^2.12.2"
+    "preact-iso": "^2.12.2",
+    "uplot": "^1.6.32",
+    "valibot": "^1.5.0"
   },
   "devDependencies": {
     "@types/node": "^26.6.2",
