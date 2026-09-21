@@ -253,6 +253,79 @@ helper is present. Vite's full licence file is not copied, because most of it
 covers Node-side tooling we do not distribute and copying it would
 misrepresent what ships.
 
+## Verified again before milestone 4
+
+Measured, not reasoned, because this document has been wrong twice and both
+corrections came from building rather than arguing.
+
+**The HTTP client is nearly free and the TLS under it is not.** This
+document said the client "reuses the existing stack". That is true of HTTP
+and false of TLS. Turning on the client half of `hyper-util` costs **two
+crates and 299 KB**, because axum already brought hyper. Everything else is
+the TLS stack, which section 16 schedules for milestone 7 and which posting
+to an HTTPS endpoint pulls forward by three milestones.
+
+| Build | Binary | Direct dependencies |
+|---|---:|---:|
+| milestone 3 | 3.78 MB | 16 of 35 |
+| with the client and TLS | **6.53 MB** | **22 of 35** |
+
+That is 44% of the binary budget where milestone 3 used 25%, and it is the
+largest single jump this project will make. It passes `cargo deny` with the
+allow list unchanged. It is a pull-forward rather than a duplication: when
+milestone 7 adds the server side it reuses all of it.
+
+**aws-lc-rs needs a C compiler and does not need cmake**, confirmed by
+building it on macOS, on Debian in this project's own container, and on
+Alpine against musl, none of which had cmake installed. A C compiler is
+already required by the allocator, so this adds no new class of requirement.
+Its source is a 68 MB unpacked tree, which every cold build pays for.
+
+**A pure-Rust provider is now serious and still loses, on one fact.**
+`graviola` saves 337 KB, drops the C toolchain entirely, and offers
+post-quantum key exchange, so that is no longer a differentiator. It requires
+processor features that exclude a Raspberry Pi 4 and anything older. For a
+broker people will run on small boards, that is disqualifying. `ring` is
+1.4 MB cheaper than aws-lc-rs and has had no release in eighteen months and
+no post-quantum exchange; the existing position, aws-lc-rs by default with
+ring available for exotic targets, stands.
+
+**Take `base64` 0.23 with default features off.** Its SIMD engine became
+default-on in 0.23 and is `unsafe`, which every crate in this workspace
+forbids, and which is the same reason this document rejected a SIMD JSON
+parser. Scalar costs 16 KB.
+
+**Do not take an MQTT client library for the bridge, and the reason is not
+dependency weight.** `rumqttc` **fails `cargo deny check advisories`** today:
+four vulnerabilities and one unmaintained crate, all through a pinned
+webpki version that only a new release of it can move, and its last release
+was ten months ago. It would also link a second cryptography provider beside
+aws-lc-rs, a second root-trust mechanism that reads an operating-system store
+a distroless image does not have, a second logging facade, and a second
+complete MQTT codec beside the one this project has hundreds of tests for.
+
+And it could not do the job anyway. Its in-flight state is private in-memory
+fields with no way to snapshot or restore them, so the durable bridge the
+design requires has to be written regardless, and the library would only be
+saving the socket loop.
+
+What a bridge needs beyond the codec is real but bounded: composing a
+CONNECT, interpreting a CONNACK and honouring the limits the server declares
+in it, client-side keep-alive with a deadline on the response, an inflight
+window against the remote's receive maximum, inbound exactly-once, an inbound
+alias table, and correlating subscribe acknowledgements. The codec encodes
+and decodes every packet in both directions already, and the framing reader
+is generic over any stream.
+
+**A defect this pass found in our own tooling.** The notices generator
+resolves a licence expression by looking for the word "or" anywhere in it,
+so an expression that requires several licences at once is read as offering a
+choice between them. `aws-lc-sys` requires ISC and Apache-2.0 and MIT and
+BSD-3-Clause simultaneously, and the generator would have labelled it
+ISC alone. The full licence text still ships; what is wrong is the summary
+line and the Apache-2.0 obligation that line is what triggers. Fixed before
+the dependency landed, not after.
+
 ## Rejected outright
 
 | Component | Reason |
