@@ -48,6 +48,29 @@ The directory is created if it is not there, and the store is the file
 `sdmqtt.redb` inside it. One broker per directory: a second is refused
 with the path it could not take.
 
+### The admin listener answers to an address, not to a name
+
+```toml
+[admin]
+address = "127.0.0.1:1884"        # the default
+allowed_hosts = ["broker.internal"]   # only if you reach it through a name
+```
+
+The admin listener is bound to loopback by default, and binding it
+further with no `admin.token` set is refused at startup rather than
+warned about: the API publishes.
+
+It also checks the name a request was made under. An **address** is
+always answered — by a browser, a probe, a scraper, `curl` — and so is
+`localhost`. A **hostname** is answered only if it is in
+`allowed_hosts` (or `SDMQTT_ADMIN_ALLOWED_HOSTS`, comma separated).
+That is not fussiness: an ordinary cross-origin request from a web page
+is already stopped by a preflight nothing here answers, and DNS
+rebinding gets around that by making the page's request same-origin.
+The name is the one thing the attack cannot forge. If you reach the
+listener through a name of your own, put it in the list; the refusal
+says so.
+
 ## Development containers
 
 Everything builds and tests in a **single container**. The per-service
