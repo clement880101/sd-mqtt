@@ -534,6 +534,9 @@ function Watcher() {
 
   const start = async () => {
     release();
+    // Claimed after `release`, which is what bumps it. Everything
+    // below belongs to this watch and not to a later one.
+    const mine = watch.current;
     rows.value = [];
     missed.value = 0;
     polls.value = 0;
@@ -544,6 +547,24 @@ function Watcher() {
     opening.value = true;
     try {
       const opened = await openTap(filter.value);
+      if (mine !== watch.current) {
+        // The watch this request belonged to is over: a second
+        // Watch, a Stop, or this page being left while the broker
+        // was opening the tap. Nothing else knows this tap's
+        // identifier — `openTapId` has not been set, and will not
+        // be — so it is given back here or by nobody.
+        //
+        // **Nobody, in this case, includes the idle reaper.** It
+        // would have reclaimed a tap nothing polls after the idle
+        // timeout, but an abandoned tap does get polled: the later
+        // watch's interval reads *its own* tap, and the abandoned
+        // one is simply never read again. This one would have sat
+        // there holding a slot until the tab closed. The same check
+        // the poll and its error path already make, missing from
+        // the one place that can lose a whole slot.
+        closeTap(opened.id);
+        return;
+      }
       const { limits, ...view } = opened;
       held.value = { view, limits };
       openTapId.current = view.id;
@@ -551,13 +572,20 @@ function Watcher() {
       void poll();
       timer.current = setInterval(() => void poll(), TAP_POLL);
     } catch (error) {
+      if (mine !== watch.current) {
+        return;
+      }
       if (error instanceof ApiError) {
         failure.value = `The broker would not open a tap (${error.code}): ${error.message}`;
       } else {
         failure.value = String(error);
       }
     } finally {
-      opening.value = false;
+      // Only this watch's, or a request that came back late would
+      // re-enable a button the watch after it is still waiting on.
+      if (mine === watch.current) {
+        opening.value = false;
+      }
     }
   };
 
