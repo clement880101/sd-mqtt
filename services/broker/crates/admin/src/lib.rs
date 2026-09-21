@@ -31,8 +31,13 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 pub mod config;
+pub mod health;
+
+#[cfg(test)]
+mod testing;
 
 pub use config::{AdminConfig, AdminStartError, Token};
+pub use health::Readiness;
 
 /// Everything a handler can reach.
 ///
@@ -42,12 +47,21 @@ pub use config::{AdminConfig, AdminStartError, Token};
 pub struct AdminState {
     /// The broker, behind the one lock the whole process shares.
     pub shared: Arc<Shared>,
+    /// What startup has managed so far. See [`Readiness`].
+    pub readiness: Arc<Readiness>,
 }
 
 impl AdminState {
-    /// A state over one broker.
+    /// A state over one broker, nothing ready yet.
+    ///
+    /// The gates are handed back so that the startup path can open
+    /// them as it passes each one. They start shut: a node that has
+    /// not said it is ready is not.
     pub fn new(shared: Arc<Shared>) -> Self {
-        Self { shared }
+        Self {
+            shared,
+            readiness: Arc::new(Readiness::starting()),
+        }
     }
 }
 
@@ -110,7 +124,7 @@ impl AdminServer {
 
 /// The routes this listener serves.
 fn router(state: AdminState) -> Router {
-    Router::new().with_state(state)
+    Router::new().merge(health::routes()).with_state(state)
 }
 
 /// A bound admin listener and the task serving it.
