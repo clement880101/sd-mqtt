@@ -41,6 +41,37 @@ jobs:
       - name: Doc tests
         run: cargo test --doc --all-features
 
+  # The interface. Its build is also its licence gate: an unapproved
+  # licence, or one a package stopped declaring, fails `npm run build`
+  # itself, and a dependency that entered or left the bundle fails the
+  # diff below. Section 11.2: the notices are generated from the
+  # bundle, so they cannot drift from it.
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/web
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: services/web/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Types
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: The notices may not drift from the bundle
+        run: |
+          if ! git diff --exit-code -- THIRD-PARTY-NOTICES.txt; then
+            echo "::error::THIRD-PARTY-NOTICES.txt is not what this bundle produces."
+            echo "Run 'npm run build' in services/web and commit the result."
+            exit 1
+          fi
+
   licenses:
     runs-on: ubuntu-latest
     steps:
