@@ -777,6 +777,27 @@ by the vanilla TanStack virtual core, validated by valibot, and styled with
 hand-written CSS over Open Props tokens. Live data arrives over the events
 stream.
 
+**The sparklines are deferred to milestone 4.** There is no such element in
+the interface and there was no note saying why, which convention 8's walk
+found. The technique was chosen deliberately — one SVG path per row rather
+than one canvas per row, in `docs/research/component-selection.md` — and then
+vanished without a trace, which is the shape of a forgotten feature rather
+than a deferred one.
+
+It is deferred, and the reason is that there is nothing to draw. A sparkline
+is a series, and no series exists per row: the clients resource answers a
+snapshot per session, the events stream carries node-level counters and
+connect and disconnect events, and nothing anywhere keeps a history per
+client or per topic. Drawing one would mean either a ring per session inside
+the broker — a metrics decision, weighed against a hundred thousand
+connections, not a table adornment — or accumulating in the browser, which
+gives an empty cell on every page load and a line that measures how long the
+tab has been open. Milestone 4 adds per-rule statistics, which is the first
+per-row series this project has, and the sparklines belong beside it.
+
+They are not an exit criterion for milestone 3, whose criterion is that the
+interface shows live clients and retained messages against a running broker.
+
 The production bundle is precompressed at build time and embedded into the
 binary by a build script, served with content negotiation: brotli, gzip and
 identity from three embedded blobs, chosen by a parsed `Accept-Encoding`
@@ -839,6 +860,17 @@ local half needs the matching layer to report a number it does not currently
 return, which would put counting inside the crate that deliberately counts
 nothing. Both halves arrive together with clustering. Recorded here so that
 it stays a decision rather than becoming an omission.
+
+**Cluster bytes sent, received and dropped are deferred to milestone 5 as
+well,** and this line is here because they were not. The neighbouring cluster
+deferrals were both recorded — the members gauge in `crates/server/src/
+metrics.rs`, the router split above — and these three had no counter, no
+task and no note, which is the state convention 8 says is indistinguishable
+from forgotten. They are not forgotten and they are not hard: there is no
+inter-node link to count bytes on until section 8's membership and
+replication exist, and a counter that can only ever read zero says something
+false rather than something empty, which is the same reasoning that keeps the
+members gauge unregistered.
 
 ## 12. Security
 
@@ -994,20 +1026,34 @@ in CI, not when the code is written.
 
 | Metric | Target | Today | Checked |
 |---|---|---|---|
-| Release binary, all features, stripped, link-time optimized | under 15 MB | 2.52 MB | every push |
+| Release binary, all features, stripped, link-time optimized | under 15 MB | 3.76 MB | every push |
 | Idle resident memory, single node, no clients | under 30 MB | not yet measured | scheduled |
-| UI bundle, gzipped | under 150 KB | 13.3 KB | every push |
-| Direct dependencies across broker crates | under 35 | 14 | every push |
+| UI bundle, gzipped | under 150 KB | 52.2 KB | every push |
+| Direct dependencies across broker crates | under 35 | 16 | every push |
 | Concurrent connections per node, target hardware | 100,000 | not yet measured | milestone 7 |
 
 The "today" column is the trend, not the limit, and is what tells a
-reader whether a budget is at 94% or at 4%. Recorded at milestone 3
-with `scripts/budgets.sh`: the binary was 2,523,184 bytes on macOS
-arm64, and the fourteen distinct direct dependencies were `bytes`,
-`clap`, `foldhash`, `parking_lot`, `postcard`, `prometheus-client`,
-`redb`, `serde`, `thiserror`, `tokio`, `toml`, `tracing`,
-`tracing-subscriber` and `uuid`. The binary's size is platform
-dependent; CI measures it on Linux x86-64 and its figure will differ.
+reader whether a budget is at 94% or at 4%. Recorded at the close of
+milestone 3 with `scripts/budgets.sh`: the binary was 3,764,176 bytes
+on macOS arm64, the bundle 52.2 KB across three documents, and the
+sixteen distinct direct dependencies were `axum`, `bytes`, `clap`,
+`foldhash`, `futures-core`, `parking_lot`, `postcard`,
+`prometheus-client`, `redb`, `serde`, `thiserror`, `tokio`, `toml`,
+`tracing`, `tracing-subscriber` and `uuid`. The binary's size is
+platform dependent; CI measures it on Linux x86-64 and its figure will
+differ.
+
+**All three were stale, and a stale figure defeats the column.** They
+read 2.52 MB, fourteen dependencies and 13.3 KB, every one of them
+written before the admin crate and the interface's three pages
+existed: the binary was out by 43%, the dependency list did not name
+`axum` or `futures-core`, and the bundle figure was the shell alone,
+before uPlot, the virtual core and the pages that use them. A column
+whose whole job is to say whether a budget is at 94% or at 4% cannot
+do it from numbers that predate the thing being measured, and the
+script that produces them prints all three on every run, so the only
+work was copying them across. Of the 1.24 MB the binary gained,
+roughly 150 KB is the attribution of section 3, embedded in it.
 
 Durable queue storage and inter-node traffic scale with the replication
 factor. At the default factor of 2, plan for roughly twice the queue disk a
@@ -1030,8 +1076,9 @@ milestone 7's to prove.
 every budget's measurement and its headroom whether or not the budget
 is met, because a green tick cannot tell 94% from 4%. The interface
 bundle reported **skipped, and why** until there was an interface to
-weigh; the pipeline of section 11.2 built one, and the shell measured
-13.3 KB across three documents. The rule that line was an instance of
+weigh; the pipeline of section 11.2 built one, whose shell measured
+13.3 KB and whose three pages now measure 52.2 KB across three
+documents. The rule that line was an instance of
 stands: a check that quietly passes when it cannot measure is worse
 than no check, so an unbuilt interface now fails the script naming
 what to run rather than passing it having looked at two budgets.
@@ -1062,11 +1109,15 @@ shippable.
    outbound topic templates, the durable outbox, dead lettering, and the Rules
    page. Exit criteria: a message published to MQTT reaches an HTTP endpoint,
    and an HTTP post reaches an MQTT subscriber, both surviving a broker
-   restart mid-flight.
+   restart mid-flight. Carries section 11.2's table-row sparklines, deferred
+   from milestone 3: the per-rule statistics are the first per-row series
+   this project has to draw.
 5. **Clustering.** Membership, metadata replication, routing, session
    ownership and migration, and the Cluster page. Exit criteria: a three-node
    cluster delivers across nodes, migrates a session on reconnect, and
-   converges after a partition heals.
+   converges after a partition heals. Carries the three cluster metrics
+   deferred from milestone 3: the members gauge, the router-match split, and
+   bytes sent, received and dropped.
 6. **Queue replication.** Rendezvous placement, the replication stream,
    asynchronous and synchronous modes, failover to the most advanced replica,
    and rate-limited re-replication. Exit criteria: killing the owner of a
@@ -1076,7 +1127,11 @@ shippable.
 7. **Hardening.** TLS with certificate hot reload, WebSocket, SCRAM-SHA-256,
    the authentication and access control UI, rate limits, a configurable
    maximum quality of service and retain availability, the container image,
-   cross-compiled release artifacts and documentation. Exit criteria: all
+   cross-compiled release artifacts and documentation. Carries section 12.3's
+   refusal of a client publishing to a dollar-prefixed topic, deferred from
+   milestone 3: it needs a reason code per protocol version and it adds a
+   classified line to the conformance baseline, both of which belong with the
+   authorization work. Exit criteria: all
    budgets met, the full conformance suite green including TLS and WebSocket,
    a SCRAM client authenticates and re-authenticates, and a release is
    published.

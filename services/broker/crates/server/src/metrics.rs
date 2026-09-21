@@ -873,6 +873,16 @@ impl Collector for Live {
         // about this broker; a membership of zero is not, because
         // this node is a member of its own cluster of one and
         // reporting none would be wrong rather than empty.
+        //
+        // The same goes for section 11.3's cluster bytes sent,
+        // received and dropped, which are also milestone 5 and are
+        // also absent. There is no inter-node link to count bytes on
+        // until section 8 exists, so the three counters could only
+        // read zero, and zero here would read as "the links are
+        // quiet" rather than "there are no links". Said out loud
+        // because the other two cluster deferrals were recorded and
+        // these three were not, which is the difference between a
+        // decision and an omission.
         let connections = shared.outbox_count();
         let (sessions, subscriptions, retained, queued) = shared.with_broker(|broker| {
             (
