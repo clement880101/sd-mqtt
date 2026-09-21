@@ -87,10 +87,13 @@ mod golden {
     #[test]
     fn the_format_marker() {
         // A fixed-size array is its elements with no length prefix, and a
-        // u16 is a varint, so version 1 is one byte.
+        // u16 is a varint, so version 2 is one byte. The version moved
+        // from 1 when the reference count of a body left the body's own
+        // row: a version 1 store's bodies begin with eight bytes this
+        // build would read as payload.
         let expected: &[u8] = &[
             b's', b'd', b'm', b'q', b't', b't', b's', b't', // magic "sdmqttst"
-            0x01, // version 1
+            0x02, // version 2
         ];
         assert_eq!(FormatMarker::current().encode(), expected);
         assert_eq!(

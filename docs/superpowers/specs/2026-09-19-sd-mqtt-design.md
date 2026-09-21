@@ -1060,8 +1060,8 @@ needs it, and the resolution is recorded as an architecture decision record.
   acknowledgement only after the commit is durable, so whatever the rest
   of the broker can do, an acknowledged message costs a share of a flush.
   Nothing had measured it. The harness is
-  `services/broker/crates/storage/tests/throughput.rs`, two ignored tests
-  run with
+  `services/broker/crates/storage/tests/throughput.rs`, three ignored
+  tests run with
   `cargo test -p storage --release --test throughput -- --ignored
   --nocapture --test-threads 1`. Machine: Apple M2 Pro, 12 logical cores,
   32 GB, macOS 26.4.1, arm64, release profile, internal APFS SSD, redb
@@ -1127,6 +1127,47 @@ needs it, and the resolution is recorded as an architecture decision record.
   store is tens of megabytes, which is why every row stores about 32 MiB:
   the same 64 KiB bodies measured over 8 MiB read 3.89, which is redb's
   file growth granularity rather than anything about the payload.
+
+- **What a fan-out costs the store, measured.** Section 7.1 stores a body
+  once and references it. That is a claim about **space**, and the table
+  above is what measures it. The claim beside it that nothing measured is
+  what the references *cost*: the backend held the reference count in the
+  body's own row, so every put after the first was a read-modify-write of
+  the whole row — deserialise the payload, reserialise it, write it back
+  — and a fan-out emits one put per session for one message. The same
+  harness, now three ignored tests, and the same machine as above. Each
+  row queues one publication for that many durable offline subscribers as
+  the broker emits it: one `BodyPut` and one `QueuePushed` per session,
+  **all in one batch**, which is one write transaction. Eight
+  publications a row, and only the apply is timed.
+
+  | body | subscribers | ms/publication, count in the body | ms/publication, count apart |
+  |---:|---:|---:|---:|
+  | 256 KiB | 1,000 | 27.2 | 2.9 |
+  | 256 KiB | 100 | 3.8 | 1.2 |
+  | 256 B | 1,000 | 2.4 | 2.0 |
+
+  **Nine times, and the change was kept.** A 256 KiB publication to a
+  thousand durable offline subscribers cost 27 ms of the storage thread,
+  inside one write transaction, with every waiter behind it blocked; with
+  the count in a table of its own it costs 3. The two rows below it say
+  what the saving is made of: at a hundred subscribers of the same
+  payload it is three times rather than nine, and at a 256-byte payload
+  it is 2.4 against 2.0, which is the shape of the batch rather than the
+  payload. So what was being paid for was rewriting the body, once per
+  subscriber, exactly as the reading predicted.
+
+  The space claim is unchanged and still holds: one row holds the payload
+  however many sessions name it, which `a_body_referenced_many_times_is_written_once`
+  asserts. What this cost the on-disk format is one table and a version
+  bump, because a version 1 store's body rows begin with eight bytes of
+  count that this build would read as payload.
+
+  The same shape one layer up was already fixed once: `broker-core`'s
+  `SharedProperties` exists so that a property block is encoded once per
+  message rather than once per subscriber. The backend reintroduced the
+  cost underneath it, which is worth remembering the next time a
+  per-subscriber loop meets a shared value.
 
 - **What a store costs the broker, measured.** The two questions above
   measured the lock with no store and the store with no broker. This is

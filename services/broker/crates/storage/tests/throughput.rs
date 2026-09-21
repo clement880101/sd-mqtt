@@ -54,8 +54,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use storage::{
-    BodyRecord, MessageId, Qos, Record, RedbStorage, RetainedRecord, Storage, SyncMode, Writer,
-    WriterConfig,
+    BodyRecord, DeliveryRecord, MessageId, ProtocolVersion, Qos, QueueEntry, Record, RedbStorage,
+    RetainedRecord, SessionKey, SessionRecord, Storage, SyncMode, Writer, WriterConfig,
 };
 
 /// How long the load runs before anything is counted.
@@ -325,6 +325,132 @@ fn what_a_large_payload_costs() {
             after.saturating_sub(before),
             grew / payload,
             payload / elapsed.as_secs_f64() / (1024.0 * 1024.0),
+        );
+    }
+}
+
+// ---- what a fan-out costs the storage thread ----------------------------
+
+/// The fan-out rows: a payload size, and how many durable subscribers
+/// one publication is queued for.
+///
+/// A thousand offline subscribers of a 256 KiB message is the shape
+/// section 7.1's shared body was built for, and the size at which
+/// rewriting the payload once per reference is worth a measurement. The
+/// hundred beside it says whether the cost is linear in subscribers, and
+/// the small payload says whether what is being measured is the payload
+/// or the shape of the batch.
+const FAN_OUT: [(usize, usize); 3] = [(256 * 1_024, 1_000), (256 * 1_024, 100), (256, 1_000)];
+
+/// How many publications each row fans out, so that the figure is not
+/// one sample.
+const FAN_OUT_MESSAGES: usize = 8;
+
+/// One publication queued for `sessions` durable offline subscribers, as
+/// the broker emits it: one [`Record::BodyPut`] and one
+/// [`Record::QueuePushed`] per session, **all in one batch**, which is
+/// one write transaction.
+///
+/// That last part is the measurement. `tests/redb.rs` puts each
+/// reference in a transaction of its own, which is not what a fan-out
+/// does and is why the cost of one was never visible there.
+fn fan_out(size: usize, sessions: usize, messages: usize) -> Duration {
+    let directory = tempfile::TempDir::new().expect("a temporary directory");
+    let store = RedbStorage::open_with(directory.path().join("store.redb"), SyncMode::Immediate)
+        .expect("a store opens");
+
+    let keys: Vec<SessionKey> = (0..sessions)
+        .map(|n| SessionKey::new("", &format!("subscriber-{n}")))
+        .collect();
+    let sessions_batch: Vec<Record> = keys
+        .iter()
+        .map(|key| {
+            Record::SessionPut(SessionRecord {
+                key: key.clone(),
+                version: ProtocolVersion::V5,
+                expiry_interval: u32::MAX,
+                expires_at: None,
+                will: None,
+                will_at: None,
+            })
+        })
+        .collect();
+    store
+        .apply(&sessions_batch)
+        .expect("the sessions are storable");
+    store.flush().expect("the flush succeeds");
+
+    let payload = bytes::Bytes::from(vec![0xa5u8; size]);
+    let mut elapsed = Duration::ZERO;
+    for message in 0..messages {
+        let id = scattered_id(message);
+        let body = BodyRecord {
+            topic: "sensor/fan-out".to_owned(),
+            payload: payload.clone(),
+            qos: Qos::AtLeastOnce,
+            retain: false,
+            expires_at: None,
+            properties: bytes::Bytes::new(),
+        };
+        let mut batch = Vec::with_capacity(sessions * 2);
+        for key in &keys {
+            batch.push(Record::BodyPut {
+                id,
+                body: body.clone(),
+            });
+            batch.push(Record::QueuePushed {
+                session: key.clone(),
+                entry: QueueEntry {
+                    sequence: message as u64 + 1,
+                    packet_id: None,
+                    delivery: DeliveryRecord {
+                        body: id,
+                        qos: Qos::AtLeastOnce,
+                        retain: false,
+                        subscription_ids: Vec::new(),
+                        dup: false,
+                    },
+                },
+            });
+        }
+        // Only the apply is timed. Building the batch is the broker's
+        // cost rather than the store's, and it is the same either way.
+        let start = Instant::now();
+        store.apply(&batch).expect("the fan-out is storable");
+        elapsed += start.elapsed();
+    }
+    store.flush().expect("the flush succeeds");
+    elapsed
+}
+
+/// What one publication to many durable subscribers costs the store.
+///
+/// Section 7.1 stores a body once and references it. That is a claim
+/// about **space**, and the file-size table above is what measures it.
+/// This is the claim beside it that nothing measured: what the
+/// references *cost* in work, on the one storage thread, inside one
+/// write transaction, with every waiter behind it blocked.
+#[test]
+#[ignore = "a measurement, not an assertion: run it deliberately with --nocapture"]
+fn what_a_fan_out_costs() {
+    println!("machine: {}", machine());
+    println!();
+    println!("one publication queued for many durable subscribers, redb");
+    println!(
+        "{:>12}  {:>12}  {:>10}  {:>16}  {:>16}",
+        "body", "subscribers", "messages", "ms/publication", "µs/subscriber"
+    );
+
+    for (size, sessions) in FAN_OUT {
+        let elapsed = fan_out(size, sessions, FAN_OUT_MESSAGES);
+        let per_message = elapsed.as_secs_f64() / FAN_OUT_MESSAGES as f64;
+        println!(
+            "{:>12}  {:>12}  {:>10}  {:>16.1}  {:>16.1}",
+            human(size),
+            sessions,
+            FAN_OUT_MESSAGES,
+            per_message * 1_000.0,
+            per_message * 1_000_000.0 / sessions as f64,
         );
     }
 }

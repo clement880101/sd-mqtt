@@ -44,7 +44,7 @@ use ::redb::{
 use serde::Serialize;
 
 use crate::record::{
-    decode_exact, BodyRecord, FormatError, FormatMarker, MessageId, QueueEntry, Record, SessionKey,
+    decode_exact, FormatError, FormatMarker, MessageId, QueueEntry, Record, SessionKey,
     SessionRecord,
 };
 use crate::restore::{Restored, RestoredSession};
@@ -66,8 +66,25 @@ const INFLIGHT: TableDefinition<&[u8], &[u8]> = TableDefinition::new("inflight")
 const QUEUES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("queues");
 /// Session key to its depth and high-water mark.
 const QUEUE_STATE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("queue_state");
-/// Message identifier to its reference count and body.
+/// Message identifier to its body.
 const BODIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("bodies");
+/// Message identifier to how many references keep its body alive.
+///
+/// **Its own table rather than a prefix on the body.** The count changes
+/// on every put and release; the body never changes at all. Holding the
+/// two in one value made every put after the first a read-modify-write
+/// of the whole row — deserialise the payload, reserialise it, write it
+/// back — and a fan-out emits one put per session for one message. A
+/// 256 KiB publication to a thousand durable offline subscribers is one
+/// batch of two thousand records, so it paid that a thousand times, on
+/// the one storage thread, inside one write transaction, with every
+/// waiter behind it blocked. Measured at 27 ms a publication; apart, 3.
+/// The figures are in section 17 of the design.
+///
+/// Section 7.1's claim was about **space** and was never in doubt: one
+/// row holds the payload however many sessions name it, and that is
+/// still true. What was wrong was the work, and nothing measured it.
+const BODY_REFERENCES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("body_references");
 /// Topic to [`RetainedRecord`].
 const RETAINED: TableDefinition<&str, &[u8]> = TableDefinition::new("retained");
 
@@ -278,8 +295,9 @@ impl Storage for RedbStorage {
         }
         for entry in bodies.iter().map_err(StorageError::from)? {
             let (id, value) = entry.map_err(StorageError::from)?;
-            let (_, body) = decode_body(value.value())?;
-            restored.bodies.insert(message_id(id.value())?, body);
+            restored
+                .bodies
+                .insert(message_id(id.value())?, decode(value.value())?);
         }
         Ok(restored)
     }
@@ -349,6 +367,7 @@ struct Tables<'txn> {
     queues: ByteTable<'txn>,
     queue_state: ByteTable<'txn>,
     bodies: ByteTable<'txn>,
+    body_references: ByteTable<'txn>,
     retained: Table<'txn, &'static str, &'static [u8]>,
 }
 
@@ -373,6 +392,9 @@ impl<'txn> Tables<'txn> {
                 .open_table(QUEUE_STATE)
                 .map_err(StorageError::from)?,
             bodies: transaction.open_table(BODIES).map_err(StorageError::from)?,
+            body_references: transaction
+                .open_table(BODY_REFERENCES)
+                .map_err(StorageError::from)?,
             retained: transaction
                 .open_table(RETAINED)
                 .map_err(StorageError::from)?,
@@ -525,34 +547,44 @@ impl<'txn> Tables<'txn> {
                 }
             }
             Record::BodyPut { id, body } => {
-                // One put is one reference, and the count is stored beside
-                // the body rather than rebuilt by scanning every queue at
-                // startup, which section 7.2 requires and a broker with a
-                // large store could not afford. The body is replaced as
-                // well as counted, so a republished identifier carries its
-                // new content.
-                let references = match self.bodies.get(&id.0[..]).map_err(StorageError::from)? {
-                    Some(held) => decode_body(held.value())?.0,
-                    None => 0,
-                } + 1;
-                self.bodies
-                    .insert(&id.0[..], encode_body(references, body).as_slice())
+                // One put is one reference, and the count is stored
+                // rather than rebuilt by scanning every queue at
+                // startup, which section 7.2 requires and a broker with
+                // a large store could not afford.
+                //
+                // **A put for a body already held touches eight bytes
+                // and never looks at the payload.** The body is written
+                // once, by the put that takes the first reference; the
+                // ones after it only count. `Storage::apply` says why
+                // that is not a loss of anything: an identifier names
+                // one publication for as long as it exists, so the body
+                // a second put carries is the body already held.
+                let references = read_references(&self.body_references, id)? + 1;
+                self.body_references
+                    .insert(&id.0[..], &references.to_be_bytes()[..])
                     .map_err(StorageError::from)?;
+                if references == 1 {
+                    self.bodies
+                        .insert(&id.0[..], encode(body).as_slice())
+                        .map_err(StorageError::from)?;
+                }
             }
             Record::BodyReleased { id } => {
-                let Some(held) = self.bodies.get(&id.0[..]).map_err(StorageError::from)? else {
+                let references = read_references(&self.body_references, id)?;
+                if references == 0 {
                     // Refused rather than clamped: clamping turns a
                     // caller's double release into a body deleted under a
                     // live reference, silently.
                     return Err(Rejection::BodyNotHeld { id: *id }.into());
-                };
-                let (references, body) = decode_body(held.value())?;
-                drop(held);
-                if references <= 1 {
+                }
+                if references == 1 {
+                    self.body_references
+                        .remove(&id.0[..])
+                        .map_err(StorageError::from)?;
                     self.bodies.remove(&id.0[..]).map_err(StorageError::from)?;
                 } else {
-                    self.bodies
-                        .insert(&id.0[..], encode_body(references - 1, &body).as_slice())
+                    self.body_references
+                        .insert(&id.0[..], &(references - 1).to_be_bytes()[..])
                         .map_err(StorageError::from)?;
                 }
             }
@@ -651,17 +683,28 @@ fn decode<'a, T: serde::Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, StorageEr
     decode_exact(bytes).map_err(StorageError::from)
 }
 
-/// A body, prefixed by the number of references keeping it alive.
-fn encode_body(references: u64, body: &BodyRecord) -> Vec<u8> {
-    let mut bytes = references.to_be_bytes().to_vec();
-    bytes.extend_from_slice(&encode(body));
-    bytes
-}
-
-/// Read a body and its count back.
-fn decode_body(bytes: &[u8]) -> Result<(u64, BodyRecord), StorageError> {
-    let (references, rest) = split_u64(bytes)?;
-    Ok((references, decode(rest)?))
+/// How many references a body has, and zero for one the store does not
+/// hold.
+///
+/// Eight big-endian bytes, written by hand for the reason
+/// [`QueueState::encode`] gives: fixed width, legible in a hex dump, and
+/// no record type of its own. Zero is never stored — the row goes with
+/// the last reference — so reading zero and holding no row are the same
+/// answer, which is what [`Rejection::BodyNotHeld`] is raised on.
+fn read_references(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    id: &MessageId,
+) -> Result<u64, StorageError> {
+    let Some(held) = table.get(&id.0[..]).map_err(StorageError::from)? else {
+        return Ok(0);
+    };
+    let (references, rest) = split_u64(held.value())?;
+    if !rest.is_empty() {
+        return Err(StorageError::Corrupt(FormatError::Trailing {
+            extra: rest.len(),
+        }));
+    }
+    Ok(references)
 }
 
 /// Take a big-endian `u64` off the front.

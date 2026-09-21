@@ -260,6 +260,22 @@ pub trait Storage: Send + Sync + 'static {
     /// without releasing its body leaks the body, and nothing reclaims it.
     /// That is a leak rather than a loss, and it is the direction to err
     /// in.
+    ///
+    /// # A body is what the first put said it was
+    ///
+    /// An identifier names one publication for as long as it exists, so
+    /// **a [`Record::BodyPut`] for an identifier the store already holds
+    /// takes a reference and nothing else**: the body it carries is
+    /// ignored, because it is the body already held. Both backends do
+    /// this, and it is what lets the redb one answer the second and
+    /// thousandth reference to a message without reading, decoding or
+    /// rewriting its payload — the cost a fan-out pays once per
+    /// subscriber otherwise, on the one storage thread, inside one write
+    /// transaction.
+    ///
+    /// A caller that wants different content stores it under a different
+    /// identifier, which is what minting one per publication already
+    /// does.
     fn apply(&self, records: &[Record]) -> Result<(), StorageError>;
 
     /// Make everything applied so far durable, as hard as the configured

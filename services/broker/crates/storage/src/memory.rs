@@ -221,17 +221,16 @@ impl State {
                 // The high-water mark is untouched. The number is spent.
             }
             Record::BodyPut { id, body } => {
-                // One put is one reference. The body is replaced as well
-                // as counted, so that a republished identifier carries its
-                // new content; the two are equal in every flow the broker
-                // has, and taking the newer one is the honest choice if
-                // they ever are not.
+                // One put is one reference, and a put for a body already
+                // held only counts: `Storage::apply` says an identifier
+                // names one publication for as long as it exists, so the
+                // body a second put carries is the body already held.
+                // The redb backend depends on that to avoid rewriting
+                // the payload once per subscriber, and the two backends
+                // are compared as values, so this one does the same.
                 self.bodies
                     .entry(*id)
-                    .and_modify(|held| {
-                        held.body = body.clone();
-                        held.references += 1;
-                    })
+                    .and_modify(|held| held.references += 1)
                     .or_insert_with(|| HeldBody {
                         body: body.clone(),
                         references: 1,

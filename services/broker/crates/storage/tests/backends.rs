@@ -641,6 +641,52 @@ mod contract {
         assert_eq!(restored.bodies.get(&body_id(1)), Some(&body(1)));
     }
 
+    /// A put for a body the store already holds takes a reference and
+    /// leaves the body alone.
+    ///
+    /// `Storage::apply` says an identifier names one publication for as
+    /// long as it exists, so the body a second put carries is the body
+    /// already held. It is written down as a rule because a backend
+    /// relies on it: the redb one answers the second and thousandth
+    /// reference without reading, decoding or rewriting the payload,
+    /// which is what a fan-out to a thousand durable subscribers costs
+    /// otherwise.
+    ///
+    /// Two bodies that differ is not something the broker can produce.
+    /// The point is that both backends answer it the same way, because
+    /// the suite compares them as values and "whatever each happens to
+    /// do" is not a contract.
+    pub fn a_body_put_again_keeps_the_body_it_already_holds<S: Storage>(new: impl Fn() -> S) {
+        let store = new();
+        let mut second = body(1);
+        second.payload = bytes::Bytes::from_static(b"a different body under the same name");
+        apply(
+            &store,
+            &[
+                Record::BodyPut {
+                    id: body_id(1),
+                    body: body(1),
+                },
+                Record::BodyPut {
+                    id: body_id(1),
+                    body: second,
+                },
+            ],
+        );
+
+        assert_eq!(
+            restore(&store).bodies.get(&body_id(1)),
+            Some(&body(1)),
+            "the second put rewrote the body instead of only counting"
+        );
+        // And it did count: one release leaves the body, the second
+        // takes it.
+        apply(&store, &[Record::BodyReleased { id: body_id(1) }]);
+        assert_eq!(restore(&store).bodies.get(&body_id(1)), Some(&body(1)));
+        apply(&store, &[Record::BodyReleased { id: body_id(1) }]);
+        assert!(restore(&store).bodies.is_empty());
+    }
+
     // ---- a batch is all or nothing --------------------------------------
 
     /// Records inside one batch see each other, in order.
@@ -1597,6 +1643,7 @@ macro_rules! every_contract_test {
             a_queue_entry_restores_with_everything_it_carries,
             retained_messages_are_held_replaced_and_removed,
             a_body_restores_once_with_every_field,
+            a_body_put_again_keeps_the_body_it_already_holds,
             a_batch_applies_all_of_itself_in_order,
             a_batch_that_fails_leaves_nothing_of_itself_behind,
             a_record_for_an_unknown_session_is_refused,

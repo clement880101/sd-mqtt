@@ -44,8 +44,17 @@ use serde::{Deserialize, Serialize};
 /// Written once per database, not once per record, and checked before
 /// anything else is read. Bump it in the same commit as any change to a
 /// record type's fields, their order, their types, or the order of the
-/// variants of [`Record`] or any enum below.
-pub const FORMAT_VERSION: u16 = 1;
+/// variants of [`Record`] or any enum below — **and as any change to
+/// how a backend lays out what it holds**, which is the same hazard
+/// wearing a different hat: a build that reads a healthy file as
+/// something other than what was written.
+///
+/// Version 2 moved the reference count of a body out of the body's own
+/// row and into a table of its own. A version 1 store's body rows begin
+/// with eight bytes of count, which this build would read as the start
+/// of a payload, so they are refused as what they are: a store this
+/// build does not read.
+pub const FORMAT_VERSION: u16 = 2;
 
 /// What every sd-mqtt store begins with, so a file that is not one is
 /// refused as such rather than as a corrupt store.
@@ -468,7 +477,9 @@ pub enum Record {
         sequence: u64,
     },
     /// A body, stored once however many sessions reference it. Each put is
-    /// one reference taken.
+    /// one reference taken, and a put for an identifier the store
+    /// already holds takes the reference without rewriting the body;
+    /// see [`crate::Storage::apply`].
     BodyPut {
         /// Which body.
         id: MessageId,
