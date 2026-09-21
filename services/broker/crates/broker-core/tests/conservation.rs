@@ -14,6 +14,13 @@ use mqtt_codec::packet::Publish;
 use mqtt_codec::{Packet, QoS, ReasonCode};
 use proptest::prelude::*;
 use std::collections::{HashMap, HashSet};
+use storage::record::SessionKey;
+
+/// Whose these paths belong to. This property is about conservation
+/// rather than about what is written down, so any key will do.
+fn a_key() -> SessionKey {
+    SessionKey::new("", "c")
+}
 
 #[derive(Debug, Clone)]
 enum Op {
@@ -86,7 +93,7 @@ struct Run {
 
 impl Run {
     fn new(limits: QueueLimits, window: usize) -> Self {
-        let mut out = Outbound::new(limits, window);
+        let mut out = Outbound::new(a_key(), limits, window);
         out.set_online(true);
         Self {
             out,
@@ -125,6 +132,7 @@ impl Run {
                 dup: false,
                 subscription_ids: Vec::new(),
                 packet_id: None,
+                sequence: 0,
             },
             now,
             &mut self.actions,
@@ -510,13 +518,13 @@ fn any_hop() -> impl Strategy<Value = Hop> {
 
 impl Loop {
     fn new(window: usize) -> Self {
-        let mut to_subscriber = Outbound::new(QueueLimits::default(), window);
+        let mut to_subscriber = Outbound::new(a_key(), QueueLimits::default(), window);
         to_subscriber.set_online(true);
         Self {
             // Small enough that the publishing client runs into it.
-            from_publisher: Inbound::new(2),
+            from_publisher: Inbound::new(a_key(), 2),
             to_subscriber,
-            at_subscriber: Inbound::new(0),
+            at_subscriber: Inbound::new(a_key(), 0),
             actions: Vec::new(),
             delivered: HashMap::new(),
             free_ids: vec![1, 2, 3, 4],
@@ -655,6 +663,7 @@ impl Loop {
                     dup: false,
                     subscription_ids: Vec::new(),
                     packet_id: None,
+                    sequence: 0,
                 },
                 0,
                 &mut self.actions,

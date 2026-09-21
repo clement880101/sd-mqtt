@@ -29,6 +29,13 @@ jobs:
       - name: Lint
         run: cargo clippy --all-targets --all-features -- -D warnings
       - uses: taiki-e/install-action@nextest
+      # This also runs `sdmqtt`'s restart test, milestone two's exit
+      # criterion, which starts the real binary on a real socket, kills
+      # it with SIGKILL and starts it again on the same store. It needs
+      # no job of its own: the binary it drives is named with
+      # `CARGO_BIN_EXE_sdmqtt`, so cargo builds it as a dependency of
+      # the test, and the store lives in a temporary directory the test
+      # makes and throws away.
       - name: Test
         run: cargo nextest run --all-features
       - name: Doc tests

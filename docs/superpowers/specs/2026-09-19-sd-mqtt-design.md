@@ -60,7 +60,7 @@ sd-mqtt/
       crates/
         mqtt-codec/          packet types, encode, decode. No I/O.
         broker-core/         sessions, routing, retained, queues, hooks
-        storage/             Storage trait, fjall backend, redb backend
+        storage/             Storage trait, redb backend, in-memory backend
         cluster/             membership, metadata replication, node link
         connectors/          rule engine and the four connector types
         api/                 HTTP API, SSE, metrics, health, UI serving
@@ -276,11 +276,41 @@ miss because the codec correctly treats an empty payload as ordinary.
 - users with both an argon2 password hash and a SCRAM verifier, access
   control rules, rules, API keys, node identity
 
-The default backend is fjall, chosen because the queue workload is appends
-with deletion from the head and values up to megabytes, which is the shape a
-log-structured merge tree is built for. A redb backend is maintained as a
-supported alternative for anyone who wants the smaller dependency tree, and
-its existence keeps the trait honest.
+**The backend is redb.** An earlier draft named fjall, reasoning that a
+queue of appends with deletion from the head is the shape a log-structured
+merge tree is built for. Measuring both before writing against either
+reversed that.
+
+The deciding facts:
+
+- redb has a native remove-and-return-head. It measured 1.47M operations a
+  second and stayed flat across a hundred thousand of them. fjall has no
+  such primitive, and its obvious head read is a forward scan over every
+  accumulated deletion marker: it collapsed from 1,357 a second to 197 as a
+  queue drained, and a hundred thousand deletions never finished. A
+  persisted head cursor recovers most of that, but the engine that needs no
+  workaround is the better one to build on.
+- redb has one dependency, `libc`. fjall has forty-two, two of which fall
+  outside this project's licence allow list and would require amending it.
+  redb passes `cargo deny` with no change at all.
+- redb spawns no background threads. fjall runs a worker pool whose write
+  path contains unbounded loops of `std::thread::sleep`, which must never
+  run on an async runtime's thread.
+
+What is given up is key-value separation: redb stores values in the tree,
+so a multi-megabyte payload costs write amplification that fjall's separate
+blob storage would avoid. Message bodies are stored once and referenced, so
+the cost is paid once per message rather than once per subscriber. It was
+recorded in section 17 as a thing to measure rather than a thing to assume,
+and section 17 now carries the measurement: a body at the configured
+maximum packet size costs less per byte than a small one, and nothing
+follows from it.
+
+Writes serialize on a single write transaction, which is what a single
+batching writer does in any case. Freed pages are reused, so the file is
+bounded by its high-water mark rather than growing without end; reclaiming
+space needs an explicit compaction that excludes all transactions, which is
+a maintenance operation rather than a background one.
 
 ### 7.2 Durability
 
@@ -295,6 +325,92 @@ Restore runs as the first startup phase, before any listener binds.
 
 Reference counts are persisted alongside the bodies they protect, not
 rebuilt by scanning at startup.
+
+### 7.3 How the broker says what changed
+
+`broker-core` does no I/O, holds no locks and takes time as a parameter.
+Persistence must not change that, so the broker does not write: it
+**says what happened** and the shell writes.
+
+`Broker` keeps a journal buffer beside the action buffer it already
+fills. Every method that changes durable state appends a `Record` to it,
+and the shell drains it under the same lock that produced it, so a
+record and the actions it belongs with are always taken together and in
+order. A buffer is state, not I/O, so the purity that makes the broker
+testable survives.
+
+The alternative, having the shell infer what to persist from the packet
+it just handed in, was rejected: it would put a second copy of the
+broker's rules in the shell, and the two would drift the first time one
+of them was corrected.
+
+**Ordering is the point, and it is not an optimisation.** For an
+at-least-once or exactly-once publication, the acknowledgement says the
+broker has taken responsibility for the message. Sending it before the
+message is durable means a restart can lose a message the publisher was
+told was safe. So the shell commits the journal, waits for the commit to
+be durable, and only then delivers the actions. The wait is what the
+batching writer exists to make cheap: many connections commit into one
+flush and are woken together.
+
+At-most-once publications are journalled where they touch durable state
+and are never waited on, because nothing was promised.
+
+### 7.4 Sequence numbers
+
+Every queue entry carries a per-session sequence number, assigned when
+the message is enqueued and monotonic within the session. It is the
+queue's key, so reading in key order is reading in the order the
+messages arrived, and the highest applied number is a single value
+rather than a scan.
+
+They exist from this milestone even though nothing reads them yet.
+Replication in milestone 6 is a matter of shipping operations a replica
+applies in order, and retrofitting an ordering onto a queue that never
+had one would mean rewriting every stored queue in the field.
+
+Gapless is a property of the assignment, not of what survives: a
+delivered and deleted entry leaves a hole in the stored keys, and that
+is expected. What must never happen is two entries sharing a number, or
+a number going backwards.
+
+### 7.5 Restore
+
+Restore is the first startup phase and completes before any listener
+binds, so no client can observe a half-restored broker.
+
+It rebuilds, in order: sessions with their expiry and will; their
+subscriptions, which re-enter the matching trie; inbound exactly-once
+identifiers awaiting release; outbound inflight entries with the
+identifiers they were sent under; and queues, read in sequence order.
+The seams for the last three exist already and were written for this:
+`Inbound::reserve`, `Outbound::restore` and `Queue::requeue`.
+
+A session whose expiry has passed while the broker was down is not
+restored. The clock the broker starts with is therefore read before
+restore, not after.
+
+### 7.6 What this milestone does not store
+
+The trait in 7.1 lists what it will eventually cover. Milestone 2
+implements sessions, subscriptions, inbound state, queues, message
+bodies and retained messages. Replica queues wait for milestone 6,
+cluster metadata for milestone 5, and users, access control rules,
+rules and API keys for milestones 4 and 7. The trait may name them; the
+backend need not answer them yet.
+
+**One real backend is built.** What keeps the trait honest in this
+milestone is an in-memory backend used by the tests, which is cheap and
+catches the same class of mistake as a second engine would.
+
+The trait is nonetheless written as though a second backend existed,
+because comparing two engines is what found the head-read problem in the
+first place. Concretely: no backend's types appear in a signature; the
+head read is expressed as "read at or after this cursor" rather than as
+"read the first key", so an engine without a head primitive can still
+answer it; and queue depth is an explicit stored counter rather than a
+call to the engine's own length, because at least one engine's answer
+counts deleted entries.
 
 ## 8. Clustering
 
@@ -721,7 +837,7 @@ shippable.
    ring. Exit criteria: a single node passes the conformance suite over plain
    TCP, with the suite's TLS and WebSocket sections deferred to milestone 7.
    The suite is chosen and pinned during this milestone.
-2. **Persistence.** The storage trait, the fjall backend, durable sessions and
+2. **Persistence.** The storage trait, the redb backend, durable sessions and
    queues with per-session sequence numbers, restore on start. Exit criteria:
    a broker restart preserves durable sessions, their subscriptions and their
    queued messages, and queue operations carry gapless sequence numbers.
@@ -939,6 +1055,245 @@ needs it, and the resolution is recorded as an architecture decision record.
   an independent conformance suite, a walk of the spec against the code,
   and mutation testing during review. None of the three found what
   either of the others did.
+
+- **The ceiling on acknowledged delivery, measured.** Section 7.3 sends an
+  acknowledgement only after the commit is durable, so whatever the rest
+  of the broker can do, an acknowledged message costs a share of a flush.
+  Nothing had measured it. The harness is
+  `services/broker/crates/storage/tests/throughput.rs`, three ignored
+  tests run with
+  `cargo test -p storage --release --test throughput -- --ignored
+  --nocapture --test-threads 1`. Machine: Apple M2 Pro, 12 logical cores,
+  32 GB, macOS 26.4.1, arm64, release profile, internal APFS SSD, redb
+  with `SyncMode::Immediate`, one small record per write, each waiter
+  holding one write outstanding at a time, three-second window after a
+  one-second warm-up.
+
+  | concurrent waiters | durable writes/s | per waiter | coalescing off |
+  |---:|---:|---:|---:|
+  | 1 | 334 | 334 | 335 |
+  | 10 | 3,343 | 334 | 339 |
+  | 100 | 25,100 | 251 | 337 |
+
+  The last column is the control: the same load with the writer's count
+  trigger at zero, so every batch is flushed on its own. It is flat at
+  about 337 a second however many waiters there are, because that is one
+  `fsync` on this device and nothing is amortising it. With coalescing,
+  a hundred waiters get 25,100, and each of them still completes about
+  250 a second — roughly one flush per round trip, shared.
+
+  **So the ceiling is set by how many publishers are waiting at once, not
+  by the device.** A broker with one publisher awaiting an
+  acknowledgement is held to about 340 messages a second whatever else it
+  can do; a hundred of them get 75 times that between them, which is 75%
+  of what a perfectly linear scaling would give. Beside
+  the lock measurement above — around 290,000 at-most-once messages a
+  second through one `Shared` — this says that for acknowledged traffic
+  at these concurrencies the disk is the limit and the lock is not.
+
+- **What a multi-megabyte payload costs the store, measured.** redb keeps
+  values in the tree rather than apart from it, so a large payload is
+  rewritten as pages split and merge, where an engine with key-value
+  separation would write it once. The same harness, same machine. Each
+  row stores about 32 MiB of payload as bodies of one size, one batch per
+  body, with identifiers scattered across the key space as a real UUID
+  would be, and compares the file size before and after with the file
+  closed both times.
+
+  | body | bodies | payload bytes | file grew by | bytes/byte | MiB/s |
+  |---:|---:|---:|---:|---:|---:|
+  | 1 KiB | 32,768 | 33,554,432 | 66,351,104 | 1.98 | 46 |
+  | 64 KiB | 512 | 33,554,432 | 66,318,336 | 1.98 | 395 |
+  | 1 MiB | 32 | 33,554,432 | 68,153,344 | 2.03 | 562 |
+  | 2,000,000 B | 16 | 32,000,000 | 34,598,912 | 1.08 | 952 |
+
+  **Large bodies are not disproportionately expensive, and no design
+  change follows.** The store costs about twice its payload in file space
+  at every body size up to a megabyte, and 1.08 at the configured maximum
+  packet size, where it is also written twenty times faster per byte than
+  a kilobyte body is. The answer this question reserved — keeping large
+  bodies in files beside the store — is not needed, and bodies stay in
+  the store.
+
+  What the figure is and is not: bytes the file grew per byte of payload,
+  which is **space** amplification. Write amplification, the bytes a
+  copy-on-write engine spends rewriting pages, is necessarily larger and
+  is not measured here, because counting device writes needs a tool the
+  test cannot call. The throughput column is the check on it: a body
+  rewritten many times over would show there, and the rate rises with
+  body size rather than falling.
+
+  One caveat for anyone reproducing it. The ratio is only stable once the
+  store is tens of megabytes, which is why every row stores about 32 MiB:
+  the same 64 KiB bodies measured over 8 MiB read 3.89, which is redb's
+  file growth granularity rather than anything about the payload.
+
+- **What a fan-out costs the store, measured.** Section 7.1 stores a body
+  once and references it. That is a claim about **space**, and the table
+  above is what measures it. The claim beside it that nothing measured is
+  what the references *cost*: the backend held the reference count in the
+  body's own row, so every put after the first was a read-modify-write of
+  the whole row — deserialise the payload, reserialise it, write it back
+  — and a fan-out emits one put per session for one message. The same
+  harness, now three ignored tests, and the same machine as above. Each
+  row queues one publication for that many durable offline subscribers as
+  the broker emits it: one `BodyPut` and one `QueuePushed` per session,
+  **all in one batch**, which is one write transaction. Eight
+  publications a row, and only the apply is timed.
+
+  | body | subscribers | ms/publication, count in the body | ms/publication, count apart |
+  |---:|---:|---:|---:|
+  | 256 KiB | 1,000 | 27.2 | 2.9 |
+  | 256 KiB | 100 | 3.8 | 1.2 |
+  | 256 B | 1,000 | 2.4 | 2.0 |
+
+  **Nine times, and the change was kept.** A 256 KiB publication to a
+  thousand durable offline subscribers cost 27 ms of the storage thread,
+  inside one write transaction, with every waiter behind it blocked; with
+  the count in a table of its own it costs 3. The two rows below it say
+  what the saving is made of: at a hundred subscribers of the same
+  payload it is three times rather than nine, and at a 256-byte payload
+  it is 2.4 against 2.0, which is the shape of the batch rather than the
+  payload. So what was being paid for was rewriting the body, once per
+  subscriber, exactly as the reading predicted.
+
+  The space claim is unchanged and still holds: one row holds the payload
+  however many sessions name it, which `a_body_referenced_many_times_is_written_once`
+  asserts. What this cost the on-disk format is one table and a version
+  bump, because a version 1 store's body rows begin with eight bytes of
+  count that this build would read as payload.
+
+  The same shape one layer up was already fixed once: `broker-core`'s
+  `SharedProperties` exists so that a property block is encoded once per
+  message rather than once per subscriber. The backend reintroduced the
+  cost underneath it, which is worth remembering the next time a
+  per-subscriber loop meets a shared value.
+
+- **What a store costs the broker, measured.** The two questions above
+  measured the lock with no store and the store with no broker. This is
+  the two together, on the same harness as the lock figures —
+  `services/broker/crates/server/tests/throughput.rs`, now four ignored
+  tests — run with
+  `cargo test -p sdmqtt-server --release --test throughput -- --ignored
+  --nocapture --test-threads 1`. Machine: Apple M2 Pro, 12 logical
+  cores, 32 GB, macOS 26.4.1, arm64, release profile, internal APFS
+  SSD, loopback TCP, MQTT 5, 32-byte payloads, one subscriber per
+  publisher on its own topic, three-second window after a one-second
+  warm-up. Both rows of each table were measured in the same run, so
+  the comparison is not against a figure recorded on another day.
+
+  At most once, paced at 512 outstanding per pair, nothing discarded:
+
+  | publishers | no store, msg/s | redb, msg/s |
+  |---:|---:|---:|
+  | 1 | 429,000 | 428,000 |
+  | 2 | 345,000 | 354,000 |
+  | 4 | 230,000 | 231,000 |
+  | 8 | 173,000 | 174,000 |
+  | 16 | 214,000 | 217,000 |
+
+  **A store costs at-most-once delivery nothing, and the reason is that
+  nothing is written.** Section 7.3 journals such a publication only
+  where it touches durable state, and one delivered straight to an
+  attached subscriber touches none: `Outbound::offer` dispatches it
+  without pushing it on to a queue, so the whole exchange produces no
+  record. The column is here to show that rather than to find a cost.
+  The no-store column also reproduces milestone one's curve on the same
+  machine, 429,000 against 452,000 at one publisher, which is the check
+  that nothing else moved underneath it.
+
+  At least once, each publisher keeping exactly one publication
+  outstanding, so the publisher count is the concurrent-waiter count
+  the storage measurement is in:
+
+  | publishers | no store, ack/s | redb, ack/s | per waiter | storage crate predicted |
+  |---:|---:|---:|---:|---:|
+  | 1 | 30,000 | 340 | 340 | 334 |
+  | 2 | 41,500 | 365 | 182 | ~670 |
+  | 4 | 53,200 | 1,125 | 281 | ~1,340 |
+  | 8 | 58,700 | 2,630 | 329 | ~2,680 |
+  | 16 | 62,500 | 4,900 | 306 | ~5,350 |
+  | 100 | 66,000 | 11,100 | 111 | 25,100 |
+
+  Every figure is the mean of two runs that agreed to within 5%.
+
+  **The prediction holds at one waiter exactly and is optimistic
+  everywhere above it.** One publisher awaiting an acknowledgement gets
+  340 a second where the store alone gave 334, so the broker adds
+  nothing measurable to a message that is waiting for a disk. Coalescing
+  then works, but not as well through the broker as through the store:
+  a hundred waiters get 11,100 rather than 25,100, which is 45% of the
+  store's own ceiling and 33 times the single-waiter rate rather than
+  75.
+
+  **The shape differs, and the reason is that a message is not a
+  record.** The storage measurement wrote one small record per durable
+  write. An acknowledged publication through the broker journals a body,
+  a queue push, a queue pop and an inflight entry before the
+  acknowledgement is owed, and the body carries the payload; the
+  subscriber's own acknowledgement then adds two more records to the
+  next flush. So a hundred waiters are not a hundred records per flush
+  but closer to six hundred, and the flush is correspondingly longer.
+  The store's figure is the ceiling on durable **commits**, not on
+  acknowledged messages, and the difference between the two is how much
+  the broker writes per message.
+
+  **Two waiters get no more between them than one gets alone** — 365 a
+  second against 340, so 182 each. It is reproducible across runs and it
+  is not noise. The writer flushes what has accumulated since the last
+  flush, and a batch that arrives while a flush is in progress waits for
+  the next one; two publishers in a strict round trip arrive almost
+  exactly in each other's flush windows, so each pays a whole flush of
+  its own. At four and above enough waiters accumulate behind each flush
+  for the coalescing to pay. Nothing is broken here, but a deployment
+  with two acknowledged publishers should not expect twice one.
+
+  Beside the at-most-once row: the same broker moves 428,000 unpromised
+  messages a second and 11,100 promised ones. **That factor of forty is
+  the price of the promise**, and it is paid to the device rather than
+  to the lock.
+
+- **Encoding a property block once per subscriber, found and fixed.**
+  `journal::body_record` built each subscriber's body record by
+  encoding the message's property block again, though the store keeps
+  one body per message however many sessions hold it. On the same
+  machine, a publish to a fan-out of a thousand offline durable
+  sessions cost 654 ns per subscriber with a realistic 95-byte block
+  against 435 ns with an empty one, and a fan-out of a hundred cost 465
+  against 248: a third to a half of the work of a fan-out was producing
+  copies of one answer. The block itself encodes in 284 ns, which is
+  the check that the difference is the encode and not something else
+  that grew with the fan-out.
+
+  `broker_core::properties::SharedProperties` now carries the block and
+  its encoding together, filling the encoding on the first ask and
+  sharing the buffer with every asker after it. Lazily, because an
+  at-most-once publication to an attached client is journalled nowhere
+  and encoding eagerly would charge the hot path for bytes no record
+  wants; and with no way to change a block in place, because a cache is
+  only honest while what it was taken from cannot change.
+
+  | fan-out | before, ns/subscriber | after, ns/subscriber |
+  |---:|---:|---:|
+  | 1 | 1,730 / 1,950 | 1,740 / 2,030 |
+  | 10 | 369 / 570 | 310 / 328 |
+  | 100 | 248 / 465 | 193 / 185 |
+  | 1,000 | 435 / 654 | 393 / 366 |
+
+  Empty block first, realistic block second, each the mean of three
+  runs. The two columns meet afterwards, and at a fan-out of one
+  nothing changed — one encode is still one encode, and the 4% between
+  1,950 and 2,030 is inside the spread of the runs it is the mean of. The measurement is
+  `what_a_property_block_costs_a_fan_out` in the same harness, kept so
+  that a build which re-encoded per subscriber would pull the two
+  columns apart again.
+
+- **Two fjall behaviours worth remembering if this is ever revisited.**
+  Its length call counts deleted entries, so it cannot answer queue
+  depth; and its keyspaces cost roughly thirty milliseconds each to
+  create, so a design with one per session would take minutes to start.
+  Both shaped the trait even though the engine was not chosen: depth is a
+  stored counter and queues share one table with composite keys.
 
 - **Eight conformance defects, found by the suite and since fixed.**
   Kept here rather than deleted, because the finding is worth more than

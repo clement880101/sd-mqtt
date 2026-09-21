@@ -3,14 +3,16 @@
 pub mod route;
 pub mod subscribe;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use foldhash::fast::RandomState;
 use mqtt_codec::packet::Connect;
 use mqtt_codec::{Limits, Packet, Properties, QoS, ReasonCode, Version};
+use storage::record::Record;
 
 use crate::clock::CoarseClock;
+use crate::journal::{self, DurableSession, DurableState};
 use crate::keepalive::{Activity, KeepAliveRing};
 use crate::registry::{Registration, Registry, SessionId};
 use crate::retained::{RetainedMessage, RetainedStore};
@@ -104,6 +106,13 @@ pub struct Broker {
     keepalive: KeepAliveRing,
     activities: HashMap<SubscriberId, Activity, RandomState>,
     config: BrokerConfig,
+    /// Everything that changed durably and has not been handed over.
+    ///
+    /// Section 7.3: the broker does no I/O, so it says what happened
+    /// into here and the shell writes it. The shell drains this under
+    /// the same lock that filled it, so a record and the actions it
+    /// belongs with are always taken together and in order.
+    journal: Vec<Record>,
 }
 
 impl Broker {
@@ -125,6 +134,130 @@ impl Broker {
             keepalive: KeepAliveRing::new(config.max_keep_alive),
             activities: HashMap::with_hasher(RandomState::default()),
             config,
+            journal: Vec::new(),
+        }
+    }
+
+    /// Move everything the broker has said onto the end of `out`.
+    ///
+    /// Drained by the shell under the same lock that filled it, which is
+    /// what keeps a record and the actions it belongs with together and
+    /// in order. Section 7.3: the shell commits this, waits for the
+    /// commit to be durable when something is about to be acknowledged,
+    /// and only then performs the actions.
+    pub fn take_journal(&mut self, out: &mut Vec<Record>) {
+        out.append(&mut self.journal);
+    }
+
+    /// Throw away everything said so far, everywhere it is held.
+    ///
+    /// For [`crate::restore`] and nothing else. Restore rebuilds a
+    /// broker by walking the same paths a live client walks, so those
+    /// paths say what they always say; but it is reading what was
+    /// already written down, not deciding anything new, and writing it
+    /// back would be a second copy of a state the store already holds.
+    ///
+    /// It reaches into every session as well as the broker's own
+    /// buffer, because a record left in a session's buffer is not
+    /// discarded by clearing this one: it would simply be handed over
+    /// by whichever call next drained that session, long after the
+    /// restore that produced it.
+    pub fn discard_journal(&mut self) {
+        for (_, session) in self.registry.iter_mut() {
+            session.take_journal(&mut self.journal);
+        }
+        self.journal.clear();
+    }
+
+    /// Everything about this broker that must survive it.
+    ///
+    /// Durable state only. What it leaves out, and why leaving it out is
+    /// the point rather than a simplification, is on [`DurableState`].
+    pub fn durable_state(&self) -> DurableState {
+        let mut bodies = BTreeMap::new();
+        let mut sessions = BTreeMap::new();
+
+        for (_, session) in self.registry.iter() {
+            let record = session.record();
+            let subscriptions = session
+                .subscriptions()
+                .iter()
+                .map(|held| (held.filter.clone(), held.clone()))
+                .collect();
+            let mut inbound: Vec<u16> = session.inbound.held().collect();
+            inbound.sort_unstable();
+
+            let mut inflight = Vec::new();
+            for entry in session.outbound.outstanding() {
+                bodies.insert(
+                    journal::stored_message_id(entry.delivery.message.id),
+                    journal::body_record(&entry.delivery.message),
+                );
+                inflight.push(journal::inflight_record(entry));
+            }
+            // In arrival order rather than send order; see the field.
+            inflight.sort_by_key(|entry| entry.sequence);
+            let mut queue = Vec::new();
+            for item in session.outbound.waiting() {
+                bodies.insert(
+                    journal::stored_message_id(item.message.id),
+                    journal::body_record(&item.message),
+                );
+                queue.push(journal::queue_entry(item));
+            }
+
+            sessions.insert(
+                record.key.clone(),
+                DurableSession {
+                    session: record,
+                    subscriptions,
+                    inbound,
+                    inflight,
+                    queue,
+                    highest_sequence: session.outbound.highest_sequence(),
+                },
+            );
+        }
+
+        let mut held = Vec::new();
+        self.retained.entries(&mut held);
+        let retained = held
+            .into_iter()
+            .map(|(topic, message)| (topic, journal::retained_record(&message)))
+            .collect();
+
+        DurableState {
+            sessions,
+            retained,
+            bodies,
+        }
+    }
+
+    /// The retained store, so that a path rebuilding this broker from
+    /// storage can put back what was held.
+    pub fn retained(&self) -> &RetainedStore {
+        &self.retained
+    }
+
+    /// How many sessions are holding records nothing has taken.
+    ///
+    /// Zero at the end of every call into the broker. A record left in a
+    /// session's own buffer is one the shell has not committed, and
+    /// section 7.3 has the shell committing before it acknowledges, so
+    /// a late drain is a broken promise rather than an untidy one. It
+    /// walks every session, which is why it is for tests and not for a
+    /// metric.
+    pub fn sessions_holding_records(&self) -> usize {
+        self.registry
+            .iter()
+            .filter(|(_, session)| session.has_unsaid())
+            .count()
+    }
+
+    /// Hand over everything one session has said.
+    fn drain_session(&mut self, subscriber: SubscriberId) {
+        if let Some(session) = self.registry.get_mut(subscriber) {
+            session.take_journal(&mut self.journal);
         }
     }
 
@@ -210,7 +343,22 @@ impl Broker {
                 if let Some(session) = self.registry.get_mut(existing) {
                     Self::discard_held(session, existing, out);
                 }
+                // Said before the session is replaced, because the
+                // buffer holding it is part of the session and goes
+                // when it does. Everything the discard released must
+                // reach the shell, and it can only reach it from here.
+                self.drain_session(existing);
             }
+            // [MQTT-3.1.2-4]: a clean start discards the session. The
+            // record takes its subscriptions, its queue, its window and
+            // its inbound identifiers with it, so nothing else needs to
+            // be said about them, and it must come before the record
+            // that creates the replacement. A session the store does
+            // not hold is a no-op, which is what this is for a client
+            // that has never connected.
+            self.journal.push(Record::SessionRemoved {
+                session: journal::key_of(&identity),
+            });
         }
         let mut registration = self.registry.register(identity, connect.clean_start, now);
         // The registry judges takeover by whether the session was still
@@ -267,6 +415,7 @@ impl Broker {
         self.keepalive
             .insert(registration.subscriber, connect.keep_alive, activity, now);
 
+        self.drain_session(registration.subscriber);
         registration
     }
 
@@ -351,6 +500,11 @@ impl Broker {
             session.take_due_will(now)
         };
 
+        // Said before the will goes out, because publishing it routes
+        // to other sessions and the order records are handed over in is
+        // the order they happened in.
+        self.drain_session(incumbent);
+
         if let Some(will) = due {
             self.publish_will(incumbent, &will, now, out);
         }
@@ -398,6 +552,21 @@ impl Broker {
     ///
     /// [`Session::is_expired`]: crate::session::state::Session::is_expired
     pub fn handle(
+        &mut self,
+        subscriber: SubscriberId,
+        packet: &Packet,
+        out: &mut Vec<Addressed>,
+    ) -> Result<(), ReasonCode> {
+        let outcome = self.handle_inner(subscriber, packet, out);
+        // Drained on every path out, including the failing ones: a
+        // packet that ends the connection may still have changed
+        // durable state on its way to doing so, and an error is not a
+        // reason to lose what it changed.
+        self.drain_session(subscriber);
+        outcome
+    }
+
+    fn handle_inner(
         &mut self,
         subscriber: SubscriberId,
         packet: &Packet,
@@ -562,7 +731,7 @@ impl Broker {
                 publish.qos,
                 publish.retain,
             );
-            message.properties = Arc::new(publish.properties.clone());
+            message.properties = Arc::new(publish.properties.clone().into());
             message.expires_at = self.deadline(&publish.properties);
 
             Some(self.publish(message, Some(from), now, out))
@@ -623,7 +792,24 @@ impl Broker {
     ) -> usize {
         if message.retain {
             // An empty payload clears the topic rather than storing one,
-            // which the store itself knows.
+            // which the store itself knows. The record says the same
+            // thing the store was just told, because the two must not
+            // disagree about whether a topic still holds a message.
+            if message.payload.is_empty() {
+                self.journal.push(Record::RetainedRemoved {
+                    topic: message.topic.to_string(),
+                });
+            } else {
+                self.journal.push(Record::RetainedPut {
+                    topic: message.topic.to_string(),
+                    message: storage::record::RetainedRecord {
+                        payload: message.payload.clone(),
+                        qos: journal::stored_qos(message.qos),
+                        expires_at: message.expires_at,
+                        properties: message.properties.encoded(),
+                    },
+                });
+            }
             self.retained.set(
                 &message.topic,
                 RetainedMessage {
@@ -679,6 +865,7 @@ impl Broker {
                         dup: false,
                         packet_id: None,
                         subscription_ids: target.subscription_ids,
+                        sequence: 0,
                     },
                     now,
                     &mut actions,
@@ -687,6 +874,7 @@ impl Broker {
             for action in actions {
                 out.push((target.subscriber, action));
             }
+            self.drain_session(target.subscriber);
         }
 
         reached
@@ -725,6 +913,7 @@ impl Broker {
         for action in actions {
             out.push((subscriber, action));
         }
+        self.drain_session(subscriber);
     }
 
     /// A connection went away without a disconnect packet.
@@ -762,6 +951,9 @@ impl Broker {
                 None => session.on_disconnected(false, now),
             }
         }
+        // A departure changes when the session expires and whether it
+        // still owes a will, both of which must survive it.
+        self.drain_session(subscriber);
     }
 
     /// Report and discard everything a session still held.
@@ -806,6 +998,10 @@ impl Broker {
             .filter_map(|(id, session)| session.take_due_will(now).map(|will| (*id, will)))
             .collect();
         for (publisher, will) in due {
+            // The session said the will is no longer owed as it handed
+            // it over; that must be written down before the publication
+            // it causes.
+            self.drain_session(publisher);
             self.publish_will(publisher, &will, now, out);
         }
 
@@ -817,14 +1013,28 @@ impl Broker {
             .collect();
         for subscriber in gone {
             if let Some(mut session) = self.registry.remove(subscriber) {
+                let key = journal::key_of(session.id());
                 subscribe::remove_all(&self.subscriptions, &self.shared, &mut session);
                 Self::discard_held(&mut session, subscriber, out);
+                // Taken out of the session before it is dropped, and
+                // before the record that ends it: the removal is what
+                // makes every one of these refer to a session the store
+                // no longer holds.
+                session.take_journal(&mut self.journal);
+                self.journal.push(Record::SessionRemoved { session: key });
             }
             self.keepalive.remove(subscriber);
             self.activities.remove(&subscriber);
         }
 
-        self.retained.sweep_expired(now);
+        // A retained message reclaimed here is gone from the store too,
+        // or it stays on disk for the life of the file: every reader
+        // skips an expired message, so nothing would ever notice.
+        let mut reclaimed = Vec::new();
+        self.retained.sweep_expired(now, &mut reclaimed);
+        for topic in reclaimed {
+            self.journal.push(Record::RetainedRemoved { topic });
+        }
     }
 
     /// How many sessions exist, connected or not.

@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use mqtt_codec::packet::{Ack, Publish};
 use mqtt_codec::{Packet, Properties, QoS, ReasonCode};
+use storage::record::{Record, SessionKey};
 
+use crate::journal::{self, Journal};
 use crate::session::inflight::{Inflight, InflightEntry, InflightState};
 use crate::session::message::Message;
 use crate::session::packet_ids::PacketIds;
@@ -18,24 +20,69 @@ use crate::session::Action;
 /// dies, so a timer would only manufacture duplicates. Redelivery happens
 /// on resume and nowhere else.
 pub struct Outbound {
+    /// Whose this is, so that a record can say so. Section 7.3: the
+    /// broker says what happened, and what happened is always to
+    /// somebody.
+    session: SessionKey,
     queue: Queue,
     inflight: Inflight,
     packet_ids: PacketIds,
     online: bool,
     /// Reused across calls so the hot path allocates nothing.
     scratch: Vec<(Delivery, DropReason)>,
+    /// What changed durably and has not been handed over.
+    journal: Journal,
+    /// The highest sequence number ever assigned to this session's
+    /// queue, whether or not that entry is still held.
+    ///
+    /// Section 7.4: two entries sharing a number, or a number going
+    /// backwards, is what must never happen, so this is a high-water
+    /// mark and not the largest key present. Zero for a session nothing
+    /// has been queued for, which makes the first assigned number one.
+    highest_sequence: u64,
 }
 
 impl Outbound {
     /// A new outbound path with the given queue bounds and window size.
-    pub fn new(limits: QueueLimits, inflight_limit: usize) -> Self {
+    pub fn new(session: SessionKey, limits: QueueLimits, inflight_limit: usize) -> Self {
         Self {
+            session,
             queue: Queue::new(limits),
             inflight: Inflight::new(inflight_limit),
             packet_ids: PacketIds::default(),
             online: false,
             scratch: Vec::new(),
+            journal: Journal::new(),
+            highest_sequence: 0,
         }
+    }
+
+    /// Move everything this path has said onto the end of `out`.
+    ///
+    /// The caller does this under the same lock that produced the
+    /// records; see the module documentation on why leaving them here is
+    /// not a tidiness question.
+    pub fn take_journal(&mut self, out: &mut Vec<Record>) {
+        self.journal.drain_into(out);
+    }
+
+    /// Whether anything said has not been handed over.
+    pub fn has_unsaid(&self) -> bool {
+        !self.journal.is_empty()
+    }
+
+    /// The highest sequence number ever assigned to this queue.
+    pub fn highest_sequence(&self) -> u64 {
+        self.highest_sequence
+    }
+
+    /// Set the high-water mark, for a path rebuilding this from storage.
+    ///
+    /// Nothing else may lower it: section 7.4's rule is about the
+    /// assignment, and a mark that went backwards would hand a second
+    /// entry a number the store has already spent.
+    pub fn set_highest_sequence(&mut self, highest: u64) {
+        self.highest_sequence = highest;
     }
 
     /// Whether a connection is attached.
@@ -69,10 +116,63 @@ impl Outbound {
     }
 
     /// Offer a message for delivery.
-    pub fn offer(&mut self, item: Delivery, now: u32, out: &mut Vec<Action>) {
+    ///
+    /// This is where a sequence number is assigned, and the only place:
+    /// whatever [`Delivery::sequence`] holds on the way in is replaced.
+    ///
+    /// # What is not written down
+    ///
+    /// Section 7.3: "At-most-once publications are journalled where they
+    /// touch durable state", and one delivered straight to an attached
+    /// client touches none. So a fire-and-forget message that would go
+    /// out of the front door the moment it came in the back skips the
+    /// queue entirely rather than being pushed, popped and journalled
+    /// four records deep for nothing. The condition is exactly the one
+    /// under which the pump below would have taken it again at once, so
+    /// nothing else about it changes.
+    pub fn offer(&mut self, mut item: Delivery, now: u32, out: &mut Vec<Action>) {
+        if item.qos == QoS::AtMostOnce
+            && self.online
+            && self.queue.is_empty()
+            && self.inflight.has_room()
+            && !self
+                .queue
+                .would_refuse(&item.message, item.qos, now, self.online)
+        {
+            self.dispatch(item, now, Resting::No, out);
+            return;
+        }
+
+        let assigned = self.highest_sequence + 1;
+        item.sequence = assigned;
         self.scratch.clear();
-        self.queue.push(item, now, self.online, &mut self.scratch);
-        self.report(out);
+        let accepted = self.queue.push(item, now, self.online, &mut self.scratch);
+        // A push reports two different things in one list: entries it
+        // evicted, which were resident and are leaving a queue the store
+        // holds them in, and the arrival itself when it was refused,
+        // which never entered one. The refusal is last and happens only
+        // when the push says no, which is what tells them apart.
+        let resident = self.scratch.len() - usize::from(!accepted);
+        self.report(resident, out);
+        if accepted {
+            self.highest_sequence = assigned;
+            let (entry, body, id) = {
+                let queued = self.queue.back().expect("the push said it took it");
+                (
+                    journal::queue_entry(queued),
+                    journal::body_record(&queued.message),
+                    journal::stored_message_id(queued.message.id),
+                )
+            };
+            // One put is one reference, and this is the one reference a
+            // queued delivery holds: it is released when the delivery
+            // leaves for good, and not when it moves into the window.
+            self.journal.push(Record::BodyPut { id, body });
+            self.journal.push(Record::QueuePushed {
+                session: self.session.clone(),
+                entry,
+            });
+        }
         self.pump(now, out);
     }
 
@@ -81,18 +181,43 @@ impl Outbound {
         while self.online && self.inflight.has_room() {
             self.scratch.clear();
             let next = self.queue.pop(now, &mut self.scratch);
-            self.report(out);
+            // Everything a pop discards was resident: it was in the
+            // queue and expired while waiting there.
+            let resident = self.scratch.len();
+            self.report(resident, out);
             let Some(item) = next else { break };
-            if !self.dispatch(item, now, out) {
+            if !self.dispatch(item, now, Resting::Yes, out) {
                 break;
             }
         }
     }
 
     /// Put one message on the wire. Returns whether to keep going.
-    fn dispatch(&mut self, item: Delivery, now: u32, out: &mut Vec<Action>) -> bool {
+    ///
+    /// `resting` says whether the store believes this delivery is in the
+    /// queue, which decides whether leaving it is a thing to write down.
+    /// Only a fire-and-forget message taken by [`Outbound::offer`]'s
+    /// direct path was never there.
+    fn dispatch(
+        &mut self,
+        item: Delivery,
+        now: u32,
+        resting: Resting,
+        out: &mut Vec<Action>,
+    ) -> bool {
         if item.qos == QoS::AtMostOnce {
             out.push(Action::Send(publish(&item, None, now)));
+            if resting == Resting::Yes {
+                // Nothing follows it: there is no acknowledgement to
+                // wait for, so the reference the queue held goes now.
+                self.journal.push(Record::QueuePopped {
+                    session: self.session.clone(),
+                    sequence: item.sequence,
+                });
+                self.journal.push(Record::BodyReleased {
+                    id: journal::stored_message_id(item.message.id),
+                });
+            }
             return true;
         }
 
@@ -108,6 +233,12 @@ impl Outbound {
                     // Every identifier is outstanding. Put it back and
                     // wait for an acknowledgement to free one; this is a
                     // stall, not a loss.
+                    //
+                    // Nothing is written down, deliberately. The entry
+                    // goes back to the head under the number it already
+                    // has, which is the number the store still has it
+                    // under, so as far as anything durable is concerned
+                    // it never left.
                     self.queue.requeue(item);
                     return false;
                 };
@@ -121,12 +252,27 @@ impl Outbound {
         } else {
             InflightState::AwaitingReceived
         };
-        self.inflight.push(InflightEntry {
+        let entry = InflightEntry {
             packet_id,
             delivery: item,
             state,
             sent_at: now,
+        };
+        if resting == Resting::Yes {
+            self.journal.push(Record::QueuePopped {
+                session: self.session.clone(),
+                sequence: entry.delivery.sequence,
+            });
+        }
+        // The body is not released here. The reference the queue took
+        // covers the window too, because the entry that leaves the queue
+        // is the entry that enters the window, and a store that released
+        // on the pop would delete the body between the two.
+        self.journal.push(Record::InflightPut {
+            session: self.session.clone(),
+            entry: journal::inflight_record(&entry),
         });
+        self.inflight.push(entry);
         true
     }
 
@@ -264,6 +410,15 @@ impl Outbound {
             return Ok(());
         };
         entry.state = InflightState::AwaitingComplete;
+        // How far the exchange has got is durable: section 7.5 resumes
+        // an entry in this state by resending the release rather than
+        // the publish, and a restart that forgot the state would send
+        // the peer a second copy of a message it already owns.
+        let updated = journal::inflight_record(entry);
+        self.journal.push(Record::InflightPut {
+            session: self.session.clone(),
+            entry: updated,
+        });
         out.push(Action::Send(Packet::PubRel(Ack {
             packet_id,
             reason: ReasonCode::Success,
@@ -313,6 +468,17 @@ impl Outbound {
             .remove(packet_id)
             .expect("the entry was found a moment ago");
         self.packet_ids.release(packet_id);
+        // Every way an exchange ends comes through here, which is why
+        // the records do too: an acknowledgement, a receipt refused, a
+        // completion, and a packet discarded for being too large all
+        // settle the same entry and release the same reference.
+        self.journal.push(Record::InflightRemoved {
+            session: self.session.clone(),
+            packet_id,
+        });
+        self.journal.push(Record::BodyReleased {
+            id: journal::stored_message_id(entry.delivery.message.id),
+        });
         Ok(entry)
     }
 
@@ -332,7 +498,7 @@ impl Outbound {
         self.online = true;
 
         let drained: Vec<InflightEntry> = self.inflight.drain().collect();
-        let (owned_by_peer, to_resend): (Vec<_>, Vec<_>) = drained
+        let (owned_by_peer, mut to_resend): (Vec<_>, Vec<_>) = drained
             .into_iter()
             .partition(|e| e.state == InflightState::AwaitingComplete);
 
@@ -345,32 +511,137 @@ impl Outbound {
             self.inflight.push(entry);
         }
 
-        // Reversed, because each requeue goes to the head, so the last one
-        // pushed ends up first.
-        for entry in to_resend.into_iter().rev() {
+        // Said in arrival order and done in reverse, which are two
+        // different orders and both are forced. A record may only ever
+        // raise the high-water mark, so the numbers must be written down
+        // ascending; a requeue goes to the head, so the last one put
+        // back ends up first.
+        //
+        // The number is a fresh one rather than the one the entry had.
+        // Section 7.4 spends a sequence for good — the pop that moved
+        // this entry into the window spent its old one — and the store
+        // refuses a number it has already seen, so an entry coming back
+        // out of the window rejoins the queue carrying the highest
+        // number in it while sitting at the head of it. Those two facts
+        // disagree, and [`Outbound::renumber`] below is what settles
+        // them.
+        for entry in &mut to_resend {
+            self.highest_sequence += 1;
+            entry.delivery.sequence = self.highest_sequence;
             // The identifier stays reserved and travels with the message.
             // Releasing it here and allocating a fresh one on the way out
             // would break exactly-once for any peer that received the
             // first copy and lost its receipt.
-            let mut delivery = entry.delivery;
-            delivery.packet_id = Some(entry.packet_id);
-            delivery.dup = true;
-            self.queue.requeue(delivery);
+            entry.delivery.packet_id = Some(entry.packet_id);
+            entry.delivery.dup = true;
+            self.journal.push(Record::InflightRemoved {
+                session: self.session.clone(),
+                packet_id: entry.packet_id,
+            });
+            // No body reference is taken. The one the delivery took when
+            // it was first queued was never released: it covered the
+            // window, and it covers the queue again now.
+            self.journal.push(Record::QueuePushed {
+                session: self.session.clone(),
+                entry: journal::queue_entry(&entry.delivery),
+            });
+        }
+
+        // Reversed, because each requeue goes to the head, so the last one
+        // pushed ends up first.
+        let requeued = !to_resend.is_empty();
+        for entry in to_resend.into_iter().rev() {
+            self.queue.requeue(entry.delivery);
         }
 
         self.pump(now, out);
+        if requeued {
+            self.renumber();
+        }
+    }
+
+    /// Put the queue's numbering back in the order the queue is in.
+    ///
+    /// Section 7.4 makes the sequence number the stored queue's key, so
+    /// reading a restored queue in key order is how the order a session
+    /// will deliver in survives a restart. A resume breaks that: the
+    /// entries coming back out of the window belong at the head and can
+    /// only be written down under fresh numbers, which are the largest
+    /// in the queue. Everything already waiting behind them is then
+    /// numbered *below* messages it must be delivered *after*.
+    ///
+    /// Usually nothing comes of it, because the pump takes every
+    /// requeued entry straight back out again — the window it drained
+    /// had room for exactly them. The exception is a window that has
+    /// been narrowed since: section 4.9 has the peer's receive maximum
+    /// re-read on each connection, the shell narrows the window after
+    /// the resume rather than before, so a client that reconnects
+    /// advertising less than it did leaves entries stranded in the
+    /// queue under numbers that put a newer message in front of them.
+    /// A restart then delivers that newer message ahead of redeliveries
+    /// the peer is still holding identifiers for, which [MQTT-4.6.0-6]
+    /// forbids for any two messages from the same publisher.
+    ///
+    /// So the queue is walked once and everything from the first
+    /// backwards step onwards is given a fresh number, ascending, which
+    /// restores "key order is delivery order" without moving anything.
+    /// The reference each delivery holds on its body is untouched: the
+    /// entry never leaves the queue, so the pop and the push below are
+    /// the same entry under a new key and not a release and a take.
+    ///
+    /// A queue already in order costs a walk and no records, which is
+    /// every resume but the narrowed one.
+    fn renumber(&mut self) {
+        let Self {
+            queue,
+            journal,
+            session,
+            highest_sequence,
+            ..
+        } = self;
+        let mut previous = 0;
+        let mut renumbering = false;
+        for item in queue.iter_mut() {
+            if !renumbering && item.sequence > previous {
+                previous = item.sequence;
+                continue;
+            }
+            // Once one entry has moved, every entry behind it must move
+            // too, or it would overtake them.
+            renumbering = true;
+            let spent = item.sequence;
+            *highest_sequence += 1;
+            item.sequence = *highest_sequence;
+            journal.push(Record::QueuePopped {
+                session: session.clone(),
+                sequence: spent,
+            });
+            journal.push(Record::QueuePushed {
+                session: session.clone(),
+                entry: journal::queue_entry(item),
+            });
+        }
     }
 
     /// Discard everything, reporting each message.
     pub fn clear(&mut self, reason: DropReason, out: &mut Vec<Action>) {
         self.scratch.clear();
         self.queue.clear(reason, &mut self.scratch);
-        self.report(out);
+        // Everything a clear reports was resident in the queue.
+        let resident = self.scratch.len();
+        self.report(resident, out);
         let drained: Vec<InflightEntry> = self.inflight.drain().collect();
         for entry in drained {
             // The window held these identifiers; nothing will
             // acknowledge them now, so they come back here or never.
             self.packet_ids.release(entry.packet_id);
+            self.journal.push(Record::InflightRemoved {
+                session: self.session.clone(),
+                packet_id: entry.packet_id,
+            });
+            self.journal.push(Record::BodyReleased {
+                id: journal::stored_message_id(entry.delivery.message.id),
+            });
             out.push(Action::Dropped {
                 id: entry.delivery.message.id,
                 reason,
@@ -399,11 +670,45 @@ impl Outbound {
         was_free
     }
 
+    /// Put back a message that was waiting in the queue when this
+    /// session was last written to storage.
+    ///
+    /// The queue's own seam, beside [`Outbound::restore`] for the
+    /// window. Nothing is journalled: a restore is reading what was
+    /// already said, not saying it again, and the delivery keeps the
+    /// sequence number it was stored under because that number is spent.
+    ///
+    /// It goes to the head, so a caller replaying a stored queue replays
+    /// it newest first.
+    ///
+    /// The identifier is reserved, when the entry carries one, exactly
+    /// as [`Outbound::restore`] reserves the window's. A queued entry
+    /// carries one when a resume put it back before it could be resent,
+    /// and the peer is holding that identifier just as surely as it
+    /// holds an outstanding one: an allocator rebuilt without it hands
+    /// the same value to an unrelated message and the peer discards one
+    /// of the two as a repeat. Reports whether it was free, so that a
+    /// stored state disagreeing with itself is visible rather than
+    /// silent.
+    pub fn requeue(&mut self, item: Delivery) -> bool {
+        let was_free = match item.packet_id {
+            Some(packet_id) => self.packet_ids.reserve(packet_id),
+            None => true,
+        };
+        self.queue.requeue(item);
+        was_free
+    }
+
     /// Every message outstanding, in the order sent, for persistence.
     ///
     /// The mirror of [`Inbound::held`](crate::session::Inbound::held).
     pub fn outstanding(&self) -> impl Iterator<Item = &InflightEntry> + '_ {
         self.inflight.iter()
+    }
+
+    /// Every message waiting, in the order the queue holds it.
+    pub fn waiting(&self) -> impl Iterator<Item = &Delivery> + '_ {
+        self.queue.iter()
     }
 
     /// How many are outstanding.
@@ -433,14 +738,27 @@ impl Outbound {
     /// A resumed message carries its identifier in the queue, so without
     /// this an expiry or an eviction would strand that identifier for the
     /// life of the session.
-    fn report(&mut self, out: &mut Vec<Action>) {
+    /// `resident` is how many of the reported messages were in the
+    /// queue, which is all of them except a refused arrival: one that
+    /// was never taken has nothing to pop and no reference to release,
+    /// and saying otherwise would release a body nobody holds.
+    fn report(&mut self, resident: usize, out: &mut Vec<Action>) {
         // Taken out so the identifiers can be released while draining;
         // the buffer goes back afterwards, so the hot path still does not
         // allocate.
         let mut scratch = std::mem::take(&mut self.scratch);
-        for (item, reason) in scratch.drain(..) {
+        for (index, (item, reason)) in scratch.drain(..).enumerate() {
             if let Some(packet_id) = item.packet_id {
                 self.packet_ids.release(packet_id);
+            }
+            if index < resident {
+                self.journal.push(Record::QueuePopped {
+                    session: self.session.clone(),
+                    sequence: item.sequence,
+                });
+                self.journal.push(Record::BodyReleased {
+                    id: journal::stored_message_id(item.message.id),
+                });
             }
             out.push(Action::Dropped {
                 id: item.message.id,
@@ -453,11 +771,24 @@ impl Outbound {
     }
 }
 
+/// Whether the store believes a delivery is sitting in the queue.
+///
+/// The one thing [`Outbound::dispatch`] cannot work out for itself, and
+/// the difference between a message whose departure must be written down
+/// and one that was never written down in the first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resting {
+    /// It is in the queue, and leaving it is a durable change.
+    Yes,
+    /// It never entered one.
+    No,
+}
+
 fn publish(item: &Delivery, packet_id: Option<u16>, now: u32) -> Packet {
     // The property block is cloned per delivery because the subscription
     // identifiers differ per subscriber. That clone is the packet-sizing
     // question recorded in the design spec's open questions.
-    let mut properties = (*item.message.properties).clone();
+    let mut properties = item.message.properties.live().clone();
     properties.subscription_identifiers = item.subscription_ids.clone();
     // [MQTT-3.3.2-6]: what the client is told is what is left, not what
     // was published. `expires_at` is the subtraction already done, so
@@ -481,7 +812,18 @@ fn publish(item: &Delivery, packet_id: Option<u16>, now: u32) -> Packet {
 
 #[cfg(test)]
 mod tests {
+    /// Whose this path belongs to; see the note in `inbound`.
+    fn a_key() -> SessionKey {
+        SessionKey::new("", "c")
+    }
+
+    /// A property block as a message carries one.
+    fn shared(properties: Properties) -> Arc<SharedProperties> {
+        Arc::new(SharedProperties::new(properties))
+    }
+
     use super::*;
+    use crate::properties::SharedProperties;
     use crate::session::message::Message;
     use crate::session::queue::{Delivery, DropReason, QueueLimits};
     use crate::session::Action;
@@ -495,7 +837,7 @@ mod tests {
         let mut actions = Vec::new();
         let mut item = delivery(QoS::AtMostOnce, b"body");
         item.message.expires_at = Some(60);
-        item.message.properties = Arc::new(Properties {
+        item.message.properties = shared(Properties {
             message_expiry_interval: Some(60),
             ..Properties::default()
         });
@@ -525,7 +867,7 @@ mod tests {
         let mut actions = Vec::new();
         let mut item = delivery(QoS::AtMostOnce, b"body");
         item.message.expires_at = Some(60);
-        item.message.properties = Arc::new(Properties {
+        item.message.properties = shared(Properties {
             message_expiry_interval: Some(60),
             ..Properties::default()
         });
@@ -548,11 +890,11 @@ mod tests {
     /// whole suite until this test existed.
     #[test]
     fn a_message_that_waited_offline_reports_what_is_left_when_it_finally_goes() {
-        let mut out = Outbound::new(QueueLimits::default(), 10);
+        let mut out = Outbound::new(a_key(), QueueLimits::default(), 10);
         let mut actions = Vec::new();
         let mut item = delivery(QoS::AtLeastOnce, b"body");
         item.message.expires_at = Some(60);
-        item.message.properties = Arc::new(Properties {
+        item.message.properties = shared(Properties {
             message_expiry_interval: Some(60),
             ..Properties::default()
         });
@@ -587,11 +929,12 @@ mod tests {
             dup: false,
             subscription_ids: Vec::new(),
             packet_id: None,
+            sequence: 0,
         }
     }
 
     fn online(inflight_limit: usize) -> Outbound {
-        let mut out = Outbound::new(QueueLimits::default(), inflight_limit);
+        let mut out = Outbound::new(a_key(), QueueLimits::default(), inflight_limit);
         out.set_online(true);
         out
     }
@@ -791,7 +1134,7 @@ mod tests {
 
     #[test]
     fn nothing_is_sent_while_offline() {
-        let mut out = Outbound::new(QueueLimits::default(), 10);
+        let mut out = Outbound::new(a_key(), QueueLimits::default(), 10);
         let mut actions = Vec::new();
         out.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
 
@@ -1031,7 +1374,7 @@ mod tests {
     fn a_restored_window_is_redelivered_on_resume() {
         // The whole point of restoring it: the takeover node resends
         // what the old one had outstanding, under the same identifiers.
-        let mut out = Outbound::new(QueueLimits::default(), 10);
+        let mut out = Outbound::new(a_key(), QueueLimits::default(), 10);
         out.restore(InflightEntry {
             packet_id: 7,
             delivery: delivery(QoS::ExactlyOnce, b"stored"),
@@ -1046,6 +1389,74 @@ mod tests {
         assert_eq!(resent.len(), 1);
         assert_eq!(resent[0].packet_id, Some(7));
         assert!(resent[0].dup);
+    }
+
+    #[test]
+    fn a_requeued_message_keeps_its_identifier_out_of_circulation() {
+        // The queue's half of the same rule as
+        // `a_restored_window_keeps_its_identifiers_out_of_circulation`,
+        // and the easier one to miss: a queued entry carries an
+        // identifier only when a resume put it back before it could be
+        // resent, which is a state a live broker passes through and a
+        // stored one can be read back in the middle of. The peer holds
+        // that identifier either way. Without the reservation the
+        // allocator hands the same value to the next message and the
+        // peer discards one of the two as a repeat.
+        let mut out = online(10);
+        let mut waiting = delivery(QoS::AtLeastOnce, b"waiting");
+        waiting.packet_id = Some(1);
+        waiting.dup = true;
+        assert!(out.requeue(waiting));
+
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtLeastOnce, b"new"), 0, &mut actions);
+        let issued: Vec<Option<u16>> = sent(&actions).iter().map(|p| p.packet_id).collect();
+        assert!(
+            !issued.contains(&Some(1)) || issued.iter().filter(|id| **id == Some(1)).count() == 1,
+            "the requeued message may use its own identifier and nothing else may"
+        );
+        assert!(
+            out.packet_ids.is_in_use(1),
+            "the identifier the peer is holding must be reserved"
+        );
+        assert_eq!(
+            sent(&actions)
+                .iter()
+                .find(|p| &p.payload[..] == b"new")
+                .expect("the new message went out")
+                .packet_id,
+            Some(2),
+            "so a new message takes the next one instead"
+        );
+    }
+
+    #[test]
+    fn requeueing_an_identifier_the_window_holds_reports_the_clash() {
+        let mut out = online(10);
+        assert!(out.restore(InflightEntry {
+            packet_id: 4,
+            delivery: delivery(QoS::AtLeastOnce, b"outstanding"),
+            state: InflightState::AwaitingAck,
+            sent_at: 0,
+        }));
+        let mut waiting = delivery(QoS::AtLeastOnce, b"waiting");
+        waiting.packet_id = Some(4);
+        assert!(
+            !out.requeue(waiting),
+            "the stored state claims one identifier twice"
+        );
+        assert_eq!(
+            out.queued_len(),
+            1,
+            "but the message is not dropped over it"
+        );
+    }
+
+    #[test]
+    fn requeueing_a_message_that_never_had_an_identifier_reserves_nothing() {
+        let mut out = Outbound::new(a_key(), QueueLimits::default(), 10);
+        assert!(out.requeue(delivery(QoS::AtLeastOnce, b"never sent")));
+        assert_eq!(out.packet_ids.in_use(), 0);
     }
 
     #[test]
@@ -1072,6 +1483,7 @@ mod tests {
     #[test]
     fn a_drop_is_reported_with_its_reason_and_topic() {
         let mut out = Outbound::new(
+            a_key(),
             QueueLimits {
                 max_messages: 1,
                 ..QueueLimits::default()
@@ -1377,7 +1789,7 @@ mod tests {
         let mut out = online(10);
         let mut actions = Vec::new();
         let mut item = delivery(QoS::AtLeastOnce, b"x");
-        item.message.properties = Arc::new(Properties {
+        item.message.properties = shared(Properties {
             subscription_identifiers: vec![3],
             ..Properties::default()
         });
@@ -1394,7 +1806,7 @@ mod tests {
 
     #[test]
     fn a_message_that_expired_while_waiting_is_dropped_rather_than_sent() {
-        let mut out = Outbound::new(QueueLimits::default(), 10);
+        let mut out = Outbound::new(a_key(), QueueLimits::default(), 10);
         let mut actions = Vec::new();
         let mut item = delivery(QoS::AtLeastOnce, b"stale");
         item.message.expires_at = Some(100);
@@ -1433,6 +1845,221 @@ mod tests {
         assert_eq!(sent(&actions).len(), 1, "only the narrowed window");
         assert_eq!(out.inflight_len(), 1);
         assert_eq!(out.queued_len(), 2);
+    }
+
+    // ---- sequence numbers, section 7.4 ---------------------------------
+
+    /// The numbers the queue is holding, in the order it holds them.
+    fn queued_sequences(out: &Outbound) -> Vec<u64> {
+        out.waiting().map(|item| item.sequence).collect()
+    }
+
+    #[test]
+    fn a_sequence_number_is_assigned_on_enqueue_and_counts_up() {
+        // Section 7.4: per-session, assigned on enqueue, monotonic. The
+        // first is one, because the high-water mark of a session nothing
+        // has been queued for is zero.
+        let mut out = Outbound::new(a_key(), QueueLimits::default(), 10);
+        let mut actions = Vec::new();
+        for _ in 0..3 {
+            out.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+        }
+
+        assert_eq!(queued_sequences(&out), vec![1, 2, 3]);
+        assert_eq!(out.highest_sequence(), 3);
+    }
+
+    #[test]
+    fn a_refused_message_does_not_spend_a_number() {
+        // The high-water mark is what was assigned, and nothing is
+        // assigned to a message the queue would not take. A mark raised
+        // by a refusal is not wrong in the way a reused number is, but
+        // it is a number the store will never see and a gap nothing
+        // explains.
+        let mut out = Outbound::new(
+            a_key(),
+            QueueLimits {
+                max_messages: 1,
+                ..QueueLimits::default()
+            },
+            10,
+        );
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtLeastOnce, b"1"), 0, &mut actions);
+        out.offer(delivery(QoS::AtLeastOnce, b"2"), 0, &mut actions);
+
+        assert_eq!(out.queued_len(), 1, "the second was refused");
+        assert_eq!(out.highest_sequence(), 1);
+    }
+
+    #[test]
+    fn a_sequence_number_is_not_reused_after_the_entry_leaves_the_queue() {
+        // The one a naive "next is the length plus one" gets wrong, and
+        // it gets it wrong silently: the store refuses the reused number
+        // and the batch carrying it is a message lost.
+        let mut out = Outbound::new(a_key(), QueueLimits::default(), 10);
+        let mut actions = Vec::new();
+        for _ in 0..3 {
+            out.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+        }
+        out.on_resume(0, &mut actions);
+        assert_eq!(out.queued_len(), 0, "the window took all three");
+
+        out.offer(delivery(QoS::AtLeastOnce, b"fourth"), 0, &mut actions);
+        assert_eq!(
+            queued_sequences(&out),
+            Vec::<u64>::new(),
+            "it went straight out"
+        );
+        assert_eq!(
+            out.outstanding()
+                .last()
+                .expect("it is outstanding")
+                .delivery
+                .sequence,
+            4,
+            "an empty queue must not hand out one again"
+        );
+    }
+
+    #[test]
+    fn two_sessions_number_their_queues_independently() {
+        // Per-session, so the second session's first message is its
+        // first, whatever the first session has spent. A counter shared
+        // between them would number this three.
+        let mut first = Outbound::new(SessionKey::new("", "one"), QueueLimits::default(), 10);
+        let mut second = Outbound::new(SessionKey::new("", "two"), QueueLimits::default(), 10);
+        let mut actions = Vec::new();
+        for _ in 0..2 {
+            first.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+        }
+        second.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+
+        assert_eq!(queued_sequences(&first), vec![1, 2]);
+        assert_eq!(queued_sequences(&second), vec![1]);
+    }
+
+    #[test]
+    fn a_restored_session_carries_on_from_the_mark_it_left() {
+        // Section 7.4: the mark is the highest ever assigned, not the
+        // largest key still present, so a restored session that started
+        // again from one would hand out numbers the store has already
+        // spent on entries it has since delivered.
+        let mut out = Outbound::new(a_key(), QueueLimits::default(), 10);
+        out.set_highest_sequence(41);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtLeastOnce, b"x"), 0, &mut actions);
+
+        assert_eq!(queued_sequences(&out), vec![42]);
+    }
+
+    #[test]
+    fn a_resume_numbers_a_redelivery_above_what_is_already_waiting() {
+        // The requeued entry goes to the head, so it must also carry the
+        // larger number, or the stored order and the delivered order
+        // disagree.
+        let mut out = online(1);
+        let mut actions = Vec::new();
+        out.offer(delivery(QoS::AtLeastOnce, b"sent"), 0, &mut actions);
+        out.offer(delivery(QoS::AtLeastOnce, b"waiting"), 0, &mut actions);
+        assert_eq!(queued_sequences(&out), vec![2], "the second waits");
+
+        out.on_disconnect();
+        actions.clear();
+        out.on_resume(0, &mut actions);
+
+        // The window of one took the redelivery straight back, so only
+        // the message that was already waiting is left.
+        assert_eq!(queued_sequences(&out), vec![2]);
+        assert_eq!(
+            out.outstanding()
+                .next()
+                .expect("the redelivery")
+                .delivery
+                .sequence,
+            3,
+            "a spent number cannot come back, so the redelivery takes a new one"
+        );
+    }
+
+    #[test]
+    fn a_narrowed_window_leaves_the_queue_numbered_in_the_order_it_will_deliver() {
+        // The case the pump does not cover. Section 4.9 re-reads the
+        // peer's receive maximum on every connection and the shell
+        // narrows the window after the resume, so a client that comes
+        // back advertising less than it did strands redeliveries in the
+        // queue. They carry the largest numbers and sit at the head, and
+        // a restart reading the stored queue in key order would deliver
+        // the message behind them first: a message the peer has never
+        // seen, ahead of duplicates it is still holding identifiers for.
+        //
+        // Nothing else sees this. The differential test compares a live
+        // broker against one rebuilt from its own records, and both read
+        // the same queue; what it cannot see is the two of them reading
+        // it in different orders.
+        let mut out = online(3);
+        let mut actions = Vec::new();
+        for payload in [b"a", b"b", b"c"] {
+            out.offer(delivery(QoS::AtLeastOnce, payload), 0, &mut actions);
+        }
+        out.offer(delivery(QoS::AtLeastOnce, b"waiting"), 0, &mut actions);
+        assert_eq!(out.inflight_len(), 3);
+        assert_eq!(queued_sequences(&out), vec![4]);
+
+        out.on_disconnect();
+        out.set_inflight_limit(1);
+        actions.clear();
+        out.on_resume(0, &mut actions);
+
+        let order = queued_sequences(&out);
+        let mut ascending = order.clone();
+        ascending.sort_unstable();
+        assert_eq!(
+            order, ascending,
+            "the stored queue is read in key order, so key order is delivery order"
+        );
+        // Concretely: a, b and c were requeued as 5, 6 and 7, the
+        // narrowed window took only a back, and the message that was
+        // waiting behind them as 4 has to move above the two left.
+        assert_eq!(order, vec![6, 7, 8]);
+        let payloads: Vec<&[u8]> = out
+            .waiting()
+            .map(|item| &item.message.payload[..])
+            .collect();
+        assert_eq!(
+            payloads,
+            vec![&b"b"[..], &b"c"[..], &b"waiting"[..]],
+            "and nothing has changed places"
+        );
+    }
+
+    #[test]
+    fn a_resume_that_the_window_absorbs_renumbers_nothing() {
+        // The common case, and the reason the walk above is a walk
+        // rather than a rewrite: the window the resume drained has room
+        // for exactly what came out of it, so everything still waiting
+        // keeps the number it was given.
+        let mut out = online(2);
+        let mut actions = Vec::new();
+        for payload in [b"a", b"b"] {
+            out.offer(delivery(QoS::AtLeastOnce, payload), 0, &mut actions);
+        }
+        out.offer(delivery(QoS::AtLeastOnce, b"waiting"), 0, &mut actions);
+
+        out.on_disconnect();
+        actions.clear();
+        out.on_resume(0, &mut actions);
+
+        assert_eq!(
+            queued_sequences(&out),
+            vec![3],
+            "the entry that never moved keeps its number"
+        );
+        assert_eq!(
+            out.highest_sequence(),
+            5,
+            "only the two redeliveries spent one"
+        );
     }
 
     #[test]

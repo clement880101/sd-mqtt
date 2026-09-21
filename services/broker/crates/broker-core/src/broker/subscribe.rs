@@ -2,7 +2,9 @@
 
 use mqtt_codec::packet::{RetainHandling, Subscribe};
 use mqtt_codec::{Limits, QoS, ReasonCode};
+use storage::record::SubscriptionRecord;
 
+use crate::journal;
 use crate::retained::RetainedStore;
 use crate::session::message::Message;
 use crate::session::queue::Delivery;
@@ -55,7 +57,18 @@ pub fn subscribe(
             Some((name, inner)) => shared.insert(name, inner, subscription),
             None => trie.insert(&options.filter, subscription),
         };
-        session.add_filter(&options.filter);
+        // Everything the filter was taken under, not just its name. The
+        // identifier above all: [MQTT-3.8.4-3] has it echoed on every
+        // delivery the subscription causes, and a restart that dropped
+        // it would deliver messages a client could no longer route.
+        session.add_subscription(SubscriptionRecord {
+            filter: options.filter.clone(),
+            qos: journal::stored_qos(options.qos),
+            no_local: options.no_local,
+            retain_as_published: options.retain_as_published,
+            retain_handling: journal::stored_retain_handling(options.retain_handling),
+            subscription_id,
+        });
 
         // A shared subscription has no single subscriber to hand retained
         // messages to, so it receives none. Section 3.3.1.3 scopes the
@@ -125,6 +138,7 @@ fn deliver_retained(
                 dup: false,
                 packet_id: None,
                 subscription_ids: subscription_id.into_iter().collect(),
+                sequence: 0,
             },
             now,
             out,
@@ -194,7 +208,7 @@ mod tests {
                 payload: Bytes::from_static(b"kept"),
                 qos: QoS::AtMostOnce,
                 expires_at: None,
-                properties: Arc::new(Properties::default()),
+                properties: Arc::new(Properties::default().into()),
             },
         );
         Fixture {
@@ -534,7 +548,7 @@ mod tests {
                 payload: Bytes::from_static(b"stale"),
                 qos: QoS::AtMostOnce,
                 expires_at: Some(5),
-                properties: Arc::new(Properties::default()),
+                properties: Arc::new(Properties::default().into()),
             },
         );
         let mut out = Vec::new();

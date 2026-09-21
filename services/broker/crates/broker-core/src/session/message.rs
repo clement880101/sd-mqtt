@@ -3,8 +3,10 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use mqtt_codec::{Properties, QoS};
+use mqtt_codec::QoS;
 use uuid::Uuid;
+
+use crate::properties::SharedProperties;
 
 /// A message identifier that sorts by the time it was created.
 ///
@@ -62,8 +64,9 @@ pub struct Message {
     pub qos: QoS,
     /// Whether the publisher asked for it to be retained.
     pub retain: bool,
-    /// MQTT 5 properties, shared across every copy.
-    pub properties: Arc<Properties>,
+    /// MQTT 5 properties, shared across every copy, and encoded at
+    /// most once however many subscribers journal this message.
+    pub properties: Arc<SharedProperties>,
     /// A coarse deadline in seconds, past which it must not be delivered.
     pub expires_at: Option<u32>,
 }
@@ -77,7 +80,7 @@ impl Message {
             payload,
             qos,
             retain,
-            properties: Arc::new(Properties::default()),
+            properties: Arc::new(SharedProperties::default()),
             expires_at: None,
         }
     }

@@ -5,7 +5,9 @@ use std::collections::HashSet;
 use foldhash::fast::RandomState;
 use mqtt_codec::packet::{Ack, Publish};
 use mqtt_codec::{Packet, Properties, QoS, ReasonCode};
+use storage::record::{Record, SessionKey};
 
+use crate::journal::Journal;
 use crate::session::Action;
 
 /// An acknowledgement a client is waiting for.
@@ -61,6 +63,8 @@ pub struct Received {
 /// by [`Inbound::on_disconnect`], while `awaiting_release` is session
 /// state and survives.
 pub struct Inbound {
+    /// Whose this is, so that a record can say so.
+    session: SessionKey,
     /// Identifiers whose at-least-once publish has arrived and whose
     /// acknowledgement has not gone out. Per connection, not session
     /// state: section 4.9 re-initialises the quota on each one.
@@ -68,17 +72,35 @@ pub struct Inbound {
     /// Identifiers whose publish has arrived and whose release has not.
     awaiting_release: HashSet<u16, RandomState>,
     receive_maximum: usize,
+    /// What changed durably and has not been handed over.
+    ///
+    /// Only `awaiting_release` reaches it. Section 4.9 makes the
+    /// at-least-once quota a property of the network connection, so
+    /// nothing about `awaiting_ack` must survive one.
+    journal: Journal,
 }
 
 impl Inbound {
     /// A receiver permitting `receive_maximum` concurrent exactly-once
     /// exchanges. Zero means unbounded.
-    pub fn new(receive_maximum: usize) -> Self {
+    pub fn new(session: SessionKey, receive_maximum: usize) -> Self {
         Self {
+            session,
             awaiting_ack: HashSet::with_hasher(RandomState::default()),
             awaiting_release: HashSet::with_hasher(RandomState::default()),
             receive_maximum,
+            journal: Journal::new(),
         }
+    }
+
+    /// Move everything this path has said onto the end of `out`.
+    pub fn take_journal(&mut self, out: &mut Vec<Record>) {
+        self.journal.drain_into(out);
+    }
+
+    /// Whether anything said has not been handed over.
+    pub fn has_unsaid(&self) -> bool {
+        !self.journal.is_empty()
     }
 
     /// Change the limit, as [`Outbound::set_inflight_limit`] does for
@@ -152,6 +174,13 @@ impl Inbound {
 
                 self.check_quota()?;
                 self.awaiting_release.insert(packet_id);
+                // The peer owns this identifier until it releases it,
+                // and a restart that forgot would dispatch the
+                // redelivery a second time. [MQTT-4.3.3-10].
+                self.journal.push(Record::InboundReserved {
+                    session: self.session.clone(),
+                    packet_id,
+                });
                 Ok(Received {
                     dispatch: true,
                     owed,
@@ -183,8 +212,11 @@ impl Inbound {
                 out.push(Action::Send(Packet::PubAck(ack(packet_id, reason))));
             }
             QoS::ExactlyOnce => {
-                if reason.is_failure() {
-                    self.awaiting_release.remove(&packet_id);
+                if reason.is_failure() && self.awaiting_release.remove(&packet_id) {
+                    self.journal.push(Record::InboundReleased {
+                        session: self.session.clone(),
+                        packet_id,
+                    });
                 }
                 out.push(Action::Send(Packet::PubRec(ack(packet_id, reason))));
             }
@@ -200,8 +232,15 @@ impl Inbound {
     /// exists for this case and nothing else.
     pub fn on_pubrel(&mut self, packet_id: u16, out: &mut Vec<Action>) {
         let reason = if self.awaiting_release.remove(&packet_id) {
+            self.journal.push(Record::InboundReleased {
+                session: self.session.clone(),
+                packet_id,
+            });
             ReasonCode::Success
         } else {
+            // Nothing was held, so nothing changed and nothing is
+            // written down. The store treats a release of an identifier
+            // it does not hold as a no-op for the same reason.
             ReasonCode::PacketIdentifierNotFound
         };
         out.push(Action::Send(Packet::PubComp(ack(packet_id, reason))));
@@ -255,6 +294,10 @@ impl Inbound {
     }
 
     /// Forget everything, for a session that is ending.
+    ///
+    /// Nothing is written down. The only caller is a session being
+    /// destroyed, and the [`Record::SessionRemoved`] that says so takes
+    /// the identifiers with it.
     pub fn clear(&mut self) {
         self.awaiting_ack.clear();
         self.awaiting_release.clear();
@@ -271,6 +314,13 @@ fn ack(packet_id: u16, reason: ReasonCode) -> Ack {
 
 #[cfg(test)]
 mod tests {
+    /// Whose these exchanges belong to. Nothing here asserts on the
+    /// records, so any key will do; the differential test in
+    /// `tests/journal.rs` is what proves the right one is written.
+    fn a_key() -> SessionKey {
+        SessionKey::new("", "c")
+    }
+
     use super::*;
     use crate::session::Action;
     use bytes::Bytes;
@@ -310,7 +360,7 @@ mod tests {
 
     #[test]
     fn fire_and_forget_is_dispatched_and_not_acknowledged() {
-        let mut inbound = Inbound::new(10);
+        let mut inbound = Inbound::new(a_key(), 10);
         let mut actions = Vec::new();
         assert!(accept(
             &mut inbound,
@@ -322,7 +372,7 @@ mod tests {
 
     #[test]
     fn at_least_once_is_dispatched_and_acknowledged() {
-        let mut inbound = Inbound::new(10);
+        let mut inbound = Inbound::new(a_key(), 10);
         let mut actions = Vec::new();
         assert!(accept(
             &mut inbound,
@@ -336,7 +386,7 @@ mod tests {
     fn at_least_once_is_dispatched_again_on_a_redelivery() {
         // At-least-once means exactly that: the broker does not dedupe,
         // because the publisher is entitled to a second attempt.
-        let mut inbound = Inbound::new(10);
+        let mut inbound = Inbound::new(a_key(), 10);
         let mut actions = Vec::new();
         assert!(accept(
             &mut inbound,
@@ -352,7 +402,7 @@ mod tests {
 
     #[test]
     fn exactly_once_is_dispatched_once_and_receipted_twice() {
-        let mut inbound = Inbound::new(10);
+        let mut inbound = Inbound::new(a_key(), 10);
         let mut actions = Vec::new();
 
         assert!(accept(
@@ -379,7 +429,7 @@ mod tests {
 
     #[test]
     fn a_release_completes_the_exchange_and_forgets_the_identifier() {
-        let mut inbound = Inbound::new(10);
+        let mut inbound = Inbound::new(a_key(), 10);
         let mut actions = Vec::new();
         accept(
             &mut inbound,
@@ -406,7 +456,7 @@ mod tests {
 
     #[test]
     fn a_release_for_an_identifier_never_seen_is_answered_not_ignored() {
-        let mut inbound = Inbound::new(10);
+        let mut inbound = Inbound::new(a_key(), 10);
         let mut actions = Vec::new();
         inbound.on_pubrel(99, &mut actions);
         assert!(matches!(
@@ -417,7 +467,7 @@ mod tests {
 
     #[test]
     fn exceeding_the_receive_maximum_is_refused() {
-        let mut inbound = Inbound::new(2);
+        let mut inbound = Inbound::new(a_key(), 2);
         let mut actions = Vec::new();
         accept(
             &mut inbound,
@@ -441,7 +491,7 @@ mod tests {
         // The case the split made reachable. The caller has not answered
         // either publish yet, so both still occupy a slot; without this
         // the client could send without limit and nothing would notice.
-        let mut inbound = Inbound::new(2);
+        let mut inbound = Inbound::new(a_key(), 2);
         inbound
             .on_publish(&publish(QoS::AtLeastOnce, Some(1), false))
             .expect("the first fits");
@@ -460,7 +510,7 @@ mod tests {
     fn the_receive_maximum_counts_the_two_levels_together() {
         // [MQTT-3.3.4-9] counts "QoS 1 and QoS 2 PUBLISH packets", not
         // one or the other.
-        let mut inbound = Inbound::new(2);
+        let mut inbound = Inbound::new(a_key(), 2);
         let mut actions = Vec::new();
         inbound
             .on_publish(&publish(QoS::AtLeastOnce, Some(1), false))
@@ -480,7 +530,7 @@ mod tests {
 
     #[test]
     fn answering_an_at_least_once_publish_frees_its_slot() {
-        let mut inbound = Inbound::new(1);
+        let mut inbound = Inbound::new(a_key(), 1);
         let mut actions = Vec::new();
         let received = inbound
             .on_publish(&publish(QoS::AtLeastOnce, Some(1), false))
@@ -504,7 +554,7 @@ mod tests {
     fn an_unanswered_at_least_once_redelivery_does_not_take_a_second_slot() {
         // It is already counted, and refusing it would deadlock the
         // exchange in the same way it would for exactly-once.
-        let mut inbound = Inbound::new(1);
+        let mut inbound = Inbound::new(a_key(), 1);
         inbound
             .on_publish(&publish(QoS::AtLeastOnce, Some(1), false))
             .expect("it fits");
@@ -520,7 +570,7 @@ mod tests {
         // client that got no acknowledgement resends on the next one.
         // Exactly-once state is session state and must survive, or a
         // redelivery comes through as a fresh message.
-        let mut inbound = Inbound::new(10);
+        let mut inbound = Inbound::new(a_key(), 10);
         let mut actions = Vec::new();
         inbound
             .on_publish(&publish(QoS::AtLeastOnce, Some(1), false))
@@ -550,7 +600,7 @@ mod tests {
     #[test]
     fn a_redelivery_does_not_count_against_the_receive_maximum() {
         // It is already counted; refusing it would deadlock the exchange.
-        let mut inbound = Inbound::new(1);
+        let mut inbound = Inbound::new(a_key(), 1);
         let mut actions = Vec::new();
         accept(
             &mut inbound,
@@ -566,7 +616,7 @@ mod tests {
     fn held_identifiers_survive_a_resume() {
         // Exactly-once state outlives the connection; discarding it would
         // let a redelivery through as a fresh message.
-        let mut inbound = Inbound::new(10);
+        let mut inbound = Inbound::new(a_key(), 10);
         inbound.reserve(7);
         let mut actions = Vec::new();
         assert!(!accept(
@@ -581,7 +631,7 @@ mod tests {
         // The point of the split. A broker cannot know there are no
         // matching subscribers until it has tried to dispatch, so the
         // reason code cannot be decided in the same call that asks it to.
-        let mut inbound = Inbound::new(10);
+        let mut inbound = Inbound::new(a_key(), 10);
         let mut actions = Vec::new();
 
         let received = inbound
@@ -606,7 +656,7 @@ mod tests {
         // [MQTT-4.3.3-9]: once the broker has said it never took the
         // message, a later publish under that identifier is a new
         // message, not a redelivery, and must be dispatched.
-        let mut inbound = Inbound::new(10);
+        let mut inbound = Inbound::new(a_key(), 10);
         let mut actions = Vec::new();
 
         let received = inbound
@@ -634,7 +684,7 @@ mod tests {
 
     #[test]
     fn a_successful_receipt_keeps_the_identifier() {
-        let mut inbound = Inbound::new(10);
+        let mut inbound = Inbound::new(a_key(), 10);
         let mut actions = Vec::new();
         let received = inbound
             .on_publish(&publish(QoS::ExactlyOnce, Some(7), false))

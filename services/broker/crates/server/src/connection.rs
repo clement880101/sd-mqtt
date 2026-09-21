@@ -41,7 +41,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::framing::{FrameError, FrameReader};
-use crate::shared::Shared;
+use crate::shared::{promises_durability, Shared};
 
 /// What a client's receive maximum is when it does not say.
 ///
@@ -55,6 +55,40 @@ const ABSENT_RECEIVE_MAXIMUM: u16 = 65_535;
 /// acknowledgements, closes and drop reports that share an outbox with
 /// a queue drain.
 const OUTBOX_SLACK: usize = 64;
+
+/// What a client is told when its publication could not be made
+/// durable.
+///
+/// # Why a close, and why this code
+///
+/// Section 7.3 leaves two honest answers and rules out the other two.
+/// Silence leaves a publisher holding a message it believes is in
+/// flight, with nothing to act on until its own timeout. A success is
+/// the lie the whole milestone exists to prevent. What is left is a
+/// close or a negative acknowledgement, and this is a close.
+///
+/// A negative acknowledgement is defensible and was not chosen, for
+/// three reasons. MQTT 3.1.1 has no reason code on a PUBACK at all, so
+/// half this broker's clients would receive a packet indistinguishable
+/// from success — the outcome that is not defensible, reached by
+/// accident. The failure is not about one message either: a store that
+/// would not take this batch has already stopped holding what the
+/// broker believes it holds, and every later publication on the same
+/// connection would be answered the same way. And a close is what
+/// makes the protocol's own recovery run at once, because an
+/// unacknowledged publication is resent on the next connection, which
+/// is exactly the behaviour wanted.
+///
+/// 0x83 rather than 0x80: 3.14.2.1 permits both on a DISCONNECT, and
+/// "implementation specific error" is what this is. The packet was
+/// valid and the protocol was followed; this particular server could
+/// not write it down. An unspecified error says less about a failure
+/// that is entirely specifiable.
+///
+/// A 3.1.1 client gets no packet, because 3.1.1 has no server-sent
+/// disconnect — but it does get the close, which is still neither
+/// silence nor a success.
+const NOT_DURABLE: ReasonCode = ReasonCode::ImplementationSpecificError;
 
 /// How deep a session's outbox must be for the queue and window it
 /// drains, or `None` when those bounds are too large for one to be
@@ -162,6 +196,11 @@ pub enum ConnectionError {
     /// The client broke the protocol and was told why.
     #[error("protocol error: {0:?}")]
     Protocol(ReasonCode),
+    /// A change this connection was about to be acknowledged for could
+    /// not be made durable, so it was closed instead. See
+    /// [`NOT_DURABLE`].
+    #[error("not made durable: {0}")]
+    NotDurable(#[source] storage::NotDurable),
 }
 
 /// Serve one connection until it ends, whatever ends it.
@@ -760,11 +799,63 @@ impl Attached {
             }
             let said_goodbye = matches!(packet, Packet::Disconnect(_));
 
-            let (outcome, actions) = self.shared.with_broker(|broker| {
-                let mut out = Vec::new();
-                let outcome = broker.handle(self.subscriber, &packet, &mut out);
-                (outcome, out)
-            });
+            // Section 7.3, and the ordering this milestone exists
+            // for. The journal reaches the writer under the lock that
+            // filled it, so the store sees records in the order the
+            // broker produced them; whether anyone waits for them is
+            // decided from what came out beside them, under the same
+            // lock. The wait is here, after the lock is gone and
+            // before a single action is delivered.
+            let ((outcome, actions), committed) = self.shared.with_broker_committed(
+                |broker| {
+                    let mut out = Vec::new();
+                    let outcome = broker.handle(self.subscriber, &packet, &mut out);
+                    (outcome, out)
+                },
+                |(_, actions)| promises_durability(actions),
+            );
+
+            if let Err(error) = committed.wait().await {
+                // Only a batch that promised a publisher something can
+                // fail here; everything else waits for nothing and
+                // succeeds at once. Not acknowledged, and not
+                // silently. See `not_durable` for why the answer is a
+                // close.
+                tracing::error!(
+                    %error,
+                    subscriber = self.subscriber.0,
+                    "a publication could not be made durable; the client is closed \
+                     rather than acknowledged"
+                );
+                // **Everything addressed to somebody else still goes.**
+                // The promise that was not kept is this publisher's, and
+                // its acknowledgement is the one packet that must not be
+                // sent. The same batch carries the publication to every
+                // subscriber the message matched, and those connections
+                // are alive, were promised nothing, and have already had
+                // the delivery recorded against their window. Returning
+                // without delivering left each of them holding a slot
+                // for a packet that was never sent and that nothing
+                // would ever resend: `Outbound` has no retransmission
+                // timer, deliberately, because a connection either
+                // delivers a packet or dies — and this path was the one
+                // case where a live connection did neither. The slot
+                // stays held until that peer reconnects and resume
+                // redelivers.
+                //
+                // Ours are dropped rather than filtered out one by one:
+                // this connection is being closed, so the only thing
+                // left for it is the close below, and its own session
+                // resumes on the next connection.
+                self.shared.deliver(
+                    actions
+                        .into_iter()
+                        .filter(|(to, _)| *to != self.subscriber)
+                        .collect(),
+                );
+                self.close_with(NOT_DURABLE);
+                return Err(ConnectionError::NotDurable(error));
+            }
             self.shared.deliver(actions);
 
             if let Err(reason) = outcome {
@@ -1005,7 +1096,10 @@ mod tests {
     use mqtt_codec::{decode, encode, Limits, Packet, Properties, QoS, ReasonCode, Version};
     use std::sync::Arc;
     use std::time::Duration;
+    use storage::Writer;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use crate::shared::gated::GatedStore;
 
     fn connect(client_id: &str, keep_alive: u16) -> Connect {
         Connect {
@@ -2061,6 +2155,7 @@ mod tests {
                         dup: false,
                         subscription_ids: Vec::new(),
                         packet_id: None,
+                        sequence: 0,
                     },
                     0,
                     &mut actions,
@@ -2926,5 +3021,331 @@ mod tests {
         let (shared, mut client, advertised) = proposing(Version::V311, 60, 4).await;
         assert_eq!(advertised, None, "3.1.1 has no properties at all");
         expires_in_the_second_after(&shared, &mut client, Version::V311, 90).await;
+    }
+
+    // ----------------------------------------------------------------
+    // Section 7.3: nothing is acknowledged before it is durable.
+    // ----------------------------------------------------------------
+
+    /// A shell with a store whose flush the test controls.
+    ///
+    /// The writer is the real one. Nothing here stubs the ordering
+    /// out: what is replaced is the device, so that the window in
+    /// which an acknowledgement could overtake a flush can be held
+    /// open for as long as an assertion needs.
+    fn with_gated_store() -> (Arc<Shared>, Arc<GatedStore>) {
+        let store = Arc::new(GatedStore::new());
+        let writer = Writer::spawn(
+            Arc::clone(&store) as Arc<dyn storage::Storage>,
+            storage::WriterConfig::default(),
+        )
+        .expect("a writer thread");
+        let shared = Arc::new(Shared::with_store(
+            Broker::new(BrokerConfig::default()),
+            Arc::new(writer),
+        ));
+        (shared, store)
+    }
+
+    /// Whether anything at all arrives within `within`.
+    async fn quiet_for(client: &mut tokio::io::DuplexStream, within: Duration) -> bool {
+        let mut chunk = [0u8; 256];
+        tokio::time::timeout(within, client.read(&mut chunk))
+            .await
+            .is_err()
+    }
+
+    #[tokio::test]
+    async fn an_acknowledgement_does_not_reach_the_client_until_the_store_has_it() {
+        // The test the whole milestone turns on, and the reason it is
+        // shaped this way: an assertion that the acknowledgement
+        // eventually arrives passes against a broker that sends it
+        // first, so the only thing that can tell the two apart is a
+        // store that has not answered yet.
+        //
+        // Convention 5 warns about a test asserting an absence, and
+        // the first half of this is one. The second half is what
+        // makes it a discrimination rather than an absence: the same
+        // connection, the same packet, and the acknowledgement
+        // arrives the moment the device does.
+        let (shared, store) = with_gated_store();
+        store.hold();
+        let mut client = serve_one(Arc::clone(&shared));
+        connect_v5(&mut client, "publisher").await;
+
+        write(
+            &mut client,
+            &publication(b"x", QoS::AtLeastOnce, Some(1)),
+            Version::V5,
+        )
+        .await;
+
+        assert!(
+            quiet_for(&mut client, Duration::from_millis(400)).await,
+            "the acknowledgement overtook the flush it is a promise about"
+        );
+
+        store.release();
+        match read(&mut client, Version::V5).await {
+            Packet::PubAck(ack) => assert_eq!(ack.packet_id, 1),
+            other => panic!("expected the acknowledgement, got {other:?}"),
+        }
+        assert!(store.flushes() > 0, "the store was asked for a flush");
+    }
+
+    #[tokio::test]
+    async fn an_exactly_once_receipt_does_not_reach_the_client_until_the_store_has_it() {
+        // The other half of the promise. A receipt is where an
+        // exactly-once publication becomes the broker's
+        // responsibility, so it waits for exactly the same reason a
+        // PUBACK does, and a shell that matched only on PUBACK would
+        // pass every test above this one.
+        let (shared, store) = with_gated_store();
+        store.hold();
+        let mut client = serve_one(Arc::clone(&shared));
+        connect_v5(&mut client, "publisher").await;
+
+        write(
+            &mut client,
+            &publication(b"x", QoS::ExactlyOnce, Some(7)),
+            Version::V5,
+        )
+        .await;
+        assert!(
+            quiet_for(&mut client, Duration::from_millis(400)).await,
+            "the receipt overtook the flush"
+        );
+
+        store.release();
+        match read(&mut client, Version::V5).await {
+            Packet::PubRec(receipt) => assert_eq!(receipt.packet_id, 7),
+            other => panic!("expected the receipt, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn what_promises_nothing_is_not_held_up_by_the_store() {
+        // The other side of the decision, and the one that fails if
+        // every batch is treated as a promise. A subscription is
+        // durable state and is journalled, but nobody was told a
+        // message was safe, so section 7.3 does not make anyone wait
+        // for it. A shell that waited on everything would serialise
+        // the entire broker behind the device for traffic that
+        // promised nothing.
+        let (shared, store) = with_gated_store();
+        store.hold();
+        let mut client = serve_one(Arc::clone(&shared));
+        connect_v5(&mut client, "subscriber").await;
+
+        subscribe_at(&mut client, Version::V5, QoS::AtMostOnce).await;
+
+        // At most once, the level section 7.3 names as never waited
+        // on, through the same held store.
+        write(
+            &mut client,
+            &publication(b"x", QoS::AtMostOnce, None),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::Publish(publish) => assert_eq!(publish.qos, QoS::AtMostOnce),
+            other => panic!("expected the publication back, got {other:?}"),
+        }
+
+        store.release();
+    }
+
+    #[tokio::test]
+    async fn a_flush_that_fails_closes_the_connection_instead_of_acknowledging() {
+        // What a client gets when the store will not take the message.
+        //
+        // Not silence, which leaves a publisher holding an
+        // unacknowledged message and no reason to resend it before
+        // its own timeout. Not a success, which is the lie this
+        // milestone exists to prevent. A close, carrying a reason a
+        // version 5 client can read, because MQTT's own recovery for
+        // an unacknowledged publication is to send it again on the
+        // next connection, and a close is what makes that happen at
+        // once.
+        let (shared, store) = with_gated_store();
+        store.fail();
+        let mut client = serve_one(Arc::clone(&shared));
+        connect_v5(&mut client, "publisher").await;
+
+        write(
+            &mut client,
+            &publication(b"x", QoS::AtLeastOnce, Some(1)),
+            Version::V5,
+        )
+        .await;
+
+        let disconnect = next_disconnect(&mut client).await;
+        assert_eq!(
+            disconnect.reason,
+            ReasonCode::ImplementationSpecificError,
+            "the client is told why, in the only code that fits a store this server could not write to"
+        );
+
+        // And nothing after it: the acknowledgement is not sent late,
+        // which is the failure mode a test that only looked for the
+        // disconnect would miss.
+        let mut chunk = [0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut chunk))
+            .await
+            .expect("the connection closes")
+            .expect("the read succeeds");
+        assert_eq!(n, 0, "the acknowledgement must never follow the refusal");
+    }
+
+    #[tokio::test]
+    async fn a_failing_flush_closes_the_publisher_without_stranding_its_subscribers() {
+        // The batch that carries the acknowledgement carries the
+        // publication to every matching subscriber too, and those
+        // connections are alive and were promised nothing. Returning
+        // before delivering took the acknowledgement away — right —
+        // and the publication with it, leaving each subscriber holding
+        // a window slot for a packet that was never sent and that
+        // nothing resends: `Outbound` has no retransmission timer
+        // because a connection either delivers a packet or dies, and
+        // this path was the case where a live one did neither.
+        //
+        // The subscriber is at least-once on purpose: at-most-once
+        // holds no slot, so the loss would be one message rather than
+        // a stuck window, and this test would be making a weaker claim
+        // than the bug deserves.
+        let (shared, store) = with_gated_store();
+        let mut subscriber = serve_one(Arc::clone(&shared));
+        connect_v5(&mut subscriber, "subscriber").await;
+        subscribe_at(&mut subscriber, Version::V5, QoS::AtLeastOnce).await;
+
+        let mut publisher = serve_one(Arc::clone(&shared));
+        connect_v5(&mut publisher, "publisher").await;
+        // Only now, so that the connect and the subscribe above are
+        // not the thing that fails.
+        store.fail();
+        write(
+            &mut publisher,
+            &publication(b"x", QoS::AtLeastOnce, Some(1)),
+            Version::V5,
+        )
+        .await;
+
+        assert_eq!(
+            next_disconnect(&mut publisher).await.reason,
+            ReasonCode::ImplementationSpecificError,
+            "the publisher is still closed rather than acknowledged"
+        );
+        match read(&mut subscriber, Version::V5).await {
+            Packet::Publish(publish) => {
+                assert_eq!(publish.payload.as_ref(), b"x");
+                assert!(
+                    publish.packet_id.is_some(),
+                    "an at-least-once delivery holds a window slot, which is what would \
+                     have been stranded"
+                );
+            }
+            other => panic!("the subscriber is owed the publication, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_promised_nothing_is_not_closed_by_a_failing_flush() {
+        // The failure is reported to the connection that was about to
+        // be lied to, and to no other. A subscribe through a store
+        // that cannot flush is not a broken promise, because no
+        // promise was made, so the connection carries on.
+        let (shared, store) = with_gated_store();
+        store.fail();
+        let mut client = serve_one(Arc::clone(&shared));
+        connect_v5(&mut client, "subscriber").await;
+
+        subscribe_at(&mut client, Version::V5, QoS::AtMostOnce).await;
+        write(&mut client, &Packet::PingReq, Version::V5).await;
+        assert!(
+            matches!(read(&mut client, Version::V5).await, Packet::PingResp),
+            "the connection is still serving"
+        );
+    }
+
+    /// The broker is reachable while somebody is waiting on the device.
+    ///
+    /// # What this does and does not guard
+    ///
+    /// It does **not** guard the ordering `Shared` exists to keep: that
+    /// the journal reaches the writer under the lock that filled it.
+    /// Nothing can, from inside a test. The window a late send opens is
+    /// between a guard dropping and the next instruction, and reaching
+    /// into it needs the scheduler to preempt one task there, which no
+    /// test can ask for. Driving one broker synchronously never enters
+    /// it at all, and a race two tasks lose almost never would pass
+    /// against the bug it was written for. The ordering is structural,
+    /// and the documentation on [`Shared`] says what holds it up.
+    ///
+    /// What this guards is the rule the fix must not break, and the one
+    /// a careless fix would: making the handoff ordered by holding the
+    /// lock across the wait as well. That is a real risk and it is
+    /// visible, because a lock held across a flush stops every other
+    /// connection in the process.
+    ///
+    /// Two worker threads, unlike everything else in this file, because
+    /// that is what turns the failure into a report. On the default
+    /// single-threaded runtime, a second connection blocking on the
+    /// broker's mutex blocks the one thread, so the timeout below could
+    /// never fire and the test would hang instead of failing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_connection_waiting_for_the_device_does_not_hold_up_another() {
+        let (shared, store) = with_gated_store();
+        store.hold();
+
+        let mut publisher = serve_one(Arc::clone(&shared));
+        connect_v5(&mut publisher, "publisher").await;
+        write(
+            &mut publisher,
+            &publication(b"x", QoS::AtLeastOnce, Some(1)),
+            Version::V5,
+        )
+        .await;
+        // The premise, asserted rather than assumed: without a
+        // publisher actually stuck on the flush there is no wait for
+        // anything to be held up by, and the rest of this would pass
+        // against a shell that never waits at all.
+        assert!(
+            quiet_for(&mut publisher, Duration::from_millis(400)).await,
+            "the acknowledgement overtook the flush, so nothing is waiting"
+        );
+
+        // Read with the bound this test owns rather than through
+        // `connect_v5`, whose own two-second read would fire first and
+        // report a reply that did not arrive instead of the reason.
+        // What comes back is discarded here and checked below.
+        let mut other = serve_one(Arc::clone(&shared));
+        write(
+            &mut other,
+            &Packet::Connect(Box::new(connect("other", 0))),
+            Version::V5,
+        )
+        .await;
+        assert!(
+            !quiet_for(&mut other, Duration::from_secs(2)).await,
+            "a second connection could not reach the broker while the first was waiting \
+             on the device: the broker's lock is being held across the flush, which \
+             serialises every connection in the process behind one fsync"
+        );
+
+        // And it is serving, not merely answering once: the same
+        // connection goes round the loop again, through the same lock.
+        write(&mut other, &Packet::PingReq, Version::V5).await;
+        match read(&mut other, Version::V5).await {
+            Packet::PingResp => {}
+            unexpected => panic!("expected the ping back, got {unexpected:?}"),
+        }
+
+        // And the one that was waiting is still owed its
+        // acknowledgement, which arrives when the device does.
+        store.release();
+        match read(&mut publisher, Version::V5).await {
+            Packet::PubAck(ack) => assert_eq!(ack.packet_id, 1),
+            other => panic!("expected the acknowledgement, got {other:?}"),
+        }
     }
 }

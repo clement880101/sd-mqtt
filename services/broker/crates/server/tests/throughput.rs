@@ -48,6 +48,48 @@
 //! curve flattens at a similar rate, the lock is the ceiling. If the
 //! lock-only curve is far higher, the sockets are, and the lock is not
 //! yet what limits this.
+//!
+//! # What a store costs
+//!
+//! Milestone one measured all of the above with no store at all.
+//! [`what_a_store_costs`] measures the same broker with one, at both
+//! qualities of service that differ in whether anything is promised:
+//!
+//! - **At most once promises nothing and waits on nothing.** Section
+//!   7.3 journals such a publication only where it touches durable
+//!   state, and one delivered straight to an attached subscriber
+//!   touches none: `Outbound::offer` dispatches it without pushing it
+//!   on to a queue, so the whole exchange writes no record at all. The
+//!   row is here to show that, not to find a cost.
+//! - **At least once promises, so it waits.** The acknowledgement is
+//!   sent after the commit is durable, and the storage crate's own
+//!   measurement says what that costs: 334 durable writes a second
+//!   with one waiter and 25,100 with a hundred. Each publisher here
+//!   keeps exactly one publication outstanding, so the publisher count
+//!   *is* the waiter count and the two tables are in the same
+//!   quantity.
+//!
+//! Both rows are measured with and without a store in the same run, so
+//! the comparison is on one machine on one day rather than against a
+//! figure recorded earlier.
+//!
+//! # What a property block costs a fan-out
+//!
+//! A message matching a thousand subscriptions is offered to a
+//! thousand sessions, and each of them journals a body record carrying
+//! the property block as bytes, though the store keeps one body per
+//! message however many sessions hold it. Encoding it per subscriber
+//! was a third of the cost of a large fan-out; `SharedProperties`
+//! encodes it once and every subscriber after the first takes a
+//! reference count.
+//!
+//! The last table is what said so and is what would say if it came
+//! back. It publishes to a growing fan-out with an empty property
+//! block and with a realistic one, and prints the encode's own cost
+//! beside the per-subscriber cost of the whole publish. The two
+//! property rows now meet; a build that encoded per subscriber again
+//! would pull them apart by the encode, which the line above the table
+//! measures on its own.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -55,11 +97,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use broker_core::broker::{Broker, BrokerConfig};
+use broker_core::journal;
+use broker_core::session::Message;
 use bytes::{Bytes, BytesMut};
-use mqtt_codec::packet::{Connect, Publish, RetainHandling, Subscribe, SubscriptionOptions};
+use mqtt_codec::packet::{Ack, Connect, Publish, RetainHandling, Subscribe, SubscriptionOptions};
 use mqtt_codec::{decode, encode, Limits, Packet, Properties, QoS, ReasonCode, Version};
 use sdmqtt_server::listener::{Server, ServerConfig};
 use sdmqtt_server::shared::Shared;
+use storage::{RedbStorage, Storage, SyncMode, Writer, WriterConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -128,12 +173,12 @@ fn publish_packet(topic: &str) -> Packet {
     })
 }
 
-fn subscribe_packet(topic: &str) -> Packet {
+fn subscribe_packet(topic: &str, qos: QoS) -> Packet {
     Packet::Subscribe(Subscribe {
         packet_id: 1,
         filters: vec![SubscriptionOptions {
             filter: topic.into(),
-            qos: QoS::AtMostOnce,
+            qos,
             no_local: false,
             retain_as_published: false,
             retain_handling: RetainHandling::SendAlways,
@@ -230,10 +275,58 @@ impl Load {
     }
 }
 
+/// Whether the broker under load writes down what it says.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Store {
+    /// None at all, which is the broker milestone one measured and the
+    /// control for every row below.
+    Absent,
+    /// redb in a temporary directory, flushing to the device.
+    Redb,
+}
+
+impl Store {
+    fn label(self) -> &'static str {
+        match self {
+            Store::Absent => "no store",
+            Store::Redb => "redb",
+        }
+    }
+}
+
+/// A `Shared` as `store` says, and the directory it lives in.
+///
+/// The directory comes back because it must outlive the server: a
+/// [`tempfile::TempDir`] deletes its tree when it is dropped, and one
+/// dropped here would take the store out from under the run.
+///
+/// `SyncMode::Immediate` is not a choice this makes. Section 7.3's
+/// promise is kept only under it, and the relaxed mode against this
+/// backend keeps a commit in the process's memory until a clean
+/// shutdown — so a figure measured under it would be the throughput of
+/// a broker that acknowledges what it has not written.
+fn shared_for(store: Store, config: &ServerConfig) -> (Arc<Shared>, Option<tempfile::TempDir>) {
+    match store {
+        Store::Absent => (Arc::new(Shared::new(config.broker.clone())), None),
+        Store::Redb => {
+            let directory = tempfile::TempDir::new().expect("a temporary directory");
+            let redb =
+                RedbStorage::open_with(directory.path().join("store.redb"), SyncMode::Immediate)
+                    .expect("a store opens");
+            let writer = Writer::spawn(Arc::new(redb) as Arc<dyn Storage>, WriterConfig::default())
+                .expect("the writer gets a thread");
+            let shared = Shared::with_store(Broker::new(config.broker.clone()), Arc::new(writer));
+            (Arc::new(shared), Some(directory))
+        }
+    }
+}
+
 /// Run `publishers` publisher/subscriber pairs, with `idle` connections
 /// attached and silent, and report the steady-state rate.
-async fn measure(publishers: usize, idle: usize, load: Load) -> Point {
-    let running = Server::bind(ServerConfig::ephemeral())
+async fn measure(publishers: usize, idle: usize, load: Load, store: Store) -> Point {
+    let config = ServerConfig::ephemeral();
+    let (shared, _directory) = shared_for(store, &config);
+    let running = Server::bind_shared(config, shared)
         .await
         .expect("the server binds");
     let address = running.address();
@@ -267,7 +360,7 @@ async fn measure(publishers: usize, idle: usize, load: Load) -> Point {
         let mine = Arc::clone(received);
         tasks.push(tokio::spawn(async move {
             let (mut stream, mut buf) = handshake(address, &format!("sub-{n}")).await;
-            let out = bytes_of(&subscribe_packet(&topic));
+            let out = bytes_of(&subscribe_packet(&topic, QoS::AtMostOnce));
             stream.write_all(&out).await.expect("the write succeeds");
             match next(&mut stream, &mut buf).await {
                 Some(Packet::SubAck(ack)) => assert_eq!(ack.reasons, vec![ReasonCode::Success]),
@@ -391,7 +484,10 @@ async fn the_publisher_curve() {
         for idle in [0, IDLE] {
             let mut rows = Vec::new();
             for publishers in PUBLISHERS {
-                rows.push((publishers, measure(publishers, idle, load).await));
+                rows.push((
+                    publishers,
+                    measure(publishers, idle, load, Store::Absent).await,
+                ));
             }
             print_curve(
                 &format!("{} pairs over TCP, {idle} idle connections", load.label()),
@@ -469,7 +565,11 @@ async fn in_process(publishers: usize, one_broker: bool) -> f64 {
             };
             let registration = broker.connect("", &connect, &mut out);
             broker
-                .handle(registration.subscriber, &subscribe_packet(&topic), &mut out)
+                .handle(
+                    registration.subscriber,
+                    &subscribe_packet(&topic, QoS::AtMostOnce),
+                    &mut out,
+                )
                 .expect("the subscribe is accepted");
             registration.subscriber
         });
@@ -549,7 +649,10 @@ fn one_tick_with_ten_thousand_sessions() {
         broker
             .handle(
                 registration.subscriber,
-                &subscribe_packet(&format!("site/{}/device/{n}/telemetry", n % 100)),
+                &subscribe_packet(
+                    &format!("site/{}/device/{n}/telemetry", n % 100),
+                    QoS::AtMostOnce,
+                ),
                 &mut out,
             )
             .expect("the subscribe is accepted");
@@ -579,6 +682,460 @@ fn one_tick_with_ten_thousand_sessions() {
     // The figure that matters for the lock: a tick this long is a pause
     // of that length for every connection in the process.
     println!("  sessions still registered: {}", broker.session_count());
+}
+
+// ---- what a store costs -------------------------------------------------
+
+/// A publish that must be acknowledged, and the identifier it is
+/// acknowledged under.
+fn publish_at_least_once(topic: &str, packet_id: u16) -> Packet {
+    Packet::Publish(Publish {
+        dup: false,
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        topic: topic.into(),
+        packet_id: Some(packet_id),
+        payload: Bytes::from_static(PAYLOAD),
+        properties: Properties::default(),
+    })
+}
+
+/// A PUBACK for a delivery, which is what keeps a subscriber's window
+/// from filling.
+fn puback(packet_id: u16) -> Packet {
+    Packet::PubAck(Ack {
+        packet_id,
+        reason: ReasonCode::Success,
+        properties: Properties::default(),
+    })
+}
+
+/// Read until one packet is whole, treating every ending as an ending.
+///
+/// [`next`] panics on a broken socket, which is right during a
+/// handshake and wrong in a loop that is still running when the server
+/// is shut down: every publisher and subscriber would panic on the way
+/// out and bury the table in backtraces.
+async fn try_next(stream: &mut TcpStream, buf: &mut BytesMut) -> Option<Packet> {
+    loop {
+        if let Some(packet) = decode(buf, Version::V5, &Limits::default()).ok()? {
+            return Some(packet);
+        }
+        let mut chunk = [0u8; 4096];
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// One measured point on the acknowledged curve.
+struct AckPoint {
+    /// Publications the broker acknowledged during the window.
+    acknowledged: u64,
+    /// Deliveries that reached a subscriber during the window.
+    delivered: u64,
+    /// How long the window actually was.
+    elapsed: Duration,
+}
+
+impl AckPoint {
+    fn acknowledged_per_second(&self) -> f64 {
+        self.acknowledged as f64 / self.elapsed.as_secs_f64()
+    }
+
+    fn delivered_per_second(&self) -> f64 {
+        self.delivered as f64 / self.elapsed.as_secs_f64()
+    }
+}
+
+/// Run `publishers` at-least-once pairs and report the acknowledged
+/// rate.
+///
+/// **One publication outstanding per publisher**, deliberately. The
+/// storage crate's curve is in concurrent waiters, and a publisher that
+/// pipelined would be several of them at once, so the publisher count
+/// here would no longer be the waiter count and the two tables could
+/// not be read against each other. It is also what a client that cares
+/// about the acknowledgement does.
+///
+/// The subscriber acknowledges every delivery it receives. Without that
+/// its inflight window fills, deliveries start queueing, and the row
+/// would measure a queue rather than a round trip.
+async fn measure_acknowledged(publishers: usize, store: Store) -> AckPoint {
+    let config = ServerConfig::ephemeral();
+    let (shared, _directory) = shared_for(store, &config);
+    let running = Server::bind_shared(config, shared)
+        .await
+        .expect("the server binds");
+    let address = running.address();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let acknowledged = Arc::new(AtomicU64::new(0));
+    let delivered = Arc::new(AtomicU64::new(0));
+    let mut tasks = Vec::new();
+
+    for n in 0..publishers {
+        let (ready, is_ready) = tokio::sync::oneshot::channel();
+        let topic = format!("bench/{n}");
+        let (stop_sub, delivered_sub) = (Arc::clone(&stop), Arc::clone(&delivered));
+        tasks.push(tokio::spawn(async move {
+            let (mut stream, mut buf) = handshake(address, &format!("sub-{n}")).await;
+            let out = bytes_of(&subscribe_packet(&topic, QoS::AtLeastOnce));
+            stream.write_all(&out).await.expect("the write succeeds");
+            match next(&mut stream, &mut buf).await {
+                Some(Packet::SubAck(ack)) => assert_eq!(ack.reasons, vec![ReasonCode::GrantedQos1]),
+                other => panic!("expected a subscribe acknowledgement, got {other:?}"),
+            }
+            ready.send(()).expect("the measurement is still waiting");
+
+            let mut chunk = vec![0u8; 64 * 1024];
+            while !stop_sub.load(Ordering::Relaxed) {
+                let read =
+                    match tokio::time::timeout(Duration::from_millis(50), stream.read(&mut chunk))
+                        .await
+                    {
+                        Ok(Ok(0)) | Err(_) => continue,
+                        Ok(Ok(read)) => read,
+                        Ok(Err(_)) => break,
+                    };
+                buf.extend_from_slice(&chunk[..read]);
+                let mut seen = 0u64;
+                let mut acks = BytesMut::new();
+                while let Ok(Some(packet)) = decode(&mut buf, Version::V5, &Limits::default()) {
+                    if let Packet::Publish(publish) = packet {
+                        seen += 1;
+                        if let Some(packet_id) = publish.packet_id {
+                            encode(&puback(packet_id), Version::V5, &mut acks)
+                                .expect("the packet encodes");
+                        }
+                    }
+                }
+                if !acks.is_empty() && stream.write_all(&acks).await.is_err() {
+                    break;
+                }
+                delivered_sub.fetch_add(seen, Ordering::Relaxed);
+            }
+        }));
+        is_ready.await.expect("the subscriber subscribed");
+    }
+
+    for n in 0..publishers {
+        let topic = format!("bench/{n}");
+        let (stop_pub, acknowledged_pub) = (Arc::clone(&stop), Arc::clone(&acknowledged));
+        tasks.push(tokio::spawn(async move {
+            let (mut stream, mut buf) = handshake(address, &format!("pub-{n}")).await;
+            let mut packet_id = 0u16;
+            while !stop_pub.load(Ordering::Relaxed) {
+                // Never zero, which the codec refuses, and wrapping
+                // rather than growing: a three-second window at any
+                // rate this broker reaches goes round several times.
+                packet_id = packet_id % 65_535 + 1;
+                let out = bytes_of(&publish_at_least_once(&topic, packet_id));
+                if stream.write_all(&out).await.is_err() {
+                    return;
+                }
+                loop {
+                    // A timeout rather than a plain read, so a
+                    // publisher waiting on an acknowledgement that will
+                    // never come still notices the stop flag. It is far
+                    // longer than any acknowledgement this measures,
+                    // including the one-waiter case at a few
+                    // milliseconds a message.
+                    match tokio::time::timeout(
+                        Duration::from_millis(500),
+                        try_next(&mut stream, &mut buf),
+                    )
+                    .await
+                    {
+                        Ok(Some(Packet::PubAck(ack))) => {
+                            assert_eq!(
+                                ack.packet_id, packet_id,
+                                "an acknowledgement for a publication that was not outstanding"
+                            );
+                            acknowledged_pub.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        // Anything else on the socket belongs to some
+                        // other exchange; this publisher subscribes to
+                        // nothing, so in practice there is nothing else.
+                        Ok(Some(_)) => continue,
+                        Ok(None) => return,
+                        Err(_) => {
+                            if stop_pub.load(Ordering::Relaxed) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    tokio::time::sleep(WARM_UP).await;
+    let start = Instant::now();
+    let (acknowledged_before, delivered_before) = (
+        acknowledged.load(Ordering::Relaxed),
+        delivered.load(Ordering::Relaxed),
+    );
+    tokio::time::sleep(WINDOW).await;
+    let point = AckPoint {
+        acknowledged: acknowledged.load(Ordering::Relaxed) - acknowledged_before,
+        delivered: delivered.load(Ordering::Relaxed) - delivered_before,
+        elapsed: start.elapsed(),
+    };
+
+    stop.store(true, Ordering::Relaxed);
+    for task in tasks {
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+    running.shutdown().await;
+    point
+}
+
+/// The publisher counts on the acknowledged curve.
+///
+/// The first five are the at-most-once curve's, so the two can be read
+/// against each other. The hundred is the storage crate's: it measured
+/// 334 durable writes a second with one waiter and 25,100 with a
+/// hundred, and a prediction that far apart at its ends is worth
+/// testing at both.
+const WAITERS: [usize; 6] = [1, 2, 4, 8, 16, 100];
+
+/// What the store costs the broker, at both qualities of service.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a measurement, not an assertion: run it deliberately with --nocapture"]
+async fn what_a_store_costs() {
+    println!("machine: {}", machine());
+
+    println!();
+    println!("at most once, paced pairs over TCP, no idle connections");
+    println!(
+        "{:>10}  {:>10}  {:>14}  {:>14}  {:>12}  {:>10}",
+        "publishers", "store", "offered msg/s", "delivered msg/s", "per publisher", "dropped"
+    );
+    for publishers in PUBLISHERS {
+        for store in [Store::Absent, Store::Redb] {
+            let point = measure(publishers, 0, Load::Paced(CREDIT), store).await;
+            println!(
+                "{:>10}  {:>10}  {:>14.0}  {:>14.0}  {:>12.0}  {:>10}",
+                publishers,
+                store.label(),
+                point.offered_per_second(),
+                point.delivered_per_second(),
+                point.delivered_per_second() / publishers as f64,
+                point.dropped,
+            );
+        }
+    }
+
+    println!();
+    println!("at least once, one publication outstanding per publisher");
+    println!(
+        "{:>10}  {:>10}  {:>16}  {:>16}  {:>12}",
+        "publishers", "store", "acknowledged /s", "delivered /s", "per publisher"
+    );
+    for publishers in WAITERS {
+        for store in [Store::Absent, Store::Redb] {
+            let point = measure_acknowledged(publishers, store).await;
+            println!(
+                "{:>10}  {:>10}  {:>16.0}  {:>16.0}  {:>12.0}",
+                publishers,
+                store.label(),
+                point.acknowledged_per_second(),
+                point.delivered_per_second(),
+                point.acknowledged_per_second() / publishers as f64,
+            );
+        }
+    }
+}
+
+// ---- what the fan-out re-encodes ----------------------------------------
+
+/// How many subscriptions one message matches, in the fan-out table.
+const FAN_OUT: [usize; 4] = [1, 10, 100, 1_000];
+
+/// How many messages each fan-out point publishes.
+///
+/// Comfortably below the queue's thousand-message bound, so every one
+/// of them is accepted and journalled rather than refused at a bound,
+/// which would measure a different path.
+const FAN_OUT_MESSAGES: usize = 200;
+
+/// A property block of the kind a real publish carries.
+///
+/// Every one of these is permitted on a PUBLISH, and together they are
+/// about a hundred bytes: enough that encoding them is not free, and
+/// not so much that the row is about an unrealistic message.
+fn realistic_properties() -> Properties {
+    Properties {
+        payload_format_indicator: Some(1),
+        message_expiry_interval: Some(3_600),
+        content_type: Some("application/json".to_owned()),
+        response_topic: Some("bench/reply".to_owned()),
+        correlation_data: Some(Bytes::from_static(b"0123456789abcdef")),
+        user_properties: vec![
+            ("tenant".to_owned(), "acme".to_owned()),
+            ("device".to_owned(), "sensor-01".to_owned()),
+        ],
+        ..Properties::default()
+    }
+}
+
+/// A connect whose session outlives the connection, so that a delivery
+/// to it queues.
+fn durable_connect(client_id: &str) -> Packet {
+    Packet::Connect(Box::new(Connect {
+        version: Version::V5,
+        client_id: client_id.into(),
+        clean_start: false,
+        keep_alive: 0,
+        username: None,
+        password: None,
+        will: None,
+        properties: Properties {
+            session_expiry_interval: Some(3_600),
+            ..Properties::default()
+        },
+    }))
+}
+
+/// Publish to `subscribers` offline durable sessions and report what
+/// one publish cost and how many records it produced.
+///
+/// Offline on purpose: an offline session queues what it is offered, so
+/// every subscriber journals a `BodyPut` and a `QueuePushed`, which is
+/// the fan-out this is about.
+///
+/// Each message gets its own property block, exactly as
+/// `Broker::handle` gives an arriving publish its own. Sharing one
+/// across the two hundred would let a cache none of them has in
+/// reality answer for all of them, and the row would be a measurement
+/// of the harness.
+///
+/// No store, no sockets and no shell: the question is what
+/// `Broker::publish` spends, and a device underneath it would bury the
+/// difference being looked for.
+fn fan_out(subscribers: usize, properties: &Properties) -> (Duration, usize) {
+    let mut broker = Broker::new(BrokerConfig::default());
+    let mut out = Vec::new();
+    for n in 0..subscribers {
+        let Packet::Connect(connect) = durable_connect(&format!("fan-{n}")) else {
+            unreachable!()
+        };
+        let registration = broker.connect("", &connect, &mut out);
+        broker
+            .handle(
+                registration.subscriber,
+                &subscribe_packet("fan/out", QoS::AtLeastOnce),
+                &mut out,
+            )
+            .expect("the subscribe is accepted");
+        broker.disconnect(registration.subscriber, &mut out);
+        out.clear();
+    }
+    // Everything above is setup, and what it journalled is not part of
+    // what a publish costs.
+    broker.discard_journal();
+
+    let now = broker.clock().now();
+    let mut records = Vec::new();
+    let mut produced = 0usize;
+    let start = Instant::now();
+    for _ in 0..FAN_OUT_MESSAGES {
+        let mut message = Message::new(
+            "fan/out",
+            Bytes::from_static(PAYLOAD),
+            QoS::AtLeastOnce,
+            false,
+        );
+        // What `Broker::handle` does to an arriving publish.
+        message.properties = Arc::new(properties.clone().into());
+        broker.publish(message, None, now, &mut out);
+        // The shell drains the journal under the same lock that filled
+        // it, so the drain is part of what a publish costs.
+        broker.take_journal(&mut records);
+        produced += records.len();
+        records.clear();
+        out.clear();
+    }
+    let elapsed = start.elapsed();
+    assert_eq!(
+        produced,
+        // A `BodyPut` and a `QueuePushed` each, every time.
+        2 * subscribers * FAN_OUT_MESSAGES,
+        "every subscriber journals the body and the queue push, and a \
+         fan-out that stopped doing so is measuring something else"
+    );
+    (
+        elapsed / FAN_OUT_MESSAGES as u32,
+        produced / FAN_OUT_MESSAGES,
+    )
+}
+
+/// What one property block costs to encode, on its own.
+fn one_encode(properties: &Properties) -> Duration {
+    const ENCODES: u32 = 200_000;
+    let start = Instant::now();
+    for _ in 0..ENCODES {
+        std::hint::black_box(journal::stored_properties(std::hint::black_box(properties)));
+    }
+    start.elapsed() / ENCODES
+}
+
+/// What carrying a property block costs a fan-out.
+///
+/// The decisive comparison is between the two property rows at the
+/// same fan-out. Everything else about the publish is identical, so
+/// the difference per subscriber is what the block costs, and the
+/// encode measured on its own says whether that difference is the
+/// encode or something else that grew with it.
+///
+/// This is the measurement `SharedProperties` was written from, and
+/// the reason it exists rather than being argued for: twice on this
+/// project the obvious optimisation was slower when measured. Before
+/// it, on this machine, a fan-out of a thousand cost 647 ns per
+/// subscriber with a realistic 95-byte block against 433 ns with an
+/// empty one, and a fan-out of a hundred 465 against 262 — the same
+/// block encoded once per subscriber, into records the store collapses
+/// to one body. After it the two rows meet, at a fan-out of one
+/// nothing changed, and nothing in between got worse.
+#[test]
+#[ignore = "a measurement, not an assertion: run it deliberately with --nocapture"]
+fn what_a_property_block_costs_a_fan_out() {
+    println!("machine: {}", machine());
+
+    let empty = Properties::default();
+    let realistic = realistic_properties();
+    println!();
+    println!(
+        "one property block encoded on its own: {:.0} ns empty, {:.0} ns realistic ({} bytes)",
+        one_encode(&empty).as_secs_f64() * 1e9,
+        one_encode(&realistic).as_secs_f64() * 1e9,
+        journal::stored_properties(&realistic).len(),
+    );
+
+    println!();
+    println!("one publish to a fan-out of offline durable sessions");
+    println!(
+        "{:>8}  {:>10}  {:>14}  {:>16}  {:>16}  {:>12}",
+        "fan-out", "properties", "records/publish", "us/publish", "ns/subscriber", "publishes/s"
+    );
+    for subscribers in FAN_OUT {
+        for (label, properties) in [("empty", &empty), ("realistic", &realistic)] {
+            let (per_publish, records) = fan_out(subscribers, properties);
+            println!(
+                "{:>8}  {:>10}  {:>14}  {:>16.1}  {:>16.0}  {:>12.0}",
+                subscribers,
+                label,
+                records,
+                per_publish.as_secs_f64() * 1e6,
+                per_publish.as_secs_f64() * 1e9 / subscribers as f64,
+                1.0 / per_publish.as_secs_f64(),
+            );
+        }
+    }
 }
 
 /// Where the numbers came from. A throughput figure without this is
