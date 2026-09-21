@@ -1231,6 +1231,101 @@ fn check(history: &[Op]) -> TestCaseResult {
 
     the_retained_index_agrees_with_a_walk(&run).map_err(TestCaseError::fail)?;
 
+    // How many sessions have a connection attached, against the same
+    // number by asking every one of them. It is what the Clients
+    // page's total is, and it is maintained at the three places
+    // connectedness moves plus the one place a connected session
+    // ceases to exist. These histories connect, disconnect, take a
+    // session over, clean-start one over a live connection and let
+    // one expire while it is away, which is every one of the four.
+    if run.broker.connected_count() != run.broker.connected_count_by_walking() {
+        return Err(TestCaseError::fail(format!(
+            "the maintained count says {} sessions are connected and {} are",
+            run.broker.connected_count(),
+            run.broker.connected_count_by_walking()
+        )));
+    }
+
+    // Every session is reachable in identity order exactly once. The
+    // ordered index is the same map the broker looks an identity up
+    // in, so it cannot hold a session the broker does not — but it
+    // can be walked wrongly, and a page that skips or repeats a
+    // session is invisible to everything else here.
+    let mut ordered: Vec<SessionId> = run
+        .broker
+        .sessions_after(None)
+        .map(|(_, session)| session.id().clone())
+        .collect();
+    let mut walked: Vec<SessionId> = run
+        .broker
+        .sessions()
+        .map(|(_, session)| session.id().clone())
+        .collect();
+    let in_order = ordered.clone();
+    ordered.sort();
+    walked.sort();
+    if ordered != walked {
+        return Err(TestCaseError::fail(format!(
+            "walking the identity order gives {ordered:?} and the broker holds {walked:?}"
+        )));
+    }
+    if in_order != ordered {
+        return Err(TestCaseError::fail(format!(
+            "the identity order is not in identity order: {in_order:?}"
+        )));
+    }
+    // And resuming after each one gives exactly the rest of it,
+    // which is what a cursor does.
+    for (index, id) in in_order.iter().enumerate() {
+        let rest: Vec<SessionId> = run
+            .broker
+            .sessions_after(Some(id))
+            .map(|(_, session)| session.id().clone())
+            .collect();
+        if rest != in_order[index + 1..] {
+            return Err(TestCaseError::fail(format!(
+                "resuming after {id:?} gives {rest:?} and not {:?}",
+                &in_order[index + 1..]
+            )));
+        }
+    }
+
+    // The subscriptions gauge, against the same number the slow way.
+    // Two counters stand behind it — the trie's and the shared
+    // table's — and between them they are adjusted at six places: an
+    // insert that is new, an insert that replaces, a remove, a
+    // teardown, and the same three for a group. A history here
+    // subscribes, resubscribes to the same filter, unsubscribes,
+    // takes a session over, clean-starts one and lets one expire,
+    // and none of it was written by whoever wrote the six.
+    if run.broker.subscription_count() != run.broker.subscription_count_by_walking() {
+        return Err(TestCaseError::fail(format!(
+            "the maintained subscription count says {} and the structures hold {}",
+            run.broker.subscription_count(),
+            run.broker.subscription_count_by_walking()
+        )));
+    }
+
+    // And the same number counted a third way, from the sessions.
+    // The admin API's subscriptions page reports the gauge as the
+    // total of a collection whose rows it reads out of the sessions,
+    // so the two have to be the same collection: every filter a
+    // session holds is in exactly one of the trie and the shared
+    // table. That is true by construction in `subscribe`, and it is
+    // the kind of construction a later special case breaks quietly —
+    // the page would stop short of a total it can never reach.
+    let held: usize = run
+        .broker
+        .sessions()
+        .map(|(_, session)| session.subscriptions().len())
+        .sum();
+    if run.broker.subscription_count() != held {
+        return Err(TestCaseError::fail(format!(
+            "the gauge says {} subscriptions and the sessions hold {held}",
+            run.broker.subscription_count()
+        )));
+    }
+
     let now = run.broker.clock().now();
     let rebuilt = rebuild(&restored, now);
     let mut live = run.broker.durable_state();

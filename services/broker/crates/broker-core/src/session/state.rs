@@ -1,5 +1,6 @@
 //! A session's lifetime: connect, disconnect, expiry and the will.
 
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -75,6 +76,90 @@ pub struct Session {
     /// is a caller that will forget one. Free until somebody is
     /// reading; see [`Presence`].
     presence: Presence,
+    /// The process-wide count of sessions with a connection
+    /// attached, which this session counts into while it has one.
+    ///
+    /// Held here for exactly the reason [`Presence`] is, and kept in
+    /// step by the same three methods plus the [`Drop`] below.
+    attached: AttachedSessions,
+}
+
+/// How many sessions sharing this have a connection attached.
+///
+/// # Why it is not counted when it is asked for
+///
+/// The Clients page is the Sessions page filtered to the connected
+/// ones, and its envelope carries the whole collection's size so that
+/// a virtualized table can show a count beside a page of it. Counting
+/// meant walking every session under the broker's one lock, on an
+/// endpoint section 11.1 leaves unauthenticated: 7.89 milliseconds
+/// with a hundred thousand sessions. This is the same answer
+/// [`QueueTotal`] is, kept the same way.
+///
+/// # Where it is kept in step
+///
+/// Connectedness changes in exactly three places, all in this file —
+/// [`Session::new`], [`Session::claim`] and
+/// [`Session::on_disconnected`] — and each of them goes through
+/// [`Session::set_connected`], which adjusts this only on a real
+/// transition. A session already connected being claimed again is
+/// takeover, which is not an arrival.
+///
+/// The fourth place is a session that simply ceases to exist: the
+/// registry hands a removed session back and the caller drops it, and
+/// a clean start replaces one outright. Without the [`Drop`] below,
+/// every such departure would leave its connection on the count
+/// forever and the gauge would only ever rise — which is word for
+/// word why [`Queue`] has one.
+///
+/// **What it does not depend on is the order at the one place a
+/// session is replaced in place.** `*slot = Session::new(..)` looked
+/// as though it might: the arrival is counted while the session it
+/// replaces is still on the count. It is safe, because an assignment
+/// evaluates its right-hand side and then drops what was in the
+/// place, so the departure follows the arrival and the two net out —
+/// and destroying the old session first would net out the same way.
+/// Checked rather than reasoned about: the mutation that swaps the
+/// two survives the whole suite, which is convention 7's "report what
+/// happened". What the case does need is the [`Drop`] itself, and
+/// `a_clean_start_over_a_live_session_is_still_one_connection` fails
+/// without it.
+///
+/// [`QueueTotal`]: crate::session::QueueTotal
+/// [`Queue`]: crate::session::Queue
+/// [`Registry::register`]: crate::registry::Registry::register
+#[derive(Clone, Debug, Default)]
+pub struct AttachedSessions(Arc<AtomicUsize>);
+
+impl AttachedSessions {
+    /// How many sessions sharing this have a connection attached.
+    pub fn get(&self) -> usize {
+        self.0.load(AtomicOrdering::Relaxed)
+    }
+
+    fn arrived(&self) {
+        self.0.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn departed(&self) {
+        self.0.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+}
+
+impl Drop for Session {
+    /// A session that ceases to exist while it is still connected
+    /// takes its connection off the count.
+    ///
+    /// Not every path out of a session disconnects it first. See the
+    /// note on [`AttachedSessions`], and [`Queue`]'s own `Drop`,
+    /// which exists for the identical reason one layer down.
+    ///
+    /// [`Queue`]: crate::session::Queue
+    fn drop(&mut self) {
+        if self.connected {
+            self.attached.departed();
+        }
+    }
 }
 
 /// The configured bounds every session is built with.
@@ -99,6 +184,9 @@ pub struct SessionBounds {
     pub total: QueueTotal,
     /// Where this session records gaining or losing a connection.
     pub presence: Presence,
+    /// The process-wide count of connected sessions this session
+    /// counts into while it has a connection.
+    pub attached: AttachedSessions,
 }
 
 impl Session {
@@ -116,6 +204,7 @@ impl Session {
             queue,
             total,
             presence,
+            attached,
         } = bounds;
         // A fresh session has a connection attached, so its outbound path
         // does too. Leaving it offline would make `is_connected` lie and
@@ -126,6 +215,7 @@ impl Session {
         outbound.set_online(true);
 
         presence.record(subscriber, &id, true);
+        attached.arrived();
         let mut session = Self {
             id,
             subscriber,
@@ -141,6 +231,7 @@ impl Session {
             expires_at: None,
             journal: Journal::new(),
             presence,
+            attached,
         };
         // A session exists the moment it is made, and nothing else will
         // say so: every record that follows names it, and the store
@@ -209,7 +300,7 @@ impl Session {
     /// Cancels any owed will: the client came back, so it was never gone.
     pub fn claim(&mut self, epoch: u64, _now: u32) {
         self.epoch = epoch;
-        self.connected = true;
+        self.set_connected(true);
         self.presence.record(self.subscriber, &self.id, true);
         self.will_at = None;
         self.expires_at = None;
@@ -229,7 +320,7 @@ impl Session {
     /// A graceful departure discards the will; an abrupt one owes it,
     /// after the delay in MQTT 5 and at once in 3.1.1.
     pub fn on_disconnected(&mut self, graceful: bool, now: u32) {
-        self.connected = false;
+        self.set_connected(false);
         self.presence.record(self.subscriber, &self.id, false);
         self.outbound.on_disconnect();
         self.inbound.on_disconnect();
@@ -391,6 +482,29 @@ impl Session {
     /// Whether a connection is attached.
     pub fn is_connected(&self) -> bool {
         self.connected
+    }
+
+    /// Move to connected or disconnected, keeping the process-wide
+    /// count in step.
+    ///
+    /// Only a real transition is counted. Claiming a session that is
+    /// already connected is takeover, which displaces one connection
+    /// with another and is not an arrival; disconnecting one that is
+    /// already gone is not a departure. The presence log is
+    /// deliberately not folded in here: it is written on every call
+    /// whether or not the state moved, which is what makes a reader's
+    /// picture right after an overflow, and merging the two would
+    /// quietly change that.
+    fn set_connected(&mut self, connected: bool) {
+        if self.connected == connected {
+            return;
+        }
+        self.connected = connected;
+        if connected {
+            self.attached.arrived();
+        } else {
+            self.attached.departed();
+        }
     }
 
     /// Which protocol version the client speaks.

@@ -1,6 +1,7 @@
 //! Sessions by identity, and what happens when two connections claim one.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use foldhash::fast::RandomState;
 use parking_lot::Mutex;
 
 use crate::session::queue::{QueueLimits, QueueTotal};
+use crate::session::state::AttachedSessions;
 use crate::session::state::Session;
 use crate::session::state::SessionBounds;
 use crate::subscriptions::SubscriberId;
@@ -17,7 +19,15 @@ use crate::subscriptions::SubscriberId;
 /// The mountpoint namespaces a listener's clients into their own topic
 /// tree, so the same client identifier arriving on two listeners is two
 /// sessions. That is multi-tenancy for the cost of one string.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// **Ordered, and the order is load bearing.** The identity index is a
+/// `BTreeMap` keyed by this, and the admin API pages its sessions,
+/// clients and subscriptions by seeking into it, so the order derived
+/// here — mountpoint first, then client identifier — is the order those
+/// pages come out in. `the_ordering_key_is_the_session_identity` in
+/// `sdmqtt-admin` is the other end of that agreement. Swapping the two
+/// fields would silently reorder every page.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId {
     /// The listener's namespace, empty for the default.
     pub mountpoint: Arc<str>,
@@ -225,7 +235,29 @@ pub struct Registration {
 /// Ending a connection belongs to the assembly that owns all three:
 /// see `Broker::disconnect`.
 pub struct Registry {
-    by_identity: HashMap<SessionId, SubscriberId, RandomState>,
+    /// Every session's handle, keyed by its identity, **in identity
+    /// order**.
+    ///
+    /// Ordered rather than hashed, and the order is what it is for as
+    /// much as the lookup is. A hash map can answer "which handle is
+    /// this identity" and nothing else; the admin API's sessions,
+    /// clients and subscriptions pages all ask "the next hundred
+    /// identities after this one", and with no order to resume from
+    /// the only way to answer was to look at every session and keep
+    /// the smallest hundred. That was 13.5, 7.9 and 25.5
+    /// milliseconds respectively with a hundred thousand sessions, on
+    /// the process's one lock, on endpoints section 11.1 leaves
+    /// unauthenticated.
+    ///
+    /// A `BTreeMap` answers both, so this is one structure rather
+    /// than a hash map with an ordered index beside it that could
+    /// drift from it. What it costs is the lookup: a handful of short
+    /// string comparisons instead of one hash, on connect and on the
+    /// one other caller, [`Registry::subscriber_of`]. Neither is a
+    /// per-packet path — routing a publish goes through the
+    /// subscription trie and then [`Registry::get`], which is still
+    /// the hash map below.
+    by_identity: BTreeMap<SessionId, SubscriberId>,
     sessions: HashMap<SubscriberId, Session, RandomState>,
     next_subscriber: u64,
     next_epoch: u64,
@@ -241,7 +273,7 @@ impl Registry {
     /// the given queue bounds.
     pub fn new(max_inflight: usize, queue: QueueLimits) -> Self {
         Self {
-            by_identity: HashMap::default(),
+            by_identity: BTreeMap::new(),
             sessions: HashMap::default(),
             next_subscriber: 0,
             next_epoch: 0,
@@ -250,6 +282,7 @@ impl Registry {
                 queue,
                 total: QueueTotal::default(),
                 presence: Presence::default(),
+                attached: AttachedSessions::default(),
             },
         }
     }
@@ -279,6 +312,23 @@ impl Registry {
             .sum()
     }
 
+    /// How many sessions have a connection attached.
+    ///
+    /// Read rather than counted; see [`AttachedSessions`] for what
+    /// the walk cost and where this is kept in step.
+    pub fn attached(&self) -> usize {
+        self.bounds.attached.get()
+    }
+
+    /// The same, by asking every session. For the test that keeps the
+    /// maintained figure honest, and for nothing else.
+    pub fn attached_by_walking(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| session.is_connected())
+            .count()
+    }
+
     /// Claim a session for a connecting client.
     ///
     /// Claiming one that already has a live connection is takeover, not an
@@ -298,6 +348,18 @@ impl Registry {
 
             if clean_start {
                 let version = existing.version();
+                // A clean start over a live connection replaces one
+                // connected session with another, and the count of
+                // connected sessions must come out where it went in.
+                // It does, in either order: an assignment evaluates
+                // its right-hand side before it drops what was in the
+                // place, so the newcomer's arrival is counted and the
+                // old session's departure taken off it, and destroying
+                // the old one first would net out the same way. Said
+                // out loud because it looks like it depends on the
+                // order and does not, and because the mutation that
+                // swaps them is one a reviewer would otherwise be
+                // asked to check for. See [`AttachedSessions`].
                 *existing = Session::new(id, subscriber, version, epoch, now, self.bounds.clone());
                 return Registration {
                     subscriber,
@@ -382,6 +444,57 @@ impl Registry {
     /// Every session, for a report.
     pub fn iter(&self) -> impl Iterator<Item = (&SubscriberId, &Session)> {
         self.sessions.iter()
+    }
+
+    /// Sessions in identity order, starting strictly after `after`.
+    ///
+    /// The ordered half of what [`Registry::by_identity`] is for.
+    /// Strictly after, so the session a cursor names is not returned
+    /// twice, and a cursor naming a session that has since gone
+    /// resumes at whatever now follows it rather than failing — which
+    /// is the whole reason the admin API's cursor is a key and not an
+    /// offset.
+    ///
+    /// The iterator is lazy, so a caller taking a page of a hundred
+    /// looks at a hundred sessions and no more. A caller filtering as
+    /// it goes — the Clients page, which wants only the connected —
+    /// looks at as many as it has to skip, which is a fact about the
+    /// population rather than about this.
+    ///
+    /// [`Registry::by_identity`]: Registry
+    pub fn iter_after(
+        &self,
+        after: Option<&SessionId>,
+    ) -> impl Iterator<Item = (SubscriberId, &Session)> {
+        self.iter_from(match after {
+            Some(after) => Bound::Excluded(after),
+            None => Bound::Unbounded,
+        })
+    }
+
+    /// Sessions in identity order from `lower`.
+    ///
+    /// The inclusive bound exists for a reader paging something a
+    /// session holds several of rather than the sessions themselves:
+    /// the admin API's subscriptions page resumes *inside* a session,
+    /// at the filter after the one its cursor names, so it has to be
+    /// given that session again. Giving it the next one instead would
+    /// silently drop every filter of the last session on a page after
+    /// the first.
+    pub fn iter_from(
+        &self,
+        lower: Bound<&SessionId>,
+    ) -> impl Iterator<Item = (SubscriberId, &Session)> {
+        self.by_identity
+            .range((lower, Bound::Unbounded))
+            .map(|(_, subscriber)| {
+                (
+                    *subscriber,
+                    self.sessions
+                        .get(subscriber)
+                        .expect("the index and the map agree"),
+                )
+            })
     }
 
     /// How many sessions exist, connected or not.
@@ -517,6 +630,144 @@ mod tests {
         registry.remove(first.subscriber);
         let second = registry.register(id("b"), true, 0);
         assert_ne!(second.subscriber, first.subscriber);
+    }
+
+    // -----------------------------------------------------------
+    // How many are connected, for a page that would otherwise count
+    // -----------------------------------------------------------
+
+    /// The count and the walk, after every path that can move it.
+    fn agree(registry: &Registry, after: &str) {
+        assert_eq!(
+            registry.attached(),
+            registry.attached_by_walking(),
+            "the maintained count and the sessions disagree after {after}"
+        );
+    }
+
+    #[test]
+    fn the_attached_count_follows_every_arrival_and_departure() {
+        let mut registry = Registry::new(20, QueueLimits::default());
+        agree(&registry, "nothing at all");
+        assert_eq!(registry.attached(), 0);
+
+        let a = registry.register(id("a"), true, 0);
+        let b = registry.register(id("b"), true, 0);
+        agree(&registry, "two connects");
+        assert_eq!(registry.attached(), 2);
+
+        depart(&mut registry, a.subscriber);
+        agree(&registry, "a departure");
+        assert_eq!(registry.attached(), 1);
+
+        // A second departure for a session already gone is not a
+        // second departure.
+        depart(&mut registry, a.subscriber);
+        agree(&registry, "a departure repeated");
+        assert_eq!(registry.attached(), 1);
+
+        registry.register(id("a"), false, 0);
+        agree(&registry, "a resume");
+        assert_eq!(registry.attached(), 2);
+
+        // Takeover displaces one connection with another. The
+        // identity never stopped being connected, so the count does
+        // not move.
+        registry.register(id("b"), false, 0);
+        agree(&registry, "a takeover");
+        assert_eq!(registry.attached(), 2);
+
+        registry.remove(b.subscriber);
+        agree(&registry, "destroying a connected session");
+        assert_eq!(registry.attached(), 1);
+    }
+
+    /// A clean start over a live connection leaves one connection,
+    /// not none.
+    ///
+    /// Convention 5's "a path no test walks", and it is a path the
+    /// obvious code gets wrong silently. `*slot = Session::new(..)`
+    /// builds the replacement and drops what was there *afterwards*,
+    /// so the arrival is counted and then the old session's departure
+    /// takes it off again: a connected client missing from the
+    /// Clients page's total for as long as it stays. Nothing else
+    /// here notices, because the session itself is perfectly correct.
+    #[test]
+    fn a_clean_start_over_a_live_session_is_still_one_connection() {
+        let mut registry = Registry::new(20, QueueLimits::default());
+        let first = registry.register(id("a"), true, 0);
+        assert_eq!(registry.attached(), 1);
+
+        let second = registry.register(id("a"), true, 5);
+        assert_eq!(second.subscriber, first.subscriber, "one identity");
+        assert!(second.took_over);
+        assert!(!second.session_present, "clean start discarded the state");
+        assert!(
+            registry
+                .get(second.subscriber)
+                .is_some_and(Session::is_connected),
+            "the newcomer is connected"
+        );
+        agree(&registry, "a clean start over a live connection");
+        assert_eq!(registry.attached(), 1);
+    }
+
+    // -----------------------------------------------------------
+    // Sessions in identity order
+    // -----------------------------------------------------------
+
+    /// What `iter_after` gives, as `mountpoint/client`.
+    fn ordered(registry: &Registry, after: Option<&SessionId>) -> Vec<String> {
+        registry
+            .iter_after(after)
+            .map(|(_, session)| {
+                let id = session.id();
+                format!("{}/{}", id.mountpoint, id.client_id)
+            })
+            .collect()
+    }
+
+    /// The order is mountpoint first, then client identifier, and it
+    /// is not the order sessions arrived in.
+    ///
+    /// The admin API pages by seeking into this, so this order is the
+    /// order its rows come out in.
+    #[test]
+    fn sessions_come_out_in_identity_order() {
+        let mut registry = Registry::new(20, QueueLimits::default());
+        for (mountpoint, client) in [
+            ("tenant-b", "z"),
+            ("", "m"),
+            ("tenant-a", "b"),
+            ("", "a"),
+            ("tenant-a", "a"),
+        ] {
+            registry.register(SessionId::new(mountpoint, client), true, 0);
+        }
+        assert_eq!(
+            ordered(&registry, None),
+            ["/a", "/m", "tenant-a/a", "tenant-a/b", "tenant-b/z"]
+        );
+    }
+
+    /// Resuming after a session gives the rest and never it again,
+    /// and a cursor naming a session that has gone still works.
+    #[test]
+    fn resuming_after_a_session_gives_what_follows_it() {
+        let mut registry = Registry::new(20, QueueLimits::default());
+        for client in ["a", "b", "c", "d"] {
+            registry.register(id(client), true, 0);
+        }
+        assert_eq!(ordered(&registry, Some(&id("b"))), ["/c", "/d"]);
+
+        let gone = registry.subscriber_of(&id("b")).expect("it is there");
+        registry.remove(gone);
+        assert_eq!(
+            ordered(&registry, Some(&id("b"))),
+            ["/c", "/d"],
+            "a cursor naming a session that has gone resumes after it"
+        );
+        assert_eq!(ordered(&registry, Some(&id("d"))), Vec::<String>::new());
     }
 
     // -----------------------------------------------------------

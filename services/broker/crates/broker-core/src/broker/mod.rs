@@ -321,6 +321,64 @@ impl Broker {
         self.registry.iter().map(|(id, session)| (*id, session))
     }
 
+    /// Every session in identity order, starting strictly after
+    /// `after`.
+    ///
+    /// **Whoever calls this is holding the process's one lock**, as
+    /// with [`Broker::sessions`] — but this one can be stopped. The
+    /// iterator is lazy over an ordered index, so a caller taking a
+    /// page of a hundred looks at a hundred sessions rather than at
+    /// every session in the broker. That is what the admin API's
+    /// pages are built on; see `sdmqtt-admin`'s `resources` module.
+    pub fn sessions_after(
+        &self,
+        after: Option<&SessionId>,
+    ) -> impl Iterator<Item = (SubscriberId, &Session)> {
+        self.registry.iter_after(after)
+    }
+
+    /// The same, including the session `from` names rather than
+    /// starting past it.
+    ///
+    /// For a reader resuming *inside* a session — the admin API's
+    /// subscriptions page, whose cursor names a filter within one.
+    /// See [`Registry::iter_from`].
+    ///
+    /// [`Registry::iter_from`]: crate::registry::Registry::iter_from
+    pub fn sessions_from(
+        &self,
+        from: Option<&SessionId>,
+    ) -> impl Iterator<Item = (SubscriberId, &Session)> {
+        self.registry.iter_from(match from {
+            Some(from) => std::ops::Bound::Included(from),
+            None => std::ops::Bound::Unbounded,
+        })
+    }
+
+    /// How many sessions have a connection attached.
+    ///
+    /// Read from a maintained count rather than by filtering every
+    /// session, which measured 7.89 milliseconds with a hundred
+    /// thousand of them under this broker's one lock. See
+    /// [`AttachedSessions`].
+    ///
+    /// This is the broker's count and not the shell's. `Shared`'s
+    /// outbox count is how many connections the server is writing
+    /// to, which is a different question with a different answer
+    /// during a takeover, and section 11.3's `connections` gauge is
+    /// deliberately the shell's.
+    ///
+    /// [`AttachedSessions`]: crate::session::AttachedSessions
+    pub fn connected_count(&self) -> usize {
+        self.registry.attached()
+    }
+
+    /// The same number by asking every session, for the test that
+    /// keeps the maintained one honest.
+    pub fn connected_count_by_walking(&self) -> usize {
+        self.registry.attached_by_walking()
+    }
+
     /// Accept a connection.
     ///
     /// Taking over a session that already has a live connection is not an
@@ -1074,8 +1132,24 @@ impl Broker {
     }
 
     /// How many subscriptions are held, for a metric and for tests.
+    ///
+    /// Both halves are read from a maintained number rather than
+    /// walked. The trie's own walk measured 2.64 milliseconds with a
+    /// hundred thousand subscriptions, and this is one of section
+    /// 11.3's gauges: the events sampler reads it once a second and
+    /// every metrics scrape reads it again, both under this broker's
+    /// one lock. See [`QueueTotal`], which is the same answer to the
+    /// same question one milestone earlier.
+    ///
+    /// [`QueueTotal`]: crate::session::QueueTotal
     pub fn subscription_count(&self) -> usize {
         self.subscriptions.len() + self.shared.member_count()
+    }
+
+    /// The same number by walking the trie and every group, for the
+    /// test that keeps the maintained one honest.
+    pub fn subscription_count_by_walking(&self) -> usize {
+        self.subscriptions.len_by_walking() + self.shared.member_count_by_walking()
     }
 
     /// How many messages are waiting in every session's queue.
