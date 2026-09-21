@@ -172,9 +172,14 @@ const SEPARATOR: char = '\u{1f}';
 
 /// The key a resource is ordered and paginated by.
 ///
-/// Borrowed, deliberately. It is built once per row *under the lock*,
-/// and an owned key would be up to three string allocations per
-/// session in the broker rather than per row returned.
+/// Borrowed, deliberately: an owned key would be up to three string
+/// allocations per row considered rather than per row returned.
+///
+/// Four of the six resources no longer build one per row at all.
+/// They read an order the broker already keeps and write a cursor
+/// only for the last row of a page; see [`encode_cursor`]. What is
+/// left on this path is nodes and listeners, which are a handful of
+/// rows held by the admin listener itself and not by the broker.
 type Key<'a> = [&'a str; PARTS];
 
 /// One page of anything.
@@ -371,11 +376,18 @@ struct Selection<'a, T> {
 
 /// Take at most `limit` rows after `after`, in key order.
 ///
-/// **This runs under the broker lock**, so what it does per item
-/// matters. It is one key comparison and, for at most `limit` of
-/// them, a push into a heap that never grows past `limit`. Sorting
-/// the whole resource, or collecting it and slicing, would do work
-/// proportional to the broker's size on every request for ten rows.
+/// One key comparison per item and, for at most `limit` of them, a
+/// push into a heap that never grows past `limit`. So the rows built
+/// are bounded by the page — but the *pass* is not, because a
+/// selection has to see an item to reject it.
+///
+/// **That is why nothing the broker holds comes through here any
+/// more.** The four resources that can be large seek into an order
+/// the broker keeps and never look at a row they will not return;
+/// see the module documentation for what the pass cost before they
+/// did. What is left is nodes and listeners, which are a handful of
+/// rows the admin listener holds itself, are not behind the broker's
+/// lock, and want the same envelope as the other four.
 fn select<'a, T>(
     items: impl Iterator<Item = (Key<'a>, T)>,
     after: Option<&[String; PARTS]>,
