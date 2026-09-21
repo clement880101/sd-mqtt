@@ -187,6 +187,72 @@ the rustls default, the fastest provider on every platform they benchmark,
 and the only one with a FIPS path. Non-FIPS builds need a C compiler but not
 cmake. graviola is the pure-Rust option worth revisiting once it matures.
 
+## Verified again before milestone 3
+
+Checked by building against them rather than by reading tables, because the
+storage entry in this document was confidently wrong until it was measured.
+Everything below was kept; what changed is what we know about it.
+
+**axum is not nearly free, and this document implied it was.** The entry says
+it reuses "the same hyper and tokio the broker already runs". The broker does
+not run hyper: the lock file has no hyper, no http and no rustls, because TLS
+is milestone 7. axum at milestone 3 pays for the whole stack up front, **22
+new crates**, measured by diffing dependency trees. It is still the right
+choice, because milestone 7 needs hyper regardless and the alternative is
+writing HTTP by hand, but the reasoning was wrong. Measured cost to the
+binary, with the project's release profile: **365 KB**, or 2.4% of the budget.
+
+**Two new Apache-2.0 obligations enter the shipped binary with it.**
+`sync_wrapper` is Apache-2.0 with no alternative in its expression. `ryu` is
+`Apache-2.0 OR BSL-1.0`, and because BSL-1.0 is not on our allow list the
+resolution is forced to Apache-2.0. Both are permissive and both pass
+`cargo deny` unchanged, but the attribution file must carry Apache-2.0 for
+them. This document previously listed `prometheus-client` as Apache-2.0; it
+is `Apache-2.0 OR MIT` and may be taken as MIT.
+
+**axum's default features cost two crates, not many.** The argument for
+turning them off is therefore not weight. It is that `tower-log` routes
+tower's internals through a second logging facade beside the tracing this
+project standardised on, and that the form extractor widens the surface of a
+JSON-only API. Keep the tracing feature; it costs nothing new.
+
+**`prometheus-client`'s obvious update call takes a lock.** A metric family
+is a read-write-locked map and the guard is held across the increment, so
+incrementing on the packet path would put a shared lock acquisition on every
+packet. The counter behind it is an atomic behind a reference count, so
+resolving every label combination to an owned handle at startup makes the
+increment a bare atomic add. The label cross-product is bounded and static,
+so this costs nothing but saying so.
+
+**Vite 8 is still current**, six months more mature, now bundling with
+Rolldown by default. `build.rollupOptions` is renamed. Precompression is
+still not built in, and is cheaper done in the build script that already
+embeds the bundle than as a twelfth npm dependency.
+
+**uPlot is the one thing to decide deliberately.** Its npm artifact is
+eighteen months old while its repository had commits this week. It is not
+abandoned; it has stopped publishing. We pin the published version and record
+that any fix since is unreachable without pinning a commit, which is worse
+for a shipped dependency because it has no version to audit.
+
+**Preact 11 is at a release candidate.** We start on 10, which is stable and
+what both the signals and routing packages resolve against.
+
+**Attribution comes from `rollup-plugin-license` 3.7.1, MIT, pinned exactly.**
+It reads the post-tree-shaking module graph, so a package installed but never
+imported is correctly absent, which is the thing a node_modules walker cannot
+do. Its declared peer range names Rollup and not Vite, so the compatibility
+is empirical: pinned, with a build assertion that the notices file is
+non-empty and names a package we know is in the bundle. The build fails on a
+licence outside the allow list, and a separate step fails on any difference
+between the regenerated file and the committed one.
+
+Its one gap is that the bundler's own injected runtime helper has no package
+to attribute, so a small companion emits the bundler's own notice when that
+helper is present. Vite's full licence file is not copied, because most of it
+covers Node-side tooling we do not distribute and copying it would
+misrepresent what ships.
+
 ## Rejected outright
 
 | Component | Reason |
