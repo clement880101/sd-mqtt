@@ -1110,6 +1110,22 @@ impl Broker {
     pub fn retained_count(&self) -> usize {
         self.retained.len()
     }
+
+    /// The same number by walking the tree, for the test that keeps
+    /// the maintained one honest.
+    ///
+    /// [`RetainedStore::len`] reads the length of the ordered index
+    /// the store keeps beside its tree, because the walk was measured
+    /// at 2.66 milliseconds with a hundred thousand topics and this
+    /// number is read once a second by the sampler and again on every
+    /// scrape. An index that drifts from the tree is worse than a slow
+    /// walk, so the two are compared after every history
+    /// `tests/journal.rs` generates.
+    ///
+    /// [`RetainedStore::len`]: crate::retained::RetainedStore::len
+    pub fn retained_count_by_walking(&self) -> usize {
+        self.retained.count_by_walking()
+    }
 }
 
 /// How long a session outlives its connection, in seconds.

@@ -1118,6 +1118,73 @@ fn bodies_are_exactly_what_is_referenced(restored: &Restored) -> Result<(), Stri
     Ok(())
 }
 
+/// The retained store's ordered index, against the tree it indexes.
+///
+/// The store keeps its topics twice: once in the tree that answers a
+/// filter, and once in order so that a page can be taken without
+/// collecting the whole store. The second is maintained at every
+/// mutation, which is the shape that drifts the first time a path
+/// forgets one — and the failure is silent, because every reader
+/// except the pages goes through the tree.
+///
+/// Both halves are checked, because they fail differently. The count
+/// catches an index that gained or lost a topic. Walking the pages
+/// catches one holding a *different* topic of the same number, which
+/// the count cannot see, and it is also how a page's ordering and its
+/// cursor are exercised against something other than the handful of
+/// topics a unit test writes.
+fn the_retained_index_agrees_with_a_walk(run: &Run) -> Result<(), String> {
+    if run.broker.retained_count() != run.broker.retained_count_by_walking() {
+        return Err(format!(
+            "the retained index says {} topics and the tree holds {}",
+            run.broker.retained_count(),
+            run.broker.retained_count_by_walking()
+        ));
+    }
+
+    let mut walked = Vec::new();
+    run.broker.retained().entries(&mut walked);
+    let mut walked: Vec<String> = walked.into_iter().map(|(topic, _)| topic).collect();
+    walked.sort();
+
+    // Pages of one, because the cursor is what this is here to
+    // exercise and a page wide enough to hold the whole store never
+    // uses it. Convention 5's "a generator that cannot produce a
+    // case": these histories retain a handful of topics at most, so
+    // pages of three took one page and a mutation making the cursor
+    // inclusive — which repeats a row on every page boundary —
+    // survived this property while the unit test caught it.
+    let mut paged: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut here = Vec::new();
+        let more = run.broker.retained().page(cursor.as_deref(), 1, &mut here);
+        let here: Vec<String> = here.into_iter().map(|(topic, _)| topic).collect();
+        if here.is_empty() && more {
+            return Err("a page came back empty and said there was more".to_string());
+        }
+        cursor = here.last().cloned();
+        paged.extend(here);
+        if !more {
+            break;
+        }
+        if paged.len() > walked.len() {
+            return Err(format!(
+                "the pages do not end: {} rows over a store of {}",
+                paged.len(),
+                walked.len()
+            ));
+        }
+    }
+
+    if paged != walked {
+        return Err(format!(
+            "paging the index gives {paged:?} and the tree holds {walked:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn drive(history: &[Op]) -> Result<(Run, Restored), String> {
     let mut run = Run::new();
     for (index, op) in history.iter().enumerate() {
@@ -1161,6 +1228,8 @@ fn check(history: &[Op]) -> TestCaseResult {
             run.broker.queue_depth_by_walking()
         )));
     }
+
+    the_retained_index_agrees_with_a_walk(&run).map_err(TestCaseError::fail)?;
 
     let now = run.broker.clock().now();
     let rebuilt = rebuild(&restored, now);
