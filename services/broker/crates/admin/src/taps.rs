@@ -2274,9 +2274,9 @@ mod tests {
         both.stop().await;
     }
 
-    /// A tap that is not there says both things that can mean.
+    /// A tap that is not there says all three things that can mean.
     #[tokio::test]
-    async fn a_tap_that_is_not_there_says_which_two_things_that_means() {
+    async fn a_tap_that_is_not_there_says_which_three_things_that_means() {
         let both = Both::start().await;
         let missing = both.read_raw(404, None).await;
         assert_eq!(missing.status, 404, "{}", missing.body);
