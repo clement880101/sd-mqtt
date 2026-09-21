@@ -86,6 +86,12 @@ pub struct AdminState {
     /// Given rather than discovered: a bound socket does not know
     /// what it is for, and the broker does not know a listener
     /// exists. What startup bound is what the API reports.
+    ///
+    /// The one exception is this listener itself, which
+    /// [`AdminServer::bind`] adds once it knows the port it was
+    /// given. A caller cannot supply that: it does not exist until
+    /// the socket is bound, and with a configured port of zero it is
+    /// the operating system's to choose.
     pub listeners: Arc<Vec<ListenerView>>,
     /// When this process started serving, for the uptime the
     /// Overview page shows.
@@ -213,6 +219,20 @@ impl AdminServer {
                 address: config.address,
                 source,
             })?;
+
+        // This listener knows what it bound better than its caller
+        // does; see `AdminState::listeners`.
+        let mut listeners = (*state.listeners).clone();
+        listeners.push(ListenerView {
+            name: "admin".to_owned(),
+            protocol: ListenerProtocol::Admin,
+            address,
+            // An admin listener has no topic namespace and no
+            // connection limit of its own.
+            mountpoint: String::new(),
+            max_connections: None,
+        });
+        let state = state.with_listeners(listeners);
 
         let (stop, stopped) = oneshot::channel();
         let events = Arc::clone(&state.events);

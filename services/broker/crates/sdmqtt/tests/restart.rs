@@ -136,6 +136,14 @@ impl BrokerProcess {
                 .arg("serve")
                 .arg("--address")
                 .arg(address.to_string())
+                // Its own, and not the default. Since milestone 3
+                // the admin listener is started with the broker, so
+                // two brokers on one host collide on it exactly as
+                // they would on the MQTT port — and two of these run
+                // at once. Nothing here reads it; `tests/admin.rs`
+                // is where it is asserted on.
+                .arg("--admin-address")
+                .arg(format!("127.0.0.1:{}", free_port()))
                 .arg("--log-level")
                 .arg("info")
                 // The writer flushes only when something must not be
