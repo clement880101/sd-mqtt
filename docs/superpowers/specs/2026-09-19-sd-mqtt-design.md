@@ -579,6 +579,12 @@ Rules are replicated metadata, so a rule created in the UI on any node
 applies everywhere. A message triggers a rule on the node where it enters the
 cluster, exactly once.
 
+**Replication is milestone 5, so in milestone 4 a rule is node-local.** It is
+stored durably and survives a restart, and it applies on the node that holds
+it. Nothing about the rule's own shape changes when replication arrives; what
+changes is how many nodes hold it. Saying this now stops a reader taking a
+single-node broker's behaviour for the design.
+
 ### 9.2 Actions
 
 **http_out** posts a JSON envelope to a URL. The envelope carries the topic,
@@ -590,7 +596,11 @@ nothing in flight. After the final attempt an envelope is published to
 `$sd/rules/<id>/dlq` and surfaced in the UI.
 
 **http_in** exposes `POST /ingest/<rule-id>`, guarded by a per-rule bearer
-token. Which listener serves it is configuration, and it defaults to a
+token. **The token is not optional and a rule without one is refused**, on
+the same reasoning that refuses an unprotected admin listener: the endpoint
+publishes, so an unguarded one is a hole rather than a degraded mode. That
+also means the ingest listener needs no address rule of its own, because
+every route on it is individually guarded. Which listener serves it is configuration, and it defaults to a
 separate ingest listener rather than the admin listener, so that publishing
 data does not require exposing the administrative surface. Running it on the
 admin listener is permitted but must be chosen explicitly. The body is published to a configured topic at a
@@ -616,6 +626,11 @@ Bridges and pollers are singletons. The owner is the live member with the
 lowest node identifier, recomputed on membership change. This is
 deterministic, needs no election protocol, and at worst duplicates work for
 the moments during which membership views disagree.
+
+In milestone 4 there is one member, so it owns every singleton. The selection
+is still written as a rule over the membership view rather than as an
+assumption that this node is alone, because a rule that is only ever
+exercised in the one-member case is a rule nobody has tested.
 
 ### 9.3 The hook interface
 
