@@ -8,6 +8,16 @@
  * the same data. So this module owns the connection, and pages read
  * the signals below.
  *
+ * **Nothing here closes it, and nothing needs to.** A `stop` was
+ * exported for "a test and for hot reload" and had neither: this
+ * package has no test runner, and an edit to this module makes the
+ * development server reload the whole document — checked, by
+ * editing this file with a tab open and watching the page's own
+ * state go — so there is never a second copy of this module to shut
+ * down. The stream's life is the tab's life. The one thing a closer
+ * would have been needed for, cancelling a pending reopen, is what
+ * {@link start} reads rather than runs over.
+ *
  * # The four things it has to get right
  *
  * **The connection dropping and coming back.** Handled by using
@@ -363,6 +373,11 @@ function connect() {
         source = null;
         clearTimeout(reopen);
         reopen = setTimeout(() => {
+          // Cleared before anything else, so that a handle in
+          // `reopen` means exactly "a reopen is pending" and
+          // `start` can read it. A fired timer's handle left in
+          // place would say the same as a pending one.
+          reopen = undefined;
           // See REOPEN_AFTER_GIVING_UP: the new stream cannot carry
           // the last identifier, so the server cannot tell us what
           // we missed. We assume we missed something.
@@ -412,20 +427,28 @@ function connect() {
  * Idempotent, so that a component mounting twice — which is what the
  * development server's hot reload does — does not spend a second of
  * the browser's six.
+ *
+ * **Idempotent across the reopen window too, and that is the part
+ * that was missing.** Between the browser giving up and
+ * {@link REOPEN_AFTER_GIVING_UP} elapsing there is no stream to hold
+ * in `source`, so a guard on that handle alone reads the window as
+ * "nothing is connected" and opens one. The pending timer then opens
+ * a second over the top of it and overwrites the handle, and the
+ * first is never closed: one of the browser's six connections to the
+ * origin is gone for the life of the tab, and its listeners are
+ * still attached, so every counters event is delivered twice and the
+ * Overview page draws every rate at twice what it is. Measured
+ * against a running broker with the interval widened to two minutes
+ * to make the window easy to hit: fourteen counters events from the
+ * server became twenty-seven rate samples, over two streams both
+ * open and both feeding.
+ *
+ * So the guard is the window, not the handle. A start inside it is a
+ * start of a connection this module has already decided to make.
  */
 export function start() {
-  if (source) {
+  if (source || reopen !== undefined) {
     return;
   }
   connect();
-}
-
-/** Close it, for a test and for hot reload. */
-export function stop() {
-  clearTimeout(reopen);
-  reopen = undefined;
-  source?.close();
-  source = null;
-  status.value = 'connecting';
-  baseline = null;
 }
