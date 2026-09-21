@@ -481,6 +481,51 @@ mod tests {
         assert!(matches!(error, AdminStartError::Unprotected { .. }));
     }
 
+    /// An empty token is not protection, and is refused wherever it
+    /// is written.
+    ///
+    /// The hole this closes: an empty string satisfies "a token is
+    /// configured", so a listener reachable off this host started
+    /// believing itself guarded and then accepted a bearer header
+    /// with nothing after it. The environment variable path already
+    /// read an empty value as absent; the file path did not, and the
+    /// two disagreeing is its own defect.
+    #[test]
+    fn an_empty_token_is_refused_rather_than_read_as_absent() {
+        let routable = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+        let error = config(routable, Some(""))
+            .check()
+            .expect_err("an empty token protects nothing");
+        assert!(
+            matches!(error, AdminStartError::EmptyToken),
+            "refused for being empty, not for being absent: {error:?}"
+        );
+    }
+
+    /// And on loopback too, where nothing needed protecting.
+    ///
+    /// One answer everywhere is easier to predict than two, and an
+    /// operator who wrote the key meant to set something.
+    #[test]
+    fn an_empty_token_is_refused_on_loopback_as_well() {
+        let error = config(IpAddr::V4(Ipv4Addr::LOCALHOST), Some(""))
+            .check()
+            .expect_err("an empty token is a mistake wherever it is written");
+        assert!(matches!(error, AdminStartError::EmptyToken));
+    }
+
+    /// The boundary: one character is a token and is accepted.
+    ///
+    /// Without this, a guard that refused every configured token
+    /// would pass the two tests above.
+    #[test]
+    fn a_token_of_one_character_is_still_a_token() {
+        let routable = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+        config(routable, Some("x"))
+            .check()
+            .expect("a short token is a poor token, not an absent one");
+    }
+
     #[test]
     fn a_token_does_not_print_itself() {
         let config = AdminConfig {

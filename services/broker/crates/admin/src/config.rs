@@ -50,6 +50,11 @@ impl Token {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    /// Whether an operator configured the key and left it blank.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl fmt::Debug for Token {
@@ -115,6 +120,20 @@ pub enum AdminStartError {
         /// The default port, so the suggested address is a whole one.
         port: u16,
     },
+    /// A token was configured, and it is empty.
+    ///
+    /// Refused rather than read as absent. An empty token satisfies
+    /// "a token is configured" while protecting nothing, so a
+    /// listener reachable off this host would start believing itself
+    /// guarded. Reading it as absent instead would be the same
+    /// reinterpretation of a value that cannot mean what it says
+    /// that `broker.max_inflight = 0` is already refused for.
+    #[error(
+        "refusing to start the admin listener: admin.token is set to an empty string, which \
+         protects nothing while satisfying the check that a token exists. Set a real token, \
+         or remove the key and bind a loopback address."
+    )]
+    EmptyToken,
     /// The socket could not be bound, which is usually something else
     /// already on the port.
     #[error("cannot bind the admin listener to {address}: {source}")]
@@ -163,6 +182,14 @@ impl AdminConfig {
     ///
     /// [`Ipv6Addr::is_loopback`]: std::net::Ipv6Addr::is_loopback
     pub fn check(&self) -> Result<(), AdminStartError> {
+        // Asked before the address, because an empty token is a
+        // mistake wherever it is written. On loopback it protects
+        // nothing and nothing needed protecting, which is merely
+        // pointless; off it, it is the difference between guarded and
+        // open. One answer for both is easier to predict than two.
+        if self.token.as_ref().is_some_and(|token| token.is_empty()) {
+            return Err(AdminStartError::EmptyToken);
+        }
         if self.token.is_some() {
             return Ok(());
         }
