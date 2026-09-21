@@ -405,7 +405,42 @@ impl StorageSection {
         let path = directory.join(STORE_FILE);
         let store = RedbStorage::open_with(&path, self.sync.to_storage())
             .map_err(|source| ConfigError::StoreUnopenable { path, source })?;
+        self.announce_sync_mode();
         Ok(Some(Arc::new(store)))
+    }
+
+    /// Say what durability this store was opened with, when that is
+    /// worth saying.
+    ///
+    /// **Only the relaxed mode gets a line**, and it is a warning.
+    /// Immediate is the default and keeps section 7.3's promise, so
+    /// naming it on every start would be noise an operator learns to
+    /// scroll past — which is how the line that matters gets missed.
+    ///
+    /// The line that matters is this one. A missing store directory is
+    /// already warned about loudly, and this is the more dangerous of
+    /// the two: a broker with no store never tells a publisher its
+    /// message is safe, while this one says it on every acknowledgement
+    /// and nothing has reached the device. The failure is invisible
+    /// until a power cut, and by then the configuration that caused it
+    /// is not in front of anybody.
+    ///
+    /// Returns whether it said anything, because a method whose only
+    /// effect is a log line cannot otherwise be told from one that does
+    /// nothing; `Shared::report_rejections` in `sdmqtt-server` is the
+    /// same shape for the same reason.
+    fn announce_sync_mode(&self) -> bool {
+        if self.sync == Sync::Immediate {
+            return false;
+        }
+        tracing::warn!(
+            path = %self.directory.as_ref().map_or_else(String::new, |at| at.display().to_string()),
+            "storage.sync is relaxed, so a flush returns without waiting for the device: \
+             against this backend nothing is written to the file until a clean shutdown, \
+             and every acknowledgement this broker sends is a promise it cannot keep \
+             across a power cut or a kill"
+        );
+        true
     }
 
     /// How the batching writer should be configured.
@@ -1250,6 +1285,93 @@ mod tests {
         assert!(
             error.to_string().contains(&path.display().to_string()),
             "the message must name the store: {error}"
+        );
+    }
+
+    /// Run `body` with a subscriber that keeps whatever was logged.
+    ///
+    /// The line is the whole feature, so the test has to read the line.
+    /// Asserting on the helper that decides to write it would be
+    /// convention 5's unit test of a helper: it would pass with nothing
+    /// calling it.
+    fn logged_by(body: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("no test panics holding it")
+                    .extend(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        // Thread-local, so tests running beside this one keep their own
+        // output.
+        tracing::subscriber::with_default(subscriber, body);
+        let written = sink.0.lock().expect("no test panics holding it").clone();
+        String::from_utf8(written).expect("tracing writes text")
+    }
+
+    /// A store in `directory` opened in `sync` mode, and what it said.
+    fn opening_says(directory: &Path, sync: Sync) -> String {
+        logged_by(|| {
+            StorageSection {
+                directory: Some(directory.to_path_buf()),
+                sync,
+                ..StorageSection::default()
+            }
+            .open()
+            .expect("the store opens");
+        })
+    }
+
+    #[test]
+    fn opening_a_store_that_acknowledges_before_the_device_says_so() {
+        // The dangerous configuration is the quiet one. A missing store
+        // directory already gets a loud warning, and this is worse: the
+        // broker answers every publication with a promise, and under
+        // this mode nothing has reached the file.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let said = opening_says(directory.path(), Sync::Relaxed);
+        assert!(
+            said.contains("WARN") && said.contains("relaxed"),
+            "opening a relaxed store said: {said:?}"
+        );
+    }
+
+    #[test]
+    fn opening_a_durable_store_is_quiet_about_it() {
+        // The control, and the reason the line above is worth anything:
+        // a warning on every start is one an operator learns to scroll
+        // past.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let said = opening_says(directory.path(), Sync::Immediate);
+        assert!(
+            said.is_empty(),
+            "the default mode keeps section 7.3's promise and needs no line, but said: {said:?}"
         );
     }
 

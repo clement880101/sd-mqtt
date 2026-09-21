@@ -114,6 +114,22 @@ pub struct Restoration {
     /// suspect identifier — but it is a defect somewhere else made
     /// visible here.
     pub identifier_clashes: usize,
+    /// Queue and inflight entries naming a body the store did not hand
+    /// back.
+    ///
+    /// The third kind of "the store disagrees with itself", and the
+    /// worst of them: the other two lose a subscription and a packet
+    /// identifier, this one loses a message. An entry whose body is gone
+    /// cannot be restored — there is nothing to deliver — so it is
+    /// skipped, and this is the only trace it leaves.
+    ///
+    /// **Counted rather than asserted.** It was a `debug_assert!(false)`
+    /// and nothing else, which is a guard in the build nobody runs and
+    /// silence in the build everybody does: a release broker dropped the
+    /// message and said nothing, which is convention 5's failure mode
+    /// with the two builds disagreeing on top. Skipping is still the
+    /// only thing to do; being able to say it happened is the fix.
+    pub bodies_missing: usize,
 }
 
 /// Rebuild `broker` from what the store handed back.
@@ -312,10 +328,10 @@ fn restore_session(
     inflight.sort_by_key(|entry| entry.sequence);
     for entry in inflight {
         let Some(body) = restored.bodies.get(&entry.delivery.body) else {
-            debug_assert!(
-                false,
-                "an inflight entry names a body the store does not hold"
-            );
+            // Nothing to deliver, so nothing to put back. Counted, so
+            // that a message disappearing here leaves a trace in every
+            // build rather than only in a debug one.
+            report.bodies_missing += 1;
             continue;
         };
         let message = journal::live_message(entry.delivery.body, body);
@@ -330,7 +346,7 @@ fn restore_session(
     // Newest first, because each requeue goes to the head.
     for entry in held.queue.iter().rev() {
         let Some(body) = restored.bodies.get(&entry.delivery.body) else {
-            debug_assert!(false, "a queued entry names a body the store does not hold");
+            report.bodies_missing += 1;
             continue;
         };
         let message = journal::live_message(entry.delivery.body, body);
@@ -975,6 +991,57 @@ mod tests {
             .map(|entry| entry.packet_id)
             .collect();
         assert_eq!(back, sent, "the identifier the peer is waiting on");
+    }
+
+    #[test]
+    fn an_entry_whose_body_the_store_lost_is_counted_rather_than_dropped_in_silence() {
+        // The store disagreeing with itself, in the one shape that
+        // loses a message rather than a subscription or an identifier.
+        // It cannot be produced by driving the broker, because the
+        // broker never says one without the other — so the body is
+        // taken out of what the store handed back, which is exactly
+        // what a store that lost the row would hand back.
+        //
+        // Before this it was a `debug_assert!(false)` and nothing else:
+        // the release build skipped the entry and said nothing at all,
+        // and the count an operator would have to notice it by did not
+        // exist. Two entries, one queued and one in the window, because
+        // the two are skipped by two different lines.
+        let mut node = Node::new();
+        let sub = node.connect("sub");
+        node.subscribe(sub, "a/+", QoS::AtLeastOnce);
+        let publisher = node.connect("pub");
+        // The first goes into the window, the rest into the queue: the
+        // configured window here is two.
+        for packet_id in 1..=4 {
+            node.publish(publisher, "a/b", QoS::AtLeastOnce, packet_id);
+        }
+        node.vanish(sub);
+
+        let mut held = node.store.restore().expect("the store restores");
+        let entries: usize = held
+            .sessions
+            .iter()
+            .map(|session| session.queue.len() + session.inflight.len())
+            .sum();
+        assert!(
+            entries >= 2,
+            "the session must hold both a queued and an inflight entry for this to test both"
+        );
+        held.bodies.clear();
+
+        let mut rebuilt = Broker::new(config());
+        let report = restore(&mut rebuilt, &held, node.broker.clock().now());
+        assert_eq!(
+            report.bodies_missing, entries,
+            "every entry whose body is gone is counted once"
+        );
+        let restored_sub = handle_of(&rebuilt, "sub").expect("the session still comes back");
+        assert_eq!(
+            held_by(&rebuilt, restored_sub),
+            0,
+            "an entry with no body cannot be delivered and is not put back"
+        );
     }
 
     #[test]

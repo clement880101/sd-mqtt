@@ -297,6 +297,7 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Arc<Shared>,
         expired = report.expired.len(),
         filters_refused = report.filters_refused,
         identifier_clashes = report.identifier_clashes,
+        bodies_missing = report.bodies_missing,
         "restored from the store"
     );
     // Every number above that should be zero and is not is a
@@ -315,6 +316,16 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Arc<Shared>,
             count = report.identifier_clashes,
             "the stored state claimed the same packet identifier twice; \
              nothing was dropped, but the store disagrees with itself"
+        );
+    }
+    // An error rather than a warning, unlike the two above: those lose a
+    // subscription and an identifier, and this one loses a message that
+    // a publisher may have been told was safe.
+    if report.bodies_missing > 0 {
+        tracing::error!(
+            count = report.bodies_missing,
+            "queued or in-flight messages named a body the store no longer holds; \
+             those messages are gone and will not be delivered"
         );
     }
 
