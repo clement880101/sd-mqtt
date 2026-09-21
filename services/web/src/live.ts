@@ -255,8 +255,12 @@ function wentBackwards(now: CounterTotals, then: CounterTotals): boolean {
 /**
  * Turn one counters event into a rate sample.
  *
- * Exported for the tests, which is also the only way to reach the
- * restart decision without restarting a broker.
+ * Exported because there is no test runner in this package and this
+ * is the decision most worth checking: calling it from a browser
+ * console with a crafted pair of samples reaches the restart branch
+ * and the replayed-burst branch without restarting a broker or
+ * losing a connection. Both were checked that way, and both were
+ * checked again with the branch removed.
  */
 export function onCounters(
   totals: CounterTotals,

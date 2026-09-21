@@ -133,9 +133,12 @@ export function Chart({ title, data, lines, height = 170, format, formatTick }: 
       created.destroy();
       plot.current = null;
     };
-    // Created once for a given shape. `data` is deliberately absent:
-    // it changes once a second and is pushed in below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // **`data` is deliberately not a dependency.** It changes once a
+    // second, and recreating the plot that often would throw away
+    // the scales and the cursor a person is reading with; it is
+    // pushed in by the effect below instead. Everything else here
+    // must be stable across renders — the page holds its series and
+    // its formatters at module scope for exactly that reason.
   }, [title, height, lines, format, formatTick]);
 
   useEffect(() => {

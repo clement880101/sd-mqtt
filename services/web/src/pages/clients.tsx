@@ -126,10 +126,16 @@ export function Clients() {
    * abandoned request that clears the flag would clear it out from
    * under the request that replaced it; one that skips clearing it
    * leaves it set forever, and the table then quietly refuses to
-   * fetch another page for the rest of the session — which is what
-   * this counter was added after watching happen. So each request
+   * fetch another page for the rest of the session. So each request
    * takes a ticket, and only the holder of the current one clears
    * the flag.
+   *
+   * **Honestly: this is reasoned, not bisected.** A table that had
+   * stopped fetching further pages was seen once, this race was
+   * found looking for the cause, and the stall could not afterwards
+   * be reproduced on demand either with the guard or without it. So
+   * the race is real and closing it is right; whether it is the
+   * race that was seen is not established.
    */
   const ticket = useRef(0);
 
