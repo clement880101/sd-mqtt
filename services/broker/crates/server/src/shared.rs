@@ -594,19 +594,28 @@ pub(crate) mod gated {
         /// answering does to the writer's whole channel rather than to
         /// one flush.
         holding_applies: bool,
-        /// When the hold gives up and lets everything through, set when
-        /// the hold begins. See [`GatedStore::LONGEST_HOLD`].
+        /// When the hold gives up and lets everything through, set by
+        /// the first call it catches. See [`GatedStore::LONGEST_HOLD`].
         held_until: Option<std::time::Instant>,
+        /// Whether a hold is in force at all, which is what tells an
+        /// unset deadline from an expired one.
+        holding: bool,
         /// Flushes fail rather than succeed.
         failing: bool,
     }
 
     impl Gate {
-        /// How long the hold has left, and `None` once it is over.
-        fn remaining(&self) -> Option<Duration> {
-            let left = self
-                .held_until?
-                .saturating_duration_since(std::time::Instant::now());
+        /// How long a call must keep waiting, and `None` when it may go.
+        ///
+        /// Starts the deadline if this is the first call to be caught.
+        fn remaining(&mut self) -> Option<Duration> {
+            if !self.holding {
+                return None;
+            }
+            let deadline = *self
+                .held_until
+                .get_or_insert_with(|| std::time::Instant::now() + GatedStore::LONGEST_HOLD);
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
             (!left.is_zero()).then_some(left)
         }
     }
@@ -627,12 +636,15 @@ pub(crate) mod gated {
         /// decides a test's answer, and finite so that a failing
         /// assertion ends in a report rather than in a hang.
         ///
-        /// **From the hold rather than from the call.** A bound applied
-        /// per call is no bound at all when a test has queued a
-        /// thousand batches behind the held one: the writer's thread
-        /// pays it once per batch, the join in `Writer::drop` waits for
-        /// all of them, and the suite hangs anyway. This is one
-        /// deadline for the whole hold.
+        /// **One deadline for the whole hold, started by the first
+        /// call it catches.** Per call is no bound at all when a test
+        /// has queued a thousand batches behind the held one: the
+        /// writer's thread pays it once per batch, the join in
+        /// `Writer::drop` waits for all of them, and the suite hangs
+        /// anyway. Started by the call rather than by `hold` because a
+        /// loaded test binary can take seconds to reach the store, and
+        /// a budget spent before the test's own assertion window opens
+        /// would make the assertion flaky.
         const LONGEST_HOLD: Duration = Duration::from_secs(20);
 
         /// A store that answers at once.
@@ -644,7 +656,8 @@ pub(crate) mod gated {
         pub(crate) fn hold(&self) {
             let mut gate = self.gate.lock();
             gate.held = true;
-            gate.held_until = Some(std::time::Instant::now() + Self::LONGEST_HOLD);
+            gate.holding = true;
+            gate.held_until = None;
         }
 
         /// Hold every apply as well, until [`GatedStore::release`].
@@ -657,7 +670,8 @@ pub(crate) mod gated {
             let mut gate = self.gate.lock();
             gate.held = true;
             gate.holding_applies = true;
-            gate.held_until = Some(std::time::Instant::now() + Self::LONGEST_HOLD);
+            gate.holding = true;
+            gate.held_until = None;
         }
 
         /// Let held flushes and applies through, and the ones after
@@ -666,6 +680,7 @@ pub(crate) mod gated {
             let mut gate = self.gate.lock();
             gate.held = false;
             gate.holding_applies = false;
+            gate.holding = false;
             gate.held_until = None;
             drop(gate);
             self.opened.notify_all();

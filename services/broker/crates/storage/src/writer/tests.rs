@@ -132,6 +132,32 @@ enum Event {
     Flushed,
 }
 
+/// Whether a store is holding, and until when.
+#[derive(Debug, Clone, Copy, Default)]
+enum Hold {
+    /// Calls go straight through.
+    #[default]
+    Open,
+    /// Calls park. `until` is set by the first call that parks, so that
+    /// the deadline measures time spent held rather than time since the
+    /// test asked for it.
+    Holding { until: Option<Instant> },
+}
+
+impl Hold {
+    /// How long a call must keep waiting, and `None` when it may go.
+    ///
+    /// Starts the deadline if this is the first call to be caught.
+    fn remaining(&mut self, longest: Duration) -> Option<Duration> {
+        let Self::Holding { until } = self else {
+            return None;
+        };
+        let deadline = *until.get_or_insert_with(|| Instant::now() + longest);
+        let left = deadline.saturating_duration_since(Instant::now());
+        (!left.is_zero()).then_some(left)
+    }
+}
+
 /// A store that records what it was asked, can be held still, and can be
 /// told to fail.
 ///
@@ -142,9 +168,9 @@ enum Event {
 struct Fake {
     /// Every call, in order.
     events: Mutex<Vec<Event>>,
-    /// While set, `apply` blocks, and no later than this instant: see
-    /// [`Fake::LONGEST_HOLD`].
-    held: Mutex<Option<Instant>>,
+    /// Whether `apply` blocks, and until when once something has been
+    /// held: see [`Fake::LONGEST_HOLD`].
+    held: Mutex<Hold>,
     /// Signalled when `held` changes.
     released: Condvar,
     /// Set by `apply` when it finds itself held, so a test can know the
@@ -170,11 +196,13 @@ impl Fake {
     /// thread, and a test that fails while the store is held would
     /// otherwise deadlock in its own unwind.
     ///
-    /// **From the hold rather than from the call.** A bound applied per
-    /// call is no bound at all when a test has queued a thousand
-    /// batches behind the held one: the thread pays it once per batch
-    /// and the suite hangs anyway. This is one deadline for the whole
-    /// hold, so once it passes every batch goes straight through.
+    /// **One deadline for the whole hold, started by the first call it
+    /// catches.** Per call is no bound at all when a test has queued a
+    /// thousand batches behind the held one: the thread pays it once
+    /// per batch and the suite hangs anyway. Started by the call rather
+    /// than by `hold` because a loaded test binary can take seconds to
+    /// reach the store, and a budget spent before the test's own
+    /// assertion window opens would make the assertion flaky.
     const LONGEST_HOLD: Duration = Duration::from_secs(20);
 
     fn new() -> Arc<Self> {
@@ -182,10 +210,9 @@ impl Fake {
     }
 
     /// Hold `apply` until [`Fake::release`], or until
-    /// [`Fake::LONGEST_HOLD`] has passed.
+    /// [`Fake::LONGEST_HOLD`] after it first catches the thread.
     fn hold(&self) {
-        *self.held.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some(Instant::now() + Self::LONGEST_HOLD);
+        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = Hold::Holding { until: None };
     }
 
     /// Whether the thread is parked inside a held `apply`.
@@ -203,7 +230,7 @@ impl Fake {
 
     /// Let it go.
     fn release(&self) {
-        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = Hold::Open;
         self.released.notify_all();
     }
 
@@ -261,17 +288,13 @@ impl Fake {
 impl Storage for Fake {
     fn apply(&self, records: &[Record]) -> Result<(), StorageError> {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        if held.is_some() {
+        if matches!(*held, Hold::Holding { .. }) {
             self.caught.store(true, Ordering::SeqCst);
         }
         // Until released, or until the hold's own deadline: see
         // [`Fake::LONGEST_HOLD`] for why a hang here would report
         // nothing at all.
-        while let Some(deadline) = *held {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
+        while let Some(remaining) = held.remaining(Self::LONGEST_HOLD) {
             let (guard, _) = self
                 .released
                 .wait_timeout(held, remaining)
