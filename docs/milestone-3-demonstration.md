@@ -376,14 +376,16 @@ broker held the port, which is how this was noticed at all.
 
 ## Budget
 
-The bundle is **52.1 KB gzipped against the 150 KB of section 15**,
+The bundle is **52.2 KB gzipped against the 150 KB of section 15**,
 which is 35% of it, summed per file the way the broker embeds and
 serves them. The shell alone was 13.3 KB, so the three pages, uPlot,
 the virtual core and valibot cost about 39 KB between them.
 
 It was 51.5 KB before the tap. The watcher gained a message list, a
 cursor and a lifecycle and lost the MQTT 4.7 matcher it used to
-carry, which nets to **+0.6 KB**. The matcher going is worth more
+carry, which nets to **+0.7 KB**. (The commit that introduced it
+says +0.6 KB, which was true when it was written; the guard against
+a stale poll landing after Stop cost the other hundred bytes.) The matcher going is worth more
 than the six hundred bytes: a second implementation of the matching
 rules, in a language no conformance suite is pointed at, is the kind
 of thing convention 8 is about.
