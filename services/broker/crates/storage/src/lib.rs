@@ -30,9 +30,10 @@ pub use self::redb::RedbStorage;
 pub use memory::MemoryStorage;
 
 pub use record::{
-    BodyRecord, DeliveryRecord, FormatError, FormatMarker, InflightRecord, InflightState,
-    MessageId, ProtocolVersion, Qos, QueueEntry, Record, RetainHandling, RetainedRecord,
-    SessionKey, SessionRecord, SubscriptionRecord, WillRecord, FORMAT_MAGIC, FORMAT_VERSION,
+    ActionRecord, BodyRecord, DeliveryRecord, FormatError, FormatMarker, HttpOutRecord,
+    InflightRecord, InflightState, MessageId, ProtocolVersion, Qos, QueueEntry, Record,
+    RetainHandling, RetainedRecord, RuleRecord, SessionKey, SessionRecord, SubscriptionRecord,
+    TriggerRecord, WillRecord, FORMAT_MAGIC, FORMAT_VERSION,
 };
 pub use restore::{Restored, RestoredSession};
 pub use writer::{Applied, Durable, NotDurable, Writer, WriterConfig, WriterStopped};

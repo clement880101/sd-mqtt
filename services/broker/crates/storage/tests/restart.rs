@@ -81,15 +81,16 @@
 //! every session in the universe including ones no plan created. A depth
 //! that drifts is otherwise invisible to a restore.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{TestCaseResult, TestRunner};
 use storage::{
-    BodyRecord, DeliveryRecord, InflightRecord, InflightState, MemoryStorage, MessageId,
-    ProtocolVersion, Qos, QueueEntry, Record, RedbStorage, RetainHandling, RetainedRecord,
-    SessionKey, SessionRecord, Storage, SubscriptionRecord, WillRecord,
+    ActionRecord, BodyRecord, DeliveryRecord, HttpOutRecord, InflightRecord, InflightState,
+    MemoryStorage, MessageId, ProtocolVersion, Qos, QueueEntry, Record, RedbStorage,
+    RetainHandling, RetainedRecord, RuleRecord, SessionKey, SessionRecord, Storage,
+    SubscriptionRecord, TriggerRecord, WillRecord,
 };
 
 // ---- the universe the generator draws from ------------------------------
@@ -121,6 +122,13 @@ const FILTERS: [&str; 4] = ["#", "a", "a/b", "sensor/+/temp"];
 
 /// The topics a plan may retain on.
 const TOPICS: [&str; 3] = ["a", "a/b", "sensor/1/temp"];
+
+/// The rule identifiers a plan may use.
+///
+/// Chosen for the same reason the session keys are: `"a"` and `"ab"` are
+/// the pair a backend that keyed rules by a prefix would confuse, and a
+/// rule's key is the identifier as text with nothing around it.
+const RULES: [&str; 3] = ["a", "ab", "telemetry"];
 
 /// How many distinct bodies a plan may store.
 const BODIES: usize = 4;
@@ -253,6 +261,20 @@ enum Op {
         /// Which topic.
         topic: usize,
     },
+    /// A rule is created, or one that exists is changed.
+    RulePut {
+        /// Which rule.
+        rule: usize,
+        /// Whether it is switched on.
+        enabled: bool,
+        /// Something to make the rest of it distinguishable.
+        shape: u8,
+    },
+    /// A rule is deleted.
+    RuleRemoved {
+        /// Which rule.
+        rule: usize,
+    },
     /// Close the current batch here.
     ///
     /// Generated rather than fixed, so that the boundary falls between
@@ -339,6 +361,9 @@ fn any_op(session_count: usize) -> impl Strategy<Value = Op> {
         3 => (0..TOPICS.len(), any::<u8>())
             .prop_map(|(topic, payload)| Op::RetainedPut { topic, payload }),
         2 => (0..TOPICS.len()).prop_map(|topic| Op::RetainedRemoved { topic }),
+        3 => (0..RULES.len(), any::<bool>(), any::<u8>())
+            .prop_map(|(rule, enabled, shape)| Op::RulePut { rule, enabled, shape }),
+        2 => (0..RULES.len()).prop_map(|rule| Op::RuleRemoved { rule }),
         3 => Just(Op::EndBatch),
     ]
 }
@@ -418,6 +443,12 @@ struct Coverage {
     a_batch_refused_after_earlier_records: u64,
     /// A record naming a session the store does not hold.
     a_record_for_a_session_not_held: u64,
+    /// A rule put over an identifier the store already holds, which
+    /// must replace it rather than leave the first one there.
+    a_rule_put_over_one_already_held: u64,
+    /// A rule removed while it was held, as against a removal of one
+    /// that was not, which is a no-op.
+    a_rule_removed_while_held: u64,
 }
 
 impl Coverage {
@@ -434,11 +465,13 @@ impl Coverage {
             other.a_queue_a_little_endian_key_would_reorder;
         self.a_batch_refused_after_earlier_records += other.a_batch_refused_after_earlier_records;
         self.a_record_for_a_session_not_held += other.a_record_for_a_session_not_held;
+        self.a_rule_put_over_one_already_held += other.a_rule_put_over_one_already_held;
+        self.a_rule_removed_while_held += other.a_rule_removed_while_held;
     }
 
     /// Every counter, named, so that a zero can be reported as the name
     /// of the case the generator cannot reach rather than as a number.
-    fn named(&self) -> [(&'static str, u64); 10] {
+    fn named(&self) -> [(&'static str, u64); 12] {
         [
             (
                 "a pop of an already empty queue",
@@ -476,6 +509,14 @@ impl Coverage {
             (
                 "a record for a session not held",
                 self.a_record_for_a_session_not_held,
+            ),
+            (
+                "a rule put over one already held",
+                self.a_rule_put_over_one_already_held,
+            ),
+            (
+                "a rule removed while it was held",
+                self.a_rule_removed_while_held,
             ),
         ]
     }
@@ -526,6 +567,8 @@ struct Model {
     /// Sessions whose removal left a high-water mark behind, so that a
     /// recreation under the same key can be recognised.
     removed_with_a_mark: BTreeMap<usize, u64>,
+    /// Which rules the store holds, by index into the universe.
+    rules: BTreeSet<usize>,
 }
 
 /// A plan compiled into batches, with what the compiler saw on the way.
@@ -561,6 +604,8 @@ impl Model {
             | Op::BodyReleased { .. }
             | Op::RetainedPut { .. }
             | Op::RetainedRemoved { .. }
+            | Op::RulePut { .. }
+            | Op::RuleRemoved { .. }
             | Op::EndBatch => None,
         };
         if let Some(session) = session {
@@ -879,6 +924,32 @@ impl Model {
                 },
                 true,
             ),
+            Op::RulePut {
+                rule,
+                enabled,
+                shape,
+            } => {
+                if apply && !self.rules.insert(rule) {
+                    coverage.a_rule_put_over_one_already_held += 1;
+                }
+                (
+                    Record::RulePut {
+                        rule: rule_record(rule, enabled, shape),
+                    },
+                    true,
+                )
+            }
+            Op::RuleRemoved { rule } => {
+                if apply && self.rules.remove(&rule) {
+                    coverage.a_rule_removed_while_held += 1;
+                }
+                (
+                    Record::RuleRemoved {
+                        id: RULES[rule].to_owned(),
+                    },
+                    true,
+                )
+            }
             Op::EndBatch => unreachable!("a batch boundary is not a record"),
         }
     }
@@ -952,6 +1023,37 @@ fn delivery(body: usize, sequence: u64) -> DeliveryRecord {
             vec![u32::try_from(sequence % 7).expect("a remainder of seven fits") + 1]
         },
         dup: sequence.is_multiple_of(5),
+    }
+}
+
+/// A rule whose every field depends on the operation that made it, so
+/// that a backend keeping a stale one is visible.
+fn rule_record(rule: usize, enabled: bool, shape: u8) -> RuleRecord {
+    RuleRecord {
+        id: RULES[rule].to_owned(),
+        name: format!("rule {rule} shape {shape}"),
+        enabled,
+        trigger: TriggerRecord {
+            filter: FILTERS[usize::from(shape) % FILTERS.len()].to_owned(),
+            min_qos: shape.is_multiple_of(2).then(|| qos_of(shape % 3)),
+            client_id: shape.is_multiple_of(3).then(|| format!("client-{shape}-*")),
+        },
+        action: ActionRecord::HttpOut(HttpOutRecord {
+            url: format!("https://example.invalid/{rule}/{shape}"),
+            method: if shape.is_multiple_of(2) {
+                "POST"
+            } else {
+                "PUT"
+            }
+            .to_owned(),
+            headers: (0..usize::from(shape) % 3)
+                .map(|n| (format!("x-{n}"), format!("v-{shape}-{n}")))
+                .collect(),
+            timeout_ms: 1_000 + u32::from(shape),
+            max_concurrency: u16::from(shape) % 9 + 1,
+            retries: shape % 7,
+            backoff_ms: 250 + u32::from(shape) * 3,
+        }),
     }
 }
 
@@ -1119,6 +1221,7 @@ fn agree(model: &dyn Storage, disk: &dyn Storage, when: &str) -> TestCaseResult 
         "{}: the bodies differ",
         when
     );
+    prop_assert_eq!(&expected.rules, &found.rules, "{}: the rules differ", when);
     // Nothing above may have been forgotten. The field-wise assertions
     // exist for the failure message; this one is what says the list of
     // them is complete, and it is also the claim that both backends

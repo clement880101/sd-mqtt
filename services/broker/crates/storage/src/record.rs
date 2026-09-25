@@ -54,7 +54,16 @@ use serde::{Deserialize, Serialize};
 /// with eight bytes of count, which this build would read as the start
 /// of a payload, so they are refused as what they are: a store this
 /// build does not read.
-pub const FORMAT_VERSION: u16 = 2;
+///
+/// Version 3 added rules, section 9.1: two variants at the end of
+/// [`Record`] and a table of their own in each backend. Nothing already
+/// stored changes shape, and the version moves all the same, because
+/// this check is exact rather than a range — a version 2 store opened by
+/// this build would come up with no rules at all and look healthy, and a
+/// version 3 store opened by a milestone 3 build would meet two record
+/// discriminants it has no meaning for. Nothing is released, so the cost
+/// is a line in the release notes rather than a migration.
+pub const FORMAT_VERSION: u16 = 3;
 
 /// What every sd-mqtt store begins with, so a file that is not one is
 /// refused as such rather than as a corrupt store.
@@ -384,6 +393,80 @@ pub struct BodyRecord {
     pub properties: Bytes,
 }
 
+/// When a rule fires, section 9.1.
+///
+/// The filter, optionally narrowed. An absent narrowing is not the same
+/// as a permissive one: `min_qos: None` says the operator did not narrow
+/// by level, and storing it as `Some(AtMostOnce)` would be this crate
+/// deciding that for them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerRecord {
+    /// The topic filter a message must match.
+    pub filter: String,
+    /// The lowest level that fires the rule, if it is narrowed.
+    pub min_qos: Option<Qos>,
+    /// The client identifier pattern that fires it, if it is narrowed.
+    ///
+    /// The pattern as written, not compiled. What its syntax means
+    /// belongs to the crate that evaluates it; storing a compiled form
+    /// would put a second description of that syntax on disk, where it
+    /// would outlive every build that agreed with it.
+    pub client_id: Option<String>,
+}
+
+/// How an `http_out` action posts, section 9.2.
+///
+/// Every field the design lists as configurable — method, headers,
+/// timeout, maximum concurrency, retry count and backoff — and no field
+/// it does not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpOutRecord {
+    /// Where to post.
+    pub url: String,
+    /// Which method to use.
+    pub method: String,
+    /// Headers to send, in the order they were configured.
+    pub headers: Vec<(String, String)>,
+    /// How long one attempt may take, in milliseconds.
+    pub timeout_ms: u32,
+    /// How many attempts may be in flight at once.
+    pub max_concurrency: u16,
+    /// How many times to retry after the first attempt fails.
+    pub retries: u8,
+    /// How long to wait before the first retry, in milliseconds.
+    pub backoff_ms: u32,
+}
+
+/// What a rule does when it fires. One, section 9.1.
+///
+/// **Variant order is the format**, as it is for [`Record`]: the other
+/// actions section 9.2 names are later milestones' variants, and each
+/// goes at the end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActionRecord {
+    /// Post a JSON envelope to a URL.
+    HttpOut(HttpOutRecord),
+}
+
+/// A rule, section 9.1.
+///
+/// Node-local in milestone 4 and replicated in milestone 5. Nothing here
+/// changes when replication arrives, which is why the record is written
+/// now rather than left until it does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleRecord {
+    /// What names it, for as long as it exists.
+    pub id: String,
+    /// What an operator calls it.
+    pub name: String,
+    /// Whether it fires at all.
+    pub enabled: bool,
+    /// When it fires.
+    pub trigger: TriggerRecord,
+    /// What it does.
+    pub action: ActionRecord,
+}
+
 /// A message held for future subscribers to a topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedRecord {
@@ -503,6 +586,20 @@ pub enum Record {
         /// Which topic.
         topic: String,
     },
+    /// A rule was created, or one that exists was changed.
+    ///
+    /// One record for both, as [`Record::SessionPut`] is: a rule is
+    /// whatever the last put said it was, so an edit needs no vocabulary
+    /// of its own and cannot half-apply.
+    RulePut {
+        /// The rule, whole.
+        rule: RuleRecord,
+    },
+    /// A rule was deleted.
+    RuleRemoved {
+        /// Which rule.
+        id: String,
+    },
 }
 
 impl Record {
@@ -564,6 +661,28 @@ impl Record {
                 topic.len() + message.payload.len() + message.properties.len()
             }
             Self::RetainedRemoved { topic } => topic.len(),
+            // An operator writes these, not a peer, so none of it is
+            // unbounded in the sense this estimate is about. Counted
+            // anyway, because the fields are strings and a bound that
+            // ignores strings is a bound waiting to be wrong.
+            Self::RulePut { rule } => {
+                rule.id.len()
+                    + rule.name.len()
+                    + rule.trigger.filter.len()
+                    + rule.trigger.client_id.as_ref().map_or(0, String::len)
+                    + match &rule.action {
+                        ActionRecord::HttpOut(http) => {
+                            http.url.len()
+                                + http.method.len()
+                                + http
+                                    .headers
+                                    .iter()
+                                    .map(|(name, value)| name.len() + value.len())
+                                    .sum::<usize>()
+                        }
+                    }
+            }
+            Self::RuleRemoved { id } => id.len(),
         };
         std::mem::size_of::<Self>() + variable
     }

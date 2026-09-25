@@ -34,6 +34,17 @@ use super::*;
 ///   that carry one.
 /// - `BodyRecord` and `RetainedRecord`: the two `Bytes` fields hold
 ///   different lengths, and the two `Option`s differ in presence.
+/// - `RuleRecord`: `id` and `name` are different lengths, and `name` and
+///   the trigger's `filter` are the same length and different text, so a
+///   swap of either pair is visible. `enabled` is false, which is the
+///   one byte in the record that is `0x00`, so it cannot be confused
+///   with the two `Option` presence bytes beside it, both `0x01`.
+/// - `HttpOutRecord`: `timeout_ms` and `backoff_ms` are different
+///   two-byte varints; `max_concurrency` and `retries` are different
+///   one-byte ones and adjacent, which is where a transposition would
+///   otherwise hide. `method` is `PUT` rather than the `POST` a default
+///   would produce, so the vector pins what was stored and not what a
+///   default would have supplied.
 ///
 /// When adding a record type, check the same property before adding its
 /// vector.
@@ -87,13 +98,14 @@ mod golden {
     #[test]
     fn the_format_marker() {
         // A fixed-size array is its elements with no length prefix, and a
-        // u16 is a varint, so version 2 is one byte. The version moved
+        // u16 is a varint, so version 3 is one byte. The version moved
         // from 1 when the reference count of a body left the body's own
-        // row: a version 1 store's bodies begin with eight bytes this
-        // build would read as payload.
+        // row, and from 2 when rules were added: a version 2 store has
+        // no rules table at all and would come up looking healthy with
+        // every rule missing.
         let expected: &[u8] = &[
             b's', b'd', b'm', b'q', b't', b't', b's', b't', // magic "sdmqttst"
-            0x02, // version 2
+            0x03, // version 3
         ];
         assert_eq!(FormatMarker::current().encode(), expected);
         assert_eq!(
@@ -392,6 +404,79 @@ mod golden {
         pins(&record, expected);
     }
 
+    /// The rule the vectors below are of.
+    ///
+    /// Written out here once because both of them name it, and because
+    /// what the bytes say it is has to be legible beside the bytes.
+    fn rule() -> RuleRecord {
+        RuleRecord {
+            id: "telemetry".to_owned(),
+            name: "Telemetry out".to_owned(),
+            enabled: false,
+            trigger: TriggerRecord {
+                filter: "sensor/+/temp".to_owned(),
+                min_qos: Some(Qos::ExactlyOnce),
+                client_id: Some("sensor-*".to_owned()),
+            },
+            action: ActionRecord::HttpOut(HttpOutRecord {
+                url: "https://example.invalid/hook".to_owned(),
+                method: "PUT".to_owned(),
+                headers: vec![("x-token".to_owned(), "secret".to_owned())],
+                timeout_ms: 2_500,
+                max_concurrency: 8,
+                retries: 5,
+                backoff_ms: 750,
+            }),
+        }
+    }
+
+    #[test]
+    fn rule_put() {
+        // A tuple is its elements in order with no framing, so a header
+        // is two lengthed strings and a `Vec` of them is a varint count
+        // then that. 2500 = 19 * 128 + 68, so the varint is 68|0x80 then
+        // 19; 750 = 5 * 128 + 110, so it is 110|0x80 then 5.
+        let expected: &[u8] = &[
+            0x0e, // Record::RulePut is variant 14
+            0x09, b't', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y', // id
+            0x0d, b'T', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y', b' ', b'o', b'u',
+            b't', // name "Telemetry out"
+            0x00, // enabled false
+            0x0d, b's', b'e', b'n', b's', b'o', b'r', b'/', b'+', b'/', b't', b'e', b'm',
+            b'p', // trigger filter "sensor/+/temp"
+            0x01, 0x02, // min_qos Some(Qos::ExactlyOnce)
+            0x01, 0x08, b's', b'e', b'n', b's', b'o', b'r', b'-',
+            b'*', // client_id Some("sensor-*")
+            0x00, // ActionRecord::HttpOut is variant 0
+            0x1c, b'h', b't', b't', b'p', b's', b':', b'/', b'/', b'e', b'x', b'a', b'm', b'p',
+            b'l', b'e', b'.', b'i', b'n', b'v', b'a', b'l', b'i', b'd', b'/', b'h', b'o', b'o',
+            b'k', // url, twenty-eight bytes
+            0x03, b'P', b'U', b'T', // method
+            0x01, // one header
+            0x07, b'x', b'-', b't', b'o', b'k', b'e', b'n', // its name
+            0x06, b's', b'e', b'c', b'r', b'e', b't', // its value
+            0xc4, 0x13, // timeout_ms 2500
+            0x08, // max_concurrency 8
+            0x05, // retries 5
+            0xee, 0x05, // backoff_ms 750
+        ];
+        pins(&Record::RulePut { rule: rule() }, expected);
+    }
+
+    #[test]
+    fn rule_removed() {
+        let expected: &[u8] = &[
+            0x0f, // Record::RuleRemoved is variant 15
+            0x09, b't', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y',
+        ];
+        pins(
+            &Record::RuleRemoved {
+                id: "telemetry".to_owned(),
+            },
+            expected,
+        );
+    }
+
     #[test]
     fn retained_removed() {
         let expected: &[u8] = &[
@@ -513,7 +598,7 @@ mod version {
 
     #[test]
     fn an_unknown_discriminant_does_not_decode() {
-        // The highest variant is 13. A record written by a build that has
+        // The highest variant is 15. A record written by a build that has
         // more of them must be refused rather than read as something else.
         let err = Record::decode(&[0x63]).expect_err("variant 99 is not ours");
         assert!(matches!(err, FormatError::Undecodable(_)), "said: {err:?}");
@@ -886,6 +971,56 @@ mod roundtrip {
             )
     }
 
+    fn trigger() -> impl Strategy<Value = TriggerRecord> {
+        (
+            text(),
+            proptest::option::of(qos()),
+            proptest::option::of(text()),
+        )
+            .prop_map(|(filter, min_qos, client_id)| TriggerRecord {
+                filter,
+                min_qos,
+                client_id,
+            })
+    }
+
+    fn action() -> impl Strategy<Value = ActionRecord> {
+        (
+            text(),
+            text(),
+            proptest::collection::vec((text(), text()), 0..4),
+            any::<u32>(),
+            any::<u16>(),
+            any::<u8>(),
+            any::<u32>(),
+        )
+            .prop_map(
+                |(url, method, headers, timeout_ms, max_concurrency, retries, backoff_ms)| {
+                    ActionRecord::HttpOut(HttpOutRecord {
+                        url,
+                        method,
+                        headers,
+                        timeout_ms,
+                        max_concurrency,
+                        retries,
+                        backoff_ms,
+                    })
+                },
+            )
+    }
+
+    fn rule() -> impl Strategy<Value = RuleRecord> {
+        (text(), text(), any::<bool>(), trigger(), action()).prop_map(
+            |(id, name, enabled, trigger, action)| RuleRecord {
+                id,
+                name,
+                enabled,
+                trigger,
+                action,
+            },
+        )
+    }
+
     fn retained() -> impl Strategy<Value = RetainedRecord> {
         (bytes(), qos(), any::<Option<u32>>(), bytes()).prop_map(
             |(payload, qos, expires_at, properties)| RetainedRecord {
@@ -928,6 +1063,8 @@ mod roundtrip {
             (text(), retained())
                 .prop_map(|(topic, message)| Record::RetainedPut { topic, message }),
             text().prop_map(|topic| Record::RetainedRemoved { topic }),
+            rule().prop_map(|rule| Record::RulePut { rule }),
+            text().prop_map(|id| Record::RuleRemoved { id }),
         ]
     }
 

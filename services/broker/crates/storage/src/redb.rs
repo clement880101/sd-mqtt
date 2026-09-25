@@ -87,6 +87,12 @@ const BODIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("bodies");
 const BODY_REFERENCES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("body_references");
 /// Topic to [`RetainedRecord`].
 const RETAINED: TableDefinition<&str, &[u8]> = TableDefinition::new("retained");
+/// Rule identifier to [`crate::record::RuleRecord`].
+///
+/// Keyed by the identifier as text rather than by a composite, because a
+/// rule belongs to the node rather than to a session: there is no prefix
+/// to scope it under and nothing to escape.
+const RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("rules");
 
 /// A [`Storage`] backed by a redb database on a path.
 #[derive(Debug)]
@@ -252,6 +258,7 @@ impl Storage for RedbStorage {
         let retained = transaction
             .open_table(RETAINED)
             .map_err(StorageError::from)?;
+        let rules = transaction.open_table(RULES).map_err(StorageError::from)?;
 
         let mut restored = Restored::default();
         for entry in sessions.iter().map_err(StorageError::from)? {
@@ -298,6 +305,12 @@ impl Storage for RedbStorage {
             restored
                 .bodies
                 .insert(message_id(id.value())?, decode(value.value())?);
+        }
+        // In key order, which is identifier order, which is what the
+        // in-memory backend's `BTreeMap` also produces.
+        for entry in rules.iter().map_err(StorageError::from)? {
+            let (_, value) = entry.map_err(StorageError::from)?;
+            restored.rules.push(decode(value.value())?);
         }
         Ok(restored)
     }
@@ -369,6 +382,7 @@ struct Tables<'txn> {
     bodies: ByteTable<'txn>,
     body_references: ByteTable<'txn>,
     retained: Table<'txn, &'static str, &'static [u8]>,
+    rules: Table<'txn, &'static str, &'static [u8]>,
 }
 
 impl<'txn> Tables<'txn> {
@@ -398,6 +412,7 @@ impl<'txn> Tables<'txn> {
             retained: transaction
                 .open_table(RETAINED)
                 .map_err(StorageError::from)?,
+            rules: transaction.open_table(RULES).map_err(StorageError::from)?,
         })
     }
 
@@ -597,6 +612,14 @@ impl<'txn> Tables<'txn> {
                 self.retained
                     .remove(topic.as_str())
                     .map_err(StorageError::from)?;
+            }
+            Record::RulePut { rule } => {
+                self.rules
+                    .insert(rule.id.as_str(), encode(rule).as_slice())
+                    .map_err(StorageError::from)?;
+            }
+            Record::RuleRemoved { id } => {
+                self.rules.remove(id.as_str()).map_err(StorageError::from)?;
             }
         }
         Ok(())

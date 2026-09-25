@@ -30,8 +30,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, PoisonError};
 
 use crate::record::{
-    BodyRecord, InflightRecord, MessageId, QueueEntry, Record, RetainedRecord, SessionKey,
-    SessionRecord, SubscriptionRecord,
+    BodyRecord, InflightRecord, MessageId, QueueEntry, Record, RetainedRecord, RuleRecord,
+    SessionKey, SessionRecord, SubscriptionRecord,
 };
 use crate::restore::{Restored, RestoredSession};
 use crate::{Rejection, Storage, StorageError};
@@ -76,6 +76,8 @@ struct State {
     bodies: BTreeMap<MessageId, HeldBody>,
     /// Retained messages by topic.
     retained: BTreeMap<String, RetainedRecord>,
+    /// Rules by identifier, ordered so that restore is deterministic.
+    rules: BTreeMap<String, RuleRecord>,
 }
 
 /// A body and the count that keeps it alive.
@@ -254,6 +256,12 @@ impl State {
             Record::RetainedRemoved { topic } => {
                 self.retained.remove(topic);
             }
+            Record::RulePut { rule } => {
+                self.rules.insert(rule.id.clone(), rule.clone());
+            }
+            Record::RuleRemoved { id } => {
+                self.rules.remove(id);
+            }
         }
         Ok(())
     }
@@ -312,6 +320,7 @@ impl Storage for MemoryStorage {
                 .iter()
                 .map(|(id, held)| (*id, held.body.clone()))
                 .collect::<HashMap<_, _>>(),
+            rules: state.rules.values().cloned().collect(),
         })
     }
 

@@ -31,9 +31,10 @@
 use std::collections::BTreeSet;
 
 use storage::{
-    BodyRecord, DeliveryRecord, InflightRecord, InflightState, MessageId, ProtocolVersion, Qos,
-    QueueEntry, Record, Rejection, Restored, RestoredSession, RetainHandling, RetainedRecord,
-    SessionKey, SessionRecord, Storage, StorageError, SubscriptionRecord,
+    ActionRecord, BodyRecord, DeliveryRecord, HttpOutRecord, InflightRecord, InflightState,
+    MessageId, ProtocolVersion, Qos, QueueEntry, Record, Rejection, Restored, RestoredSession,
+    RetainHandling, RetainedRecord, RuleRecord, SessionKey, SessionRecord, Storage, StorageError,
+    SubscriptionRecord, TriggerRecord,
 };
 
 /// The contract, as functions over any backend.
@@ -69,6 +70,33 @@ mod contract {
             retain_as_published: true,
             retain_handling: RetainHandling::SendIfNew,
             subscription_id: Some(9),
+        }
+    }
+
+    /// A rule with no field left at its default, for the same reason as
+    /// the session above: a backend that drops one must be visible.
+    ///
+    /// `enabled` is false, because the flag a store can silently fail to
+    /// keep is the one whose absence looks like the ordinary case.
+    fn rule(id: &str) -> RuleRecord {
+        RuleRecord {
+            id: id.to_owned(),
+            name: format!("rule {id}"),
+            enabled: false,
+            trigger: TriggerRecord {
+                filter: "sensor/+/temp".to_owned(),
+                min_qos: Some(Qos::ExactlyOnce),
+                client_id: Some("sensor-*".to_owned()),
+            },
+            action: ActionRecord::HttpOut(HttpOutRecord {
+                url: format!("https://example.invalid/{id}"),
+                method: "PUT".to_owned(),
+                headers: vec![("x-token".to_owned(), "secret".to_owned())],
+                timeout_ms: 2_500,
+                max_concurrency: 8,
+                retries: 5,
+                backoff_ms: 750,
+            }),
         }
     }
 
@@ -1590,6 +1618,82 @@ mod contract {
         );
     }
 
+    // ---- rules -----------------------------------------------------------
+
+    /// Rules are held, replaced whole, and removed. Section 9.1.
+    pub fn rules_are_held_replaced_and_removed<S: Storage>(new: impl Fn() -> S) {
+        let store = new();
+        assert!(
+            restore(&store).rules.is_empty(),
+            "an empty store holds no rules"
+        );
+
+        apply(
+            &store,
+            &[
+                Record::RulePut { rule: rule("b") },
+                Record::RulePut { rule: rule("a") },
+            ],
+        );
+        assert_eq!(
+            restore(&store).rules,
+            vec![rule("a"), rule("b")],
+            "both rules come back, in identifier order"
+        );
+
+        // A put over an identifier already held replaces it whole. The
+        // enabled flag above all: turning a connector on and off is the
+        // ordinary edit, and a store that kept the first value would
+        // leave an operator's switch doing nothing after a restart.
+        let mut changed = rule("a");
+        changed.enabled = true;
+        changed.name = "renamed".to_owned();
+        changed.trigger.min_qos = None;
+        apply(
+            &store,
+            &[Record::RulePut {
+                rule: changed.clone(),
+            }],
+        );
+        assert_eq!(restore(&store).rules, vec![changed.clone(), rule("b")]);
+
+        apply(&store, &[Record::RuleRemoved { id: "a".to_owned() }]);
+        assert_eq!(restore(&store).rules, vec![rule("b")]);
+
+        // Removing one that is not held is a no-op rather than a
+        // refusal, like every other removal in this vocabulary: the
+        // postcondition it asks for already holds.
+        apply(
+            &store,
+            &[Record::RuleRemoved {
+                id: "never".to_owned(),
+            }],
+        );
+        assert_eq!(restore(&store).rules, vec![rule("b")]);
+    }
+
+    /// A rule belongs to the node, not to a session.
+    ///
+    /// The mistake this guards is filing rules under whatever structure
+    /// was nearest: a session removed takes its queue, its subscriptions
+    /// and its inflight with it, and must take nothing of a rule's.
+    pub fn a_rule_survives_the_session_that_was_there_when_it_was_made<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = with_session(new, "sensor");
+        apply(&store, &[Record::RulePut { rule: rule("a") }]);
+        apply(
+            &store,
+            &[Record::SessionRemoved {
+                session: key("sensor"),
+            }],
+        );
+
+        let restored = restore(&store);
+        assert!(restored.sessions.is_empty(), "the session went");
+        assert_eq!(restored.rules, vec![rule("a")], "the rule did not");
+    }
+
     // ---- flush ------------------------------------------------------------
 
     /// A flush changes nothing about what the store holds, and a store
@@ -1659,6 +1763,8 @@ macro_rules! every_contract_test {
             a_body_stored_again_after_release_starts_from_one,
             releasing_a_body_that_is_not_held_is_refused,
             a_pop_does_not_release_the_body_it_named,
+            rules_are_held_replaced_and_removed,
+            a_rule_survives_the_session_that_was_there_when_it_was_made,
             a_flush_keeps_everything_and_leaves_the_store_usable,
         }
     };
