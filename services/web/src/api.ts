@@ -31,6 +31,7 @@ export type ErrorCode =
   | 'not_acceptable'
   | 'unauthorized'
   | 'resource_exhausted'
+  | 'loop_detected'
   | 'internal';
 
 /** A failure the API described in its own shape. */

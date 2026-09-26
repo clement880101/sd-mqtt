@@ -667,6 +667,10 @@ async fn ingest_one(
         );
     }
 
+    // Read before the topic, because a request that is going round a
+    // cycle should be stopped by the cheapest check that can see it.
+    let hops = hops_presented(&headers);
+
     let topic = match topic_for(action, &headers, &query) {
         Ok(topic) => topic,
         Err(TopicRefused::Repeated) => {
@@ -730,16 +734,14 @@ async fn ingest_one(
             // deliverable until it is delivered, which is what every
             // other publication with no expiry does.
             message_expiry_interval: None,
-            // **No hop count, deliberately.** Section 9.2's third loop
-            // is an `http_out` rule feeding a system that posts back
-            // through this endpoint, and the hop count that would
-            // close it has to survive the round trip through that
-            // system — so it is the caller's to send back, not ours to
-            // mint. Stamping a fresh count here would reset every
-            // message to one hop and make the count say nothing. What
-            // reads a count the caller sent lands with the connector
-            // that drops on it; see `crate::hops`.
-            user_properties: Vec::new(),
+            // **The count the caller sent back, plus this hop.**
+            // Section 9.2's third loop is an `http_out` rule feeding a
+            // system that posts back through this endpoint, and the
+            // count that closes it has to survive the round trip
+            // through that system — so it is the caller's to return.
+            // See [`hops_presented`].
+            user_properties: crate::hops::after(hops),
+            origin: rule.clone(),
         },
     )
     .await
@@ -761,7 +763,52 @@ async fn ingest_one(
             "internal",
             refused.to_string(),
         ),
+        // 508, which is "Loop Detected" and says exactly this. A
+        // caller told nothing would go on feeding the cycle at full
+        // speed, and this endpoint is the only place in it that can be
+        // seen from outside.
+        Err(refused @ PublishRefused::TooManyHops(_)) => ApiError::refusal(
+            StatusCode::LOOP_DETECTED,
+            "loop_detected",
+            refused.to_string(),
+        ),
     }
+}
+
+/// How many connectors the caller says this body has already been
+/// through.
+///
+/// # Why a header, and why the caller's word is taken for it
+///
+/// Section 9.2's third loop has no bridge in it: an `http_out` rule
+/// feeds a system, and the system posts back through here. The count
+/// that bounds it therefore has to cross a piece of somebody else's
+/// software, and the only way it can is if that software passes it on.
+/// The envelope `http_out` posts carries it among `user_properties`, so
+/// a system that returns what it was given returns the count, and this
+/// is where it is read back in.
+///
+/// **A caller could lie about it, and that is not what this is for.** A
+/// caller that omits the count is answered exactly as one that sent
+/// zero, because that is what every caller did before this existed and
+/// a gateway that knows nothing of hop counts is the ordinary case. The
+/// count is a cooperation between connectors, not an access control:
+/// whoever holds this rule's token can already publish as often as they
+/// like, and the thing that stops *that* is section 9.1's rate limiting
+/// and not this. What it stops is the accident — a chain of rules
+/// somebody wired into a circle — which is the failure nothing else in
+/// the system can see, because no single rule is in the whole of it.
+///
+/// A header that is not a number is `0`, for the reason
+/// [`broker_core::hops::count_of`] gives: guessing what somebody else's
+/// `sd-hops` meant is worse than reading it as a body that has not been
+/// round anything.
+fn hops_presented(headers: &HeaderMap) -> u32 {
+    headers
+        .get(crate::hops::HOP_COUNT)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
 }
 
 /// The level, as an operator's configuration numbers it.
@@ -780,6 +827,8 @@ pub fn qos_of(number: u8) -> Option<QoS> {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::HeaderValue;
+
     use super::*;
     use crate::rule::TopicFromRequest;
 
@@ -1096,6 +1145,62 @@ mod tests {
             "a tokenless rule must have no route at all rather than an open one"
         );
         assert!(ingest.is_empty());
+    }
+
+    /// The half of section 9.2's third loop this endpoint owns. A
+    /// system that returns the count it was given keeps the chain
+    /// countable across a piece of software neither end wrote.
+    #[test]
+    fn the_hop_count_a_caller_returns_is_read_back() {
+        let mut headers = HeaderMap::new();
+        headers.insert(crate::hops::HOP_COUNT, HeaderValue::from_static("3"));
+        assert_eq!(hops_presented(&headers), 3);
+        assert_eq!(
+            crate::hops::count_of(&crate::hops::after(hops_presented(&headers))),
+            Some(4),
+            "and this endpoint's own hop is added to it"
+        );
+    }
+
+    /// A caller that knows nothing of hop counts is answered exactly as
+    /// one that sent zero, which is what every caller did before the
+    /// header existed. A gateway posting sensor readings is that
+    /// caller, and it must not need changing.
+    #[test]
+    fn a_caller_that_sends_no_hop_count_has_been_nowhere() {
+        assert_eq!(hops_presented(&HeaderMap::new()), 0);
+        assert_eq!(
+            crate::hops::count_of(&crate::hops::after(0)),
+            Some(1),
+            "so its post is the first hop, as a poller's fetch is"
+        );
+    }
+
+    /// Anything that is not a count is not one. Guessing what somebody
+    /// else's `sd-hops` meant is worse than reading it as a body that
+    /// has not been round anything.
+    #[test]
+    fn a_hop_header_that_is_not_a_count_is_none() {
+        for nonsense in ["", "many", "-1", "1.5", "0x2", "4294967296"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                crate::hops::HOP_COUNT,
+                HeaderValue::from_str(nonsense).expect("a header value"),
+            );
+            assert_eq!(
+                hops_presented(&headers),
+                0,
+                "{nonsense:?} is not a hop count anything wrote"
+            );
+        }
+    }
+
+    /// The name is the property's, so an operator reading a message's
+    /// properties and an operator writing a header are reading and
+    /// writing the same word.
+    #[test]
+    fn the_header_is_named_after_the_property() {
+        assert_eq!(crate::hops::HOP_COUNT, "sd-hops");
     }
 
     #[test]

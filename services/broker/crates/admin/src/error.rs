@@ -106,6 +106,22 @@ pub enum ErrorCode {
     /// succeed unchanged a moment later, which is exactly what a
     /// client needs to know to decide whether to retry.
     ResourceExhausted,
+    /// The request would extend a cycle of connectors.
+    ///
+    /// Section 9.2's third loop: a rule feeding a system that
+    /// publishes back through another rule is a circle no single rule
+    /// is in the whole of, so the hop count each publication carries is
+    /// what bounds it and a publication over `broker.max_hops` is
+    /// dropped. This is how the one endpoint in that circle that a
+    /// caller can see says so.
+    ///
+    /// Deliberately not [`ErrorCode::InvalidRequest`], for the reason
+    /// [`ErrorCode::ResourceExhausted`] is not: the request is well
+    /// formed and the caller has done nothing wrong. It is also not
+    /// `resource_exhausted`, because retrying unchanged will not help —
+    /// what has to change is a configuration, and the status says which
+    /// kind of problem it is.
+    LoopDetected,
     /// Something went wrong that is not the caller's fault.
     Internal,
 }
@@ -126,6 +142,9 @@ impl ErrorCode {
             // being told is "not this one, not now", which is the
             // status a client already knows to retry after.
             ErrorCode::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
+            // 508, which is what "Loop Detected" is for and says the
+            // whole thing without a sentence.
+            ErrorCode::LoopDetected => StatusCode::LOOP_DETECTED,
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

@@ -552,6 +552,10 @@ pub struct Metrics {
     /// fallen behind loses events, and none of them may disappear
     /// uncounted. See [`Metrics::admin_events_dropped`].
     admin_events_dropped: Counter,
+    /// Section 9.2's third loop, counted where it is stopped: "one
+    /// over the configured maximum is dropped and counted". See
+    /// [`Metrics::publications_over_hop_limit`].
+    publications_over_hop_limit: Counter,
     sockets_closed: [Counter; SOCKET_OUTCOMES.len()],
     /// Indexed by [`REASON_KINDS`] then by [`ALL_REASONS`].
     reasons_sent: [[Counter; ALL_REASONS.len()]; REASON_KINDS.len()],
@@ -633,6 +637,16 @@ impl Metrics {
              each one is answered with a resynchronise rather than a gap",
             admin_events_dropped.clone(),
         );
+        let publications_over_hop_limit = Counter::default();
+        registry.register(
+            "publications_over_hop_limit",
+            // Unlike the counter above this one *is* a loss, and a
+            // deliberate one: a chain of connectors that feeds itself
+            // is stopped by dropping the message that would extend it.
+            // A non-zero value means there is a cycle to find.
+            "Publications dropped for having been through more connectors than              broker.max_hops allows; a non-zero value means a rule is feeding a cycle",
+            publications_over_hop_limit.clone(),
+        );
         let closed = Family::<[(&'static str, &'static str); 1], Counter>::default();
         registry.register(
             "sockets_closed",
@@ -706,6 +720,7 @@ impl Metrics {
             reasons_sent,
             authentications,
             admin_events_dropped,
+            publications_over_hop_limit,
             dropped_by_queue,
             dropped_by_shell,
             records_dropped,
@@ -773,6 +788,19 @@ impl Metrics {
     /// how an operator sees that a browser is falling behind.
     pub fn admin_events_dropped(&self) -> &Counter {
         &self.admin_events_dropped
+    }
+
+    /// Publications dropped for having been through too many
+    /// connectors.
+    ///
+    /// Section 9.2: "Every publication a connector originates carries
+    /// a hop count, and one over the configured maximum is dropped and
+    /// counted." This is the counting. Section 11.3's rule that
+    /// nothing disappears uncounted applies here as much as to a
+    /// queue: a connector chain that quietly swallowed a message would
+    /// be a support case nobody could answer.
+    pub fn publications_over_hop_limit(&self) -> &Counter {
+        &self.publications_over_hop_limit
     }
 
     /// A socket that has finished, by how it ended.

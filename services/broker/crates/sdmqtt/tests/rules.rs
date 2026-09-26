@@ -120,6 +120,26 @@ impl Received {
     }
 }
 
+impl Received {
+    /// The hop count the envelope carries among its user properties.
+    ///
+    /// Found by searching the text, for the reason [`Received::field`]
+    /// gives: a renamed property or a changed shape is a failure here
+    /// too, which a tolerant parser would let through.
+    fn hops(&self) -> u32 {
+        let text = String::from_utf8(self.body.clone()).expect("the envelope is text");
+        let marker = "[\"sd-hops\",\"";
+        let start = text
+            .find(marker)
+            .unwrap_or_else(|| panic!("the envelope carries no hop count: {text}"))
+            + marker.len();
+        let rest = &text[start..];
+        rest[..rest.find('"').expect("the value is closed")]
+            .parse()
+            .expect("a hop count is a number")
+    }
+}
+
 /// An HTTP endpoint on the loopback that a rule can post to.
 ///
 /// It keeps its port for the whole test, because the rule's URL is
@@ -266,7 +286,8 @@ fn serve(mut stream: TcpStream, received: &Arc<Mutex<Vec<Received>>>, accepting:
         "503 Service Unavailable"
     };
     let _ = stream.write_all(
-        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
+        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
     );
     let _ = stream.flush();
 }
@@ -290,7 +311,7 @@ fn write_config(
     mqtt: SocketAddr,
     admin: SocketAddr,
     ingest: SocketAddr,
-    rule: &str,
+    tables: &str,
 ) {
     let text = format!(
         r#"
@@ -313,7 +334,7 @@ flush_records = 1000000000
 [log]
 level = "info"
 
-{rule}
+{tables}
 "#,
         store = store.display(),
         interval = NEVER.as_millis(),
@@ -500,14 +521,34 @@ fn http(
     token: &str,
     body: Option<&[u8]>,
 ) -> Answered {
+    http_with(address, method, path, token, &[], body)
+}
+
+/// The same, carrying headers of its own.
+///
+/// One caller, and it is the one that matters: section 9.2's hop count
+/// crosses the HTTP leg of a cycle as a request header, so a test that
+/// could not send one could not drive a cycle at all.
+fn http_with(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    token: &str,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+) -> Answered {
     let mut stream = TcpStream::connect_timeout(&address, PATIENCE).expect("the listener accepts");
     stream
         .set_read_timeout(Some(PATIENCE))
         .expect("a read deadline");
     let body = body.unwrap_or(b"");
+    let extra: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     let head = format!(
         "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\
-         Authorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n",
+         Authorization: Bearer {token}\r\n{extra}Content-Length: {}\r\n\r\n",
         body.len()
     );
     stream
@@ -1190,4 +1231,178 @@ topic = "{INGEST_TOPIC}"
         "the refusal must name the rule: {said}"
     );
     assert!(said.contains("token"), "and say what is missing: {said}");
+}
+
+// ---- section 9.2's third loop, driven round until it stops ---------------
+
+/// How many connectors a publication may go through in this test.
+///
+/// Small so that the cycle below is short enough to read in the
+/// assertions, and not the default, so that a test which passed because
+/// the default happened to be what the code used would not.
+const CYCLE_MAX_HOPS: u32 = 3;
+
+/// The rule identifier the cycle's ingest half has.
+const CYCLE_INGEST: &str = "round";
+
+/// The topic the cycle goes round on.
+const CYCLE_TOPIC: &str = "loop/round";
+
+/// The two rules that make a cycle with no bridge in it, and the hop
+/// limit that bounds it.
+///
+/// Section 9.2: "an outbound rule feeding a system that posts back
+/// through an ingest rule is a cycle with no bridge in it". This is
+/// exactly that. The `[broker]` table rides along because
+/// `write_config` appends whatever it is given to the file, and a TOML
+/// table may appear anywhere in one.
+fn rules_that_cycle_through(url: &str) -> String {
+    format!(
+        r#"
+[broker]
+max_hops = {CYCLE_MAX_HOPS}
+
+[[rules]]
+id = "{CYCLE_INGEST}"
+name = "The way in"
+
+[rules.http_in]
+token = "{INGEST_TOKEN}"
+topic = "{CYCLE_TOPIC}"
+qos = 0
+
+[[rules]]
+id = "back-out"
+name = "The way out"
+filter = "{CYCLE_TOPIC}"
+
+[rules.http_out]
+url = "{url}"
+timeout_ms = 2000
+retries = 0
+"#
+    )
+}
+
+/// **The cycle, driven round a real broker until the limit stops it.**
+///
+/// A connector's publication now fires the message hooks, which is what
+/// makes section 9.2's "where any rule can act on them" true — and it
+/// is also what lets one connector's output be another's input, so it
+/// is what makes a cycle of connectors possible. This drives one.
+///
+/// The circle is an ingest rule publishing to a topic, an `http_out`
+/// rule firing on that topic, and a system on the other end of it that
+/// posts back to the ingest rule. The system is this test, which is the
+/// honest shape of it: the count has to cross a piece of software
+/// neither end wrote, and it crosses because that software returns what
+/// it was given. Nothing here trusts the arithmetic — the number in
+/// each envelope is read off the wire and handed back on the next post.
+///
+/// What it asserts is the whole of the ruling: the chain grows by one
+/// each time round, the broker carries it while it is under the limit,
+/// it refuses the publication that would take it over with a `508`, and
+/// the counter section 9.2 asks for has moved.
+#[test]
+fn a_cycle_of_connectors_is_driven_into_the_hop_limit() {
+    let endpoint = Endpoint::start();
+    let workspace = tempfile::tempdir().expect("a temporary directory");
+    let store = workspace.path().join("store");
+    let config = workspace.path().join("sdmqtt.toml");
+    let mqtt = loopback(free_port());
+    let admin = loopback(free_port());
+    let ingest = loopback(free_port());
+    write_config(
+        &config,
+        &store,
+        mqtt,
+        admin,
+        ingest,
+        &rules_that_cycle_through(&endpoint.url()),
+    );
+    let broker = BrokerProcess::start(&config, &store, mqtt, workspace.path().join("broker.log"));
+    accepting(ingest, "the ingest listener");
+
+    let path = format!("/ingest/{CYCLE_INGEST}");
+    let post = |hops: Option<u32>| {
+        let value = hops.map(|count| count.to_string());
+        let headers: Vec<(&str, &str)> = value
+            .as_deref()
+            .map(|value| vec![("sd-hops", value)])
+            .unwrap_or_default();
+        http_with(
+            ingest,
+            "POST",
+            &path,
+            INGEST_TOKEN,
+            &headers,
+            Some(b"round and round"),
+        )
+    };
+
+    // **The first post carries no count**, which is every caller that
+    // knows nothing of hop counts and is the ordinary case.
+    let first = post(None);
+    assert_eq!(
+        first.status, 200,
+        "the first post is an ordinary one: {}",
+        first.body
+    );
+
+    // Round the circle: read what the rule posted out, hand the count
+    // back in, and stop when the broker says the cycle ends here.
+    let mut carried = Vec::new();
+    let mut seen = 0usize;
+    let last = loop {
+        endpoint.wait_for(
+            seen + 1,
+            "the rule posts what the ingest endpoint published",
+        );
+        let envelope = endpoint.requests()[seen].clone();
+        seen += 1;
+        let hops = envelope.hops();
+        carried.push(hops);
+        let answer = post(Some(hops));
+        if answer.status != 200 {
+            break answer;
+        }
+        assert!(
+            seen < 10,
+            "the cycle is not stopping: the counts so far are {carried:?}"
+        );
+    };
+
+    assert_eq!(
+        carried,
+        vec![1, 2, 3],
+        "each turn of the cycle is one hop further round, and the last one \
+         the broker carried was at the limit"
+    );
+    assert_eq!(
+        last.status, 508,
+        "the post that would have taken it over is refused, and 508 is \
+         Loop Detected: {}",
+        last.body
+    );
+    assert!(
+        last.body.contains("loop_detected"),
+        "in this project's one error shape: {}",
+        last.body
+    );
+    assert_eq!(
+        endpoint.count(),
+        3,
+        "and the rule fired three times, not four: the refused publication \
+         reached no subscriber and no rule"
+    );
+
+    // Section 9.2 says dropped **and counted**, and the counter is the
+    // whole of what an operator has to find a cycle with.
+    let exposition = http(admin, "GET", "/metrics", ADMIN_TOKEN, None).body;
+    assert!(
+        exposition.contains("sdmqtt_publications_over_hop_limit_total 1"),
+        "the drop is counted: {exposition}"
+    );
+
+    broker.kill();
 }

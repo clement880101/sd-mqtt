@@ -436,6 +436,7 @@ impl Poller {
                 // Section 9.2: every publication a connector originates
                 // carries a hop count. This one originates.
                 user_properties: hops::originated(),
+                origin: self.rule.as_str().to_owned(),
             },
         )
         .await
@@ -451,6 +452,13 @@ impl Poller {
                 Polled::Refused(refused.to_string())
             }
             Err(refused @ PublishRefused::NotDurable) => Polled::Refused(refused.to_string()),
+            // Unreachable while a poller stamps the first hop, which
+            // is under every maximum `validate` permits. Answered
+            // rather than made a panic, because "unreachable" here
+            // depends on a number in a configuration file and this
+            // connector's whole discipline is that a fetch that failed
+            // has lost nothing.
+            Err(refused @ PublishRefused::TooManyHops(_)) => Polled::Refused(refused.to_string()),
         }
     }
 

@@ -354,6 +354,7 @@ pub async fn state(bridge: &Bridge, value: &'static [u8]) {
             retain: true,
             message_expiry_interval: None,
             user_properties: Vec::new(),
+            origin: bridge.rule.as_str().to_owned(),
         },
     )
     .await
@@ -688,6 +689,7 @@ impl Session<'_> {
                 retain: publish.retain,
                 message_expiry_interval: publish.properties.message_expiry_interval,
                 user_properties: carried,
+                origin: self.bridge.rule.as_str().to_owned(),
             },
         )
         .await
@@ -709,6 +711,21 @@ impl Session<'_> {
                     topic = %local,
                     why = %refused,
                     "an inbound message could not be made durable"
+                );
+            }
+            // The node's limit, which is not this bridge's: `carry`
+            // above has already applied `mqtt_bridge.max_hops` and
+            // would have refused anything over it. Reaching this means
+            // `broker.max_hops` is the lower of the two, which is a
+            // configuration an operator is entitled to write and which
+            // this counts as a refusal like any other.
+            Err(refused @ PublishRefused::TooManyHops(_)) => {
+                self.carried.refused += 1;
+                tracing::warn!(
+                    rule = self.bridge.rule.as_str(),
+                    topic = %local,
+                    why = %refused,
+                    "an inbound message is over this broker's hop limit and is dropped"
                 );
             }
         }

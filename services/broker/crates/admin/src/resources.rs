@@ -1224,6 +1224,14 @@ pub(crate) fn publish_refusal(refused: &PublishRefused) -> ApiError {
             ApiError::in_field(ErrorCode::InvalidRequest, "topic", refused.to_string())
         }
         PublishRefused::NotDurable => ApiError::new(ErrorCode::Internal, refused.to_string()),
+        // The cycle this bounds has no bridge in it and no admin API
+        // in it either: an operator publishing by hand carries no hop
+        // count, so there is no chain here for a limit to end. Should
+        // one ever arrive it is this broker's defect and not the
+        // caller's, which is what `internal` says. `loop_detected`
+        // belongs to section 9.2's ingest endpoint, which is the one
+        // place in such a cycle a caller can see.
+        PublishRefused::TooManyHops(_) => ApiError::new(ErrorCode::Internal, refused.to_string()),
     }
 }
 
@@ -1265,6 +1273,9 @@ async fn publish(
             // An operator publishing by hand is not a connector, so
             // there is no hop count to carry; see `rules::hops`.
             user_properties: Vec::new(),
+            // Named so that a rule's trigger can tell a message an
+            // operator published by hand from one a client sent.
+            origin: "admin-api".to_owned(),
         },
     )
     .await

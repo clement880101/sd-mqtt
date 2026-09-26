@@ -79,6 +79,38 @@
 //! [`Decision::Next`] passes the question along. If every hook says
 //! next — which includes the case of no hooks at all — the configured
 //! [`Defaults`] apply.
+//!
+//! # Which publications fire [`Hook::message_received`]
+//!
+//! Three routes reach a subscriber and they do not all fire it. Written
+//! down here because the difference was once an accident of which
+//! internal function a caller happened to call, and section 9.2 was
+//! untrue because of it.
+//!
+//! - **A client's publish** fires the authorizing chain and then this.
+//!   It always has.
+//! - **A publication with no session behind it** — section 9.2's ingest
+//!   endpoint, a poller, the inbound half of a bridge, the admin API's
+//!   publish — fires this and not the authorizing chain, through
+//!   [`Broker::originate`]. Section 9.2 says a bridge publishes inbound
+//!   messages "where any rule can act on them"; this is what makes that
+//!   sentence true. The authorizing chain is not asked because there is
+//!   no client to judge and no client to tell; see
+//!   [`Broker::originate`].
+//! - **A will** fires this and not the authorizing chain. A will is a
+//!   message the client published in advance, in its CONNECT, and an
+//!   application cannot tell one from a publication by the device
+//!   itself. `Broker::publish_will` has the argument in full, including
+//!   why the authorizing half is refused.
+//!
+//! What fires nothing is [`Broker::publish`], which is now reached only
+//! by a will that the hooks have already seen and by a rule's dead
+//! letter. A dead letter is the broker reporting that a rule's endpoint
+//! stopped answering; firing that rule with it would be a cycle with a
+//! guaranteed period.
+//!
+//! [`Broker::originate`]: crate::broker::Broker::originate
+//! [`Broker::publish`]: crate::broker::Broker::publish
 
 use std::fmt;
 use std::sync::Arc;
@@ -164,7 +196,20 @@ pub struct Credentials<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct ClientInfo<'a> {
     /// The session's handle, which is never reused.
-    pub subscriber: SubscriberId,
+    ///
+    /// **`None` for a publication with no session behind it**, which
+    /// is section 9.2's ingest endpoint, a poller, the inbound half of
+    /// a bridge and the admin API's publish. Those reach the hooks
+    /// through [`Broker::originate`] and there is no handle to give
+    /// them: nothing subscribed, nothing can be delivered to them, and
+    /// a hook that answered one would be answering nobody.
+    ///
+    /// An `Option` rather than a reserved handle, because a reserved
+    /// handle is a value every reader has to know is special and the
+    /// compiler cannot make them.
+    ///
+    /// [`Broker::originate`]: crate::broker::Broker::originate
+    pub subscriber: Option<SubscriberId>,
     /// The listener's namespace, empty for the default.
     pub mountpoint: &'a str,
     /// The identifier the session is keyed by.
@@ -548,7 +593,7 @@ mod tests {
 
     fn client() -> ClientInfo<'static> {
         ClientInfo {
-            subscriber: SubscriberId(1),
+            subscriber: Some(SubscriberId(1)),
             mountpoint: "",
             client_id: "c",
         }

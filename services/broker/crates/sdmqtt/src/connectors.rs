@@ -134,6 +134,24 @@ impl Hook for RuleHook {
     /// sees the topic the message was published on rather than a topic
     /// some later hook rewrote it to.
     ///
+    /// # What fires this, which is more than it was
+    ///
+    /// A client's publish, a will, and — since section 9.2 was made
+    /// true — every publication with no session behind it: the inbound
+    /// half of a bridge, section 9.2's ingest endpoint, a poller and
+    /// the admin API. That is what lets connectors chain, and it is
+    /// also what makes a cycle of them possible; the hop count on the
+    /// message is what bounds one, applied at
+    /// [`broker_core::broker::Broker::originate`] before this is ever
+    /// called.
+    ///
+    /// **`client.client_id` is not always a client.** For a publication
+    /// with no session it is whatever originated it, which for all four
+    /// of those is the rule identifier. A rule's trigger can be
+    /// narrowed by a client identifier pattern, so that is how an
+    /// operator says "the messages this bridge brought in" or "not the
+    /// ones that came through ingest".
+    ///
     /// The message is always delivered. A rule is a copy of a message
     /// sent somewhere else, not a filter on where it goes; dropping a
     /// publication because a connector wanted it would be a connector
@@ -204,8 +222,16 @@ impl Hook for RuleHook {
 /// it is for a connection.
 ///
 /// **It cannot loop.** [`broker_core::broker::Broker::publish`] is the
-/// internal route a will already takes and does not fire the message
-/// hooks, so a dead letter cannot fire the rule that produced it.
+/// internal route that fires no message hook, so a dead letter cannot
+/// fire the rule that produced it.
+///
+/// It is the only caller left on that route besides a will, and it
+/// stayed there on purpose when everything else moved to
+/// [`broker_core::broker::Broker::originate`]. A dead letter is the
+/// broker saying a rule's endpoint has stopped answering; firing that
+/// rule with it would be a cycle with a guaranteed period, and one
+/// whose every turn writes another envelope into the outbox that is
+/// already backed up.
 struct BrokerDeadLetters {
     shared: Arc<Shared>,
 }

@@ -694,8 +694,10 @@ impl Default for MqttBridge {
             // One hop is what a connector stamps on what it
             // originates, so a default of eight leaves room for a
             // chain nobody would build on purpose and still stops one
-            // that has started going round.
-            max_hops: 8,
+            // that has started going round. Taken from the node-wide
+            // default rather than restated, so the two numbers cannot
+            // drift while both claim to be the documented one.
+            max_hops: broker_core::broker::DEFAULT_MAX_HOPS,
             topics: Vec::new(),
         }
     }

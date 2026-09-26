@@ -292,6 +292,18 @@ pub struct BrokerSection {
     /// How many bytes those messages may occupy in total. The one knob
     /// that bounds per-session memory.
     pub max_queue_bytes: usize,
+    /// How many connectors a publication may have been through.
+    ///
+    /// Section 9.2's third loop: a rule feeding a system that
+    /// publishes back through another rule is a cycle no single rule is
+    /// in the whole of. Every publication a connector originates
+    /// carries a hop count, and one over this is dropped and counted.
+    ///
+    /// Node-wide, and not the same number as `mqtt_bridge.max_hops`,
+    /// which is one bridge's own check on its own traffic. This one is
+    /// the door every publication without a session goes through, so it
+    /// is the one a connector written later cannot be written without.
+    pub max_hops: u32,
 }
 
 impl Default for BrokerSection {
@@ -307,6 +319,7 @@ impl Default for BrokerSection {
             max_inflight: broker.max_inflight,
             max_queue_messages: broker.max_queue_messages,
             max_queue_bytes: broker.max_queue_bytes,
+            max_hops: broker.max_hops,
         }
     }
 }
@@ -1462,6 +1475,18 @@ impl Config {
                 why: "a queue that holds nothing drops every message an offline session is sent",
             });
         }
+        // The same refusal `mqtt_bridge.max_hops` makes, for the same
+        // reason: a maximum of zero is over-the-limit for the first
+        // hop, so every ingest post, every poll and every message a
+        // bridge brought in would be dropped, and the symptom is a
+        // broker that silently carries nothing a connector gives it.
+        if self.broker.max_hops == 0 {
+            return Err(ConfigError::Unusable {
+                key: "broker.max_hops",
+                value: "0".to_string(),
+                why: "every publication a connector originates has been through one                       connector, so a maximum of zero drops all of them",
+            });
+        }
 
         // The relation between the queue and the channel that drains
         // it. A session's writer reads one outbox, and the broker can
@@ -1696,6 +1721,7 @@ impl Config {
                 max_inflight: self.broker.max_inflight,
                 max_queue_messages: self.broker.max_queue_messages,
                 max_queue_bytes: self.broker.max_queue_bytes,
+                max_hops: self.broker.max_hops,
             },
             connection: ConnectionConfig {
                 limits,

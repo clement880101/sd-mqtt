@@ -1018,7 +1018,8 @@ parameter at fault where one is at fault, and is absent otherwise, so a form
 can mark an input without reading the sentence.
 
 The codes today are `invalid_request`, `not_found`, `method_not_allowed`,
-`not_acceptable`, `unauthorized`, `resource_exhausted` and `internal`.
+`not_acceptable`, `unauthorized`, `resource_exhausted`, `loop_detected` and
+`internal`.
 Adding one is a compatible change and renaming one is not; a client treats an
 unknown code as the class its HTTP status implies. The status is **derived
 from the code** rather than sent beside it, so the two cannot disagree.
@@ -1032,6 +1033,14 @@ for a bounded thing that is full — today the live subscriber taps, whose cap
 is fixed. It is deliberately not `invalid_request`: the request was well
 formed and would succeed unchanged a moment later, which is exactly what a
 client needs in order to decide whether to retry.
+
+`loop_detected` arrived with milestone 4 and is a `508`, for a publication
+that has been through more connectors than `broker.max_hops` allows — section
+9.2's third loop, reported by the ingest endpoint, which is the one place in
+such a cycle that a caller can see. It is neither of the two above: the
+request is well formed, so it is not `invalid_request`, and retrying it
+unchanged will not help, so it is not `resource_exhausted`. What has to change
+is a configuration.
 
 The body is nested under `error` so that a client which forgot to look at the
 status code still cannot confuse a failure with a success: no successful

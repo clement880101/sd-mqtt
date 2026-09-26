@@ -64,6 +64,24 @@ pub struct BrokerConfig {
     /// escapable: a count permits a thousand enormous payloads, a byte
     /// total permits a million empty ones.
     pub max_queue_bytes: usize,
+    /// How many connectors a publication may have been through.
+    ///
+    /// Section 9.2's third loop, and [`Broker::originate`] is where it
+    /// is applied: a publication arriving there having already been
+    /// through this many connectors is dropped rather than routed, and
+    /// counted.
+    ///
+    /// **Node-wide rather than per rule**, because a hop count is a
+    /// property of a chain that crosses rules and a per-rule number can
+    /// only say what one link of it allows. `mqtt_bridge.max_hops`
+    /// stays what it is: a bridge's own check, made before a message
+    /// costs a network round trip, and the one that carries the marker
+    /// with it.
+    ///
+    /// Zero would drop everything a connector originates, so
+    /// `Config::validate` refuses it, exactly as it refuses a bridge's
+    /// zero.
+    pub max_hops: u32,
 }
 
 impl Default for BrokerConfig {
@@ -78,12 +96,43 @@ impl Default for BrokerConfig {
             // the documented number.
             max_queue_messages: QueueLimits::default().max_messages,
             max_queue_bytes: QueueLimits::default().max_bytes,
+            max_hops: DEFAULT_MAX_HOPS,
         }
     }
 }
 
+/// How many connectors a publication may have been through by default.
+///
+/// The same number `mqtt_bridge.max_hops` defaults to, and named once
+/// so the two cannot drift while both claim to be the documented
+/// figure. Eight is deep enough that no honest chain of connectors
+/// reaches it and shallow enough that a cycle is stopped in under a
+/// second.
+pub const DEFAULT_MAX_HOPS: u32 = 8;
+
 /// An action addressed to one session, for the caller to perform.
 pub type Addressed = (SubscriberId, Action);
+
+/// A publication that had been through too many connectors to make
+/// another hop.
+///
+/// Section 9.2: "Every publication a connector originates carries a hop
+/// count, and one over the configured maximum is dropped and counted."
+/// This is the dropping; the counting is the caller's, because this
+/// crate holds no metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "this publication has already been through {hops} connectors and the limit is \
+     {maximum}, so it is dropped rather than published. Raise broker.max_hops, or find \
+     the cycle: a rule feeding a system that publishes back through another rule is one \
+     no single rule can see."
+)]
+pub struct Looped {
+    /// How many connectors it had already been through.
+    pub hops: u32,
+    /// What [`BrokerConfig::max_hops`] allows.
+    pub maximum: u32,
+}
 
 /// What the hooks said to do with an arriving message.
 ///
@@ -198,7 +247,7 @@ impl Broker {
         if !self.hooks.is_empty() {
             if let Some(id) = self.client_of(subscriber) {
                 let client = ClientInfo {
-                    subscriber,
+                    subscriber: Some(subscriber),
                     mountpoint: &id.mountpoint,
                     client_id: &id.client_id,
                 };
@@ -599,7 +648,7 @@ impl Broker {
     fn tell_connected(&self, subscriber: SubscriberId) {
         if let Some(id) = self.client_of(subscriber) {
             self.hooks.client_connected(&ClientInfo {
-                subscriber,
+                subscriber: Some(subscriber),
                 mountpoint: &id.mountpoint,
                 client_id: &id.client_id,
             });
@@ -704,6 +753,41 @@ impl Broker {
     /// The one path, so the two callers cannot drift: a will owed to a
     /// takeover and one owed to a timeout or an expiry are the same
     /// message.
+    ///
+    /// # A will fires the message hooks, and that was a decision
+    ///
+    /// It did not, until the day a connector's publication started to.
+    /// The argument that settles it: **a will is a message the client
+    /// published**, in advance, in its CONNECT. To an application,
+    /// `device/1/status = offline` arriving as a will is
+    /// indistinguishable from the device having published it and should
+    /// be. A rule that fires on a device coming up and not on it going
+    /// down is broken in the one case anybody installed it for.
+    ///
+    /// The argument against is cost: a tick that owes a thousand wills
+    /// would run the hook chain a thousand times inside a sweep. It
+    /// does not hold. Routing a will is a fan-out, which is far more
+    /// work than a hook call, so the sweep was never bounded in the
+    /// number of wills due and this does not change its order.
+    ///
+    /// **[`Hook::authorize_publish`] is not asked**, and that half is
+    /// deliberate too. [MQTT-3.1.2-8] makes publishing the will the
+    /// server's obligation once the connection ended abnormally, and
+    /// the client is gone and cannot be told it was refused. Judging a
+    /// will belongs at CONNECT, where there is still somebody to answer;
+    /// that is section 12.1's and milestone 7's.
+    ///
+    /// A hook may still **drop** a will, which is a power worth having:
+    /// suppressing the will of a client being taken down deliberately.
+    /// Nobody receives it and it is not retained, exactly as for a
+    /// client's own publish.
+    ///
+    /// # What still fires nothing
+    ///
+    /// [`Broker::publish`] itself, which is now reached only by this
+    /// and by a dead letter. A dead letter is the broker reporting that
+    /// a rule's endpoint has stopped answering, and firing that rule
+    /// with it would be a cycle with a guaranteed period.
     fn publish_will(
         &mut self,
         publisher: SubscriberId,
@@ -713,6 +797,28 @@ impl Broker {
     ) {
         let mut message = will_message(will);
         message.expires_at = self.deadline(&message.properties);
+        if !self.hooks.is_empty() {
+            // The session is still registered on both paths that reach
+            // here — a will is taken off a session and nothing removes
+            // one between taking it and this — so the `else` of this
+            // `if let` is unreachable by construction. It publishes
+            // anyway rather than returning, because the will is owed by
+            // [MQTT-3.1.2-8] and an identity we have mislaid is our bug
+            // rather than a reason to swallow somebody's message.
+            //
+            // Cloned because the hook chain is borrowed from `self`
+            // beside it.
+            if let Some(identity) = self.client_of(publisher).cloned() {
+                let client = ClientInfo {
+                    subscriber: Some(publisher),
+                    mountpoint: &identity.mountpoint,
+                    client_id: &identity.client_id,
+                };
+                if self.hooks.message_received(&client, &mut message) == Disposition::Drop {
+                    return;
+                }
+            }
+        }
         self.publish(message, Some(publisher), now, out);
     }
 
@@ -781,7 +887,7 @@ impl Broker {
                     .cloned()
                     .ok_or(ReasonCode::ProtocolError)?;
                 let client = ClientInfo {
-                    subscriber,
+                    subscriber: Some(subscriber),
                     mountpoint: &identity.mountpoint,
                     client_id: &identity.client_id,
                 };
@@ -990,7 +1096,7 @@ impl Broker {
             return Verdict::Refused;
         };
         let client = ClientInfo {
-            subscriber: from,
+            subscriber: Some(from),
             mountpoint: &identity.mountpoint,
             client_id: &identity.client_id,
         };
@@ -1043,6 +1149,93 @@ impl Broker {
                 .acknowledge(owed.packet_id, owed.qos, reason, &mut actions);
         }
         self.emit(subscriber, actions, out);
+    }
+
+    /// Publish a message that has no session behind it, firing the
+    /// message hooks on the way.
+    ///
+    /// # This is what makes section 9.2 true
+    ///
+    /// Section 9.2 says a bridge publishes inbound messages into the
+    /// local broker "where any rule can act on them". It was not true
+    /// while every caller without a session went straight to
+    /// [`Broker::publish`], which is the route a will takes and fires
+    /// no message hook: a message arriving over a bridge, through
+    /// ingest or from a poller reached every subscriber and triggered
+    /// no rule. The difference is whether connectors compose. A
+    /// gateway posting to ingest whose message should then fan out to
+    /// a webhook is the obvious thing somebody will try, and it did
+    /// nothing.
+    ///
+    /// So this exists beside [`Broker::publish`] rather than replacing
+    /// it. A will is the broker speaking for a client that is gone, a
+    /// dead letter is the broker reporting on itself, and neither is a
+    /// message a connector originated; they keep the route that fires
+    /// nothing. See the ruling in [`crate::hooks`].
+    ///
+    /// # The authorizing hooks are not asked, deliberately
+    ///
+    /// [`Hook::authorize_publish`] judges what a client asked to
+    /// publish, and there is no client here. What let this publication
+    /// in was the ingest rule's bearer token, the admin listener's
+    /// token, or a bridge somebody wrote into the configuration file —
+    /// all of them decisions an operator already made. Asking the
+    /// authorizing chain as well would let an access-control hook
+    /// written about clients silently switch off a configured
+    /// connector, which is not a power that hook was given.
+    ///
+    /// # The hop count, and what happens at the limit
+    ///
+    /// Here, because here is where a cycle becomes possible: a
+    /// connector's publication firing the hooks is what lets one
+    /// connector's output become another's input. A publication that
+    /// has already been through [`BrokerConfig::max_hops`] connectors
+    /// is **not routed, not retained and fires no rule**, and the
+    /// caller is told so rather than answered — section 9.2's "dropped
+    /// and counted".
+    ///
+    /// Above the hooks rather than below them, so the cycle stops
+    /// instead of being noticed one hop after it was extended.
+    ///
+    /// # Errors
+    ///
+    /// [`Looped`], which is the publication being over the limit.
+    /// Nothing was written and nothing was delivered.
+    pub fn originate(
+        &mut self,
+        mut message: Message,
+        origin: &str,
+        now: u32,
+        out: &mut Vec<Addressed>,
+    ) -> Result<usize, Looped> {
+        let hops = crate::hops::count_of(&message.properties.user_properties).unwrap_or(0);
+        if hops > self.config.max_hops {
+            return Err(Looped {
+                hops,
+                maximum: self.config.max_hops,
+            });
+        }
+        if self.hooks.is_empty() {
+            // The same shortcut the client path takes: with no hooks
+            // installed there is nothing to ask and no identity worth
+            // building. The default for publish is not consulted,
+            // because that default answers the authorizing chain and
+            // the authorizing chain is not asked here.
+            return Ok(self.publish(message, None, now, out));
+        }
+        let client = ClientInfo {
+            subscriber: None,
+            mountpoint: "",
+            client_id: origin,
+        };
+        match self.hooks.message_received(&client, &mut message) {
+            // Nobody received it, and it is not retained either: a hook
+            // that refused a message must not leave it sitting on the
+            // topic for the next subscriber. The same rule the client
+            // path applies.
+            Disposition::Drop => Ok(0),
+            Disposition::Deliver => Ok(self.publish(message, None, now, out)),
+        }
     }
 
     /// Route a message to every subscriber that wants it, updating the
@@ -1225,7 +1418,7 @@ impl Broker {
         if departed {
             if let Some(id) = self.client_of(subscriber) {
                 self.hooks.client_disconnected(&ClientInfo {
-                    subscriber,
+                    subscriber: Some(subscriber),
                     mountpoint: &id.mountpoint,
                     client_id: &id.client_id,
                 });
@@ -1293,7 +1486,7 @@ impl Broker {
                 let identity = session.id().clone();
                 let key = journal::key_of(&identity);
                 let client = ClientInfo {
-                    subscriber,
+                    subscriber: Some(subscriber),
                     mountpoint: &identity.mountpoint,
                     client_id: &identity.client_id,
                 };

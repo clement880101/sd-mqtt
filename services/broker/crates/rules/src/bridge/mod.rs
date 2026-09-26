@@ -30,30 +30,36 @@
 //! [`flow`] and [`inbound`], which are the same two rules from the
 //! client's side, and do not try to share them.
 //!
-//! # What an inbound message does **not** do here, and it is section 9.2
+//! # What an inbound message does here, and it is section 9.2
 //!
 //! Section 9.2 says a bridge "publishes them into the local broker
-//! where any rule can act on them". Today they cannot, and the reason
-//! is one layer down: a bridge publishes through
-//! `sdmqtt_server::publish`, which goes to `Broker::publish` — the
-//! internal route a will takes — and **that route does not fire the
-//! message hooks**. So an inbound message reaches every subscriber and
-//! fires no rule, and the same is true of section 9.2's ingest
-//! endpoint, which has used that route since it was written.
+//! where any rule can act on them". It did not, and the reason was one
+//! layer down: a bridge publishes through `sdmqtt_server::publish`,
+//! which went to `Broker::publish` — the internal route that fires no
+//! message hook. So an inbound message reached every subscriber and
+//! fired no rule, and the same was true of section 9.2's ingest
+//! endpoint and of a poller.
 //!
-//! This is recorded rather than fixed because fixing it is a change to
-//! the publish path shared by three connectors and the admin API, with
-//! its own question about what a hook may then do to a message the
-//! broker originated, and it is not what this task is. Convention 8:
-//! the deferred and the forgotten look identical in a codebase and
-//! opposite in a review, so it is said here.
+//! It now goes through `Broker::originate`, which fires them, and the
+//! sentence is true. What that opens is a loop: a message this bridge
+//! brings in can now fire a rule, and a rule can be another bridge's
+//! outbound half. Three things bound it, and they are different checks
+//! rather than three copies of one.
 //!
-//! Two consequences worth stating plainly. The loop that cannot happen
-//! today is a message arriving through this bridge and being sent
-//! straight back out by its own outbound entries, because nothing
-//! fires them. The one that can, and which [`marker`] is tested
-//! against end to end, is a message this bridge sent that the *remote*
-//! republished and handed back.
+//! - [`topics::check`] refuses a configuration whose inbound and
+//!   outbound filters intersect, so the tightest loop — this bridge's
+//!   own entries feeding each other — cannot be configured at all.
+//! - [`marker`] refuses a message that has already been through **this**
+//!   bridge, whichever direction it was going. That closes every cycle
+//!   made of bridges, because such a cycle must come back to the bridge
+//!   it left by, and by then the mark is on it.
+//! - The hop count closes the one the marker cannot see, which has no
+//!   bridge in it: an `http_out` rule feeding a system that posts back
+//!   through an ingest rule. [`marker::carry`] applies this rule's
+//!   `mqtt_bridge.max_hops` before a message costs a round trip, and
+//!   `Broker::originate` applies the node's `broker.max_hops` at the
+//!   door every publication without a session goes through. See
+//!   [`crate::hops`].
 //!
 //! # No client library, and the reason is not weight
 //!

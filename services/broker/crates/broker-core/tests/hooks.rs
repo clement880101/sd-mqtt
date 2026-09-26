@@ -905,3 +905,380 @@ fn a_broker_with_no_hooks_behaves_exactly_as_it_did() {
     assert_eq!(published(&out), vec![(subscriber, "a/b".to_string())]);
     assert_eq!(ack_reasons(&out), vec![ReasonCode::Success]);
 }
+
+// ---------------------------------------------------------------------
+// 10. A publication with no session behind it.
+// ---------------------------------------------------------------------
+
+/// A message as a connector hands one over: a topic, a payload and the
+/// user properties it carries, which is where the hop count lives.
+fn originated(topic: &str, user_properties: Vec<(String, String)>) -> Message {
+    let mut message = Message::new(topic, Bytes::from_static(b"body"), QoS::AtMostOnce, false);
+    message.properties = Arc::new(broker_core::properties::SharedProperties::new(Properties {
+        user_properties,
+        ..Properties::default()
+    }));
+    message
+}
+
+/// Section 9.2: a bridge publishes inbound messages into the local
+/// broker "where any rule can act on them". This is the sentence.
+#[test]
+fn a_publication_with_no_session_fires_the_message_hook() {
+    let recorder = Recorder::new();
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(recorder.clone());
+    let subscriber = join(&mut broker, "s");
+
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("ingest/across", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    out.clear();
+
+    let delivered = broker
+        .originate(
+            originated("ingest/across", Vec::new()),
+            "gateway",
+            0,
+            &mut out,
+        )
+        .expect("one hop is under any maximum");
+
+    assert_eq!(delivered, 1, "the subscriber still gets it");
+    assert!(
+        recorder
+            .seen()
+            .contains(&"message_received gateway ingest/across".to_owned()),
+        "and the rule chain was asked, naming what originated it: {:?}",
+        recorder.seen()
+    );
+}
+
+/// The other half of the ruling. There is no client, so the chain that
+/// judges what a client asked to publish is not asked: an access
+/// control hook written about clients must not be able to switch off a
+/// configured connector.
+#[test]
+fn a_publication_with_no_session_does_not_ask_the_authorizing_chain() {
+    let mut denier = Authorizer::new();
+    denier.publish = Decision::Deny;
+    let denier = Arc::new(denier);
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(denier.clone());
+    let subscriber = join(&mut broker, "s");
+
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    out.clear();
+
+    let delivered = broker
+        .originate(originated("a/b", Vec::new()), "poller", 0, &mut out)
+        .expect("one hop is under any maximum");
+    assert_eq!(delivered, 1, "a denying chain does not reach it");
+    assert_eq!(
+        published(&out).len(),
+        1,
+        "and the subscriber was sent it: {out:?}"
+    );
+}
+
+/// A hook may still take it, which is the power a connector chain needs
+/// to be able to filter.
+#[test]
+fn a_hook_may_drop_a_publication_with_no_session() {
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(Arc::new(Swallower));
+    let subscriber = join(&mut broker, "s");
+
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    out.clear();
+
+    let delivered = broker
+        .originate(originated("a/b", Vec::new()), "ingest", 0, &mut out)
+        .expect("one hop is under any maximum");
+    assert_eq!(delivered, 0);
+    assert!(published(&out).is_empty(), "nobody receives it: {out:?}");
+}
+
+/// And it may rewrite it before anything is matched, exactly as it may
+/// for a client's publish.
+#[test]
+fn a_hook_rewrites_a_publication_with_no_session_before_matching() {
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(Arc::new(Mover {
+        from: "from/here",
+        to: "to/there",
+    }));
+    let subscriber = join(&mut broker, "s");
+
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("to/there", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    out.clear();
+
+    let delivered = broker
+        .originate(originated("from/here", Vec::new()), "bridge", 0, &mut out)
+        .expect("one hop is under any maximum");
+    assert_eq!(delivered, 1);
+    assert_eq!(
+        published(&out),
+        vec![(subscriber, "to/there".to_owned())],
+        "routed by the rewritten topic, not the one it arrived on"
+    );
+}
+
+/// Section 9.2's third loop, at the door. A publication already at the
+/// maximum is not routed, not retained and fires no rule.
+#[test]
+fn a_publication_over_the_hop_limit_is_dropped_and_fires_nothing() {
+    let recorder = Recorder::new();
+    let mut broker = Broker::new(BrokerConfig {
+        max_hops: 3,
+        ..BrokerConfig::default()
+    });
+    broker.hooks_mut().install(recorder.clone());
+    let subscriber = join(&mut broker, "s");
+
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    out.clear();
+
+    let hops = |count: u32| vec![(broker_core::hops::HOP_COUNT.to_owned(), count.to_string())];
+
+    // At the maximum is still carried: the limit is what a publication
+    // may have been through, not one less.
+    let delivered = broker
+        .originate(originated("a/b", hops(3)), "bridge", 0, &mut out)
+        .expect("three hops is the maximum, not over it");
+    assert_eq!(delivered, 1);
+
+    out.clear();
+    let refused = broker
+        .originate(originated("a/b", hops(4)), "bridge", 0, &mut out)
+        .expect_err("four hops is over a maximum of three");
+    assert_eq!(refused.hops, 4);
+    assert_eq!(refused.maximum, 3);
+    assert!(out.is_empty(), "nothing is routed: {out:?}");
+    assert_eq!(
+        recorder.count("message_received"),
+        1,
+        "and no rule was fired by it: {:?}",
+        recorder.seen()
+    );
+}
+
+/// A retained publication over the limit leaves nothing behind either.
+/// A message a limit refused must not sit on the topic waiting for the
+/// next subscriber to find it.
+#[test]
+fn a_retained_publication_over_the_hop_limit_is_not_retained() {
+    let mut broker = Broker::new(BrokerConfig {
+        max_hops: 1,
+        ..BrokerConfig::default()
+    });
+    let mut out = Vec::new();
+
+    let mut message = originated(
+        "a/b",
+        vec![(broker_core::hops::HOP_COUNT.to_owned(), "9".to_owned())],
+    );
+    message.retain = true;
+    broker
+        .originate(message, "bridge", 0, &mut out)
+        .expect_err("nine hops is over a maximum of one");
+
+    let subscriber = join(&mut broker, "s");
+    out.clear();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    assert!(
+        published(&out).is_empty(),
+        "there is no retained message to find: {out:?}"
+    );
+}
+
+/// A message with no count has not been through a connector, so it is
+/// never over a limit. Every publication the admin API makes is one.
+#[test]
+fn a_publication_with_no_hop_count_is_never_over_the_limit() {
+    let mut broker = Broker::new(BrokerConfig {
+        max_hops: 1,
+        ..BrokerConfig::default()
+    });
+    let subscriber = join(&mut broker, "s");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    out.clear();
+
+    let delivered = broker
+        .originate(originated("a/b", Vec::new()), "admin", 0, &mut out)
+        .expect("no count is not a count of anything");
+    assert_eq!(delivered, 1);
+}
+
+// ---------------------------------------------------------------------
+// 11. A will.
+// ---------------------------------------------------------------------
+
+/// A client that leaves a will and then vanishes.
+fn connect_with_will(client: &str, topic: &str) -> Connect {
+    Connect {
+        will: Some(mqtt_codec::packet::Will {
+            topic: topic.to_string(),
+            payload: Bytes::from_static(b"offline"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            properties: Properties::default(),
+        }),
+        ..connect_packet(client)
+    }
+}
+
+/// The ruling, driven through the broker. A rule that fires on a device
+/// coming up must fire on it going down.
+#[test]
+fn a_will_fires_the_message_hook() {
+    let recorder = Recorder::new();
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(recorder.clone());
+
+    let subscriber = join(&mut broker, "s");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("device/1/status", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+
+    let mut out = Vec::new();
+    let publisher = broker
+        .connect("", &connect_with_will("d", "device/1/status"), &mut out)
+        .expect("the default decision authenticates")
+        .subscriber;
+    out.clear();
+    // Gone without a disconnect packet, which is what owes a will.
+    broker.disconnect(publisher, &mut out);
+    broker.tick(&mut out);
+
+    assert_eq!(
+        published(&out),
+        vec![(subscriber, "device/1/status".to_owned())],
+        "the will still reaches the subscriber: {out:?}"
+    );
+    assert!(
+        recorder
+            .seen()
+            .contains(&"message_received d device/1/status".to_owned()),
+        "and the rule chain saw it, named after the client that left it: {:?}",
+        recorder.seen()
+    );
+}
+
+/// The other half of that ruling: the client is gone and cannot be told
+/// it was refused, so the chain that would refuse it is not asked.
+#[test]
+fn a_will_does_not_ask_the_authorizing_chain() {
+    let mut denier = Authorizer::new();
+    denier.publish = Decision::Deny;
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(Arc::new(denier));
+
+    let subscriber = join(&mut broker, "s");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("device/1/status", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+
+    let mut out = Vec::new();
+    let publisher = broker
+        .connect("", &connect_with_will("d", "device/1/status"), &mut out)
+        .expect("the default decision authenticates")
+        .subscriber;
+    out.clear();
+    broker.disconnect(publisher, &mut out);
+    broker.tick(&mut out);
+
+    assert_eq!(
+        published(&out),
+        vec![(subscriber, "device/1/status".to_owned())],
+        "[MQTT-3.1.2-8] owes this will whatever an authorizing hook thinks: {out:?}"
+    );
+}
+
+/// And a hook may take a will, which is what suppressing the will of a
+/// client being taken down deliberately looks like.
+#[test]
+fn a_hook_may_drop_a_will() {
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(Arc::new(Swallower));
+
+    let subscriber = join(&mut broker, "s");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("device/1/status", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+
+    let mut out = Vec::new();
+    let publisher = broker
+        .connect("", &connect_with_will("d", "device/1/status"), &mut out)
+        .expect("the default decision authenticates")
+        .subscriber;
+    out.clear();
+    broker.disconnect(publisher, &mut out);
+    broker.tick(&mut out);
+
+    assert!(
+        published(&out).is_empty(),
+        "nobody receives a will a hook took: {out:?}"
+    );
+}
