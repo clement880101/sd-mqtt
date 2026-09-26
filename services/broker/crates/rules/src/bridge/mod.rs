@@ -65,8 +65,10 @@
 //! in-memory fields, so the durable bridge would have had to be written
 //! anyway.
 
+pub mod backoff;
 pub mod rewrite;
 pub mod topics;
 
+pub use backoff::{Backoff, Entropy};
 pub use rewrite::{Rewrite, Rewritten};
 pub use topics::{intersects, TopicError};
