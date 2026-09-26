@@ -2101,6 +2101,196 @@ mod tests {
         );
     }
 
+    // ---- mqtt_bridge ---------------------------------------------------
+
+    /// A minimal bridge, which is the shape everything below is a
+    /// mistake in.
+    const MINIMAL_BRIDGE: &str = r##"
+        [[rules]]
+        id = "to-b"
+        name = "Bridge to B"
+
+        [rules.mqtt_bridge]
+        address = "mqtts://remote.invalid:8883"
+        client_id = "bridge-a"
+
+        [[rules.mqtt_bridge.topics]]
+        filter = "sensors/#"
+        direction = "out"
+        qos = 1
+        remote_prefix = "from-a/"
+        "##;
+
+    #[test]
+    fn a_bridge_table_reads_into_the_action() {
+        let config = Config::from_toml(&with_rule(MINIMAL_BRIDGE)).expect("every key is known");
+        let rule = config.rules[0].to_rule().expect("a usable bridge");
+        let Action::MqttBridge(bridge) = &rule.action else {
+            panic!("this rule bridges");
+        };
+        assert_eq!(bridge.address, "mqtts://remote.invalid:8883");
+        assert_eq!(bridge.client_id, "bridge-a");
+        assert_eq!(bridge.version, mqtt_codec::Version::V5);
+        assert_eq!(bridge.topics.len(), 1);
+        assert_eq!(bridge.topics[0].direction, Direction::Out);
+        assert_eq!(bridge.topics[0].qos, QoS::AtLeastOnce);
+        assert_eq!(bridge.topics[0].remote_prefix, "from-a/");
+        assert!(rule.trigger.is_none(), "a bridge has no rule-level filter");
+    }
+
+    /// Every refusal the section makes, each named so a failure says
+    /// which mistake it was rather than only that there was one —
+    /// convention 2.
+    #[test]
+    fn a_bridge_that_cannot_work_is_refused_with_its_own_reason() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "a filter that loops through a wildcard",
+                r##"
+                [[rules.mqtt_bridge.topics]]
+                filter = "sensors/+/temp"
+                direction = "out"
+                [[rules.mqtt_bridge.topics]]
+                filter = "sensors/kitchen/#"
+                direction = "in"
+                "##,
+                "mqtt_bridge loops",
+            ),
+            (
+                "a direction that is not one",
+                r##"
+                [[rules.mqtt_bridge.topics]]
+                filter = "a/#"
+                direction = "sideways"
+                "##,
+                "is not a direction",
+            ),
+            (
+                "a level that is not one",
+                r##"
+                [[rules.mqtt_bridge.topics]]
+                filter = "a/#"
+                direction = "out"
+                qos = 3
+                "##,
+                "is not a level",
+            ),
+            ("a bridge that carries nothing", "", "no topic entries"),
+        ];
+        for (what, topics, fragment) in cases {
+            let text = with_rule(&format!(
+                r##"
+                [[rules]]
+                id = "to-b"
+                name = "Bridge to B"
+                [rules.mqtt_bridge]
+                address = "mqtts://remote.invalid:8883"
+                client_id = "bridge-a"
+                {topics}
+                "##
+            ));
+            let said = Config::from_toml(&text)
+                .expect("every key is known")
+                .validate()
+                .expect_err(&format!("{what} must be refused"))
+                .to_string();
+            assert!(
+                said.contains(fragment),
+                "{what}: the refusal must say which mistake it was, and {fragment:?} is \
+                 not in {said:?}"
+            );
+        }
+    }
+
+    /// Refused when the configuration is read rather than discovered
+    /// on the wire: MQTT 3.1.1 has no way for the remote to say what
+    /// identifier it assigned, so the session could never be resumed.
+    #[test]
+    fn a_3_1_1_bridge_with_no_client_identifier_is_refused() {
+        let text = with_rule(
+            r##"
+            [[rules]]
+            id = "to-b"
+            name = "Bridge to B"
+            [rules.mqtt_bridge]
+            address = "mqtts://remote.invalid:8883"
+            protocol_level = 4
+            [[rules.mqtt_bridge.topics]]
+            filter = "a/#"
+            direction = "out"
+            "##,
+        );
+        let said = Config::from_toml(&text)
+            .expect("every key is known")
+            .validate()
+            .expect_err("3.1.1 cannot assign one")
+            .to_string();
+        assert!(said.contains("client_id"), "{said}");
+
+        // And the same rule on MQTT 5 is accepted, because there the
+        // remote does say.
+        let five = text.replace("protocol_level = 4", "protocol_level = 5");
+        Config::from_toml(&five)
+            .expect("every key is known")
+            .validate()
+            .expect("MQTT 5 assigns one and says so");
+    }
+
+    /// Section 12.3, on the way in: the configuration is logged at
+    /// startup and a bridge's password is in it.
+    #[test]
+    fn a_bridge_password_does_not_print_itself() {
+        let text = with_rule(
+            r##"
+            [[rules]]
+            id = "to-b"
+            name = "Bridge to B"
+            [rules.mqtt_bridge]
+            address = "mqtts://remote.invalid:8883"
+            client_id = "bridge-a"
+            username = "user"
+            password = "a-bridge-secret"
+            [[rules.mqtt_bridge.topics]]
+            filter = "a/#"
+            direction = "out"
+            "##,
+        );
+        let config = Config::from_toml(&text).expect("every key is known");
+        let shown = format!("{config:?}");
+        assert!(
+            !shown.contains("a-bridge-secret"),
+            "a password must not reach the first log line this binary writes: {shown}"
+        );
+    }
+
+    /// Section 9.1: one action. A rule that declares a bridge and
+    /// something else is an operator who means two rules.
+    #[test]
+    fn a_rule_that_bridges_and_posts_is_refused() {
+        let text = with_rule(
+            r##"
+            [[rules]]
+            id = "two"
+            name = "Two things"
+            filter = "a/#"
+            [rules.http_out]
+            url = "https://example.invalid/hook"
+            [rules.mqtt_bridge]
+            address = "mqtts://remote.invalid:8883"
+            client_id = "bridge-a"
+            [[rules.mqtt_bridge.topics]]
+            filter = "a/#"
+            direction = "out"
+            "##,
+        );
+        let said = Config::from_toml(&text)
+            .expect("every key is known")
+            .validate()
+            .expect_err("a rule has one action")
+            .to_string();
+        assert!(said.contains("write two rules"), "{said}");
+    }
+
     // ---- the ingest listener -------------------------------------------
 
     #[test]
