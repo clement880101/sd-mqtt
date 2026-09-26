@@ -277,3 +277,225 @@ export function readTap(id: number, after: number | null): Promise<TapRead> {
 export function closeTap(id: number): void {
   void fetch(`/api/v1/taps/${id}`, { method: 'DELETE', keepalive: true }).catch(() => {});
 }
+
+// ---------------------------------------------------------------
+// Rules
+// ---------------------------------------------------------------
+
+/**
+ * A rule, in exactly the shape the API reads and writes.
+ *
+ * Written against `services/broker/crates/rules/src/spec.rs`, which
+ * is the one type a rule is read into whether it came from a
+ * `[[rules]]` table or from this page: one serde derive over TOML and
+ * JSON, so a key here is the same key an operator writes in a file.
+ * That is why this interface is the whole rule and not a subset — a
+ * create and an update both send all of it, because the API takes the
+ * whole rule and not a patch.
+ *
+ * **A rule has exactly one action.** Two is refused and none is
+ * refused, so exactly one of the four optional tables below is
+ * present.
+ */
+export interface RuleView {
+  /** One topic level: no `/`, `+` or `#`. It names the outbox. */
+  id: string;
+  /** What an operator calls it. */
+  name: string;
+  /** Whether it fires at all. Not the same as deleting it. */
+  enabled: boolean;
+  /** The topic filter, for an action that fires on messages. */
+  filter?: string | null;
+  /** The lowest level that fires it, if it is narrowed. */
+  min_qos?: number | null;
+  /** The client identifier glob that fires it, if it is narrowed. */
+  client_id?: string | null;
+  http_out?: HttpOutSpec | null;
+  http_in?: HttpInSpec | null;
+  http_poll?: HttpPollSpec | null;
+  mqtt_bridge?: MqttBridgeSpec | null;
+}
+
+/** Which of the four a rule is. */
+export type ActionKind = 'http_out' | 'http_in' | 'http_poll' | 'mqtt_bridge';
+
+/** The four, in the order the editor offers them. */
+export const ACTIONS: ActionKind[] = ['http_out', 'http_in', 'http_poll', 'mqtt_bridge'];
+
+/** Which action this rule has, or null for one this build cannot name. */
+export function actionOf(rule: RuleView): ActionKind | null {
+  return ACTIONS.find((kind) => rule[kind] != null) ?? null;
+}
+
+/** Post a JSON envelope out. */
+export interface HttpOutSpec {
+  url: string;
+  method: string;
+  /**
+   * Headers, by name.
+   *
+   * **Read back with every value empty**, deliberately: a rule's
+   * headers are where its bearer token goes and the read resources
+   * are not behind the token. An update that sends an empty value
+   * keeps the stored one, which is what lets the obvious edit — read
+   * a rule, change one field, write it back — not blank a
+   * credential.
+   */
+  headers: Record<string, string>;
+  timeout_ms: number;
+  max_concurrency: number;
+  retries: number;
+  backoff_ms: number;
+}
+
+/** Accept a post and publish its body. */
+export interface HttpInSpec {
+  /**
+   * The bearer token a request must present.
+   *
+   * Never read back — it is a secret and this resource needs no
+   * token to read. Sent empty on an update, which keeps the stored
+   * one; required on a create, where there is nothing to keep.
+   */
+  token?: string;
+  topic: string;
+  topic_header?: string | null;
+  topic_query?: string | null;
+  topic_prefix?: string | null;
+  qos: number;
+  retain: boolean;
+}
+
+/** Fetch a URL on an interval and publish the body. */
+export interface HttpPollSpec {
+  url: string;
+  /** As `HttpOutSpec.headers`: read back empty, kept when sent empty. */
+  headers: Record<string, string>;
+  interval_ms: number;
+  timeout_ms: number;
+  max_body_bytes: number;
+  topic: string;
+  qos: number;
+  retain: boolean;
+}
+
+/** One topic a bridge carries. */
+export interface BridgeTopicSpec {
+  filter: string;
+  /** `in`, `out` or `both`. `both` on one entry is a loop and is refused. */
+  direction: string;
+  qos: number;
+  local_prefix: string;
+  remote_prefix: string;
+  template?: string | null;
+}
+
+/** Connect to a remote broker as a client. */
+export interface MqttBridgeSpec {
+  address: string;
+  client_id: string;
+  /** 4 for MQTT 3.1.1, 5 for MQTT 5. The byte, as every other tool writes it. */
+  protocol_level: number;
+  username?: string | null;
+  /** A secret: never read back, and kept when an update leaves it out. */
+  password?: string | null;
+  keep_alive_secs: number;
+  clean_start: boolean;
+  session_expiry_secs: number;
+  receive_maximum: number;
+  maximum_packet_size: number;
+  topic_alias_maximum: number;
+  state_topic: string;
+  reconnect_min_ms: number;
+  reconnect_max_ms: number;
+  max_hops: number;
+  topics: BridgeTopicSpec[];
+}
+
+/** What a rule has done since this process started. */
+export interface RuleTotals {
+  fired: number;
+  delivered: number;
+  failed: number;
+  dead_lettered: number;
+  waiting: number;
+}
+
+/** Which series a sparkline can draw. */
+export type SeriesName = keyof RuleTotals;
+
+/**
+ * One rule's numbers and the series behind them.
+ *
+ * **Five arrays rather than an array of five-field objects**, which
+ * is the broker's shape and is what a sparkline reads: one of them at
+ * a time. Shorter than the full minute for a rule installed less than
+ * a minute ago, and empty for one installed less than a second ago.
+ */
+export interface RuleStatsView {
+  id: string;
+  totals: RuleTotals;
+  /** How long one point covers. Sent, so nothing here assumes it. */
+  interval_seconds: number;
+  series: Record<SeriesName, number[]>;
+}
+
+/** One envelope a rule gave up on. */
+export interface DeadLetterView {
+  /** Which letter this is for this rule, counting from one. */
+  sequence: number;
+  /** When it was published, in whole seconds since the epoch. */
+  at: number;
+  /** The topic it went to: `$sd/rules/<id>/dlq`. */
+  topic: string;
+  /** What was published, as text, cut to what the broker keeps. */
+  document: string;
+  /** Whether `document` is the whole of it. */
+  truncated: boolean;
+}
+
+/** A rule identifier in a path. One topic level, but not a safe one. */
+function rulePath(id: string): string {
+  return `rules/${encodeURIComponent(id)}`;
+}
+
+/** Create a rule. Refused if one of that name already exists. */
+export function createRule(rule: RuleView): Promise<RuleView> {
+  return request<RuleView>('/api/v1/rules', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(rule),
+  });
+}
+
+/**
+ * Replace a rule.
+ *
+ * The whole rule, not a patch — with the one exception the API makes
+ * for a secret it never gave out. See `HttpInSpec.token`.
+ */
+export function updateRule(rule: RuleView): Promise<RuleView> {
+  return request<RuleView>(`/api/v1/${rulePath(rule.id)}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(rule),
+  });
+}
+
+/** Turn a rule on or off without deleting it. */
+export function setRuleEnabled(id: string, enabled: boolean): Promise<RuleView> {
+  return request<RuleView>(`/api/v1/${rulePath(id)}/${enabled ? 'enable' : 'disable'}`, {
+    method: 'POST',
+  });
+}
+
+/**
+ * Delete a rule and everything running for it.
+ *
+ * Refused while its outbox holds anything, because deleting a rule
+ * deletes its outbox and what is in one is messages this broker told
+ * somebody it had accepted.
+ */
+export function deleteRule(id: string): Promise<{ id: string }> {
+  return request<{ id: string }>(`/api/v1/${rulePath(id)}`, { method: 'DELETE' });
+}
