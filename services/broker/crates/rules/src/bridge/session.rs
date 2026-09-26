@@ -149,6 +149,15 @@ pub struct Bridge {
     pub shared: Arc<Shared>,
     /// Woken when the hook has put something in the outbox.
     pub wake: Arc<Notify>,
+    /// What this rule has been doing. See [`crate::stats`].
+    ///
+    /// A bridge reports `fired` from the hook that queues a message,
+    /// `delivered` when the remote has taken one, and `failed` for a
+    /// message the remote said it would not accept. **It never dead
+    /// letters**, and that is the connector rather than a counter
+    /// nobody wired up: a bridge has no attempt limit to exhaust. It
+    /// reconnects, and what it queued meanwhile is still queued.
+    pub stats: Arc<crate::stats::RuleStats>,
 }
 
 impl Bridge {
@@ -923,6 +932,7 @@ impl Session<'_> {
                      dropped; sending it would be a protocol error the remote closes for"
                 );
                 self.carried.refused += 1;
+                self.bridge.stats.failed();
                 return None;
             }
         }
@@ -943,6 +953,7 @@ impl Session<'_> {
             // Already gone, which a repeat acknowledgement can cause.
             return;
         }
+        self.bridge.stats.delivered();
         let records: Vec<Record> = self.bridge.outbox.completed(&entry);
         if let Err(error) = self.bridge.writer.apply(records) {
             tracing::error!(

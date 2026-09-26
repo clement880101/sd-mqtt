@@ -79,6 +79,7 @@ use serde::Serialize;
 use storage::record::Secret;
 
 use crate::rule::{Action, HttpIn, Rule, RuleId, TopicSource};
+use crate::stats::RuleStats;
 
 /// The path an ingest rule is reached at, with the rule identifier as
 /// its last level.
@@ -346,8 +347,9 @@ pub fn check(action: &HttpIn) -> Result<(), HttpInError> {
 /// publishes, so nothing that awaits is inside it.
 #[derive(Debug, Default)]
 pub struct Ingest {
-    /// The rules with a route, by identifier.
-    rules: RwLock<BTreeMap<String, HttpIn>>,
+    /// The rules with a route, by identifier, each with the
+    /// statistics its requests are counted against.
+    rules: RwLock<BTreeMap<String, (HttpIn, Arc<RuleStats>)>>,
 }
 
 impl Ingest {
@@ -381,6 +383,17 @@ impl Ingest {
     /// same answer an identifier nobody configured gets, and therefore
     /// tells a caller nothing.
     pub fn register(&self, id: &RuleId, action: HttpIn) {
+        self.register_with(id, action, Arc::new(RuleStats::new()));
+    }
+
+    /// The same, counting this rule's requests against `stats`.
+    ///
+    /// What [`crate::live::Registry`] calls, so that the statistics an
+    /// ingest rule reports are the ones its rule holds rather than a
+    /// set this route registry made up. [`Ingest::register`] keeps its
+    /// shorter shape for the tests, which are about what the endpoint
+    /// publishes and not about counting it.
+    pub fn register_with(&self, id: &RuleId, action: HttpIn, stats: Arc<RuleStats>) {
         if action.token.is_empty() {
             tracing::error!(
                 rule = id.as_str(),
@@ -389,7 +402,9 @@ impl Ingest {
             );
             return;
         }
-        self.rules.write().insert(id.as_str().to_owned(), action);
+        self.rules
+            .write()
+            .insert(id.as_str().to_owned(), (action, stats));
     }
 
     /// Take `id`'s route away.
@@ -408,7 +423,20 @@ impl Ingest {
     /// and a borrow would hold it for as long as the handler runs —
     /// which includes publishing, which awaits.
     pub fn rule(&self, id: &str) -> Option<HttpIn> {
-        self.rules.read().get(id).cloned()
+        self.rules.read().get(id).map(|(action, _)| action.clone())
+    }
+
+    /// The rule served at `id` and the statistics it is counted
+    /// against.
+    ///
+    /// What the handler takes, in one lock acquisition rather than
+    /// two: the second would be a different map if a rule were
+    /// replaced in between.
+    fn served(&self, id: &str) -> Option<(HttpIn, Arc<RuleStats>)> {
+        self.rules
+            .read()
+            .get(id)
+            .map(|(action, stats)| (action.clone(), Arc::clone(stats)))
     }
 
     /// How many rules have a route.
@@ -665,7 +693,7 @@ async fn ingest_one(
     query: Result<Query<Vec<(String, String)>>, QueryRejection>,
     body: Bytes,
 ) -> Response {
-    let Some(action) = endpoint.ingest.rule(&rule) else {
+    let Some((action, stats)) = endpoint.ingest.served(&rule) else {
         return ApiError::no_such_rule();
     };
 
@@ -709,27 +737,38 @@ async fn ingest_one(
         );
     }
 
+    // **The rule has fired**, and not before: a request that did not
+    // present the token never reached this rule, and counting one
+    // would make somebody guessing at the endpoint look like traffic.
+    // What the request then *did* is the outcome below, counted once.
+    stats.fired();
+
     // Read before the topic, because a request that is going round a
     // cycle should be stopped by the cheapest check that can see it.
     let hops = hops_presented(&headers);
 
     let topic = match topic_for(&action, &headers, &query) {
         Ok(topic) => topic,
+        // Every arm below is a request that reached this rule and
+        // published nothing, which is what `failed` counts.
         Err(TopicRefused::Repeated) => {
+            stats.failed();
             return ApiError::refusal(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
                 "the topic was given more than once, and nothing says which one wins",
-            )
+            );
         }
         Err(TopicRefused::NotText) => {
+            stats.failed();
             return ApiError::refusal(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
                 "the header the topic is read from is not text",
-            )
+            );
         }
         Err(TopicRefused::OutsidePrefix) => {
+            stats.failed();
             let prefix = action
                 .topic_from
                 .as_ref()
@@ -751,6 +790,7 @@ async fn ingest_one(
     // this is the part of it the payload may have.
     let largest = largest_body(endpoint.max_packet_size, &topic);
     if body.len() > largest {
+        stats.failed();
         return ApiError::refusal(
             StatusCode::PAYLOAD_TOO_LARGE,
             "invalid_request",
@@ -788,32 +828,42 @@ async fn ingest_one(
     )
     .await
     {
-        Ok(published) => Json(Accepted {
-            delivered: published.delivered,
-            durable: published.durable,
-        })
-        .into_response(),
+        Ok(published) => {
+            stats.delivered();
+            Json(Accepted {
+                delivered: published.delivered,
+                durable: published.durable,
+            })
+            .into_response()
+        }
         Err(refused @ (PublishRefused::NotATopic(_) | PublishRefused::Reserved)) => {
+            stats.failed();
             ApiError::refusal(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
                 refused.to_string(),
             )
         }
-        Err(refused @ PublishRefused::NotDurable) => ApiError::refusal(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            refused.to_string(),
-        ),
+        Err(refused @ PublishRefused::NotDurable) => {
+            stats.failed();
+            ApiError::refusal(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                refused.to_string(),
+            )
+        }
         // 508, which is "Loop Detected" and says exactly this. A
         // caller told nothing would go on feeding the cycle at full
         // speed, and this endpoint is the only place in it that can be
         // seen from outside.
-        Err(refused @ PublishRefused::TooManyHops(_)) => ApiError::refusal(
-            StatusCode::LOOP_DETECTED,
-            "loop_detected",
-            refused.to_string(),
-        ),
+        Err(refused @ PublishRefused::TooManyHops(_)) => {
+            stats.failed();
+            ApiError::refusal(
+                StatusCode::LOOP_DETECTED,
+                "loop_detected",
+                refused.to_string(),
+            )
+        }
     }
 }
 

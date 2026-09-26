@@ -78,7 +78,7 @@ use http_body_util::Full;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use mqtt_codec::QoS;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use sdmqtt_server::shared::Shared;
 use storage::record::{BodyRecord, MessageId, Qos, Record};
 use storage::{Storage, Writer};
@@ -93,6 +93,7 @@ use crate::http_out::{client, DeadLetters, Delivery, Poster};
 use crate::http_poll::Poller;
 use crate::rule::{Action, Rule, RuleId};
 use crate::singleton::Membership;
+use crate::stats::{RuleStats, Sample, Totals, SAMPLE_INTERVAL};
 use crate::{Ingest, Outbox};
 
 /// The HTTP client every rule on this node shares.
@@ -183,6 +184,25 @@ struct Installed {
     /// `None` for an ingest rule, which has no pump, and for a
     /// singleton that is switched off.
     pump: Option<JoinHandle<()>>,
+    /// What this rule has been doing, and the series of it.
+    ///
+    /// **Kept across an update**, which is why it is taken from the
+    /// old installation rather than made fresh in [`Registry::start`]:
+    /// an operator who disables a rule and enables it again has not
+    /// asked for its chart to start over, and a series that reset on
+    /// every edit would be one nobody could read a trend from.
+    stats: Arc<RuleStats>,
+}
+
+impl Installed {
+    /// How many envelopes are waiting for this rule.
+    ///
+    /// Zero for a rule with no outbox, which is the true answer:
+    /// section 9.2 gives an ingest rule nothing to queue and a poller
+    /// nothing at all.
+    fn waiting(&self) -> u64 {
+        self.outbox.as_ref().map_or(0, |outbox| outbox.waiting())
+    }
 }
 
 impl Installed {
@@ -227,6 +247,8 @@ pub struct Registry {
     store: Arc<dyn Storage>,
     /// How anything is written down.
     writer: Arc<Writer>,
+    /// Where an exhausted envelope goes.
+    dead_letters: Arc<dyn DeadLetters>,
     /// Who is live, which is who owns the singletons.
     ///
     /// Held because dropping it would leave every
@@ -234,14 +256,15 @@ pub struct Registry {
     /// change again. Nothing changes it in milestone 4, and something
     /// will in milestone 5.
     membership: Arc<Membership>,
-    /// Where an exhausted envelope goes.
-    dead_letters: Arc<dyn DeadLetters>,
     /// The one HTTP client.
     client: HttpClient,
     /// The ingest routes, which this installs into and withdraws from.
     ingest: Arc<Ingest>,
     /// What is installed, by identifier.
     installed: RwLock<BTreeMap<RuleId, Installed>>,
+    /// The task that closes one interval of every rule's series and
+    /// starts the next. See [`crate::stats`].
+    sampler: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Registry {
@@ -255,7 +278,7 @@ impl Registry {
         let dead_letters: Arc<dyn DeadLetters> = Arc::new(BrokerDeadLetters {
             shared: Arc::clone(&shared),
         });
-        Arc::new(Self {
+        let registry = Arc::new(Self {
             shared,
             store,
             writer,
@@ -264,7 +287,10 @@ impl Registry {
             client: client(),
             ingest: Arc::new(Ingest::new()),
             installed: RwLock::new(BTreeMap::new()),
-        })
+            sampler: Mutex::new(None),
+        });
+        *registry.sampler.lock() = Some(tokio::spawn(sample_forever(Arc::downgrade(&registry))));
+        registry
     }
 
     /// The ingest routes this node serves.
@@ -361,13 +387,30 @@ impl Registry {
             Action::HttpIn(_) | Action::HttpPoll(_) => None,
         };
 
+        // **Kept across the replacement.** A rule that is being
+        // edited, disabled or enabled is the same rule, and an
+        // operator watching its chart has not asked for it to start
+        // over. A rule this node has not held before starts at zero.
+        let stats = self.installed.read().get(&rule.id).map_or_else(
+            || {
+                // The same four numbers also reach Prometheus, and
+                // the handles are taken here — once, when the rule is
+                // installed — rather than looked up when something
+                // happens. See `sdmqtt_server::metrics`.
+                Arc::new(RuleStats::exporting(Some(
+                    self.shared.metrics().rule(rule.id.as_str()),
+                )))
+            },
+            |held| Arc::clone(&held.stats),
+        );
+
         // Out of the map, and stopped, before the replacement starts:
         // two supervisors for one bridge would be two connections to
         // the remote under one client identifier, which the remote
         // resolves by closing one of them.
         self.uninstall(&rule.id);
 
-        let installed = self.start(rule, outbox);
+        let installed = self.start(rule, outbox, stats);
         self.installed
             .write()
             .insert(installed.rule.id.clone(), installed);
@@ -446,11 +489,60 @@ impl Registry {
         Ok(())
     }
 
+    /// What every rule has done since this process started, and the
+    /// series of it, in identifier order.
+    ///
+    /// Copied out under the read lock and read outside it, which is
+    /// the shape every resource on the admin listener has. Nothing
+    /// here asks the store anything: the four counters are atomics and
+    /// the depth is [`Outbox::waiting`], which is maintained.
+    pub fn statistics(&self) -> Vec<(RuleId, Totals, Vec<Sample>)> {
+        self.installed
+            .read()
+            .iter()
+            .map(|(id, held)| {
+                (
+                    id.clone(),
+                    held.stats.totals(held.waiting()),
+                    held.stats.series(),
+                )
+            })
+            .collect()
+    }
+
+    /// What one rule has done, and the series of it.
+    pub fn statistics_of(&self, id: &RuleId) -> Option<(Totals, Vec<Sample>)> {
+        self.installed
+            .read()
+            .get(id)
+            .map(|held| (held.stats.totals(held.waiting()), held.stats.series()))
+    }
+
+    /// Close one interval of every rule's series.
+    ///
+    /// The handles and the depths are copied out under the read lock
+    /// and the ring is written outside it, so the hook is never behind
+    /// a sampler holding the map while it takes sixty locks.
+    fn sample(&self) {
+        let taking: Vec<(Arc<RuleStats>, u64)> = self
+            .installed
+            .read()
+            .values()
+            .map(|held| (Arc::clone(&held.stats), held.waiting()))
+            .collect();
+        for (stats, waiting) in taking {
+            stats.sample(waiting);
+        }
+    }
+
     /// Stop everything every rule is running.
     ///
     /// The process stopping is the only thing that ends a pump, so
     /// this is what a graceful shutdown calls.
     pub async fn shutdown(&self) {
+        if let Some(sampler) = self.sampler.lock().take() {
+            sampler.abort();
+        }
         let stopped: Vec<JoinHandle<()>> = {
             let mut installed = self.installed.write();
             installed
@@ -490,7 +582,7 @@ impl Registry {
     ///
     /// Takes no lock and is called with none held. Everything it does
     /// is a spawn or a map insert on the ingest routes.
-    fn start(&self, rule: Rule, outbox: Option<Arc<Outbox>>) -> Installed {
+    fn start(&self, rule: Rule, outbox: Option<Arc<Outbox>>, stats: Arc<RuleStats>) -> Installed {
         match &rule.action {
             Action::HttpOut(action) => {
                 let outbox = outbox.expect("an http_out rule is opened with an outbox");
@@ -509,7 +601,8 @@ impl Registry {
                             poster,
                             action,
                             Arc::clone(&self.dead_letters),
-                        );
+                        )
+                        .with_stats(Arc::clone(&stats));
                         Some(tokio::spawn(delivery.run()))
                     }
                     Err(error) => {
@@ -529,6 +622,7 @@ impl Registry {
                     bridge_filters: Vec::new(),
                     wake: None,
                     pump,
+                    stats,
                 }
             }
             Action::HttpPoll(action) => {
@@ -546,7 +640,11 @@ impl Registry {
                         Arc::clone(&self.shared),
                         action,
                     ) {
-                        Ok(poller) => Some(tokio::spawn(poller.run(self.membership.ownership()))),
+                        Ok(poller) => Some(tokio::spawn(
+                            poller
+                                .with_stats(Arc::clone(&stats))
+                                .run(self.membership.ownership()),
+                        )),
                         Err(error) => {
                             tracing::error!(
                                 rule = rule.id.as_str(),
@@ -571,6 +669,7 @@ impl Registry {
                     bridge_filters: Vec::new(),
                     wake: None,
                     pump,
+                    stats,
                 }
             }
             Action::MqttBridge(action) => {
@@ -586,6 +685,7 @@ impl Registry {
                     writer: Arc::clone(&self.writer),
                     shared: Arc::clone(&self.shared),
                     wake: Arc::clone(&wake),
+                    stats: Arc::clone(&stats),
                 };
                 let bridge_filters: Vec<String> = bridge
                     .rewrites
@@ -623,6 +723,7 @@ impl Registry {
                     bridge_filters,
                     wake: Some(wake),
                     pump,
+                    stats,
                 }
             }
             Action::HttpIn(action) => {
@@ -630,7 +731,8 @@ impl Registry {
                 // left serving while it was switched off would be the
                 // one connector that ignored the switch.
                 if rule.enabled {
-                    self.ingest.register(&rule.id, action.clone());
+                    self.ingest
+                        .register_with(&rule.id, action.clone(), Arc::clone(&stats));
                 } else {
                     tracing::info!(
                         rule = rule.id.as_str(),
@@ -643,9 +745,35 @@ impl Registry {
                     bridge_filters: Vec::new(),
                     wake: None,
                     pump: None,
+                    stats,
                 }
             }
         }
+    }
+}
+
+/// Close one interval of every rule's series, once per interval, for
+/// as long as the registry exists.
+///
+/// **A tick rather than an event.** The ring has to advance whether or
+/// not anything happened, because a quiet rule and a rule whose
+/// connector died draw the same flat line only if the ring stands
+/// still for the first of them; see [`crate::stats`].
+///
+/// A [`Weak`] reference, so that a registry nobody holds any more is
+/// dropped rather than kept alive by its own sampler.
+async fn sample_forever(registry: Weak<Registry>) {
+    let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
+    // The interval has already elapsed once by the time a tick is
+    // missed, and a burst of catch-up samples would draw spikes that
+    // never happened.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let Some(registry) = registry.upgrade() else {
+            return;
+        };
+        registry.sample();
     }
 }
 
@@ -719,6 +847,11 @@ impl Hook for RuleHook {
                 if !held.fires(&message.topic, message.qos, client.client_id) {
                     continue;
                 }
+                // **The rule fired**, whether or not it has an outbox
+                // to put anything in. Counted here rather than beside
+                // the append, so that a connector which queues nothing
+                // still reports that a message matched it.
+                held.stats.fired();
                 let Some(outbox) = &held.outbox else {
                     continue;
                 };

@@ -394,6 +394,8 @@ pub struct Poller {
     retain: bool,
     /// How long between the start of one fetch and the next.
     interval: Duration,
+    /// What this rule has been doing. See [`crate::stats`].
+    stats: Arc<crate::stats::RuleStats>,
 }
 
 impl Poller {
@@ -417,7 +419,18 @@ impl Poller {
             qos: action.qos,
             retain: action.retain,
             interval: Duration::from_millis(u64::from(action.interval_ms)),
+            stats: Arc::new(crate::stats::RuleStats::new()),
         })
+    }
+
+    /// Count what this poller does against `stats`.
+    ///
+    /// A builder rather than a fifth argument, for the reason
+    /// [`crate::http_out::Delivery::with_stats`] gives.
+    #[must_use]
+    pub fn with_stats(mut self, stats: Arc<crate::stats::RuleStats>) -> Self {
+        self.stats = stats;
+        self
     }
 
     /// Where this fetches from.
@@ -527,6 +540,16 @@ impl Poller {
             }
 
             let polled = self.poll().await;
+            // **`fired` is the interval coming round**, and the
+            // outcome below is a different fact about the same turn:
+            // a poller that fetches every second and publishes
+            // nothing is the shape an operator needs to see, and one
+            // counter fed from both could not show it.
+            self.stats.fired();
+            match &polled {
+                Polled::Published { .. } => self.stats.delivered(),
+                Polled::Skipped(_) | Polled::Refused(_) => self.stats.failed(),
+            }
             match &polled {
                 Polled::Published { bytes, delivered } => tracing::debug!(
                     rule = self.rule.as_str(),

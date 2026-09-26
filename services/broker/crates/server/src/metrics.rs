@@ -47,7 +47,7 @@ use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
 use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::family::Family;
-use prometheus_client::metrics::gauge::ConstGauge;
+use prometheus_client::metrics::gauge::{ConstGauge, Gauge};
 use prometheus_client::registry::Registry;
 
 use broker_core::session::DropReason;
@@ -509,6 +509,92 @@ reason_table!(RecordDrop, ALL_RECORD_DROPS, record_drop_label, record_drop_index
     WriterStopped => "writer_stopped",
 });
 
+/// What a rule did, as a label value.
+///
+/// Section 11.3 does not list per-rule counters, and these are a
+/// deliberate addition rather than a line of it being filled in. The
+/// argument is section 9's: a rule is a connector to somebody else's
+/// system, the way an operator finds out one has stopped working is an
+/// alert, and a total across every rule cannot say which one stopped.
+///
+/// **The cardinality is a number an operator wrote.** A rule
+/// identifier is a label where a client identifier deliberately is not
+/// one, because rules are created by the person running the broker and
+/// counted in tens, while clients arrive from outside and are counted
+/// in hundreds of thousands.
+///
+/// A deleted rule keeps its series, at the value it stopped at. That
+/// is the right way round: a counter that disappears is one a
+/// dashboard reads as a reset to zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleEvent {
+    /// A message matched it, a request arrived for it, or its interval
+    /// came round.
+    Fired,
+    /// Something reached where the rule was sending it.
+    Delivered,
+    /// An attempt failed.
+    Failed,
+    /// An envelope ran out of attempts.
+    DeadLettered,
+}
+
+/// Every rule outcome, in the order the handles are indexed in.
+const RULE_EVENTS: [RuleEvent; 4] = [
+    RuleEvent::Fired,
+    RuleEvent::Delivered,
+    RuleEvent::Failed,
+    RuleEvent::DeadLettered,
+];
+
+/// The label value for a rule outcome.
+fn rule_event_label(event: RuleEvent) -> &'static str {
+    match event {
+        RuleEvent::Fired => "fired",
+        RuleEvent::Delivered => "delivered",
+        RuleEvent::Failed => "failed",
+        RuleEvent::DeadLettered => "dead_lettered",
+    }
+}
+
+/// Where a rule outcome's handle sits in the flat array.
+fn rule_event_index(event: RuleEvent) -> usize {
+    match event {
+        RuleEvent::Fired => 0,
+        RuleEvent::Delivered => 1,
+        RuleEvent::Failed => 2,
+        RuleEvent::DeadLettered => 3,
+    }
+}
+
+/// One rule's owned handles.
+///
+/// Resolved when the rule is installed and never looked up again,
+/// which is the shape every other family in this module has: nothing
+/// searches a label set while a request or a packet is being served.
+#[derive(Debug)]
+pub struct RuleCounters {
+    events: [Counter; RULE_EVENTS.len()],
+    waiting: Gauge,
+}
+
+impl RuleCounters {
+    /// The counter for one outcome. An index, not a lookup.
+    pub fn event(&self, event: RuleEvent) -> &Counter {
+        &self.events[rule_event_index(event)]
+    }
+
+    /// How many envelopes are waiting in this rule's outbox.
+    ///
+    /// A gauge rather than a counter, and **set rather than added
+    /// to**: it is a depth. The sampler that advances the rule's own
+    /// series sets it, so a scrape reads a number that was already
+    /// there rather than one it went looking for.
+    pub fn waiting(&self) -> &Gauge {
+        &self.waiting
+    }
+}
+
 /// One counter per packet type per version, resolved at startup.
 #[derive(Debug)]
 struct PacketCounters([[Counter; PACKET_KINDS.len()]; VERSIONS.len()]);
@@ -569,6 +655,12 @@ pub struct Metrics {
     dropped_by_queue: Box<[Counter]>,
     dropped_by_shell: Box<[Counter]>,
     records_dropped: Box<[Counter]>,
+    /// Section 9's rules, by identifier and outcome. See
+    /// [`RuleEvent`]. Handles are taken by [`Metrics::rule`] when a
+    /// rule is installed.
+    rule_events: Family<Vec<(String, String)>, Counter>,
+    /// How much each rule has waiting. See [`RuleCounters::waiting`].
+    rule_waiting: Family<Vec<(String, String)>, Gauge>,
     /// Whether [`Metrics::watch`] has already run. A registry with
     /// two collectors over the same numbers would render every one of
     /// them twice, which a scraper reads as a duplicate series.
@@ -697,6 +789,19 @@ impl Metrics {
             .map(|reason| dropped.get_or_create_owned(&[("reason", shell_label(*reason))]))
             .collect();
 
+        let rule_events = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "rule_events",
+            "What each of section 9's rules has done, by rule and outcome",
+            rule_events.clone(),
+        );
+        let rule_waiting = Family::<Vec<(String, String)>, Gauge>::default();
+        registry.register(
+            "rule_outbox_waiting",
+            "Envelopes waiting in each rule's durable outbox",
+            rule_waiting.clone(),
+        );
+
         let records = Family::<[(&'static str, &'static str); 1], Counter>::default();
         registry.register(
             "records_dropped",
@@ -724,6 +829,8 @@ impl Metrics {
             dropped_by_queue,
             dropped_by_shell,
             records_dropped,
+            rule_events,
+            rule_waiting,
             watched: AtomicBool::new(false),
         }
     }
@@ -746,6 +853,30 @@ impl Metrics {
         self.registry
             .lock()
             .register_collector(Box::new(Live(Arc::downgrade(shared))));
+    }
+
+    /// One rule's owned handles.
+    ///
+    /// Called once, when the rule is installed. Calling it twice for
+    /// one identifier gives two handles to the same series, which is
+    /// what makes reinstalling a rule keep its numbers rather than
+    /// start them again.
+    pub fn rule(&self, rule: &str) -> RuleCounters {
+        let events = std::array::from_fn(|at| {
+            self.rule_events.get_or_create_owned(&vec![
+                ("rule".to_owned(), rule.to_owned()),
+                (
+                    "event".to_owned(),
+                    rule_event_label(RULE_EVENTS[at]).to_owned(),
+                ),
+            ])
+        });
+        RuleCounters {
+            events,
+            waiting: self
+                .rule_waiting
+                .get_or_create_owned(&vec![("rule".to_owned(), rule.to_owned())]),
+        }
     }
 
     /// The counter for a packet read from a client.

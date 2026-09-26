@@ -71,6 +71,21 @@ pub struct Outbox {
     /// Atomic because [`Outbox::append`] is called from a hook, which
     /// the broker holds by shared reference.
     next_sequence: AtomicU64,
+    /// How many envelopes are waiting.
+    ///
+    /// **Maintained here rather than asked of the store**, because
+    /// the thing that asks is a sampler that runs once a second for
+    /// every rule on the node, and a store read per rule per second
+    /// is the walk this project has already had to take out of two
+    /// resources. Seeded from [`Storage::outbox_depth`] when the
+    /// outbox is opened, which is the one place it is read.
+    ///
+    /// It counts what has been *appended*, so it includes envelopes
+    /// the writer has not flushed yet. That is the more useful of the
+    /// two numbers for an operator watching a backlog: a message this
+    /// broker has accepted and not yet delivered is waiting whether
+    /// or not the batch it is in has reached the disk.
+    waiting: AtomicU64,
 }
 
 impl Outbox {
@@ -81,9 +96,11 @@ impl Outbox {
     /// Whatever the store says when asked for the high-water mark.
     pub fn open(rule: RuleId, store: &dyn Storage) -> Result<Self, StorageError> {
         let highest = store.outbox_highest_sequence(rule.as_str())?;
+        let waiting = store.outbox_depth(rule.as_str())?;
         Ok(Self {
             rule,
             next_sequence: AtomicU64::new(highest + 1),
+            waiting: AtomicU64::new(waiting),
         })
     }
 
@@ -135,6 +152,7 @@ impl Outbox {
                 entry: entry.clone(),
             },
         ];
+        self.waiting.fetch_add(1, Ordering::Relaxed);
         (entry, records)
     }
 
@@ -183,6 +201,7 @@ impl Outbox {
     /// for the life of the file, and a release without the removal
     /// deletes a payload the outbox is still going to send.
     pub fn completed(&self, entry: &OutboxRecord) -> Vec<Record> {
+        self.left();
         vec![
             Record::OutboxRemoved {
                 rule: self.rule.as_str().to_owned(),
@@ -190,6 +209,42 @@ impl Outbox {
             },
             Record::BodyReleased { id: entry.body },
         ]
+    }
+
+    /// The record that takes out an envelope whose payload is gone.
+    ///
+    /// **No release**, and that is the difference from
+    /// [`Outbox::completed`]: the store refuses a release of a body it
+    /// does not hold, and the body is what has gone missing. Its own
+    /// method rather than the caller building the record, so that
+    /// every way an envelope leaves this outbox goes through here and
+    /// the depth below cannot drift.
+    pub fn orphaned(&self, sequence: u64) -> Vec<Record> {
+        self.left();
+        vec![Record::OutboxRemoved {
+            rule: self.rule.as_str().to_owned(),
+            sequence,
+        }]
+    }
+
+    /// How many envelopes are waiting, without asking the store.
+    ///
+    /// See [`Outbox::waiting`] for why this is maintained rather than
+    /// read.
+    pub fn waiting(&self) -> u64 {
+        self.waiting.load(Ordering::Relaxed)
+    }
+
+    /// One envelope has left.
+    ///
+    /// Saturating, because a depth that went negative would be a bug
+    /// here and a very large number in a chart.
+    fn left(&self) {
+        let _ = self
+            .waiting
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                Some(held.saturating_sub(1))
+            });
     }
 }
 

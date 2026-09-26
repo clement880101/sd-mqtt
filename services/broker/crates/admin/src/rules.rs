@@ -75,6 +75,7 @@ use std::sync::Arc;
 use ::rules::live::{InstallError, Registry};
 use ::rules::rule::{Rule, RuleId};
 use ::rules::spec::{RuleSpec, SpecError};
+use ::rules::stats::{Sample, Totals, SAMPLE_INTERVAL};
 use ::rules::Action;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -83,6 +84,8 @@ use axum::{Json, Router};
 
 use crate::error::{ApiError, ErrorCode};
 use crate::resources::{page, select, Authorized, Page, Paging};
+use serde::Serialize;
+
 use crate::AdminState;
 
 /// The registry this node serves, or the refusal for a node with none.
@@ -365,6 +368,118 @@ struct Deleted {
     id: String,
 }
 
+// ---------------------------------------------------------------
+// What each rule has been doing
+// ---------------------------------------------------------------
+
+/// One rule's numbers, and the series behind them.
+///
+/// A resource of its own rather than fields on [`RuleView`], because
+/// a rule and its statistics change at completely different rates: the
+/// first changes when an operator edits it and the second changes
+/// every second, and a page that polls the second would be refetching
+/// the first for nothing.
+#[derive(Debug, Serialize)]
+struct RuleStatsView {
+    /// Whose numbers.
+    id: String,
+    /// What the rule has done since this process started.
+    ///
+    /// **Since the process started, not since the rule was created.**
+    /// The series below is in memory and so are these; a rule's
+    /// durable history of what it delivered is its endpoint's own logs
+    /// and its dead-letter topic.
+    totals: Totals,
+    /// How long one point of the series covers.
+    ///
+    /// Sent rather than assumed, so that a drawing does not have to
+    /// know this module's constant to label an axis.
+    interval_seconds: u64,
+    /// The series, oldest first, at most one point per
+    /// `interval_seconds` for the last minute.
+    ///
+    /// **Five arrays rather than an array of five-field objects.** A
+    /// sparkline wants one of them at a time, and the columnar shape
+    /// is both what the drawing reads and about a third of the bytes.
+    ///
+    /// Shorter than the full minute for a rule installed less than a
+    /// minute ago, and empty for one installed less than a second ago.
+    /// Both happen constantly and a drawing has to cope with them.
+    series: Series,
+}
+
+/// The five arrays a sparkline is drawn from.
+#[derive(Debug, Default, Serialize)]
+struct Series {
+    /// How many times the rule fired in each interval.
+    fired: Vec<u32>,
+    /// How much reached where it was going.
+    delivered: Vec<u32>,
+    /// How many attempts failed.
+    failed: Vec<u32>,
+    /// How many envelopes ran out of attempts.
+    dead_lettered: Vec<u32>,
+    /// How much was waiting in the outbox at each point.
+    waiting: Vec<u32>,
+}
+
+impl From<Vec<Sample>> for Series {
+    fn from(samples: Vec<Sample>) -> Self {
+        let mut series = Self::default();
+        for sample in samples {
+            series.fired.push(sample.fired);
+            series.delivered.push(sample.delivered);
+            series.failed.push(sample.failed);
+            series.dead_lettered.push(sample.dead_lettered);
+            series.waiting.push(sample.waiting);
+        }
+        series
+    }
+}
+
+/// One row of the statistics resource.
+fn stats_view(id: &RuleId, totals: Totals, samples: Vec<Sample>) -> RuleStatsView {
+    RuleStatsView {
+        id: id.as_str().to_owned(),
+        totals,
+        interval_seconds: SAMPLE_INTERVAL.as_secs(),
+        series: samples.into(),
+    }
+}
+
+/// What every rule has been doing, a page at a time.
+///
+/// **Not under `/api/v1/rules/`**, and the reason is the router rather
+/// than taste: a static `stats` segment there would take precedence
+/// over `{id}`, so a rule an operator called `stats` would be a rule
+/// nobody could read back. A resource of its own has no such trap.
+async fn statistics(
+    State(state): State<AdminState>,
+    paging: Paging,
+) -> Result<Json<Page<RuleStatsView>>, ApiError> {
+    let held = registry(&state)?.statistics();
+    let keys: Vec<_> = held
+        .iter()
+        .map(|(id, totals, samples)| ([id.as_str(), "", ""], (id, totals, samples)))
+        .collect();
+    let selection = select(keys.into_iter(), paging.after.as_ref(), paging.limit);
+    Ok(Json(page(selection, |_, (id, totals, samples)| {
+        stats_view(id, *totals, samples.clone())
+    })))
+}
+
+/// What one rule has been doing.
+async fn statistics_of(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Json<RuleStatsView>, ApiError> {
+    let id = identifier(&id)?;
+    let (totals, samples) = registry(&state)?
+        .statistics_of(&id)
+        .ok_or_else(|| ApiError::not_found(format!("there is no rule called {:?}", id.as_str())))?;
+    Ok(Json(stats_view(&id, totals, samples)))
+}
+
 /// The routes this module owns.
 pub(crate) fn routes() -> Router<AdminState> {
     Router::new()
@@ -372,6 +487,8 @@ pub(crate) fn routes() -> Router<AdminState> {
         .route("/api/v1/rules/{id}", get(read).put(update).delete(delete))
         .route("/api/v1/rules/{id}/enable", post(enable))
         .route("/api/v1/rules/{id}/disable", post(disable))
+        .route("/api/v1/rules/{id}/stats", get(statistics_of))
+        .route("/api/v1/rule-stats", get(statistics))
 }
 
 #[cfg(test)]
@@ -468,6 +585,13 @@ mod tests {
 
         async fn delete(&self, path: &str) -> testing::Response {
             testing::request(self.admin.address(), "DELETE", path, None).await
+        }
+
+        /// One rule's statistics, as JSON.
+        async fn stats(&self, rule: &str) -> serde_json::Value {
+            let answered = self.get(&format!("/api/v1/rules/{rule}/stats")).await;
+            assert_eq!(answered.status, 200, "{}", answered.body);
+            serde_json::from_str(&answered.body).expect("statistics are JSON")
         }
 
         /// Wait until `rule`'s outbox holds `expected` envelopes.
@@ -1037,6 +1161,179 @@ mod tests {
         assert_eq!(answered.status, 404, "{}", answered.body);
         assert_eq!(error_of(&answered.body).0, "not_found", "{}", answered.body);
         admin.shutdown().await;
+    }
+
+    // -----------------------------------------------------------
+    // What each rule has been doing
+    // -----------------------------------------------------------
+
+    /// The two numbers a publication moves, and the three it does not.
+    ///
+    /// Convention 5: a counter that rose on everything would satisfy
+    /// an assertion that the one being tested rose, so all five are
+    /// read after each step.
+    #[tokio::test]
+    async fn a_publication_moves_fired_and_waiting_and_nothing_else() {
+        let node = Node::start(None).await;
+        node.post("/api/v1/rules", &posting_rule("telemetry")).await;
+
+        let before = node.stats("telemetry").await;
+        assert_eq!(before["totals"]["fired"], 0);
+        assert_eq!(before["totals"]["waiting"], 0);
+
+        node.post("/api/v1/publish", &publication("sensor/1/temp"))
+            .await;
+        assert!(node.until_outbox("telemetry", 1).await);
+
+        let after = node.stats("telemetry").await;
+        assert_eq!(after["totals"]["fired"], 1, "{after}");
+        assert_eq!(
+            after["totals"]["waiting"], 1,
+            "the outbox depth is not reported: {after}"
+        );
+        // The endpoint is dead and the backoff is an hour, so nothing
+        // has been delivered and nothing has been abandoned. What has
+        // happened is at most one failed attempt, which is the pump's
+        // and not this publication's.
+        assert_eq!(after["totals"]["delivered"], 0, "{after}");
+        assert_eq!(after["totals"]["dead_lettered"], 0, "{after}");
+
+        // A message the rule does not match moves nothing at all.
+        let quiet = node.stats("telemetry").await;
+        node.post("/api/v1/publish", &publication("something/else"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let still = node.stats("telemetry").await;
+        assert_eq!(
+            still["totals"]["fired"], quiet["totals"]["fired"],
+            "a message the rule does not match moved its counters"
+        );
+        node.stop().await;
+    }
+
+    /// The mutation the plan names: a series that only advances when
+    /// something happens makes a quiet rule look like a busy one whose
+    /// chart stopped.
+    ///
+    /// Asserted through the resource rather than on the ring, because
+    /// the ring's own test cannot see whether anything ever calls it.
+    #[tokio::test]
+    async fn the_series_advances_while_a_rule_is_quiet() {
+        let node = Node::start(None).await;
+        node.post("/api/v1/rules", &posting_rule("telemetry")).await;
+
+        let deadline = Instant::now() + PATIENCE;
+        let mut points = 0;
+        while Instant::now() < deadline {
+            let stats = node.stats("telemetry").await;
+            points = stats["series"]["fired"].as_array().expect("a series").len();
+            if points >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            points >= 2,
+            "the series stood still while the rule was quiet, so a stopped rule and an \
+             idle one draw the same line"
+        );
+        let stats = node.stats("telemetry").await;
+        assert_eq!(stats["interval_seconds"], 1, "{stats}");
+        for name in ["fired", "delivered", "failed", "dead_lettered", "waiting"] {
+            assert_eq!(
+                stats["series"][name].as_array().expect("a series").len(),
+                points,
+                "the five arrays of the series are different lengths: {stats}"
+            );
+        }
+        node.stop().await;
+    }
+
+    /// Section 11.3, for a rule: the same four numbers reach a
+    /// scraper, labelled by rule and by outcome.
+    ///
+    /// A chart is what an operator looks at and an alert is what tells
+    /// them to; a rule whose numbers only existed in a browser would
+    /// have the first and not the second.
+    #[tokio::test]
+    async fn what_a_rule_has_done_reaches_the_metrics_endpoint() {
+        let node = Node::start(None).await;
+        node.post("/api/v1/rules", &posting_rule("telemetry")).await;
+        node.post("/api/v1/publish", &publication("sensor/1/temp"))
+            .await;
+        assert!(node.until_outbox("telemetry", 1).await);
+        // The depth is set by the sampler, so it is there a second
+        // after the envelope is.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+        let exposition = node.get("/metrics").await;
+        assert_eq!(exposition.status, 200, "{}", exposition.body);
+        for wanted in [
+            "sdmqtt_rule_events_total{rule=\"telemetry\",event=\"fired\"} 1",
+            "sdmqtt_rule_outbox_waiting{rule=\"telemetry\"} 1",
+        ] {
+            assert!(
+                exposition.body.contains(wanted),
+                "the exposition has no {wanted}:\n{}",
+                exposition.body
+            );
+        }
+        // And the outcomes that did not happen are not claimed to
+        // have. A family that reported every rule as delivering would
+        // pass the two assertions above.
+        assert!(
+            exposition
+                .body
+                .contains("sdmqtt_rule_events_total{rule=\"telemetry\",event=\"delivered\"} 0"),
+            "the exposition claims a delivery that did not happen:\n{}",
+            exposition.body
+        );
+        node.stop().await;
+    }
+
+    /// The statistics of every rule, as a page.
+    #[tokio::test]
+    async fn every_rule_reports_what_it_has_been_doing() {
+        let node = Node::start(None).await;
+        for id in ["alpha", "bravo"] {
+            node.post("/api/v1/rules", &posting_rule(id)).await;
+        }
+        let listed = node.get("/api/v1/rule-stats").await;
+        assert_eq!(listed.status, 200, "{}", listed.body);
+        let page: serde_json::Value = serde_json::from_str(&listed.body).expect("a page");
+        assert_eq!(page["total"], 2);
+        assert_eq!(page["items"][0]["id"], "alpha");
+        assert_eq!(page["items"][1]["id"], "bravo");
+        assert_eq!(page["items"][0]["totals"]["fired"], 0);
+        assert_eq!(
+            node.get("/api/v1/rule-stats/").await.status,
+            404,
+            "a resource that does not exist was served"
+        );
+        node.stop().await;
+    }
+
+    /// A rule's numbers survive it being disabled and enabled again.
+    ///
+    /// An operator watching a chart has not asked for it to start over
+    /// because they turned a connector off for a minute.
+    #[tokio::test]
+    async fn a_rules_numbers_survive_being_switched_off_and_on() {
+        let node = Node::start(None).await;
+        node.post("/api/v1/rules", &posting_rule("telemetry")).await;
+        node.post("/api/v1/publish", &publication("sensor/1/temp"))
+            .await;
+        assert!(node.until_outbox("telemetry", 1).await);
+        assert_eq!(node.stats("telemetry").await["totals"]["fired"], 1);
+
+        node.post("/api/v1/rules/telemetry/disable", "").await;
+        node.post("/api/v1/rules/telemetry/enable", "").await;
+        assert_eq!(
+            node.stats("telemetry").await["totals"]["fired"],
+            1,
+            "switching a rule off and on again started its numbers over"
+        );
+        node.stop().await;
     }
 
     /// The listing is a page with the same envelope as every other

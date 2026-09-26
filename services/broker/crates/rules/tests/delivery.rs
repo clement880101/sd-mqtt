@@ -822,3 +822,124 @@ async fn one_client_serves_more_than_one_rule() {
     assert_eq!(fixture.delivery().turn().await, Turn::Delivered);
     assert_eq!(endpoint.count(), 1);
 }
+
+// ---- what the pump counts ----------------------------------------------
+
+/// Each counter moves for its own outcome and for no other.
+///
+/// Convention 5: a counter that rose on everything would satisfy any
+/// assertion that it rose. So one delivery and one exhausted envelope
+/// are driven through the same pump and all four numbers are read
+/// after each, rather than the one the step is named after.
+#[tokio::test]
+async fn each_counter_moves_for_its_own_outcome_and_no_other() {
+    let endpoint = Endpoint::start(Behaviour::Accept).await;
+    let fixture = Fixture::new(
+        action_for(endpoint.url()),
+        &[("sensor-1", b"21.5" as &[u8])],
+    );
+    let stats = Arc::new(rules::stats::RuleStats::new());
+    let delivery = fixture.delivery().with_stats(Arc::clone(&stats));
+
+    assert_eq!(
+        stats.totals(fixture.outbox.waiting()),
+        rules::stats::Totals {
+            waiting: 1,
+            ..rules::stats::Totals::default()
+        },
+        "a pump that has done nothing counted something"
+    );
+
+    assert_eq!(delivery.turn().await, Turn::Delivered);
+    assert_eq!(
+        stats.totals(fixture.outbox.waiting()),
+        rules::stats::Totals {
+            delivered: 1,
+            waiting: 0,
+            ..rules::stats::Totals::default()
+        },
+        "one delivery moved something other than `delivered`, or left the depth behind"
+    );
+
+    // The same pump against an endpoint that refuses everything: two
+    // retries is three attempts, so three failures and one envelope
+    // abandoned. `fired` stays at zero throughout, because firing is
+    // the hook's and not the pump's.
+    let endpoint = Endpoint::start(Behaviour::AlwaysRefuse {
+        status: 500,
+        retry_after: None,
+    })
+    .await;
+    let mut action = action_for(endpoint.url());
+    action.retries = 2;
+    let fixture = Fixture::new(action, &[("sensor-1", b"21.5" as &[u8])]);
+    let stats = Arc::new(rules::stats::RuleStats::new());
+    let delivery = fixture.delivery().with_stats(Arc::clone(&stats));
+
+    assert!(matches!(delivery.turn().await, Turn::BackedOff(_)));
+    assert_eq!(
+        stats.totals(fixture.outbox.waiting()),
+        rules::stats::Totals {
+            failed: 1,
+            waiting: 1,
+            ..rules::stats::Totals::default()
+        },
+        "a failed attempt was counted as something else, or as a dead letter"
+    );
+
+    assert!(matches!(delivery.turn().await, Turn::BackedOff(_)));
+    assert!(matches!(delivery.turn().await, Turn::DeadLettered(_)));
+    assert_eq!(
+        stats.totals(fixture.outbox.waiting()),
+        rules::stats::Totals {
+            // Three attempts, every one of which failed, and one
+            // envelope abandoned. `failed` counts attempts and
+            // `dead_lettered` counts envelopes, so three and one is
+            // the answer and four and one would be double counting.
+            failed: 3,
+            dead_lettered: 1,
+            waiting: 0,
+            ..rules::stats::Totals::default()
+        },
+        "the dead letter and the attempt that caused it were counted as one thing"
+    );
+}
+
+/// The head of the outbox not being due yet is not a failure.
+///
+/// A turn that makes no request at all must move nothing: a pump that
+/// counted a failure every time it looked at a backed-off outbox would
+/// report a rule failing thousands of times a minute against an
+/// endpoint it never called.
+#[tokio::test]
+async fn a_turn_that_makes_no_request_counts_nothing() {
+    let endpoint = Endpoint::start(Behaviour::AlwaysRefuse {
+        status: 500,
+        // Long enough that the next turn is certainly too early.
+        retry_after: Some(60),
+    })
+    .await;
+    let mut action = action_for(endpoint.url());
+    action.retries = 5;
+    let fixture = Fixture::new(action, &[("sensor-1", b"21.5" as &[u8])]);
+    let stats = Arc::new(rules::stats::RuleStats::new());
+    let delivery = fixture.delivery().with_stats(Arc::clone(&stats));
+
+    assert!(matches!(delivery.turn().await, Turn::BackedOff(_)));
+    let after_one = stats.totals(fixture.outbox.waiting());
+    assert_eq!(after_one.failed, 1);
+
+    // The endpoint asked for a minute, so this turn finds the head not
+    // due and returns without calling anything.
+    assert!(matches!(delivery.turn().await, Turn::BackedOff(_)));
+    assert_eq!(
+        endpoint.count(),
+        1,
+        "the second turn made a request, so it is not the case this test is about"
+    );
+    assert_eq!(
+        stats.totals(fixture.outbox.waiting()),
+        after_one,
+        "a turn that made no request moved a counter"
+    );
+}

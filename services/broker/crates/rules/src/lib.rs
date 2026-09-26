@@ -57,6 +57,7 @@ pub mod outbox;
 pub mod rule;
 pub mod singleton;
 pub mod spec;
+pub mod stats;
 
 pub use bridge::TopicError;
 pub use envelope::Envelope;
@@ -73,3 +74,4 @@ pub use singleton::{Membership, NodeId, Ownership};
 pub use spec::{
     BridgeTopicSpec, HttpInSpec, HttpOutSpec, HttpPollSpec, MqttBridgeSpec, RuleSpec, SpecError,
 };
+pub use stats::{RuleStats, Sample, Totals};

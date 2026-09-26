@@ -891,3 +891,84 @@ async fn a_path_that_is_not_served_answers_in_the_one_shape() {
 
     node.stop().await;
 }
+
+// ---- what the endpoint counts -------------------------------------------
+
+/// An ingest rule reports what its endpoint has been asked for, and
+/// each number means what its name says.
+///
+/// Convention 5: a counter that rose on every request would satisfy an
+/// assertion that the accepted post moved `fired`, so the request that
+/// does **not** authenticate is tried beside it and all four numbers
+/// are read after each.
+#[tokio::test]
+async fn an_ingest_rule_counts_what_it_was_asked_and_what_it_published() {
+    let stats = Arc::new(rules::stats::RuleStats::new());
+    let ingest = Ingest::new();
+    ingest.register_with(
+        &RuleId::new("fixed").expect("an identifier"),
+        HttpIn {
+            token: Secret::new(TOKEN),
+            topic: FIXED.to_owned(),
+            topic_from: None,
+            qos: QoS::AtMostOnce,
+            retain: false,
+        },
+        Arc::clone(&stats),
+    );
+    let node = Node::start(ingest).await;
+
+    // A request with no token never reached the rule, so nothing it
+    // did is the rule's.
+    let refused = post(node.ingest, "/ingest/fixed", None, &[], b"21.5").await;
+    assert_eq!(refused.status, 401);
+    assert_eq!(
+        stats.totals(0),
+        rules::stats::Totals::default(),
+        "a request that did not authenticate was counted as the rule running"
+    );
+
+    // A request that did.
+    let accepted = post(node.ingest, "/ingest/fixed", Some(TOKEN), &[], b"21.5").await;
+    assert_eq!(accepted.status, 200, "{}", accepted.body);
+    assert_eq!(
+        stats.totals(0),
+        rules::stats::Totals {
+            fired: 1,
+            delivered: 1,
+            ..rules::stats::Totals::default()
+        },
+        "an accepted post moved something other than `fired` and `delivered`"
+    );
+
+    // A request this rule will not publish: the body is larger than
+    // the broker carries. The rule ran and published nothing, which is
+    // a failure and not a delivery.
+    let largest = largest_body(
+        node.mqtt
+            .shared()
+            .with_broker(|broker| broker.config().limits.max_packet_size),
+        FIXED,
+    );
+    let refused = post(
+        node.ingest,
+        "/ingest/fixed",
+        Some(TOKEN),
+        &[],
+        &vec![b'x'; largest + 1],
+    )
+    .await;
+    assert_eq!(refused.status, 413, "{}", refused.body);
+    assert_eq!(
+        stats.totals(0),
+        rules::stats::Totals {
+            fired: 2,
+            delivered: 1,
+            failed: 1,
+            ..rules::stats::Totals::default()
+        },
+        "a post the rule would not publish was counted as a delivery"
+    );
+
+    node.stop().await;
+}

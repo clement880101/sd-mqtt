@@ -581,6 +581,8 @@ pub enum Turn {
 /// delivery has got is in the stored record, so this can be stopped,
 /// dropped and rebuilt without losing a count.
 pub struct Delivery {
+    /// What this rule has been doing. See [`crate::stats`].
+    stats: Arc<crate::stats::RuleStats>,
     /// Whose outbox.
     outbox: Arc<Outbox>,
     /// Where envelopes are read from.
@@ -608,6 +610,7 @@ impl Delivery {
         dead_letters: Arc<dyn DeadLetters>,
     ) -> Self {
         Self {
+            stats: Arc::new(crate::stats::RuleStats::new()),
             outbox,
             store,
             writer,
@@ -616,6 +619,18 @@ impl Delivery {
             backoff: Duration::from_millis(u64::from(action.backoff_ms)),
             dead_letters,
         }
+    }
+
+    /// Count what this pump does against `stats`.
+    ///
+    /// A builder rather than a seventh argument to [`Delivery::new`],
+    /// because every test of this pump is about what it posts and none
+    /// of them is about the counters: a required argument would put a
+    /// handle nobody reads in twenty call sites.
+    #[must_use]
+    pub fn with_stats(mut self, stats: Arc<crate::stats::RuleStats>) -> Self {
+        self.stats = stats;
+        self
     }
 
     /// Take one envelope as far as it goes.
@@ -678,11 +693,7 @@ impl Delivery {
                     sequence = entry.sequence,
                     "an envelope named a payload the store no longer holds; it cannot be sent"
                 );
-                self.record(vec![Record::OutboxRemoved {
-                    rule: self.outbox.rule().as_str().to_owned(),
-                    sequence: entry.sequence,
-                }])
-                .await;
+                self.record(self.outbox.orphaned(entry.sequence)).await;
                 return Turn::Orphaned;
             }
             Err(error) => {
@@ -704,6 +715,7 @@ impl Delivery {
                 id = %envelope.id,
                 "delivered"
             );
+            self.stats.delivered();
             self.finish(&entry).await;
             return Turn::Delivered;
         }
@@ -720,6 +732,8 @@ impl Delivery {
                 ?attempt,
                 "an envelope ran out of attempts and is being dead-lettered"
             );
+            self.stats.failed();
+            self.stats.dead_lettered();
             self.dead_letters.dead_letter(
                 &self.outbox.rule().dead_letter_topic(),
                 dead_letter(&envelope, &attempt, entry.attempts + 1),
@@ -744,6 +758,7 @@ impl Delivery {
             wait_ms = wait.as_millis(),
             "an attempt failed; the rule is backing off"
         );
+        self.stats.failed();
         self.record(vec![self.outbox.attempted(&entry, next_attempt_at)])
             .await;
         Turn::BackedOff(wait)
