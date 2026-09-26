@@ -47,8 +47,10 @@
 #![warn(missing_docs)]
 
 pub mod envelope;
+pub mod hops;
 pub mod http_in;
 pub mod http_out;
+pub mod http_poll;
 pub mod outbox;
 pub mod rule;
 pub mod singleton;
@@ -56,9 +58,10 @@ pub mod singleton;
 pub use envelope::Envelope;
 pub use http_in::{HttpInError, Ingest};
 pub use http_out::{Attempt, DeadLetters, Delivery, HttpOutError, Poster, Turn};
+pub use http_poll::{Fetched, Fetcher, HttpPollError, Polled, Poller};
 pub use outbox::Outbox;
 pub use rule::{
-    Action, ClientPattern, HttpIn, HttpOut, Rule, RuleError, RuleId, TopicFromRequest, TopicSource,
-    Trigger,
+    Action, ClientPattern, HttpIn, HttpOut, HttpPoll, Rule, RuleError, RuleId, TopicFromRequest,
+    TopicSource, Trigger,
 };
 pub use singleton::{Membership, NodeId, Ownership};

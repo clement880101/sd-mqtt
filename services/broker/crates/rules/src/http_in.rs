@@ -730,6 +730,16 @@ async fn ingest_one(
             // deliverable until it is delivered, which is what every
             // other publication with no expiry does.
             message_expiry_interval: None,
+            // **No hop count, deliberately.** Section 9.2's third loop
+            // is an `http_out` rule feeding a system that posts back
+            // through this endpoint, and the hop count that would
+            // close it has to survive the round trip through that
+            // system — so it is the caller's to send back, not ours to
+            // mint. Stamping a fresh count here would reset every
+            // message to one hop and make the count say nothing. What
+            // reads a count the caller sent lands with the connector
+            // that drops on it; see `crate::hops`.
+            user_properties: Vec::new(),
         },
     )
     .await

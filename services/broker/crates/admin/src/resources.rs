@@ -1262,6 +1262,9 @@ async fn publish(
             qos: qos_of(request.qos)?,
             retain: request.retain,
             message_expiry_interval: request.message_expiry_interval,
+            // An operator publishing by hand is not a connector, so
+            // there is no hop count to carry; see `rules::hops`.
+            user_properties: Vec::new(),
         },
     )
     .await

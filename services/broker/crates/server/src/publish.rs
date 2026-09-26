@@ -56,6 +56,17 @@ pub struct Publication {
     pub retain: bool,
     /// How long it stays deliverable, in seconds.
     pub message_expiry_interval: Option<u32>,
+    /// The v5 user properties it carries.
+    ///
+    /// Section 9.2's hop count travels in one of these, so a connector
+    /// that originates a publication has something to put it in; see
+    /// `rules::hops`. A caller with nothing to say passes none, and the
+    /// message then carries the empty property block it carried before
+    /// this field existed.
+    ///
+    /// **A 3.1.1 subscriber will not see them**, as it sees no other v5
+    /// property. That is the codec's rule and not this one's.
+    pub user_properties: Vec<(String, String)>,
 }
 
 /// What a publication that was made comes back with.
@@ -126,12 +137,14 @@ pub async fn publish(
         qos,
         retain,
         message_expiry_interval,
+        user_properties,
     } = publication;
     // Only at-most-once promises nobody anything. Both acknowledged
     // levels are a promise, and both wait.
     let promised = qos != QoS::AtMostOnce;
     let properties = Properties {
         message_expiry_interval,
+        user_properties,
         ..Properties::default()
     };
 

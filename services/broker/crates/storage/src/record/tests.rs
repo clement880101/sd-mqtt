@@ -542,6 +542,83 @@ mod golden {
         );
     }
 
+    /// The polling rule the vector below is of.
+    ///
+    /// Section 9.2's `http_poll`. Like an ingest rule it stores the
+    /// empty trigger — a poller is fired by its own interval, not by a
+    /// published message — so the three zero bytes sit together again
+    /// and are pinned by [`rule_put`] rather than here. What this
+    /// vector is for is the action, and in particular its **three
+    /// adjacent varint fields**: an interval, a timeout and a body
+    /// limit, which is the transposition a round trip cannot see.
+    fn polling_rule() -> RuleRecord {
+        RuleRecord {
+            id: "weather".to_owned(),
+            name: "Weather poll".to_owned(),
+            enabled: true,
+            trigger: TriggerRecord {
+                filter: String::new(),
+                min_qos: None,
+                client_id: None,
+            },
+            action: ActionRecord::HttpPoll(HttpPollRecord {
+                url: "https://example.invalid/now".to_owned(),
+                headers: vec![("accept".to_owned(), "text/plain".to_owned())],
+                interval_ms: 60_000,
+                timeout_ms: 5_000,
+                max_body_bytes: 65_536,
+                topic: "weather/now".to_owned(),
+                qos: Qos::ExactlyOnce,
+                retain: true,
+            }),
+        }
+    }
+
+    /// The independence property, for this vector: every string in it
+    /// is a different length — 7, 12, 27, 6, 10, 11 — so a
+    /// transposition of any pair changes the bytes; the three varints
+    /// encode to three, two and three bytes and share no byte value in
+    /// the same position, so swapping any two of them changes the
+    /// vector; and `qos` and `retain` are the two adjacent one-byte
+    /// fields and differ.
+    #[test]
+    fn rule_put_http_poll() {
+        // 60000 = 3 * 16384 + 84 * 128 + 96, so the varint is 96|0x80,
+        // 84|0x80, 3. 5000 = 39 * 128 + 8, so it is 8|0x80 then 39.
+        // 65536 = 4 * 16384, so it is 0|0x80, 0|0x80, 4 — the one that
+        // shows a varint's trailing groups are not dropped.
+        let expected: &[u8] = &[
+            0x0e, // Record::RulePut is variant 14
+            0x07, b'w', b'e', b'a', b't', b'h', b'e', b'r', // id
+            0x0c, b'W', b'e', b'a', b't', b'h', b'e', b'r', b' ', b'p', b'o', b'l',
+            b'l', // name "Weather poll"
+            0x01, // enabled true
+            0x00, // trigger filter "", the empty trigger of a polling rule
+            0x00, // min_qos None
+            0x00, // client_id None
+            0x02, // ActionRecord::HttpPoll is variant 2
+            0x1b, b'h', b't', b't', b'p', b's', b':', b'/', b'/', b'e', b'x', b'a', b'm', b'p',
+            b'l', b'e', b'.', b'i', b'n', b'v', b'a', b'l', b'i', b'd', b'/', b'n', b'o',
+            b'w', // url, twenty-seven bytes
+            0x01, // one header
+            0x06, b'a', b'c', b'c', b'e', b'p', b't', // its name
+            0x0a, b't', b'e', b'x', b't', b'/', b'p', b'l', b'a', b'i', b'n', // its value
+            0xe0, 0xd4, 0x03, // interval_ms 60000
+            0x88, 0x27, // timeout_ms 5000
+            0x80, 0x80, 0x04, // max_body_bytes 65536
+            0x0b, b'w', b'e', b'a', b't', b'h', b'e', b'r', b'/', b'n', b'o',
+            b'w', // topic "weather/now"
+            0x02, // qos ExactlyOnce
+            0x01, // retain true
+        ];
+        pins(
+            &Record::RulePut {
+                rule: polling_rule(),
+            },
+            expected,
+        );
+    }
+
     #[test]
     fn rule_removed() {
         let expected: &[u8] = &[
@@ -1145,29 +1222,95 @@ mod roundtrip {
             })
     }
 
+    /// **Every variant, not the first one.** Convention 5: a generator
+    /// that cannot produce a case leaves that case untested however
+    /// many thousand cases are run, and this strategy produced nothing
+    /// but an `HttpOut` while two other variants existed. The round
+    /// trip below is what says a record survives the encoding, so a
+    /// variant it never builds is a variant nothing says that about.
     fn action() -> impl Strategy<Value = ActionRecord> {
-        (
-            text(),
-            text(),
-            proptest::collection::vec((text(), text()), 0..4),
-            any::<u32>(),
-            any::<u16>(),
-            any::<u8>(),
-            any::<u32>(),
-        )
-            .prop_map(
-                |(url, method, headers, timeout_ms, max_concurrency, retries, backoff_ms)| {
-                    ActionRecord::HttpOut(HttpOutRecord {
-                        url,
-                        method,
-                        headers,
-                        timeout_ms,
-                        max_concurrency,
-                        retries,
-                        backoff_ms,
-                    })
-                },
+        prop_oneof![
+            (
+                text(),
+                text(),
+                proptest::collection::vec((text(), text()), 0..4),
+                any::<u32>(),
+                any::<u16>(),
+                any::<u8>(),
+                any::<u32>(),
             )
+                .prop_map(
+                    |(url, method, headers, timeout_ms, max_concurrency, retries, backoff_ms)| {
+                        ActionRecord::HttpOut(HttpOutRecord {
+                            url,
+                            method,
+                            headers,
+                            timeout_ms,
+                            max_concurrency,
+                            retries,
+                            backoff_ms,
+                        })
+                    },
+                ),
+            (
+                text(),
+                text(),
+                proptest::option::of((topic_from(), text())),
+                qos(),
+                any::<bool>(),
+            )
+                .prop_map(|(token, topic, topic_from, qos, retain)| {
+                    ActionRecord::HttpIn(HttpInRecord {
+                        token: Secret::new(token),
+                        topic,
+                        topic_from: topic_from
+                            .map(|(source, prefix)| TopicFromRequestRecord { source, prefix }),
+                        qos,
+                        retain,
+                    })
+                }),
+            (
+                text(),
+                proptest::collection::vec((text(), text()), 0..4),
+                any::<u32>(),
+                any::<u32>(),
+                any::<u32>(),
+                text(),
+                qos(),
+                any::<bool>(),
+            )
+                .prop_map(
+                    |(
+                        url,
+                        headers,
+                        interval_ms,
+                        timeout_ms,
+                        max_body_bytes,
+                        topic,
+                        qos,
+                        retain,
+                    )| {
+                        ActionRecord::HttpPoll(HttpPollRecord {
+                            url,
+                            headers,
+                            interval_ms,
+                            timeout_ms,
+                            max_body_bytes,
+                            topic,
+                            qos,
+                            retain,
+                        })
+                    },
+                ),
+        ]
+    }
+
+    /// Where an ingest rule reads a topic from, either spelling.
+    fn topic_from() -> impl Strategy<Value = TopicFromRecord> {
+        prop_oneof![
+            text().prop_map(TopicFromRecord::Header),
+            text().prop_map(TopicFromRecord::Query),
+        ]
     }
 
     fn outbox_entry() -> impl Strategy<Value = OutboxRecord> {

@@ -65,7 +65,8 @@ use broker_core::broker::BrokerConfig;
 use mqtt_codec::{Limits, QoS};
 use rules::http_in::HttpInError;
 use rules::rule::{
-    Action, ClientPattern, HttpIn, HttpOut, Rule, RuleId, TopicFromRequest, TopicSource, Trigger,
+    Action, ClientPattern, HttpIn, HttpOut, HttpPoll, Rule, RuleId, TopicFromRequest, TopicSource,
+    Trigger,
 };
 use sdmqtt_admin::config::{AdminConfig, AdminStartError, Token};
 use sdmqtt_server::connection::{outbox_depth_for, ConnectionConfig};
@@ -549,6 +550,9 @@ pub struct RuleSection {
     pub http_out: Option<HttpOutSection>,
     /// Accept a post and publish its body, if that is what it does.
     pub http_in: Option<HttpInSection>,
+    /// Fetch a URL on an interval and publish the body, if that is
+    /// what it does.
+    pub http_poll: Option<HttpPollSection>,
 }
 
 /// A rule left out of a file is on.
@@ -658,21 +662,33 @@ impl RuleSection {
                 ))
             }
             (Some(_), false) => {
-                return Err(wrong(
-                    "an http_in rule is fired by a request rather than by a published \
-                     message, so it has no filter; remove it"
+                // Which kind of rule it is decides what fired it, and
+                // an operator who wrote a filter believes something
+                // about when the rule runs that is not true. Saying
+                // which is the difference between a message they can
+                // act on and one they have to guess at.
+                return Err(wrong(match &action {
+                    Action::HttpPoll(_) => "an http_poll rule is fired by its own interval \
+                                            rather than by a published message, so it has \
+                                            no filter; remove it"
                         .to_owned(),
-                ))
+                    _ => "an http_in rule is fired by a request rather than by a published \
+                          message, so it has no filter; remove it"
+                        .to_owned(),
+                }));
             }
             (None, false) => {
                 // The two narrowings belong to a filter, so writing one
                 // without a filter is the same mistake said smaller.
                 if self.min_qos.is_some() || self.client_id.is_some() {
-                    return Err(wrong(
-                        "min_qos and client_id narrow a filter, and an http_in rule has \
-                         none; remove them"
-                            .to_owned(),
-                    ));
+                    return Err(wrong(format!(
+                        "min_qos and client_id narrow a filter, and an {} rule has \
+                         none; remove them",
+                        match &action {
+                            Action::HttpPoll(_) => "http_poll",
+                            _ => "http_in",
+                        }
+                    )));
                 }
                 None
             }
@@ -689,38 +705,61 @@ impl RuleSection {
     /// Section 9.1: **one** action. Two tables is an operator who means
     /// two rules, and none is a rule that does nothing; both are
     /// refused rather than resolved by a precedence nobody wrote down.
+    ///
+    /// Written as a count of what was declared rather than as a match
+    /// over the combinations, because the combinations square with
+    /// every action added and the answer for all but one of them is
+    /// the same sentence.
     fn to_action(&self, wrong: &impl Fn(String) -> ConfigError) -> Result<Action, ConfigError> {
-        match (&self.http_out, &self.http_in) {
-            (Some(_), Some(_)) => Err(wrong(
-                "a rule has one action, section 9.1, and this one declares both \
-                 [rules.http_out] and [rules.http_in]; write two rules"
-                    .to_owned(),
-            )),
-            (None, None) => Err(wrong(
-                "a rule needs an action; write a [rules.http_out] or a [rules.http_in] table"
-                    .to_owned(),
-            )),
-            (Some(out), None) => {
-                let action = HttpOut {
-                    url: out.url.clone(),
-                    method: out.method.clone(),
-                    headers: out
-                        .headers
-                        .iter()
-                        .map(|(name, value)| (name.clone(), value.clone()))
-                        .collect(),
-                    timeout_ms: out.timeout_ms,
-                    max_concurrency: out.max_concurrency,
-                    retries: out.retries,
-                    backoff_ms: out.backoff_ms,
-                };
-                // Before anything is stored and long before anything is
-                // posted.
-                rules::http_out::check(&action).map_err(|error| wrong(error.to_string()))?;
-                Ok(Action::HttpOut(action))
-            }
-            (None, Some(into)) => Ok(Action::HttpIn(into.to_action(wrong)?)),
+        let declared: Vec<&str> = [
+            self.http_out.as_ref().map(|_| "[rules.http_out]"),
+            self.http_in.as_ref().map(|_| "[rules.http_in]"),
+            self.http_poll.as_ref().map(|_| "[rules.http_poll]"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if declared.len() > 1 {
+            // Spelled as a word, because the sentence is read by a
+            // person and because three is as many as there can be.
+            let count = if declared.len() == 2 { "two" } else { "three" };
+            return Err(wrong(format!(
+                "a rule has one action, section 9.1, and this one declares {}; \
+                 write {count} rules",
+                declared.join(" and "),
+            )));
         }
+
+        if let Some(out) = &self.http_out {
+            let action = HttpOut {
+                url: out.url.clone(),
+                method: out.method.clone(),
+                headers: out
+                    .headers
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+                timeout_ms: out.timeout_ms,
+                max_concurrency: out.max_concurrency,
+                retries: out.retries,
+                backoff_ms: out.backoff_ms,
+            };
+            // Before anything is stored and long before anything is
+            // posted.
+            rules::http_out::check(&action).map_err(|error| wrong(error.to_string()))?;
+            return Ok(Action::HttpOut(action));
+        }
+        if let Some(into) = &self.http_in {
+            return Ok(Action::HttpIn(into.to_action(wrong)?));
+        }
+        if let Some(poll) = &self.http_poll {
+            return Ok(Action::HttpPoll(poll.to_action(wrong)?));
+        }
+        Err(wrong(
+            "a rule needs an action; write a [rules.http_out], a [rules.http_in] or a \
+             [rules.http_poll] table"
+                .to_owned(),
+        ))
     }
 }
 
@@ -826,6 +865,112 @@ impl HttpInSection {
         };
         // Before anything is stored and long before anything is served.
         rules::http_in::check(&action).map_err(|error| wrong(error.to_string()))?;
+        Ok(action)
+    }
+}
+
+/// How an `http_poll` rule fetches.
+///
+/// Every field section 9.2 lists as configurable for it, and no field
+/// it does not. **There is no retry count and no backoff**, unlike
+/// `[rules.http_out]`: a poller has no outbox, a fetch that failed is
+/// tried again on the next interval, and a body republished late is
+/// worse than one not republished. `crates/rules/src/http_poll.rs`
+/// carries the argument.
+///
+/// `url` and `topic` have no default, because a default that fetches
+/// from somewhere or publishes to somewhere is worse than one that
+/// does neither. Both are refused when left out.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HttpPollSection {
+    /// Where to fetch from. `https://`, or `http://` to a loopback
+    /// address, on exactly the rule `[rules.http_out]` is held to.
+    pub url: String,
+    /// Headers to send.
+    ///
+    /// A table, sorted by name, for the reason
+    /// [`HttpOutSection::headers`] gives.
+    pub headers: BTreeMap<String, String>,
+    /// How long between the start of one fetch and the next, in
+    /// milliseconds.
+    ///
+    /// **A fetch slower than this loses the intervals it covered.**
+    /// One fetch is ever in flight, and the boundaries a slow fetch
+    /// passed are dropped rather than fired in a burst afterwards, so
+    /// an endpoint that has become slow is not answered with a run of
+    /// back-to-back requests.
+    pub interval_ms: u32,
+    /// How long one fetch may take, in milliseconds.
+    ///
+    /// May be longer than the interval, and is not refused for it: a
+    /// fetch that overruns is bounded by the paragraph above rather
+    /// than by a rule about what an operator may write.
+    pub timeout_ms: u32,
+    /// The most of a response body that will be read, in bytes.
+    ///
+    /// A body past this is a **failed fetch**, not a truncated
+    /// publication: half a document on a topic is worse than nothing
+    /// on it, and a subscriber cannot tell the two apart.
+    pub max_body_bytes: u32,
+    /// Where the body is published.
+    pub topic: String,
+    /// The level it is published at, as MQTT numbers it.
+    pub qos: u8,
+    /// Whether it is retained.
+    ///
+    /// Usually what an operator wants from a poller — the current
+    /// value, available to a subscriber that has just connected — and
+    /// off by default all the same, because a retained message outlives
+    /// the rule that wrote it.
+    pub retain: bool,
+}
+
+impl Default for HttpPollSection {
+    /// Nowhere to fetch from, nowhere to publish to, and bounds on
+    /// everything else. The rules crate's own defaults.
+    fn default() -> Self {
+        let action = HttpPoll::default();
+        Self {
+            url: action.url,
+            headers: BTreeMap::new(),
+            interval_ms: action.interval_ms,
+            timeout_ms: action.timeout_ms,
+            max_body_bytes: action.max_body_bytes,
+            topic: action.topic,
+            qos: 0,
+            retain: action.retain,
+        }
+    }
+}
+
+impl HttpPollSection {
+    /// This table as the rules crate's own type.
+    fn to_action(&self, wrong: &impl Fn(String) -> ConfigError) -> Result<HttpPoll, ConfigError> {
+        let qos = rules::http_in::qos_of(self.qos).ok_or_else(|| {
+            wrong(format!(
+                "http_poll.qos = {} is not a level; MQTT has 0, 1 and 2",
+                self.qos
+            ))
+        })?;
+
+        let action = HttpPoll {
+            url: self.url.clone(),
+            headers: self
+                .headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            interval_ms: self.interval_ms,
+            timeout_ms: self.timeout_ms,
+            max_body_bytes: self.max_body_bytes,
+            topic: self.topic.clone(),
+            qos,
+            retain: self.retain,
+        };
+        // Before anything is stored and long before anything is
+        // fetched.
+        rules::http_poll::check(&action).map_err(|error| wrong(error.to_string()))?;
         Ok(action)
     }
 }
@@ -1737,6 +1882,255 @@ mod tests {
             .expect("every key is known")
             .validate()
             .expect("every ingest route is individually guarded");
+    }
+
+    // ---- http_poll -----------------------------------------------------
+
+    /// Every part of a polling rule can be said, and reaches the rules
+    /// crate's own type.
+    #[test]
+    fn every_part_of_a_polling_rule_can_be_said() {
+        let text = with_rule(
+            r#"
+            [[rules]]
+            id = "weather"
+            name = "Weather poll"
+
+            [rules.http_poll]
+            url = "https://example.invalid/now"
+            headers = { "accept" = "text/plain" }
+            interval_ms = 30000
+            timeout_ms = 2500
+            max_body_bytes = 65536
+            topic = "weather/now"
+            qos = 1
+            retain = true
+            "#,
+        );
+        let config = Config::from_toml(&text).expect("every key is known");
+        config
+            .validate()
+            .expect("a complete polling rule is usable");
+
+        let rule = config.rules[0].to_rule().expect("it converts");
+        assert_eq!(rule.id.as_str(), "weather");
+        assert!(
+            rule.trigger.is_none(),
+            "a poller is fired by its own interval and has no trigger"
+        );
+        let Action::HttpPoll(action) = &rule.action else {
+            panic!("this rule polls: {:?}", rule.action);
+        };
+        assert_eq!(action.url, "https://example.invalid/now");
+        assert_eq!(
+            action.headers,
+            vec![("accept".to_owned(), "text/plain".to_owned())]
+        );
+        assert_eq!(action.interval_ms, 30_000);
+        assert_eq!(action.timeout_ms, 2_500);
+        assert_eq!(action.max_body_bytes, 65_536);
+        assert_eq!(action.topic, "weather/now");
+        assert_eq!(action.qos, QoS::AtLeastOnce);
+        assert!(action.retain);
+
+        // And it survives the store, which is where it actually lives.
+        let stored = rule.to_record();
+        assert_eq!(
+            Rule::try_from(&stored).expect("it reads back"),
+            rule,
+            "a polling rule round trips through the record"
+        );
+    }
+
+    /// A polling rule says the two things it must and takes the rest
+    /// from the rules crate.
+    #[test]
+    fn a_polling_rule_takes_the_rules_crate_defaults() {
+        let text = with_rule(
+            r#"
+            [[rules]]
+            id = "weather"
+            name = "Weather poll"
+
+            [rules.http_poll]
+            url = "https://example.invalid/now"
+            topic = "weather/now"
+            "#,
+        );
+        let config = Config::from_toml(&text).expect("every key is known");
+        config.validate().expect("a minimal polling rule is usable");
+
+        let defaults = HttpPoll::default();
+        let poll = config.rules[0].http_poll.as_ref().expect("this rule polls");
+        assert_eq!(poll.interval_ms, defaults.interval_ms);
+        assert_eq!(poll.timeout_ms, defaults.timeout_ms);
+        assert_eq!(poll.max_body_bytes, defaults.max_body_bytes);
+        assert!(!poll.retain, "a retained default outlives the rule");
+    }
+
+    /// What a polling rule may not say is refused, with the rule named
+    /// and the mistake said.
+    ///
+    /// The accepted rule above is what stops this passing against a
+    /// check that refuses everything. Convention 5.
+    #[test]
+    fn what_a_polling_rule_may_not_say_is_refused_by_name() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "a plain-text url to somewhere that is not this machine",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                [rules.http_poll]
+                url = "http://example.invalid/now"
+                topic = "weather/now"
+                "#,
+                "in the clear",
+            ),
+            (
+                "an interval of zero",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "weather/now"
+                interval_ms = 0
+                "#,
+                "interval_ms is zero",
+            ),
+            (
+                "a body limit of zero",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "weather/now"
+                max_body_bytes = 0
+                "#,
+                "max_body_bytes is zero",
+            ),
+            (
+                "a topic with a wildcard in it",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "weather/+"
+                "#,
+                "http_poll.topic",
+            ),
+            (
+                "a topic in the reserved namespace",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "$sd/weather"
+                "#,
+                "dollar-prefixed",
+            ),
+            (
+                "a level MQTT does not have",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "weather/now"
+                qos = 3
+                "#,
+                "http_poll.qos",
+            ),
+            (
+                "a filter, on a rule nothing published fires",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                filter = "weather/#"
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "weather/now"
+                "#,
+                "its own interval",
+            ),
+            (
+                "a narrowing with no filter to narrow",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                min_qos = 1
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "weather/now"
+                "#,
+                "an http_poll rule has",
+            ),
+            (
+                "two actions, where section 9.1 allows one",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                filter = "weather/#"
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "weather/now"
+                [rules.http_out]
+                url = "https://example.invalid/hook"
+                "#,
+                "two rules",
+            ),
+        ];
+
+        for (what, text, fragment) in cases {
+            let error = refuse(&with_rule(text));
+            let said = error.to_string();
+            assert!(
+                said.contains("weather"),
+                "{what}: the refusal must name the rule: {said}"
+            );
+            assert!(
+                said.contains(fragment),
+                "{what}: the refusal must say which mistake it was, and {fragment:?} is \
+                 not in {said:?}"
+            );
+        }
+    }
+
+    /// A rule with no action at all names every table it could have
+    /// been.
+    ///
+    /// An operator who wrote none needs the list, and a list that goes
+    /// stale as actions are added is worse than no list; this is what
+    /// notices.
+    #[test]
+    fn a_rule_with_no_action_names_every_action_there_is() {
+        let said = refuse(&with_rule(
+            r#"
+            [[rules]]
+            id = "weather"
+            name = "Weather poll"
+            "#,
+        ))
+        .to_string();
+        for table in ["[rules.http_out]", "[rules.http_in]", "[rules.http_poll]"] {
+            assert!(
+                said.contains(table),
+                "a rule with no action must name {table}: {said}"
+            );
+        }
     }
 
     #[test]

@@ -34,6 +34,16 @@
 //! alone, not run, and logged. Deleting it would take its outbox with
 //! it, and anything still waiting in that outbox is a message somebody
 //! was told had been accepted.
+//!
+//! # A singleton is started here, and asks whether it may run
+//!
+//! Section 9.2 makes a poller a singleton owned by the live member with
+//! the lowest node identifier. Milestone 4 has one member, so the
+//! [`Membership`] built below holds one node and that node owns
+//! everything — but it is a membership view and the poller asks it,
+//! rather than a poller written on the assumption that it is alone. The
+//! reasoning is `rules::singleton`'s; what happens here is that
+//! milestone 5 replaces one constructor call and nothing else.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -44,7 +54,9 @@ use broker_core::session::message::Message;
 use bytes::Bytes;
 use mqtt_codec::QoS;
 use rules::http_out::{client, DeadLetters, Delivery, Poster};
+use rules::http_poll::Poller;
 use rules::rule::{Action, Rule, Trigger};
+use rules::singleton::{Membership, NodeId};
 use rules::{Ingest, Outbox};
 use sdmqtt_server::shared::Shared;
 use storage::record::{BodyRecord, MessageId, Qos, Record};
@@ -172,6 +184,12 @@ impl DeadLetters for BrokerDeadLetters {
 /// only thing that ends it.
 pub struct Connectors {
     pumps: Vec<tokio::task::JoinHandle<()>>,
+    /// Who is live, which is who owns the singletons.
+    ///
+    /// Held because dropping it would leave every [`rules::Ownership`]
+    /// handle watching a view that can never change again. Nothing
+    /// changes it in milestone 4, and something will in milestone 5.
+    _membership: Arc<Membership>,
     /// How many rules were installed, of either kind.
     ///
     /// Not `pumps.len()`: an ingest rule has no pump, and a node whose
@@ -228,10 +246,19 @@ impl Connectors {
 pub fn start_without_rules() -> Connectors {
     Connectors {
         pumps: Vec::new(),
+        _membership: Arc::new(Membership::alone(NodeId::new(THIS_NODE))),
         rules: 0,
         ingest: Arc::new(Ingest::new()),
     }
 }
+
+/// What this node calls itself.
+///
+/// Section 8.1 gives a node a persisted identity and that is milestone
+/// 5's; until then there is one node and this is what it is called.
+/// The same string the admin API reports as the only row in its node
+/// listing, so an operator reading one is reading the other.
+const THIS_NODE: &str = "local";
 
 /// Install the configured rules and start their pumps.
 ///
@@ -260,6 +287,11 @@ pub async fn start(
     let dead_letters: Arc<dyn DeadLetters> = Arc::new(BrokerDeadLetters {
         shared: Arc::clone(shared),
     });
+
+    // One member, so it owns every singleton. Written as a view
+    // because a rule only ever exercised in the one-member case is a
+    // rule nobody has tested; see `rules::singleton`.
+    let membership = Arc::new(Membership::alone(NodeId::new(THIS_NODE)));
 
     let mut configured = BTreeSet::new();
     let mut fired = Vec::new();
@@ -336,6 +368,42 @@ pub async fn start(
                 pumps.push(tokio::spawn(delivery.run()));
                 fired.push(Fired { rule, outbox });
             }
+            Action::HttpPoll(action) => {
+                // **No outbox**, and that is the connector rather than
+                // an omission: a poller is given nothing, so a fetch
+                // that failed has lost nothing, and it is asked again
+                // on the next interval. See `rules::http_poll`.
+                let poller =
+                    Poller::new(rule.id.clone(), client.clone(), Arc::clone(shared), action)
+                        .map_err(|error| StartupError::Connector(error.to_string()))?;
+
+                tracing::info!(
+                    rule = rule.id.as_str(),
+                    name = %rule.name,
+                    enabled = rule.enabled,
+                    url = %action.url,
+                    topic = %action.topic,
+                    interval_ms = action.interval_ms,
+                    owner = %membership.owner(),
+                    "a rule is installed"
+                );
+
+                // **A disabled rule fetches nothing.** The same rule an
+                // ingest rule's route follows: `enabled` is what an
+                // operator reaches for to turn a connector off, and a
+                // poller that kept fetching would be the one connector
+                // that ignored the switch. Nothing is spawned rather
+                // than a task that starts and stops, because there is
+                // no state to keep warm.
+                if rule.enabled {
+                    pumps.push(tokio::spawn(poller.run(membership.ownership())));
+                } else {
+                    tracing::info!(
+                        rule = rule.id.as_str(),
+                        "this polling rule is switched off and fetches nothing"
+                    );
+                }
+            }
             Action::HttpIn(action) => {
                 // **A disabled rule gets no route.** `enabled` is what
                 // an operator reaches for to turn a connector off, and
@@ -402,6 +470,7 @@ pub async fn start(
 
     Ok(Connectors {
         pumps,
+        _membership: membership,
         rules: config.rules.len(),
         ingest: Arc::new(ingest),
     })

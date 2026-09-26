@@ -15,8 +15,8 @@ use std::fmt;
 
 use mqtt_codec::QoS;
 use storage::record::{
-    ActionRecord, HttpInRecord, HttpOutRecord, Qos, RuleRecord, Secret, TopicFromRecord,
-    TopicFromRequestRecord, TriggerRecord,
+    ActionRecord, HttpInRecord, HttpOutRecord, HttpPollRecord, Qos, RuleRecord, Secret,
+    TopicFromRecord, TopicFromRequestRecord, TriggerRecord,
 };
 
 /// What can be wrong with a rule.
@@ -44,6 +44,19 @@ pub enum RuleError {
          so it has no trigger; remove the filter"
     )]
     TriggerOnIngest,
+    /// A polling rule was given a trigger.
+    ///
+    /// Its own variant rather than a shared one worded generally,
+    /// because the two are different mistakes: an operator who put a
+    /// filter on an ingest rule expected a request to be filtered, and
+    /// one who put a filter on a poller expected a message to start a
+    /// fetch. Saying which is what tells them the rule does not work
+    /// the way they think.
+    #[error(
+        "an http_poll rule is fired by its own interval rather than by a published \
+         message, so it has no trigger; remove the filter"
+    )]
+    TriggerOnPoll,
     /// An ingest rule was given no bearer token.
     ///
     /// Section 9.2: **the token is not optional and a rule without one
@@ -259,26 +272,62 @@ impl Trigger {
 
 /// What a rule does when it fires.
 ///
-/// One action, section 9.1. Two today: `http_out` posts an envelope out
-/// and `http_in` accepts a post in. `http_poll` and `mqtt_bridge` are
-/// later milestones' variants of this.
+/// One action, section 9.1. Three today: `http_out` posts an envelope
+/// out, `http_in` accepts a post in, and `http_poll` fetches on an
+/// interval. `mqtt_bridge` is the fourth and is a later task's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Post a JSON envelope to a URL. Section 9.2.
     HttpOut(HttpOut),
     /// Accept a post and publish its body. Section 9.2.
     HttpIn(HttpIn),
+    /// Fetch a URL on an interval and publish the body. Section 9.2.
+    HttpPoll(HttpPoll),
 }
 
 impl Action {
     /// Whether this action is fired by a published message.
     ///
     /// The question a trigger answers. `http_out` is; `http_in` is
-    /// fired by a request and has nothing to trigger on.
+    /// fired by a request and `http_poll` by a clock, and neither has
+    /// anything to trigger on.
     pub fn fires_on_messages(&self) -> bool {
         match self {
             Self::HttpOut(_) => true,
-            Self::HttpIn(_) => false,
+            Self::HttpIn(_) | Self::HttpPoll(_) => false,
+        }
+    }
+
+    /// Whether only one node in the cluster may run this action.
+    ///
+    /// Section 9.2: bridges and pollers are singletons, selected by
+    /// [`crate::singleton`]. An `http_out` rule is not — a message
+    /// fires it on the node it entered the cluster on, and that is
+    /// where its outbox is — and neither is `http_in`, whose endpoint
+    /// is reachable wherever it is served.
+    pub fn is_singleton(&self) -> bool {
+        match self {
+            Self::HttpPoll(_) => true,
+            Self::HttpOut(_) | Self::HttpIn(_) => false,
+        }
+    }
+
+    /// Why a rule with this action may not have a trigger.
+    ///
+    /// # Errors
+    ///
+    /// The refusal naming what fires this kind of rule instead.
+    fn trigger_refusal(&self) -> RuleError {
+        match self {
+            Self::HttpIn(_) => RuleError::TriggerOnIngest,
+            Self::HttpPoll(_) => RuleError::TriggerOnPoll,
+            // [`Self::fires_on_messages`] is true for this one, so a
+            // trigger on it is required rather than refused and the
+            // caller never asks. The arm is here because the compiler
+            // does, and it answers with the refusal that *is* this
+            // action's, so that a future caller reaching it is wrong
+            // rather than panicking.
+            Self::HttpOut(_) => RuleError::NoTrigger,
         }
     }
 }
@@ -392,6 +441,65 @@ pub struct HttpOut {
     pub backoff_ms: u32,
 }
 
+/// How an `http_poll` action fetches. Section 9.2.
+///
+/// A GET on an interval, publishing the response body to a topic.
+///
+/// **No retry count and no backoff**, unlike [`HttpOut`] beside it.
+/// That is the connector rather than a field left out: a poller has no
+/// outbox, so a fetch that failed is simply tried again on the next
+/// interval, and a body republished late is worse than one not
+/// republished. The argument is in [`crate::http_poll`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpPoll {
+    /// Where to fetch from. `https://`, or `http://` to a loopback
+    /// address, on exactly the rule [`HttpOut`] is held to.
+    pub url: String,
+    /// Headers to send, in the order they were configured.
+    pub headers: Vec<(String, String)>,
+    /// How long between the start of one fetch and the next, in
+    /// milliseconds.
+    pub interval_ms: u32,
+    /// How long one fetch may take, in milliseconds.
+    pub timeout_ms: u32,
+    /// The most of a response body that will be read, in bytes.
+    pub max_body_bytes: u32,
+    /// Where the body is published.
+    pub topic: String,
+    /// The level it is published at.
+    pub qos: QoS,
+    /// Whether it is retained.
+    pub retain: bool,
+}
+
+impl Default for HttpPoll {
+    /// Nowhere to fetch from, nowhere to publish to, and bounds on
+    /// everything else.
+    ///
+    /// The url and the topic are deliberately empty rather than
+    /// placeholders, for the reason [`HttpOut::default`] gives about
+    /// the url: a default that reaches somewhere is worse than one that
+    /// reaches nowhere.
+    ///
+    /// A minute between fetches. Section 9.2 gives no figure, and a
+    /// default short enough to matter to somebody else's endpoint is a
+    /// default that should have been written down; a minute is the
+    /// interval an operator who did not think about it would not be
+    /// embarrassed by.
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            headers: Vec::new(),
+            interval_ms: 60_000,
+            timeout_ms: 10_000,
+            max_body_bytes: 256 * 1024,
+            topic: String::new(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+        }
+    }
+}
+
 impl Default for HttpOut {
     /// Somewhere to post, and bounds on everything else.
     ///
@@ -449,8 +557,8 @@ impl Rule {
     /// - [`RuleError::NoName`] when the name is empty.
     /// - [`RuleError::NoTrigger`] when an action that fires on
     ///   published messages was given none.
-    /// - [`RuleError::TriggerOnIngest`] when an action that does not
-    ///   was given one.
+    /// - [`RuleError::TriggerOnIngest`] or [`RuleError::TriggerOnPoll`]
+    ///   when an action that does not was given one.
     /// - [`RuleError::NoToken`] when an `http_in` action has no bearer
     ///   token. Section 9.2: the token is not optional. Refused here
     ///   rather than only where a route is registered, because a rule
@@ -467,7 +575,7 @@ impl Rule {
         }
         match (action.fires_on_messages(), trigger.is_some()) {
             (true, false) => return Err(RuleError::NoTrigger),
-            (false, true) => return Err(RuleError::TriggerOnIngest),
+            (false, true) => return Err(action.trigger_refusal()),
             _ => {}
         }
         if let Action::HttpIn(http) = &action {
@@ -531,6 +639,16 @@ impl Rule {
                     retries: http.retries,
                     backoff_ms: http.backoff_ms,
                 }),
+                Action::HttpPoll(http) => ActionRecord::HttpPoll(HttpPollRecord {
+                    url: http.url.clone(),
+                    headers: http.headers.clone(),
+                    interval_ms: http.interval_ms,
+                    timeout_ms: http.timeout_ms,
+                    max_body_bytes: http.max_body_bytes,
+                    topic: http.topic.clone(),
+                    qos: stored_qos(http.qos),
+                    retain: http.retain,
+                }),
                 Action::HttpIn(http) => ActionRecord::HttpIn(HttpInRecord {
                     token: http.token.clone(),
                     topic: http.topic.clone(),
@@ -570,6 +688,16 @@ impl TryFrom<&RuleRecord> for Rule {
                 max_concurrency: http.max_concurrency,
                 retries: http.retries,
                 backoff_ms: http.backoff_ms,
+            }),
+            ActionRecord::HttpPoll(http) => Action::HttpPoll(HttpPoll {
+                url: http.url.clone(),
+                headers: http.headers.clone(),
+                interval_ms: http.interval_ms,
+                timeout_ms: http.timeout_ms,
+                max_body_bytes: http.max_body_bytes,
+                topic: http.topic.clone(),
+                qos: live_qos(http.qos),
+                retain: http.retain,
             }),
             ActionRecord::HttpIn(http) => Action::HttpIn(HttpIn {
                 token: http.token.clone(),

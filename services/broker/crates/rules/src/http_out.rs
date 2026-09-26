@@ -287,7 +287,12 @@ impl Poster {
         client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<hyper::body::Bytes>>,
         action: &HttpOut,
     ) -> Result<Self, HttpOutError> {
-        let (uri, method, headers, timeout) = parts(action)?;
+        let Endpoint {
+            uri,
+            method,
+            headers,
+            timeout,
+        } = parts(action)?;
         Ok(Self {
             client,
             uri,
@@ -369,25 +374,58 @@ pub fn check(action: &HttpOut) -> Result<(), HttpOutError> {
 }
 
 /// Everything a request needs, from what an operator configured.
-fn parts(action: &HttpOut) -> Result<(Uri, Method, HeaderMap, Duration), HttpOutError> {
-    if action.max_concurrency == 0 {
-        return Err(HttpOutError::NoConcurrency);
-    }
-    let uri: Uri = action.url.parse().map_err(|_| HttpOutError::NotAUrl {
-        url: action.url.clone(),
+///
+/// **Not just this connector's.** Section 9.2 gives two connectors a
+/// URL — `http_out` and `http_poll` — and everything that can be wrong
+/// with one is wrong in the same way for both: the refusal of a plain
+/// `http://` URL to anywhere but this machine is the same rule, and a
+/// second copy of it is a second place for it to be weakened. So this
+/// is the one that both go through; see [`Endpoint`].
+#[derive(Debug, Clone)]
+pub struct Endpoint {
+    /// Where the request goes.
+    pub uri: Uri,
+    /// Which method it uses.
+    pub method: Method,
+    /// What it carries.
+    pub headers: HeaderMap,
+    /// How long one attempt may take.
+    pub timeout: Duration,
+}
+
+/// Check a URL, a method, some headers and a timeout, whichever
+/// connector configured them.
+///
+/// `content_type` is set before the configured headers are, so that a
+/// connector configuring its own replaces this rather than being
+/// replaced by it. A connector that sends no body passes `None`.
+///
+/// # Errors
+///
+/// [`HttpOutError`], naming the part of the configuration that is
+/// wrong. Every variant but [`HttpOutError::NoConcurrency`], which
+/// belongs to `http_out`'s own pump and is checked by [`parts`].
+pub fn endpoint(
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    timeout_ms: u32,
+    content_type: Option<&'static str>,
+) -> Result<Endpoint, HttpOutError> {
+    let uri: Uri = url.parse().map_err(|_| HttpOutError::NotAUrl {
+        url: url.to_owned(),
     })?;
-    check_scheme(&uri, &action.url)?;
+    check_scheme(&uri, url)?;
 
-    let method =
-        Method::from_bytes(action.method.as_bytes()).map_err(|_| HttpOutError::NotAMethod {
-            method: action.method.clone(),
-        })?;
+    let method = Method::from_bytes(method.as_bytes()).map_err(|_| HttpOutError::NotAMethod {
+        method: method.to_owned(),
+    })?;
 
-    let mut headers = HeaderMap::new();
-    // Set first so that a rule configuring its own content type
-    // replaces this rather than being replaced by it.
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    for (name, value) in &action.headers {
+    let mut built = HeaderMap::new();
+    if let Some(content_type) = content_type {
+        built.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    }
+    for (name, value) in headers {
         let name =
             HeaderName::from_bytes(name.as_bytes()).map_err(|error| HttpOutError::BadHeader {
                 name: name.clone(),
@@ -397,15 +435,29 @@ fn parts(action: &HttpOut) -> Result<(Uri, Method, HeaderMap, Duration), HttpOut
             name: name.as_str().to_owned(),
             why: error.to_string(),
         })?;
-        headers.insert(name, value);
+        built.insert(name, value);
     }
 
-    Ok((
+    Ok(Endpoint {
         uri,
         method,
-        headers,
-        Duration::from_millis(u64::from(action.timeout_ms)),
-    ))
+        headers: built,
+        timeout: Duration::from_millis(u64::from(timeout_ms)),
+    })
+}
+
+/// Everything a request needs, from what an `http_out` rule configured.
+fn parts(action: &HttpOut) -> Result<Endpoint, HttpOutError> {
+    if action.max_concurrency == 0 {
+        return Err(HttpOutError::NoConcurrency);
+    }
+    endpoint(
+        &action.url,
+        &action.method,
+        &action.headers,
+        action.timeout_ms,
+        Some("application/json"),
+    )
 }
 
 /// Refuse a URL that would put the payload on a network in the clear.

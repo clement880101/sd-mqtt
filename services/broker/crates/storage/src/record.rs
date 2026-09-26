@@ -544,6 +544,36 @@ pub struct HttpInRecord {
     pub retain: bool,
 }
 
+/// How an `http_poll` action fetches, section 9.2.
+///
+/// A GET on an interval, publishing the response body to a topic.
+///
+/// **There is no retry count and no backoff here**, and that is the
+/// shape of the connector rather than a field forgotten: a poller has
+/// no outbox, a fetch that failed is simply tried again on the next
+/// interval, and a body fetched late is worse than one not fetched at
+/// all. `crates/rules/src/http_poll.rs` has the argument.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpPollRecord {
+    /// Where to fetch from.
+    pub url: String,
+    /// Headers to send, in the order they were configured.
+    pub headers: Vec<(String, String)>,
+    /// How long between the start of one fetch and the next, in
+    /// milliseconds.
+    pub interval_ms: u32,
+    /// How long one fetch may take, in milliseconds.
+    pub timeout_ms: u32,
+    /// The most of a response body that will be read, in bytes.
+    pub max_body_bytes: u32,
+    /// Where the body is published.
+    pub topic: String,
+    /// The level it is published at.
+    pub qos: Qos,
+    /// Whether it is retained.
+    pub retain: bool,
+}
+
 /// What a rule does when it fires. One, section 9.1.
 ///
 /// **Variant order is the format**, as it is for [`Record`]: the other
@@ -558,6 +588,15 @@ pub enum ActionRecord {
     /// Appended, so every `HttpOut` record written before this build
     /// still reads back as one and [`FORMAT_VERSION`] does not move.
     HttpIn(HttpInRecord),
+    /// Fetch a URL on an interval and publish the body. Section 9.2's
+    /// `http_poll`.
+    ///
+    /// Appended for the same reason and with the same effect: a record
+    /// written before this build still reads back as whichever of the
+    /// two it was, so [`FORMAT_VERSION`] does not move. What would move
+    /// it is a variant inserted anywhere but the end, because the index
+    /// is the format.
+    HttpPoll(HttpPollRecord),
 }
 
 /// A rule, section 9.1.
@@ -931,6 +970,15 @@ impl Record {
                                             | TopicFromRecord::Query(name) => name.len(),
                                         }
                                 })
+                        }
+                        ActionRecord::HttpPoll(http) => {
+                            http.url.len()
+                                + http.topic.len()
+                                + http
+                                    .headers
+                                    .iter()
+                                    .map(|(name, value)| name.len() + value.len())
+                                    .sum::<usize>()
                         }
                     }
             }
