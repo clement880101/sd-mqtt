@@ -51,6 +51,7 @@ pub mod http_in;
 pub mod http_out;
 pub mod outbox;
 pub mod rule;
+pub mod singleton;
 
 pub use envelope::Envelope;
 pub use http_in::{HttpInError, Ingest};
@@ -60,3 +61,4 @@ pub use rule::{
     Action, ClientPattern, HttpIn, HttpOut, Rule, RuleError, RuleId, TopicFromRequest, TopicSource,
     Trigger,
 };
+pub use singleton::{Membership, NodeId, Ownership};
