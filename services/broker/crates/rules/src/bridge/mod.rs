@@ -72,6 +72,7 @@ pub mod flow;
 pub mod inbound;
 pub mod keepalive;
 pub mod rewrite;
+pub mod subs;
 pub mod topics;
 
 pub use aliases::Aliases;
@@ -81,4 +82,5 @@ pub use flow::{Flow, FlowError};
 pub use inbound::Inbound;
 pub use keepalive::KeepAlive;
 pub use rewrite::{Rewrite, Rewritten};
+pub use subs::{Granted, SubscribeError, Subscriptions};
 pub use topics::{intersects, TopicError};
