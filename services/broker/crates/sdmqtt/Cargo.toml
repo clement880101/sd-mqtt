@@ -11,6 +11,9 @@ description = "A distributed MQTT broker"
 sdmqtt-server = { path = "../server", version = "0.1.0" }
 sdmqtt-admin = { path = "../admin", version = "0.1.0" }
 broker-core = { path = "../broker-core", version = "0.1.0" }
+# The rules and the outbound connector. This is where the HTTP client
+# and the TLS under it enter the binary.
+rules = { path = "../rules", version = "0.1.0" }
 mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
 # With its default features, which is the redb backend: this is the
 # crate that actually opens a file. `broker-core` and `sdmqtt-server`
@@ -18,6 +21,9 @@ mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
 storage = { path = "../storage", version = "0.1.0" }
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "derive", "error-context"] }
 serde = { version = "1", features = ["derive"] }
+# A dead letter's payload, which the broker takes as `Bytes` and never
+# copies.
+bytes.workspace = true
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "signal"] }

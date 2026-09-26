@@ -1145,6 +1145,7 @@ dependencies = [
  "bytes",
  "clap",
  "mqtt-codec",
+ "rules",
  "sdmqtt-admin",
  "sdmqtt-server",
  "serde",

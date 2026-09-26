@@ -7,6 +7,7 @@
 //! is not get in the way.
 
 mod config;
+mod connectors;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -143,7 +144,7 @@ async fn main() -> ExitCode {
 
 /// Everything that can go wrong before the broker is serving.
 #[derive(Debug, thiserror::Error)]
-enum StartupError {
+pub enum StartupError {
     /// The configuration could not be assembled.
     #[error("{0}")]
     Config(#[from] ConfigError),
@@ -176,6 +177,15 @@ enum StartupError {
     /// to, and an operator who wanted one without them can say so.
     #[error("{0}")]
     Admin(#[from] AdminStartError),
+    /// A rule could not be installed.
+    ///
+    /// Fatal rather than a rule that is quietly missing. A broker that
+    /// started with a connector silently not running is a broker
+    /// dropping messages an operator believes are being delivered, and
+    /// the outbox those messages would have gone into is exactly what
+    /// this milestone exists to make trustworthy.
+    #[error("cannot start a rule: {0}")]
+    Connector(String),
 }
 
 /// Wait for whichever stop signal comes first, and name it.
@@ -243,11 +253,29 @@ fn now_seconds() -> u32 {
 /// `Ok(None)` means the configuration named no store directory, which
 /// is a supported mode and not a failure; see the documentation on
 /// [`config::StorageSection::directory`].
-fn restore_broker(config: &Config) -> Result<Option<Arc<Shared>>, StartupError> {
+fn restore_broker(config: &Config) -> Result<Option<Rebuilt>, StartupError> {
     let Some(store) = config.storage.open()? else {
         return Ok(None);
     };
     restore_from(store, config).map(Some)
+}
+
+/// A broker rebuilt from a store, and the two things that read and
+/// write it.
+///
+/// The store and the writer come back out because the connectors need
+/// them: a rule is written into the store at startup and its pump reads
+/// the outbox the hook fills. [`Shared`] holds a writer of its own and
+/// does not hand it out, deliberately — the only way to reach it
+/// through [`Shared`] is to hold the broker's lock, which is what keeps
+/// the store's order the order the broker produced.
+struct Rebuilt {
+    /// What a listener is given.
+    shared: Arc<Shared>,
+    /// What a rule's pump reads.
+    store: Arc<dyn Storage>,
+    /// What a rule's hook and pump write through.
+    writer: Arc<Writer>,
 }
 
 /// The same, against a store somebody else opened.
@@ -258,7 +286,7 @@ fn restore_broker(config: &Config) -> Result<Option<Arc<Shared>>, StartupError> 
 /// the two orders are indistinguishable, so a test that could not make
 /// the read slow could not tell them apart, and the rule section 7.5
 /// states would be guarded by nothing.
-fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Arc<Shared>, StartupError> {
+fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, StartupError> {
     // **Before the restore, not after.** Section 7.5: this is what
     // decides which sessions outlived the outage, and a clock read
     // afterwards would count the read of the store itself against
@@ -380,7 +408,11 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Arc<Shared>,
         );
     }
 
-    Ok(Arc::new(Shared::with_store(broker, writer)))
+    Ok(Rebuilt {
+        shared: Arc::new(Shared::with_store(broker, Arc::clone(&writer))),
+        store,
+        writer,
+    })
 }
 
 /// Start the admin listener beside the MQTT one.
@@ -444,10 +476,10 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
 
     // Section 7.2 and 7.5: the store is opened and the broker rebuilt
     // from it before anything binds.
-    let shared = match restore_broker(&config)? {
-        Some(shared) => {
+    let rebuilt = match restore_broker(&config)? {
+        Some(rebuilt) => {
             readiness.storage_is_open();
-            shared
+            Some(rebuilt)
         }
         None => {
             // Loud, because the alternative to a default is silence
@@ -464,9 +496,28 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             // running with no store is a supported mode, not a node
             // that is forever unready.
             readiness.storage_is_not_configured();
-            Arc::new(Shared::new(config.server().broker))
+            None
         }
     };
+    let shared = match &rebuilt {
+        Some(rebuilt) => Arc::clone(&rebuilt.shared),
+        None => Arc::new(Shared::new(config.server().broker)),
+    };
+
+    // **Before anything binds.** A rule half installed is a message
+    // that fires nothing, and the first thing a client does after a
+    // listener comes up could be to publish one. `Config::validate` has
+    // already refused a configuration with rules and no store, so a
+    // rule here always has somewhere durable to put an envelope.
+    let connectors = match &rebuilt {
+        Some(rebuilt) => {
+            connectors::start(&config, &shared, &rebuilt.store, &rebuilt.writer).await?
+        }
+        None => connectors::start_without_rules(),
+    };
+    if connectors.len() > 0 {
+        tracing::info!(rules = connectors.len(), "rules are running");
+    }
 
     let running = Server::bind_shared(config.server(), shared).await?;
     tracing::info!(
@@ -504,6 +555,10 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         tracing::info!("the admin listener has stopped");
     }
     running.shutdown().await;
+    // After the listener, so that nothing can enter an outbox while its
+    // pump is being stopped, and before the process ends, so that a
+    // pump in the middle of a store write is joined rather than left.
+    connectors.shutdown().await;
     tracing::info!("stopped");
     Ok(())
 }
@@ -677,7 +732,8 @@ mod tests {
 
         let shared = restore_broker(&with_store(directory.path()))
             .expect("the store opens")
-            .expect("a directory was configured");
+            .expect("a directory was configured")
+            .shared;
         let (sessions, subscriptions, clock) = shared.with_broker(|broker| {
             (
                 broker.session_count(),
@@ -747,7 +803,8 @@ mod tests {
 
         let shared = restore_broker(&with_store(directory.path()))
             .expect("the store opens")
-            .expect("a directory was configured");
+            .expect("a directory was configured")
+            .shared;
         assert_eq!(
             shared.with_broker(|broker| broker.session_count()),
             0,
@@ -800,7 +857,8 @@ mod tests {
 
         let shared = restore_broker(&with_store(directory.path()))
             .expect("the store opens")
-            .expect("a directory was configured");
+            .expect("a directory was configured")
+            .shared;
         assert_eq!(
             shared.with_broker(|broker| broker.session_count()),
             1,
@@ -921,7 +979,8 @@ mod tests {
             .expect("the store takes them");
 
         let shared = restore_from(Arc::new(store), &Config::default())
-            .expect("a store that is slow is not a store that failed");
+            .expect("a store that is slow is not a store that failed")
+            .shared;
         assert_eq!(
             shared.with_broker(|broker| broker.session_count()),
             1,

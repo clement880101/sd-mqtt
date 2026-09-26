@@ -55,13 +55,15 @@
 //! survive a restart. Silence is what would make this dangerous, not
 //! the default.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use broker_core::broker::BrokerConfig;
-use mqtt_codec::Limits;
+use mqtt_codec::{Limits, QoS};
+use rules::rule::{Action, ClientPattern, HttpOut, Rule, RuleId, Trigger};
 use sdmqtt_admin::config::{AdminConfig, AdminStartError, Token};
 use sdmqtt_server::connection::{outbox_depth_for, ConnectionConfig};
 use sdmqtt_server::listener::{ServerConfig, DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT};
@@ -154,6 +156,18 @@ pub enum ConfigError {
     /// nothing goes through this file.
     #[error("{0}")]
     Admin(#[from] AdminStartError),
+    /// A rule cannot mean what it says.
+    ///
+    /// Its own variant rather than [`ConfigError::Unusable`] because a
+    /// rule's key is not a fixed string: what an operator needs to see
+    /// is which rule, by the name they gave it.
+    #[error("the rule {id:?} cannot be used: {why}")]
+    Rule {
+        /// Which rule.
+        id: String,
+        /// What is wrong with it.
+        why: String,
+    },
     /// The store itself could not be opened.
     ///
     /// Separate from the directory failing, because the answers are
@@ -485,6 +499,158 @@ impl StorageSection {
     }
 }
 
+/// One rule, as a configuration file spells it.
+///
+/// Section 9.1's rule, flattened by one level: the trigger's three parts
+/// sit beside the name rather than in a table of their own, because a
+/// `[rules.trigger]` holding one required key and two optional ones is
+/// ceremony around a filter.
+///
+/// **Rules are node-local in milestone 4** and replication is milestone
+/// 5's. What a rule declared here does is get written into the store at
+/// startup, so it survives a restart and its outbox hangs off it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleSection {
+    /// What names it, and what its dead-letter topic is built from.
+    ///
+    /// One topic level: no separator, no wildcard, nothing that would
+    /// give one rule's dead-letter topic to another. The rules crate
+    /// refuses anything else.
+    pub id: String,
+    /// What an operator calls it.
+    pub name: String,
+    /// Whether it fires at all.
+    ///
+    /// **Not the same as deleting it.** Turning a connector off while
+    /// an endpoint is down and back on afterwards is the ordinary
+    /// thing to want, and deleting the rule would take its outbox with
+    /// it.
+    #[serde(default = "enabled_unless_said_otherwise")]
+    pub enabled: bool,
+    /// The topic filter a message must match.
+    pub filter: String,
+    /// The lowest level that fires it, if it is narrowed.
+    pub min_qos: Option<u8>,
+    /// The client identifier pattern that fires it, if it is narrowed.
+    pub client_id: Option<String>,
+    /// What it does. One action, section 9.1.
+    pub http_out: HttpOutSection,
+}
+
+/// A rule left out of a file is on.
+fn enabled_unless_said_otherwise() -> bool {
+    true
+}
+
+/// How an `http_out` rule posts.
+///
+/// Every field section 9.2 lists as configurable. The defaults are the
+/// rules crate's own, restated here only where serde needs a function;
+/// `url` has no default because a default that posts somewhere is worse
+/// than one that posts nowhere.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HttpOutSection {
+    /// Where to post. `https://`, or `http://` to a loopback address.
+    pub url: String,
+    /// Which method to use.
+    pub method: String,
+    /// Headers to send.
+    ///
+    /// A table, so it is written the way a header is read:
+    /// `headers = { "x-token" = "secret" }`. **Sorted by name**, which
+    /// a table is anyway and which costs nothing: HTTP gives no meaning
+    /// to the order of two differently named headers, and a table
+    /// cannot express the one case where order does matter — the same
+    /// name twice — at all.
+    pub headers: BTreeMap<String, String>,
+    /// How long one attempt may take, in milliseconds.
+    pub timeout_ms: u32,
+    /// How many attempts may be in flight at once.
+    pub max_concurrency: u16,
+    /// How many times to retry after the first attempt fails.
+    pub retries: u8,
+    /// How long to wait before the first retry, in milliseconds.
+    pub backoff_ms: u32,
+}
+
+impl Default for HttpOutSection {
+    /// Nowhere to post, and bounds on everything else.
+    fn default() -> Self {
+        let action = HttpOut::default();
+        Self {
+            url: action.url,
+            method: action.method,
+            headers: BTreeMap::new(),
+            timeout_ms: action.timeout_ms,
+            max_concurrency: action.max_concurrency,
+            retries: action.retries,
+            backoff_ms: action.backoff_ms,
+        }
+    }
+}
+
+impl RuleSection {
+    /// This section as the rules crate's own type.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Rule`] naming the rule and what is wrong with it.
+    /// Everything an operator can get wrong is checked here, once, at
+    /// startup: the identifier, the filter, the level, the URL, the
+    /// scheme, the method and every header. A rule that cannot post is
+    /// a broker that does not start, rather than a rule that quietly
+    /// never fires.
+    pub fn to_rule(&self) -> Result<Rule, ConfigError> {
+        let wrong = |why: String| ConfigError::Rule {
+            id: self.id.clone(),
+            why,
+        };
+
+        let id = RuleId::new(self.id.clone()).map_err(|error| wrong(error.to_string()))?;
+        let mut trigger =
+            Trigger::new(self.filter.clone()).map_err(|error| wrong(error.to_string()))?;
+        if let Some(level) = self.min_qos {
+            trigger.min_qos = Some(match level {
+                0 => QoS::AtMostOnce,
+                1 => QoS::AtLeastOnce,
+                2 => QoS::ExactlyOnce,
+                other => {
+                    return Err(wrong(format!(
+                        "min_qos = {other} is not a level; MQTT has 0, 1 and 2"
+                    )))
+                }
+            });
+        }
+        if let Some(pattern) = &self.client_id {
+            trigger.client_id = Some(ClientPattern::new(pattern.clone()));
+        }
+
+        let action = HttpOut {
+            url: self.http_out.url.clone(),
+            method: self.http_out.method.clone(),
+            headers: self
+                .http_out
+                .headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            timeout_ms: self.http_out.timeout_ms,
+            max_concurrency: self.http_out.max_concurrency,
+            retries: self.http_out.retries,
+            backoff_ms: self.http_out.backoff_ms,
+        };
+        // Before anything is stored and long before anything is posted.
+        rules::http_out::check(&action).map_err(|error| wrong(error.to_string()))?;
+
+        let mut rule = Rule::new(id, self.name.clone(), trigger, Action::HttpOut(action))
+            .map_err(|error| wrong(error.to_string()))?;
+        rule.enabled = self.enabled;
+        Ok(rule)
+    }
+}
+
 /// The log section.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -514,6 +680,14 @@ pub struct Config {
     pub admin: AdminConfig,
     /// The log section.
     pub log: Log,
+    /// The rules this node holds, section 9.1.
+    ///
+    /// Written as `[[rules]]` tables, which is why this is a list and
+    /// not a map: a map keyed by identifier would read better and would
+    /// put the identifier somewhere `deny_unknown_fields` cannot check
+    /// it, so a typo in a key would silently create a second rule.
+    #[serde(default)]
+    pub rules: Vec<RuleSection>,
 }
 
 /// What the command line says, where it says anything.
@@ -700,6 +874,41 @@ impl Config {
         if self.admin.enabled {
             self.admin.check()?;
         }
+
+        // **A rule with no store is a rule that silently loses
+        // messages.** An envelope goes into a durable outbox before the
+        // publisher is answered, and without `storage.directory` there
+        // is nothing durable to put it in: every message in flight when
+        // the process ends is gone, which is the one thing this
+        // connector exists not to do. Refused rather than warned about,
+        // unlike running with no store at all — that is a supported
+        // mode, and declaring a rule is an operator saying they want
+        // messages delivered somewhere else.
+        if !self.rules.is_empty() && self.storage.directory.is_none() {
+            return Err(ConfigError::Unusable {
+                key: "storage.directory",
+                value: "unset".to_string(),
+                why: "a rule needs a durable outbox, so rules require a store directory",
+            });
+        }
+
+        // Two rules under one identifier is one rule's outbox, one
+        // rule's dead-letter topic and two rules' messages. The store
+        // would accept it — a put replaces — and the second would
+        // silently take the first's place.
+        let mut seen = BTreeMap::new();
+        for section in &self.rules {
+            // Everything an operator can get wrong about a rule, said
+            // once here with the rule named, so that a broker never
+            // starts with a connector that cannot post.
+            section.to_rule()?;
+            if seen.insert(section.id.clone(), ()).is_some() {
+                return Err(ConfigError::Rule {
+                    id: section.id.clone(),
+                    why: "two rules share this identifier; each rule needs its own".to_string(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -883,6 +1092,192 @@ mod tests {
             config.listener.address,
             "and the defaults reach the server"
         );
+    }
+
+    // ---- rules ---------------------------------------------------------
+
+    /// A file with a store and one rule in it.
+    fn with_rule(rule: &str) -> String {
+        format!("[storage]\ndirectory = \"/tmp/sdmqtt-test\"\n\n{rule}")
+    }
+
+    /// A rule whose only stated keys are the required ones.
+    const MINIMAL: &str = r#"
+        [[rules]]
+        id = "telemetry"
+        name = "Telemetry out"
+        filter = "sensor/+/temp"
+
+        [rules.http_out]
+        url = "https://example.invalid/hook"
+    "#;
+
+    #[track_caller]
+    fn refuse(text: &str) -> ConfigError {
+        let mut config = Config::from_toml(text).expect("the file parses");
+        config
+            .storage
+            .directory
+            .get_or_insert_with(|| PathBuf::from("/tmp/sdmqtt-test"));
+        config
+            .validate()
+            .expect_err("this configuration must be refused")
+    }
+
+    #[test]
+    fn a_rule_takes_the_rules_crate_defaults_for_everything_it_does_not_say() {
+        let config = Config::from_toml(&with_rule(MINIMAL)).expect("every key is known");
+        config.validate().expect("a minimal rule is usable");
+
+        assert_eq!(config.rules.len(), 1);
+        let section = &config.rules[0];
+        assert!(section.enabled, "a rule left alone is on");
+        assert_eq!(section.min_qos, None, "and is not narrowed by level");
+        assert_eq!(section.client_id, None);
+
+        let defaults = HttpOut::default();
+        assert_eq!(section.http_out.method, defaults.method);
+        assert_eq!(section.http_out.timeout_ms, defaults.timeout_ms);
+        assert_eq!(section.http_out.retries, defaults.retries);
+        assert_eq!(section.http_out.backoff_ms, defaults.backoff_ms);
+        assert_eq!(section.http_out.max_concurrency, defaults.max_concurrency);
+
+        let rule = section.to_rule().expect("it converts");
+        assert_eq!(rule.id.as_str(), "telemetry");
+        assert_eq!(rule.trigger.filter(), "sensor/+/temp");
+        assert_eq!(rule.id.dead_letter_topic(), "$sd/rules/telemetry/dlq");
+    }
+
+    #[test]
+    fn every_part_of_a_rule_can_be_said() {
+        let text = with_rule(
+            r#"
+            [[rules]]
+            id = "telemetry"
+            name = "Telemetry out"
+            enabled = false
+            filter = "sensor/+/temp"
+            min_qos = 2
+            client_id = "sensor-*"
+
+            [rules.http_out]
+            url = "https://example.invalid/hook"
+            method = "PUT"
+            timeout_ms = 2500
+            max_concurrency = 8
+            retries = 5
+            backoff_ms = 750
+            headers = { "x-token" = "secret" }
+        "#,
+        );
+        let config = Config::from_toml(&text).expect("every key is known");
+        config.validate().expect("it is usable");
+        let rule = config.rules[0].to_rule().expect("it converts");
+
+        assert!(!rule.enabled);
+        assert_eq!(rule.trigger.min_qos, Some(QoS::ExactlyOnce));
+        assert_eq!(
+            rule.trigger.client_id.as_ref().map(ClientPattern::as_str),
+            Some("sensor-*")
+        );
+        let Action::HttpOut(action) = &rule.action;
+        assert_eq!(action.method, "PUT");
+        assert_eq!(action.timeout_ms, 2_500);
+        assert_eq!(action.max_concurrency, 8);
+        assert_eq!(action.retries, 5);
+        assert_eq!(action.backoff_ms, 750);
+        assert_eq!(
+            action.headers,
+            vec![("x-token".to_owned(), "secret".to_owned())]
+        );
+    }
+
+    /// A rule with nowhere durable to put an envelope is refused.
+    ///
+    /// Running with no store at all stays a warning, because that is a
+    /// supported mode. Declaring a rule is an operator saying they want
+    /// messages delivered somewhere else, and an outbox that is not
+    /// written down loses every one that was in flight.
+    #[test]
+    fn a_rule_without_a_store_is_refused() {
+        let mut config = Config::from_toml(MINIMAL).expect("the file parses");
+        assert!(config.storage.directory.is_none());
+        let error = config
+            .validate()
+            .expect_err("a rule with no store must be refused");
+        assert!(
+            matches!(&error, ConfigError::Unusable { key, .. } if *key == "storage.directory"),
+            "said: {error}"
+        );
+
+        // And the same file with a store is fine, so the refusal is
+        // about the store and not about the rule.
+        config.storage.directory = Some(PathBuf::from("/tmp/sdmqtt-test"));
+        config.validate().expect("with a store it is usable");
+    }
+
+    #[test]
+    fn two_rules_under_one_identifier_are_refused() {
+        let error = refuse(&with_rule(&format!("{MINIMAL}\n{MINIMAL}")));
+        assert!(
+            matches!(&error, ConfigError::Rule { id, .. } if id == "telemetry"),
+            "said: {error}"
+        );
+    }
+
+    /// Everything a rule can be wrong about is refused at startup, by
+    /// name, rather than becoming a rule that quietly never fires.
+    #[test]
+    fn a_rule_that_cannot_post_stops_the_broker_starting() {
+        for (what, rule) in [
+            (
+                "a plain-text url to somewhere that is not this machine",
+                MINIMAL.replace(
+                    "https://example.invalid/hook",
+                    "http://example.invalid/hook",
+                ),
+            ),
+            (
+                "a url that is not one",
+                MINIMAL.replace("https://example.invalid/hook", "not a url"),
+            ),
+            (
+                "a method that is not one",
+                format!("{MINIMAL}\n        method = \"NOT A METHOD\"\n"),
+            ),
+            (
+                "a header name that cannot be sent",
+                format!("{MINIMAL}\n        headers = {{ \"not a name\" = \"v\" }}\n"),
+            ),
+            (
+                "an identifier with a topic separator in it",
+                MINIMAL.replace(r#"id = "telemetry""#, r#"id = "a/b""#),
+            ),
+            (
+                "a filter that is not one",
+                MINIMAL.replace(
+                    r#"filter = "sensor/+/temp""#,
+                    r#"filter = "sensor/+x/temp""#,
+                ),
+            ),
+            (
+                "a level MQTT does not have",
+                MINIMAL.replace(
+                    r#"filter = "sensor/+/temp""#,
+                    "filter = \"sensor/+/temp\"\n        min_qos = 3",
+                ),
+            ),
+            (
+                "a concurrency of zero, which is a rule that never posts",
+                format!("{MINIMAL}\n        max_concurrency = 0\n"),
+            ),
+        ] {
+            let error = refuse(&with_rule(&rule));
+            assert!(
+                matches!(&error, ConfigError::Rule { id, .. } if id == "telemetry" || id == "a/b"),
+                "{what}: said {error}"
+            );
+        }
     }
 
     #[test]
