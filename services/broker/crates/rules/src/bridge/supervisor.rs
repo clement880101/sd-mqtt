@@ -32,10 +32,46 @@
 //! restart discards them. That is a real cost and it is the smaller
 //! one: those are messages the remote would deliver again on its own
 //! terms if it kept them, and the alternative is a protocol violation.
-//! Making the in-flight window durable is what removes the cost, it is
-//! a record shape and a restore path rather than a line of code, and
-//! it is named here so that it reads as a deferral rather than as an
-//! oversight — convention 8.
+//!
+//! # The window is still not durable, and this is what that costs
+//!
+//! **Ruled on and left, deliberately.** Making it durable is a record
+//! type, a write on the path every outbound publish takes, a restore,
+//! a reconciliation against the CONNACK's Session Present — a restored
+//! window is worse than none if the remote threw its session away
+//! anyway — both storage backends, the contract suite and a restart
+//! property. It is a known and bounded amount of work, and it is not
+//! this task's; what is this task's is saying exactly what an operator
+//! gives up until it is done, so that the deferral is legible from
+//! outside the source. Convention 8: the deferred and the forgotten
+//! look identical in a codebase and opposite in a review.
+//!
+//! What an operator loses, in full:
+//!
+//! - **Messages the remote held for this bridge while this broker was
+//!   down are discarded.** An inbound topic entry at an acknowledged
+//!   level, a remote that kept the session, and anything published on
+//!   that filter during the restart: the clean start throws the
+//!   session away and takes the queue with it. This broker never sees
+//!   those messages, so **no counter here moves and no log line here
+//!   mentions them** — the loss is invisible from this end, which is
+//!   the worst property it has.
+//! - **`clean_start = false` and `session_expiry_secs` do not mean
+//!   across a restart of this broker what they mean across a dropped
+//!   socket.** They are honoured on every reconnection within a
+//!   process and overridden on the first of each process. An operator
+//!   who set them expecting the remote to hold their traffic while
+//!   this broker restarted does not get that.
+//! - **The remote may see a message twice, without a duplicate flag.**
+//!   Anything in flight when the process died is re-sent from the
+//!   durable outbox under a fresh identifier in a fresh session, so
+//!   at-least-once is kept and the second copy is not marked as a
+//!   repeat of the first. A remote deduplicating on packet identifier
+//!   cannot catch it.
+//!
+//! Because the first of those is invisible, [`Supervisor::once`] says
+//! it out loud on the connection it happens on rather than leaving it
+//! here.
 //!
 //! # The state topic is local, and the will is the remote's copy
 //!
@@ -352,11 +388,22 @@ impl Supervisor {
         // process has forgotten.
         let clean_start = !self.connected_before || self.bridge.action.clean_start;
         if !self.connected_before && !self.bridge.action.clean_start {
-            tracing::info!(
+            // **A warning and not a note.** The module documentation
+            // says why the clean start is right; what it costs is a
+            // loss this broker cannot see — messages the remote held
+            // for us and is about to discard were never ours, so no
+            // counter here moves and nothing else would ever mention
+            // them. An operator who configured a resumed session is
+            // entitled to be told that this one time they did not get
+            // one, and what that threw away.
+            tracing::warn!(
                 rule = self.bridge.rule.as_str(),
                 "this is the first connection of this process, so it asks for a clean \
-                 start even though the rule does not: a resumed session would hold \
-                 packet identifiers this process no longer knows about"
+                 start even though mqtt_bridge.clean_start is false: a resumed session \
+                 would hold packet identifiers this process no longer knows about. \
+                 Anything the remote was holding for this bridge while this broker was \
+                 down is discarded with the session, and nothing here counts it, \
+                 because it never arrived"
             );
         }
 
