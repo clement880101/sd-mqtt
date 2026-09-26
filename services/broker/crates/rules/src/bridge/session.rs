@@ -53,7 +53,7 @@ use crate::rule::{MqttBridge, RuleId};
 
 use super::aliases::Aliases;
 use super::connack::{self, Asked, ConnAckError, Negotiated, OFFLINE, ONLINE};
-use super::flow::Flow;
+use super::flow::{Finished, Flow};
 use super::inbound::Inbound;
 use super::keepalive::{Due, KeepAlive};
 use super::marker::{self, Marker, Refused};
@@ -152,11 +152,13 @@ pub struct Bridge {
     /// What this rule has been doing. See [`crate::stats`].
     ///
     /// A bridge reports `fired` from the hook that queues a message,
-    /// `delivered` when the remote has taken one, and `failed` for a
-    /// message the remote said it would not accept. **It never dead
-    /// letters**, and that is the connector rather than a counter
-    /// nobody wired up: a bridge has no attempt limit to exhaust. It
-    /// reconnects, and what it queued meanwhile is still queued.
+    /// `delivered` when the remote has taken one, and `failed` for
+    /// every message it will not hand over: one the remote refused by
+    /// reason code, one this bridge would not carry, and one whose
+    /// payload has gone from the store. **It never dead letters**, and
+    /// that is the connector rather than a counter nobody wired up: a
+    /// bridge has no attempt limit to exhaust. It reconnects, and what
+    /// it queued meanwhile is still queued.
     pub stats: Arc<crate::stats::RuleStats>,
 }
 
@@ -170,6 +172,43 @@ impl Bridge {
             .map(|rewrite| (rewrite.remote_filter().to_owned(), rewrite.qos()))
             .collect()
     }
+}
+
+/// Why an envelope is leaving this bridge's outbox.
+///
+/// **Every way out goes through [`Session::retire`]**, and this is
+/// what it is told, because the three are not the same event and the
+/// statistics an operator reads are where the difference shows. A
+/// `retire` that counted a delivery whatever had happened drew a
+/// healthy line for a bridge whose every message was being refused,
+/// and that is the shape this enum exists to make impossible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retired {
+    /// The remote took responsibility for it.
+    Delivered,
+    /// It was refused: by the remote's reason code, or by this bridge
+    /// before it ever went out.
+    Refused,
+    /// Its payload is gone from the store, so there was nothing to
+    /// send and there is nothing to release.
+    Orphaned,
+}
+
+/// Why an outbox entry produced no publish.
+///
+/// Three outcomes rather than an [`Option`], because what the entry is
+/// owed differs: one leaves with its payload released, one leaves
+/// without a release because the payload is what has gone, and one
+/// decides nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Declined {
+    /// This bridge will not carry it. The entry leaves, released.
+    Refused,
+    /// The store no longer holds its payload.
+    Orphaned,
+    /// The store could not be read, so nothing is known about this
+    /// entry and nothing is decided about it.
+    Unreadable,
 }
 
 /// What one connection produced, for the supervisor's log line.
@@ -499,8 +538,7 @@ impl Session<'_> {
             Packet::Publish(publish) => self.take_in(publish, write, out, keep).await,
             Packet::PubAck(ack) => {
                 let finished = self.flow.on_puback(&ack).map_err(protocol)?;
-                self.retire(finished.token).await;
-                self.carried.sent += 1;
+                self.answered(finished).await;
                 Ok(())
             }
             Packet::PubRec(ack) => {
@@ -510,24 +548,18 @@ impl Session<'_> {
                     keep.sent(Instant::now());
                 }
                 if let Some(finished) = finished {
-                    // The remote refused it. The entry still leaves the
+                    // The remote refused it, which is the only way an
+                    // exchange ends here. The entry still leaves the
                     // outbox: [MQTT-4.3.3-x] says the publish must not
                     // be retransmitted, so retrying would be a protocol
                     // error dressed as persistence.
-                    tracing::warn!(
-                        rule = self.bridge.rule.as_str(),
-                        reason = ?finished.reason,
-                        "the remote refused a message; it is not retried"
-                    );
-                    self.retire(finished.token).await;
-                    self.carried.refused += 1;
+                    self.answered(finished).await;
                 }
                 Ok(())
             }
             Packet::PubComp(ack) => {
                 let finished = self.flow.on_pubcomp(&ack).map_err(protocol)?;
-                self.retire(finished.token).await;
-                self.carried.sent += 1;
+                self.answered(finished).await;
                 Ok(())
             }
             Packet::PubRel(ack) => {
@@ -770,12 +802,30 @@ impl Session<'_> {
             };
             self.cursor = entry.sequence + 1;
 
-            let Some(publish) = self.compose(&entry) else {
+            let publish = match self.compose(&entry) {
+                Ok(publish) => publish,
                 // Not carried, for a reason already logged. The entry
                 // leaves the outbox: keeping it would stall the bridge
                 // behind a message it has decided not to send.
-                self.retire(entry.sequence).await;
-                continue;
+                Err(Declined::Refused) => {
+                    self.retire(entry.sequence, Retired::Refused).await;
+                    continue;
+                }
+                // The same, minus the release: see [`Retired`].
+                Err(Declined::Orphaned) => {
+                    self.retire(entry.sequence, Retired::Orphaned).await;
+                    continue;
+                }
+                // **Nothing is known about this entry, so nothing is
+                // decided about it.** A store that could not answer is
+                // not a message this bridge has refused, and taking
+                // the envelope out on the strength of one failed read
+                // would throw away something this broker accepted. The
+                // cursor has already moved past it, so the bridge is
+                // not stalled behind it either: the next pass over the
+                // outbox — this connection's or the next one's — reads
+                // it again.
+                Err(Declined::Unreadable) => continue,
             };
 
             if publish.qos == QoS::AtMostOnce {
@@ -784,7 +834,7 @@ impl Session<'_> {
                 // bytes are written.
                 send(write, out, &Packet::Publish(publish), version).await?;
                 keep.sent(Instant::now());
-                self.retire(entry.sequence).await;
+                self.retire(entry.sequence, Retired::Delivered).await;
                 self.carried.sent += 1;
                 continue;
             }
@@ -804,24 +854,36 @@ impl Session<'_> {
 
     /// Turn one outbox entry into the publish that goes out, or
     /// decline it.
-    fn compose(&mut self, entry: &OutboxRecord) -> Option<Publish> {
+    fn compose(&mut self, entry: &OutboxRecord) -> Result<Publish, Declined> {
         let body = match self.bridge.store.body(&entry.body) {
             Ok(Some(body)) => body,
             Ok(None) => {
+                // The payload is gone, so there is nothing to send and
+                // no reconnection that would ever make it come back.
+                // **[`Declined::Orphaned`] rather than a refusal**: the
+                // store refuses a release of a body it does not hold
+                // and a batch is applied in full or not at all, so an
+                // entry retired with a completion record would leave
+                // neither record behind — the envelope would still be
+                // there on the next connection, and on every one after
+                // it. `http_out` has the same case and the same
+                // answer; see [`crate::Outbox::orphaned`].
                 tracing::error!(
                     rule = self.bridge.rule.as_str(),
                     sequence = entry.sequence,
-                    "an outbox entry named a payload the store no longer holds"
+                    "an outbox entry named a payload the store no longer holds; it \
+                     cannot be sent"
                 );
-                return None;
+                return Err(Declined::Orphaned);
             }
             Err(error) => {
                 tracing::error!(
                     rule = self.bridge.rule.as_str(),
+                    sequence = entry.sequence,
                     %error,
                     "an outbox entry's payload could not be read"
                 );
-                return None;
+                return Err(Declined::Unreadable);
             }
         };
 
@@ -850,7 +912,7 @@ impl Session<'_> {
                 "an outbox entry matches no outbound topic entry"
             );
             self.carried.refused += 1;
-            return None;
+            return Err(Declined::Refused);
         };
 
         let stored = broker_core::journal::live_properties(&body.properties);
@@ -880,7 +942,7 @@ impl Session<'_> {
                          allows, and is dropped"
                     ),
                 }
-                return None;
+                return Err(Declined::Refused);
             }
         };
 
@@ -932,16 +994,44 @@ impl Session<'_> {
                      dropped; sending it would be a protocol error the remote closes for"
                 );
                 self.carried.refused += 1;
-                self.bridge.stats.failed();
-                return None;
+                return Err(Declined::Refused);
             }
         }
 
-        Some(publish)
+        Ok(publish)
     }
 
-    /// Take one entry out of the outbox, its delivery finished.
-    async fn retire(&self, sequence: u64) {
+    /// One exchange the remote has answered, counted for what the
+    /// answer said.
+    ///
+    /// **The reason code decides.** [MQTT-3.4.2-1] gives a PUBACK and
+    /// a PUBCOMP a reason code, and 0x80 and above is a refusal: "not
+    /// authorized" and "quota exceeded" are the ordinary answers from
+    /// a broker with access control, and a bridge that counted them as
+    /// deliveries would drop every message while its chart drew a flat
+    /// healthy line. The entry leaves the outbox either way, because
+    /// [MQTT-4.3.3-x] says a refused publish must not be
+    /// retransmitted; what changes is which counter moves.
+    async fn answered(&mut self, finished: Finished) {
+        if finished.accepted {
+            self.retire(finished.token, Retired::Delivered).await;
+            self.carried.sent += 1;
+            return;
+        }
+        tracing::warn!(
+            rule = self.bridge.rule.as_str(),
+            reason = ?finished.reason,
+            "the remote refused a message; it is not retried"
+        );
+        self.retire(finished.token, Retired::Refused).await;
+        self.carried.refused += 1;
+    }
+
+    /// Take one entry out of the outbox, and say what became of it.
+    ///
+    /// The one door out of this bridge's outbox, so that what an
+    /// operator reads cannot disagree with what happened.
+    async fn retire(&self, sequence: u64, outcome: Retired) {
         let Ok(Some(entry)) = self
             .bridge
             .outbox
@@ -953,13 +1043,29 @@ impl Session<'_> {
             // Already gone, which a repeat acknowledgement can cause.
             return;
         }
-        self.bridge.stats.delivered();
-        let records: Vec<Record> = self.bridge.outbox.completed(&entry);
+        match outcome {
+            Retired::Delivered => self.bridge.stats.delivered(),
+            // A message this bridge accepted and will never hand over
+            // is a failure, whether the remote refused it or its
+            // payload went missing. The bridge has no attempt limit to
+            // exhaust, so it never dead letters; see [`Bridge::stats`].
+            Retired::Refused | Retired::Orphaned => self.bridge.stats.failed(),
+        }
+        let records: Vec<Record> = match outcome {
+            // **No release.** The store refuses a release of a body it
+            // does not hold, and the body is what has gone; a batch is
+            // all or nothing, so a completion record here would leave
+            // the envelope in the outbox for ever.
+            Retired::Orphaned => self.bridge.outbox.orphaned(sequence),
+            Retired::Delivered | Retired::Refused => self.bridge.outbox.completed(&entry),
+        };
         if let Err(error) = self.bridge.writer.apply(records) {
             tracing::error!(
                 rule = self.bridge.rule.as_str(),
+                sequence,
+                ?outcome,
                 %error,
-                "a delivered message could not be taken out of its outbox"
+                "a finished message could not be taken out of its outbox"
             );
         }
     }
