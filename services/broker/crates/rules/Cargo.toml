@@ -18,11 +18,40 @@ broker-core = { path = "../broker-core", version = "0.1.0" }
 # `broker-core` takes it that way: nothing here touches a disk.
 storage = { path = "../storage", version = "0.1.0", default-features = false }
 thiserror.workspace = true
+# The HTTP client, and the TLS under it.
+#
+# Section 16 schedules the TLS stack for milestone 7; posting to an
+# HTTPS endpoint pulls it forward by three milestones. The client half
+# of `hyper-util` is nearly free because axum already brought hyper;
+# everything else in the jump is TLS. Measured, recorded and accepted in
+# `docs/research/component-selection.md`.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client", "client-legacy", "http1", "tokio"] }
+# `webpki-tokio` rather than `native-tokio`: a distroless image has no
+# operating-system trust store to read, and this broker is built to run
+# in one. `aws-lc-rs` rather than `ring` for the reasons in the research
+# notes; `ring` stays available for exotic targets.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "webpki-tokio", "aws-lc-rs"] }
+http-body-util = "0.1"
+# **Default features off.** Its SIMD engine became default-on in 0.23
+# and is `unsafe`, which every crate in this workspace forbids. Scalar
+# costs 16 KB.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `rt` and `time` for the task that does the posting, and `sync` for the
+# concurrency limit a rule's configuration sets.
+tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-# The outbox's tests build payloads; `Bytes` is what a stored body
-# carries and what the broker hands over without copying.
+# The outbox's and the envelope's tests build payloads; `Bytes` is what
+# a stored body carries and what the broker hands over without copying.
 bytes.workspace = true
+# The delivery tests stand up a real HTTP server on the loopback and
+# assert the envelope arrives, so they need a runtime with a listener
+# and a timer in it. Dev only: nothing of `net` ships.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
 
 [lints]
 workspace = true

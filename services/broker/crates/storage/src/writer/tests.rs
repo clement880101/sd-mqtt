@@ -359,6 +359,10 @@ impl Storage for Fake {
     fn outbox_highest_sequence(&self, _: &str) -> Result<u64, StorageError> {
         Ok(0)
     }
+
+    fn body(&self, _: &MessageId) -> Result<Option<BodyRecord>, StorageError> {
+        Ok(None)
+    }
 }
 
 /// A store that dies rather than answering, for the one path where the
@@ -401,6 +405,10 @@ impl Storage for Unavailable {
 
     fn outbox_highest_sequence(&self, _: &str) -> Result<u64, StorageError> {
         Ok(0)
+    }
+
+    fn body(&self, _: &MessageId) -> Result<Option<BodyRecord>, StorageError> {
+        Ok(None)
     }
 }
 
@@ -1349,6 +1357,9 @@ fn the_thread_is_named() {
         }
         fn outbox_highest_sequence(&self, _: &str) -> Result<u64, StorageError> {
             Ok(0)
+        }
+        fn body(&self, _: &MessageId) -> Result<Option<BodyRecord>, StorageError> {
+            Ok(None)
         }
     }
 

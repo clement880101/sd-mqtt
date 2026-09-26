@@ -451,6 +451,10 @@ impl Storage for MemoryStorage {
             .get(rule)
             .map_or(0, |held| held.highest_sequence))
     }
+
+    fn body(&self, id: &MessageId) -> Result<Option<BodyRecord>, StorageError> {
+        Ok(self.state().bodies.get(id).map(|held| held.body.clone()))
+    }
 }
 
 #[cfg(test)]

@@ -2171,6 +2171,44 @@ mod contract {
         );
     }
 
+    /// A body can be read back one at a time, and reading one the store
+    /// does not hold is `None` rather than an error.
+    ///
+    /// [`Storage::restore`] answers this at startup for everything at
+    /// once; an outbox filled while the broker is running needs the
+    /// payload of an envelope nobody has read since, and the answer has
+    /// to come from the store rather than from a memory of it.
+    pub fn a_body_can_be_read_back_on_its_own<S: Storage>(new: impl Fn() -> S) {
+        let store = new();
+        assert_eq!(
+            store.body(&body_id(1)).expect("the read must answer"),
+            None,
+            "a body the store does not hold must read as absent, not as an error"
+        );
+
+        apply(
+            &store,
+            &[Record::BodyPut {
+                id: body_id(1),
+                body: body(1),
+            }],
+        );
+        assert_eq!(
+            store.body(&body_id(1)).expect("the read must answer"),
+            Some(body(1)),
+            "the body came back changed"
+        );
+        // And not somebody else's.
+        assert_eq!(store.body(&body_id(2)).expect("the read must answer"), None);
+
+        apply(&store, &[Record::BodyReleased { id: body_id(1) }]);
+        assert_eq!(
+            store.body(&body_id(1)).expect("the read must answer"),
+            None,
+            "a released body was still readable"
+        );
+    }
+
     // ---- flush ------------------------------------------------------------
 
     /// A flush changes nothing about what the store holds, and a store
@@ -2249,6 +2287,7 @@ macro_rules! every_contract_test {
             an_envelope_for_an_unknown_rule_is_refused,
             an_outbox_survives_an_edit_and_goes_with_a_delete,
             removing_an_envelope_does_not_release_the_body_it_named,
+            a_body_can_be_read_back_on_its_own,
             a_flush_keeps_everything_and_leaves_the_store_usable,
         }
     };
@@ -2280,7 +2319,8 @@ every_contract_test!(run_against, redb, crate::on_disk::fresh);
 /// unchanged.
 mod on_disk {
     use storage::{
-        OutboxRecord, QueueEntry, Record, RedbStorage, Restored, SessionKey, Storage, StorageError,
+        BodyRecord, MessageId, OutboxRecord, QueueEntry, Record, RedbStorage, Restored, SessionKey,
+        Storage, StorageError,
     };
 
     /// A store, and the directory it lives in.
@@ -2344,6 +2384,10 @@ mod on_disk {
 
         fn outbox_highest_sequence(&self, rule: &str) -> Result<u64, StorageError> {
             self.store.outbox_highest_sequence(rule)
+        }
+
+        fn body(&self, id: &MessageId) -> Result<Option<BodyRecord>, StorageError> {
+            self.store.body(id)
         }
     }
 }

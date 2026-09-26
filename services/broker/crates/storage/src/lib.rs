@@ -387,6 +387,22 @@ pub trait Storage: Send + Sync + 'static {
     /// next. Zero for a rule that has never fired, which makes the first
     /// assigned number one, and zero again once the rule is removed.
     fn outbox_highest_sequence(&self, rule: &str) -> Result<u64, StorageError>;
+
+    /// One stored body, by the identifier that names it.
+    ///
+    /// [`Storage::restore`] hands over every body the store holds and is
+    /// read once at startup; this is for what arrives afterwards. An
+    /// outbox entry names a body rather than carrying one — the payload
+    /// is stored once however many rules and sessions reference it — and
+    /// something has to be able to read it back to build the request it
+    /// eventually posts.
+    ///
+    /// Returns `None` for a body the store does not hold, which is not an
+    /// error: the last reference to it may have been released while the
+    /// caller was deciding to ask. A caller holding a reference of its
+    /// own cannot see that, which is what makes taking one explicit worth
+    /// the trouble.
+    fn body(&self, id: &MessageId) -> Result<Option<BodyRecord>, StorageError>;
 }
 
 #[cfg(test)]

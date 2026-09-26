@@ -887,6 +887,13 @@ mod tests {
         fn outbox_highest_sequence(&self, rule: &str) -> Result<u64, storage::StorageError> {
             self.inner.outbox_highest_sequence(rule)
         }
+
+        fn body(
+            &self,
+            id: &storage::MessageId,
+        ) -> Result<Option<storage::BodyRecord>, storage::StorageError> {
+            self.inner.body(id)
+        }
     }
 
     #[test]

@@ -44,8 +44,8 @@ use ::redb::{
 use serde::Serialize;
 
 use crate::record::{
-    decode_exact, FormatError, FormatMarker, MessageId, OutboxRecord, QueueEntry, Record,
-    SessionKey, SessionRecord,
+    decode_exact, BodyRecord, FormatError, FormatMarker, MessageId, OutboxRecord, QueueEntry,
+    Record, SessionKey, SessionRecord,
 };
 use crate::restore::{Restored, RestoredSession};
 use crate::{Rejection, Storage, StorageError, SyncMode};
@@ -372,6 +372,15 @@ impl Storage for RedbStorage {
 
     fn outbox_highest_sequence(&self, rule: &str) -> Result<u64, StorageError> {
         Ok(self.outbox_state_of(rule)?.highest_sequence)
+    }
+
+    fn body(&self, id: &MessageId) -> Result<Option<BodyRecord>, StorageError> {
+        let transaction = self.database.begin_read().map_err(StorageError::from)?;
+        let bodies = open_read(&transaction, BODIES)?;
+        let Some(held) = bodies.get(&id.0[..]).map_err(StorageError::from)? else {
+            return Ok(None);
+        };
+        decode(held.value()).map(Some)
     }
 }
 

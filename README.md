@@ -48,6 +48,69 @@ The directory is created if it is not there, and the store is the file
 `sdmqtt.redb` inside it. One broker per directory: a second is refused
 with the path it could not take.
 
+### Rules post to an endpoint, and do it at least once
+
+A rule watches a topic filter and posts a JSON envelope to a URL.
+
+```toml
+[[rules]]
+id = "telemetry"                  # one topic level: no /, +, # or spaces
+name = "Telemetry out"
+enabled = true                    # the default
+filter = "sensor/+/temp"
+min_qos = 1                       # optional: only at this level or above
+client_id = "sensor-*"            # optional: only from these clients
+
+[rules.http_out]
+url = "https://example.com/hook"  # https, or http to a loopback address
+method = "POST"
+timeout_ms = 10000                # how long one attempt may take
+retries = 3                       # attempts after the first
+backoff_ms = 1000                 # doubling, and capped at five minutes
+headers = { "x-token" = "secret" }
+```
+
+**A message that fires a rule is written to that rule's durable outbox
+before the publisher is answered**, and the posting happens afterwards
+from a task of its own. So an endpoint that is down does not slow the
+broker down, and a broker that is killed with messages in flight still
+delivers them when it comes back. Rules need `storage.directory`: an
+outbox that is not written down is not an outbox.
+
+**Delivery is at least once. Your endpoint will eventually see the same
+message twice.** A request that times out may have arrived, been
+understood and been acted on — this end cannot tell — and the choice is
+between retrying and risking a duplicate or not retrying and losing a
+message. sd-mqtt retries.
+
+Every envelope therefore carries an `id` that is minted once, stored
+with it, and **does not change between attempts**:
+
+```json
+{"id":"0123456789abcdeffedcba9876543210","topic":"sensor/1/temp",
+ "payload":"21.5","qos":1,"retain":false,"client_id":"sensor-1",
+ "timestamp":1700000000,"user_properties":[["unit","celsius"]]}
+```
+
+Remember recent identifiers and drop the repeats, or make the endpoint
+idempotent. A payload that is not valid UTF-8 arrives as
+`payload_base64` instead of `payload`, never both.
+
+An envelope that fails every attempt is published to
+`$sd/rules/<id>/dlq` with the reason and the attempt count, and leaves
+the outbox.
+
+**A failing endpoint is not hammered.** The backoff belongs to the rule
+rather than to each envelope, so a rule with a thousand messages waiting
+makes one attempt per backoff window and not a thousand at once. A
+`Retry-After` in seconds is honoured over the rule's own figure, up to
+five minutes.
+
+Rules named in the configuration are written into the store at startup,
+so they survive a restart. A rule left in the store that the
+configuration no longer names is kept, not run, and logged: deleting it
+would take its outbox — and anything still waiting in it — with it.
+
 ### The admin listener answers to an address, not to a name
 
 ```toml
