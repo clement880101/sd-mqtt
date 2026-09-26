@@ -77,6 +77,24 @@ const STARTUP: Duration = Duration::from_secs(20);
 /// How long to wait for something that should happen.
 const PATIENCE: Duration = Duration::from_secs(20);
 
+/// The admin listener's token, so a test can read what the broker
+/// thinks it holds.
+const ADMIN_TOKEN: &str = "a-secret-for-the-test";
+
+/// The ingest rule's identifier, and so the last level of its path.
+const INGEST_RULE: &str = "gateway";
+
+/// The ingest rule's own bearer token, which is not the admin one: a
+/// rule's token is per rule, and a test that used one secret for both
+/// could not tell them apart.
+const INGEST_TOKEN: &str = "a-secret-for-the-gateway";
+
+/// Where the ingest rule publishes.
+const INGEST_TOPIC: &str = "ingest/across";
+
+/// What is posted before the broker is killed.
+const POSTED: &[u8] = b"posted before the broker was killed";
+
 // ---- the endpoint -------------------------------------------------------
 
 /// One request, as the endpoint saw it.
@@ -266,7 +284,14 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// A file rather than flags, because a rule has no flag and should not:
 /// a command line is visible in `ps` to every user on the host, and a
 /// rule's headers are usually somebody's bearer token.
-fn write_config(path: &Path, store: &Path, mqtt: SocketAddr, admin: SocketAddr, rule: &str) {
+fn write_config(
+    path: &Path,
+    store: &Path,
+    mqtt: SocketAddr,
+    admin: SocketAddr,
+    ingest: SocketAddr,
+    rule: &str,
+) {
     let text = format!(
         r#"
 [listener]
@@ -274,7 +299,10 @@ address = "{mqtt}"
 
 [admin]
 address = "{admin}"
-token = "a-secret-for-the-test"
+token = "{ADMIN_TOKEN}"
+
+[ingest]
+address = "{ingest}"
 
 [storage]
 directory = "{store}"
@@ -291,6 +319,26 @@ level = "info"
         interval = NEVER.as_millis(),
     );
     std::fs::write(path, text).expect("the configuration file can be written");
+}
+
+/// A `[[rules]]` table accepting posts on one fixed topic.
+///
+/// At least once, which is the whole point: section 7.3 says an
+/// acknowledgement at that level promises the message is durable, and
+/// the response to the post is that acknowledgement.
+fn rule_accepting_posts() -> String {
+    format!(
+        r#"
+[[rules]]
+id = "{INGEST_RULE}"
+name = "Gateway in"
+
+[rules.http_in]
+token = "{INGEST_TOKEN}"
+topic = "{INGEST_TOPIC}"
+qos = 1
+"#
+    )
 }
 
 /// A `[[rules]]` table posting to `url`.
@@ -427,6 +475,95 @@ fn free_port() -> u16 {
 
 fn loopback(port: u16) -> SocketAddr {
     format!("127.0.0.1:{port}").parse().expect("an address")
+}
+
+// ---- an HTTP client over the socket -------------------------------------
+
+/// What an HTTP request came back with.
+#[derive(Debug)]
+struct Answered {
+    status: u16,
+    body: String,
+}
+
+/// One request, with `Connection: close` so the response ends at end of
+/// file.
+///
+/// Small on purpose. The same argument the admin crate's own test
+/// client makes: this project already builds its own MQTT client on its
+/// own codec, and a second HTTP stack in the dev-dependencies would be
+/// a larger thing to audit than the thing it tests.
+fn http(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<&[u8]>,
+) -> Answered {
+    let mut stream = TcpStream::connect_timeout(&address, PATIENCE).expect("the listener accepts");
+    stream
+        .set_read_timeout(Some(PATIENCE))
+        .expect("a read deadline");
+    let body = body.unwrap_or(b"");
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\
+         Authorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(head.as_bytes())
+        .expect("the head is written");
+    stream.write_all(body).expect("and the body");
+    stream.flush().expect("and flushed");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("the response ends");
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in {text:?}"));
+    let body = text
+        .split_once("\r\n\r\n")
+        .map_or(String::new(), |(_, rest)| rest.to_owned());
+    Answered { status, body }
+}
+
+/// Ask the admin API for `path` until `ready` is happy, or give up
+/// loudly.
+///
+/// What this is for is the one race in the test below: dropping a
+/// socket is not the same instant as the broker noticing. Posting
+/// before it has noticed would hand the message to a connection that is
+/// ending, and the test would be about something else.
+#[track_caller]
+fn until(admin: SocketAddr, path: &str, what: &str, ready: impl Fn(&str) -> bool) -> String {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let body = http(admin, "GET", path, ADMIN_TOKEN, None).body;
+        if ready(&body) {
+            return body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: {path} never settled; the last answer was {body}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Wait until something is accepting on `address`.
+#[track_caller]
+fn accepting(address: SocketAddr, what: &str) {
+    let deadline = Instant::now() + STARTUP;
+    while Instant::now() < deadline {
+        if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("{what} never accepted on {address}");
 }
 
 // ---- a client over the socket -------------------------------------------
@@ -587,6 +724,7 @@ fn a_message_reaches_an_endpoint_and_survives_the_broker_being_killed() {
         &store,
         mqtt,
         loopback(free_port()),
+        loopback(free_port()),
         &rule_posting_to(&endpoint.url(), 5, 2_000),
     );
 
@@ -704,6 +842,7 @@ fn the_attempt_count_survives_the_kill() {
         &store,
         mqtt,
         loopback(free_port()),
+        loopback(free_port()),
         &rule_posting_to(&endpoint.url(), RETRIES, 50),
     );
     endpoint.go_down();
@@ -772,6 +911,7 @@ fn a_rule_that_cannot_post_stops_the_broker_starting() {
         &workspace.path().join("store"),
         mqtt,
         loopback(free_port()),
+        loopback(free_port()),
         // Plain text to somewhere that is not this machine. The payload
         // and the rule's headers do not cross a network in the clear.
         &rule_posting_to("http://example.invalid/hook", 3, 50),
@@ -797,4 +937,257 @@ fn a_rule_that_cannot_post_stops_the_broker_starting() {
         said.contains("clear") || said.contains("loopback"),
         "the refusal must say what is wrong with it: {said}"
     );
+}
+
+/// **The other half of milestone four's exit criterion.** An HTTP post
+/// reaches an MQTT subscriber across a restart.
+///
+/// 1. A broker with a store, an ingest rule, and a subscriber whose
+///    session outlives its connection.
+/// 2. The subscriber disconnects, so what is published queues.
+/// 3. A post at least once. It is acknowledged, so it is a promise.
+/// 4. **The broker is killed**, running no destructor.
+/// 5. It starts again, the subscriber reconnects, and the message is
+///    there.
+///
+/// # Killed, not stopped
+///
+/// A clean close of the store writes out everything, flushed or not, so
+/// a politely restarted broker would pass this test against a broker
+/// that never made anything durable. `BrokerProcess::kill` sends
+/// `SIGKILL` and asserts the process died of it.
+///
+/// # The writer is configured never to flush on its own
+///
+/// An hour between interval flushes and a billion records before a
+/// count flush. So nothing here survives because a timer went off, and
+/// the only flush that can have happened is section 7.3's third
+/// trigger: a batch somebody is waiting on. The only waiter in this
+/// path is the post itself, waiting for the durability its `200`
+/// promises. That is the sharp form: **if the message survives, it
+/// survived because answering the post is what made it durable.**
+///
+/// It is also the shape of the mutation this test exists for. Answering
+/// before the wait leaves nothing to trigger a flush at all, so nothing
+/// is on the disk when the process dies.
+#[test]
+fn an_http_post_reaches_a_subscriber_across_a_restart() {
+    let workspace = tempfile::tempdir().expect("a temporary directory");
+    let store = workspace.path().join("store");
+    let config = workspace.path().join("sdmqtt.toml");
+    let mqtt = loopback(free_port());
+    let admin = loopback(free_port());
+    let ingest = loopback(free_port());
+    write_config(
+        &config,
+        &store,
+        mqtt,
+        admin,
+        ingest,
+        &rule_accepting_posts(),
+    );
+
+    let broker = BrokerProcess::start(&config, &store, mqtt, workspace.path().join("first.log"));
+    accepting(ingest, "the ingest listener");
+
+    // ---- a subscriber whose session outlives its connection --------
+    {
+        let mut subscriber = Client::connect(mqtt, "durable-subscriber");
+        subscriber.subscribe(INGEST_TOPIC);
+    }
+    // **Dropped, and then waited for.** Closing a socket is not the
+    // same instant as the broker noticing; a post made in between would
+    // be handed to a connection that is ending, and this test would be
+    // about something else.
+    until(
+        admin,
+        "/api/v1/sessions",
+        "the subscriber must be seen to have gone before anything is posted",
+        |body| body.contains("durable-subscriber") && body.contains("\"connected\":false"),
+    );
+
+    // ---- the post, which is a promise ------------------------------
+    let answered = http(
+        ingest,
+        "POST",
+        &format!("/ingest/{INGEST_RULE}"),
+        INGEST_TOKEN,
+        Some(POSTED),
+    );
+    assert_eq!(answered.status, 200, "{}", answered.body);
+    // **This assertion is about what the answer says, not about what
+    // happened.** The field reports the level's promise, so a handler
+    // that answered before waiting would still set it; the mutation
+    // that skips the wait passes this line and fails the reconnection
+    // at the end. It is here because a caller reads it, not because it
+    // guards anything.
+    assert!(
+        answered.body.contains("\"durable\":true"),
+        "an at-least-once post says the answer is a promise: {}",
+        answered.body
+    );
+    assert!(
+        answered.body.contains("\"delivered\":1"),
+        "and that it reached the session that is waiting for it: {}",
+        answered.body
+    );
+
+    // The broker agrees that it is queued for a session that is not
+    // there. Read before the kill, so a failure afterwards is about
+    // durability rather than about the message never having existed.
+    until(
+        admin,
+        "/api/v1/sessions",
+        "the message must be queued for the disconnected session",
+        |body| body.contains("\"queued\":1"),
+    );
+
+    // ---- killed, not stopped ---------------------------------------
+    broker.kill();
+
+    // ---- and it is still there -------------------------------------
+    let _restarted =
+        BrokerProcess::start(&config, &store, mqtt, workspace.path().join("second.log"));
+    let mut subscriber = Client::connect(mqtt, "durable-subscriber");
+    let delivered = subscriber
+        .delivery_within(PATIENCE)
+        .expect("a post acknowledged before the kill must reach the subscriber after it");
+    assert_eq!(delivered.topic, INGEST_TOPIC);
+    assert_eq!(
+        &delivered.payload[..],
+        POSTED,
+        "something other than what was posted arrived"
+    );
+    assert_eq!(
+        delivered.qos,
+        QoS::AtLeastOnce,
+        "at the level the rule publishes at, which is the level that promised anything"
+    );
+}
+
+/// The ingest listener is its own, and answers nothing of the admin
+/// listener's; and the admin listener answers no ingest route.
+///
+/// Section 9.2: it "defaults to a separate ingest listener rather than
+/// the admin listener, so that publishing data does not require
+/// exposing the administrative surface". Against the real binary,
+/// because that sentence is about two sockets a process bound and
+/// nothing below the shell can see them both.
+///
+/// The failure shape it rules out: an ingest listener that serves the
+/// admin router as well would expose `/api/v1/publish` — which, on a
+/// listener an operator has deliberately opened to webhook senders,
+/// publishes to any topic with no token at all.
+#[test]
+fn the_ingest_listener_serves_ingest_and_nothing_else() {
+    let workspace = tempfile::tempdir().expect("a temporary directory");
+    let store = workspace.path().join("store");
+    let config = workspace.path().join("sdmqtt.toml");
+    let mqtt = loopback(free_port());
+    let admin = loopback(free_port());
+    let ingest = loopback(free_port());
+    write_config(
+        &config,
+        &store,
+        mqtt,
+        admin,
+        ingest,
+        &rule_accepting_posts(),
+    );
+
+    let _broker = BrokerProcess::start(&config, &store, mqtt, workspace.path().join("log"));
+    accepting(ingest, "the ingest listener");
+
+    // Nothing of the admin listener's is on the ingest listener.
+    for path in ["/", "/api/v1/publish", "/api/v1/retained", "/metrics"] {
+        let answered = http(ingest, "GET", path, ADMIN_TOKEN, None);
+        assert_eq!(
+            answered.status, 404,
+            "{path} is the admin listener's and was served on the ingest listener: {}",
+            answered.body
+        );
+    }
+
+    // And the ingest route is not on the admin listener, because this
+    // configuration did not ask for it there.
+    let elsewhere = http(
+        admin,
+        "POST",
+        &format!("/ingest/{INGEST_RULE}"),
+        INGEST_TOKEN,
+        Some(b"x"),
+    );
+    assert_eq!(
+        elsewhere.status, 404,
+        "the ingest route is served where the configuration asked for it: {}",
+        elsewhere.body
+    );
+
+    // The two listeners answer a path neither serves in the same shape,
+    // which is what says the ingest listener's error body is section
+    // 13's and not a second description of it. The two are written in
+    // different crates, because `rules` cannot depend on `sdmqtt-admin`,
+    // and this is the only place both are visible at once.
+    let here = http(ingest, "GET", "/no/such/path", ADMIN_TOKEN, None);
+    let there = http(admin, "GET", "/api/v1/no/such/path", ADMIN_TOKEN, None);
+    assert_eq!(here.status, there.status);
+    assert!(
+        here.body.contains("\"error\":{\"code\":\"not_found\"")
+            && there.body.contains("\"error\":{\"code\":\"not_found\""),
+        "both listeners answer in the one shape: {} against {}",
+        here.body,
+        there.body
+    );
+
+    // And the admin listener still works, so the assertions above are
+    // not passing against a broker that answered 404 to everything.
+    let alive = http(admin, "GET", "/health/live", ADMIN_TOKEN, None);
+    assert_eq!(alive.status, 200, "{}", alive.body);
+}
+
+/// An ingest rule with no token stops the broker starting, by name.
+///
+/// Section 9.2: the token is not optional. The alternative is a broker
+/// that comes up perfectly with an endpoint that publishes for anybody
+/// who finds the port.
+#[test]
+fn an_ingest_rule_with_no_token_stops_the_broker_starting() {
+    let workspace = tempfile::tempdir().expect("a temporary directory");
+    let config = workspace.path().join("sdmqtt.toml");
+    let mqtt = loopback(free_port());
+    write_config(
+        &config,
+        &workspace.path().join("store"),
+        mqtt,
+        loopback(free_port()),
+        loopback(free_port()),
+        &format!(
+            r#"
+[[rules]]
+id = "{INGEST_RULE}"
+name = "Gateway in"
+
+[rules.http_in]
+topic = "{INGEST_TOPIC}"
+"#
+        ),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sdmqtt"))
+        .arg("serve")
+        .arg("--config")
+        .arg(&config)
+        .arg("--store-directory")
+        .arg(workspace.path().join("store"))
+        .env("SDMQTT_CONFIG", "")
+        .env("SDMQTT_STORAGE_DIRECTORY", "")
+        .output()
+        .expect("the broker binary runs");
+    assert!(!output.status.success(), "the broker must refuse to start");
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        said.contains(INGEST_RULE),
+        "the refusal must name the rule: {said}"
+    );
+    assert!(said.contains("token"), "and say what is missing: {said}");
 }
