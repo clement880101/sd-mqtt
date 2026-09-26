@@ -47,11 +47,16 @@
 #![warn(missing_docs)]
 
 pub mod envelope;
+pub mod http_in;
 pub mod http_out;
 pub mod outbox;
 pub mod rule;
 
 pub use envelope::Envelope;
+pub use http_in::{HttpInError, Ingest};
 pub use http_out::{Attempt, DeadLetters, Delivery, HttpOutError, Poster, Turn};
 pub use outbox::Outbox;
-pub use rule::{Action, ClientPattern, HttpOut, Rule, RuleError, RuleId, Trigger};
+pub use rule::{
+    Action, ClientPattern, HttpIn, HttpOut, Rule, RuleError, RuleId, TopicFromRequest, TopicSource,
+    Trigger,
+};

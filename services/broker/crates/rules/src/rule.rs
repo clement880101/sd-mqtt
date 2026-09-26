@@ -14,7 +14,10 @@
 use std::fmt;
 
 use mqtt_codec::QoS;
-use storage::record::{ActionRecord, HttpOutRecord, Qos, RuleRecord, TriggerRecord};
+use storage::record::{
+    ActionRecord, HttpInRecord, HttpOutRecord, Qos, RuleRecord, Secret, TopicFromRecord,
+    TopicFromRequestRecord, TriggerRecord,
+};
 
 /// What can be wrong with a rule.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -28,6 +31,30 @@ pub enum RuleError {
     /// A rule must be called something an operator can recognise.
     #[error("a rule must have a name")]
     NoName,
+    /// An action that fires on messages was given no trigger.
+    #[error("a rule whose action fires on published messages needs a trigger")]
+    NoTrigger,
+    /// An action that does not fire on messages was given one.
+    ///
+    /// Refused rather than ignored. A filter on an ingest rule is a
+    /// filter that can never fire, and an operator who wrote one
+    /// believes something about when the rule runs that is not true.
+    #[error(
+        "an http_in rule is fired by a request rather than by a published message, \
+         so it has no trigger; remove the filter"
+    )]
+    TriggerOnIngest,
+    /// An ingest rule was given no bearer token.
+    ///
+    /// Section 9.2: **the token is not optional and a rule without one
+    /// is refused**, on the same reasoning that refuses an unprotected
+    /// admin listener. The endpoint publishes, so an unguarded one is a
+    /// hole rather than a degraded mode.
+    #[error(
+        "an http_in rule must have a token: the endpoint publishes, so an unguarded \
+         one is a hole rather than a degraded mode. Set http_in.token."
+    )]
+    NoToken,
 }
 
 /// What names a rule, for as long as it exists.
@@ -232,13 +259,110 @@ impl Trigger {
 
 /// What a rule does when it fires.
 ///
-/// One action, section 9.1. An enum of one today: `http_out` is the
-/// action milestone 4 builds, and the others section 9.2 names are later
-/// milestones' variants of this.
+/// One action, section 9.1. Two today: `http_out` posts an envelope out
+/// and `http_in` accepts a post in. `http_poll` and `mqtt_bridge` are
+/// later milestones' variants of this.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Post a JSON envelope to a URL. Section 9.2.
     HttpOut(HttpOut),
+    /// Accept a post and publish its body. Section 9.2.
+    HttpIn(HttpIn),
+}
+
+impl Action {
+    /// Whether this action is fired by a published message.
+    ///
+    /// The question a trigger answers. `http_out` is; `http_in` is
+    /// fired by a request and has nothing to trigger on.
+    pub fn fires_on_messages(&self) -> bool {
+        match self {
+            Self::HttpOut(_) => true,
+            Self::HttpIn(_) => false,
+        }
+    }
+}
+
+/// Where a request may name the topic it is publishing to.
+///
+/// Section 9.2: a named header **or** a query parameter. An enum rather
+/// than two optional fields, so that "both, and nothing says which
+/// wins" is a state that cannot be written down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopicSource {
+    /// The named request header.
+    Header(String),
+    /// The named query parameter.
+    Query(String),
+}
+
+impl TopicSource {
+    /// The header or parameter name, whichever this is.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Header(name) | Self::Query(name) => name,
+        }
+    }
+}
+
+/// A topic the request chose, and the prefix that bounds it.
+///
+/// **The prefix is not optional, and that is deliberate.** Section 9.2
+/// allows the topic to come from a header or a query parameter
+/// "restricted by a prefix so a caller cannot publish anywhere", and
+/// that restriction is the whole safety of the feature: without it an
+/// ingest rule is a way for whoever holds one rule's token to publish
+/// to any topic on the broker, including the reserved namespace. Held
+/// together with the source rather than beside it, so that a source
+/// with no prefix is not a check somebody can forget — it is a value
+/// nobody can construct.
+///
+/// What "under" means is [`crate::http_in::is_under`], and it is by
+/// topic level rather than by string prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicFromRequest {
+    /// Where the request says it.
+    pub source: TopicSource,
+    /// The prefix the topic must be at or under.
+    pub prefix: String,
+}
+
+/// How an `http_in` action accepts a post. Section 9.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpIn {
+    /// The bearer token a request must present.
+    ///
+    /// Not optional. [`Rule::new`] refuses an empty one, which is where
+    /// every rule this process holds is accepted — from a
+    /// configuration file and from the store alike.
+    pub token: Secret,
+    /// Where the body is published when the request does not choose.
+    pub topic: String,
+    /// Where the request may choose instead, and what bounds it.
+    pub topic_from: Option<TopicFromRequest>,
+    /// The level the body is published at.
+    pub qos: QoS,
+    /// Whether it is retained.
+    pub retain: bool,
+}
+
+impl Default for HttpIn {
+    /// No token, nowhere to publish, and the level that promises
+    /// nothing.
+    ///
+    /// The token is deliberately empty rather than a generated
+    /// placeholder: a default that is a secret is a secret in a
+    /// repository. [`Rule::new`] refuses this value, which is the point
+    /// — the default is a shape to fill in, not a rule that runs.
+    fn default() -> Self {
+        Self {
+            token: Secret::new(String::new()),
+            topic: String::new(),
+            topic_from: None,
+            qos: QoS::AtMostOnce,
+            retain: false,
+        }
+    }
 }
 
 /// How an `http_out` action posts.
@@ -300,8 +424,14 @@ pub struct Rule {
     /// ordinary thing to want, and deleting the rule would take its
     /// outbox with it.
     pub enabled: bool,
-    /// When it fires.
-    pub trigger: Trigger,
+    /// When it fires, for an action that fires on messages.
+    ///
+    /// `None` for one that does not: section 9.2's `http_in` is fired
+    /// by a request, and a filter on it would be a filter that can
+    /// never match. [`Rule::new`] refuses either half without the
+    /// other, so this is `Some` exactly when
+    /// [`Action::fires_on_messages`] is true.
+    pub trigger: Option<Trigger>,
     /// What it does. One, section 9.1.
     pub action: Action,
 }
@@ -309,18 +439,41 @@ pub struct Rule {
 impl Rule {
     /// A rule.
     ///
+    /// **This is where a rule is accepted**, from a configuration file
+    /// and from the store alike — [`Rule::try_from`] goes through here
+    /// too — so it is where the refusals that must hold of every rule
+    /// in this process live.
+    ///
     /// # Errors
     ///
-    /// [`RuleError::NoName`] when the name is empty.
+    /// - [`RuleError::NoName`] when the name is empty.
+    /// - [`RuleError::NoTrigger`] when an action that fires on
+    ///   published messages was given none.
+    /// - [`RuleError::TriggerOnIngest`] when an action that does not
+    ///   was given one.
+    /// - [`RuleError::NoToken`] when an `http_in` action has no bearer
+    ///   token. Section 9.2: the token is not optional. Refused here
+    ///   rather than only where a route is registered, because a rule
+    ///   stored without one is a rule that will be registered later.
     pub fn new(
         id: RuleId,
         name: impl Into<String>,
-        trigger: Trigger,
+        trigger: Option<Trigger>,
         action: Action,
     ) -> Result<Self, RuleError> {
         let name = name.into();
         if name.is_empty() {
             return Err(RuleError::NoName);
+        }
+        match (action.fires_on_messages(), trigger.is_some()) {
+            (true, false) => return Err(RuleError::NoTrigger),
+            (false, true) => return Err(RuleError::TriggerOnIngest),
+            _ => {}
+        }
+        if let Action::HttpIn(http) = &action {
+            if http.token.is_empty() {
+                return Err(RuleError::NoToken);
+            }
         }
         Ok(Self {
             id,
@@ -333,11 +486,15 @@ impl Rule {
 
     /// Whether this message fires this rule.
     ///
-    /// A disabled rule fires on nothing. Asked here rather than by every
-    /// caller, because a caller that forgot would run a rule an operator
-    /// switched off.
+    /// A disabled rule fires on nothing, and so does a rule with no
+    /// trigger. Asked here rather than by every caller, because a
+    /// caller that forgot would run a rule an operator switched off.
     pub fn fires_on(&self, topic: &str, qos: QoS, client_id: &str) -> bool {
-        self.enabled && self.trigger.matches(topic, qos, client_id)
+        self.enabled
+            && self
+                .trigger
+                .as_ref()
+                .is_some_and(|trigger| trigger.matches(topic, qos, client_id))
     }
 
     /// This rule as the store holds it.
@@ -346,15 +503,24 @@ impl Rule {
             id: self.id.as_str().to_owned(),
             name: self.name.clone(),
             enabled: self.enabled,
-            trigger: TriggerRecord {
-                filter: self.trigger.filter().to_owned(),
-                min_qos: self.trigger.min_qos.map(stored_qos),
-                client_id: self
-                    .trigger
-                    .client_id
-                    .as_ref()
-                    .map(|pattern| pattern.as_str().to_owned()),
-            },
+            // A rule with no trigger stores the empty one. See
+            // [`RuleRecord::trigger`]: an empty filter is not a filter,
+            // so it cannot be read back as one somebody meant.
+            trigger: self.trigger.as_ref().map_or_else(
+                || TriggerRecord {
+                    filter: String::new(),
+                    min_qos: None,
+                    client_id: None,
+                },
+                |trigger| TriggerRecord {
+                    filter: trigger.filter().to_owned(),
+                    min_qos: trigger.min_qos.map(stored_qos),
+                    client_id: trigger
+                        .client_id
+                        .as_ref()
+                        .map(|pattern| pattern.as_str().to_owned()),
+                },
+            ),
             action: match &self.action {
                 Action::HttpOut(http) => ActionRecord::HttpOut(HttpOutRecord {
                     url: http.url.clone(),
@@ -364,6 +530,19 @@ impl Rule {
                     max_concurrency: http.max_concurrency,
                     retries: http.retries,
                     backoff_ms: http.backoff_ms,
+                }),
+                Action::HttpIn(http) => ActionRecord::HttpIn(HttpInRecord {
+                    token: http.token.clone(),
+                    topic: http.topic.clone(),
+                    topic_from: http.topic_from.as_ref().map(|from| TopicFromRequestRecord {
+                        source: match &from.source {
+                            TopicSource::Header(name) => TopicFromRecord::Header(name.clone()),
+                            TopicSource::Query(name) => TopicFromRecord::Query(name.clone()),
+                        },
+                        prefix: from.prefix.clone(),
+                    }),
+                    qos: stored_qos(http.qos),
+                    retain: http.retain,
                 }),
             },
         }
@@ -382,14 +561,6 @@ impl TryFrom<&RuleRecord> for Rule {
     /// codec keeps: what a reader rejects, a writer must refuse, and the
     /// reader is here.
     fn try_from(record: &RuleRecord) -> Result<Self, Self::Error> {
-        let mut trigger = Trigger::new(record.trigger.filter.clone())?;
-        trigger.min_qos = record.trigger.min_qos.map(live_qos);
-        trigger.client_id = record
-            .trigger
-            .client_id
-            .as_ref()
-            .map(|pattern| ClientPattern::new(pattern.clone()));
-
         let action = match &record.action {
             ActionRecord::HttpOut(http) => Action::HttpOut(HttpOut {
                 url: http.url.clone(),
@@ -400,6 +571,35 @@ impl TryFrom<&RuleRecord> for Rule {
                 retries: http.retries,
                 backoff_ms: http.backoff_ms,
             }),
+            ActionRecord::HttpIn(http) => Action::HttpIn(HttpIn {
+                token: http.token.clone(),
+                topic: http.topic.clone(),
+                topic_from: http.topic_from.as_ref().map(|from| TopicFromRequest {
+                    source: match &from.source {
+                        TopicFromRecord::Header(name) => TopicSource::Header(name.clone()),
+                        TopicFromRecord::Query(name) => TopicSource::Query(name.clone()),
+                    },
+                    prefix: from.prefix.clone(),
+                }),
+                qos: live_qos(http.qos),
+                retain: http.retain,
+            }),
+        };
+
+        // An empty filter is the stored spelling of "no trigger"; see
+        // [`RuleRecord::trigger`]. Anything else has to be a filter,
+        // and `Rule::new` decides whether this action may have one.
+        let trigger = if record.trigger.filter.is_empty() {
+            None
+        } else {
+            let mut trigger = Trigger::new(record.trigger.filter.clone())?;
+            trigger.min_qos = record.trigger.min_qos.map(live_qos);
+            trigger.client_id = record
+                .trigger
+                .client_id
+                .as_ref()
+                .map(|pattern| ClientPattern::new(pattern.clone()));
+            Some(trigger)
         };
 
         let mut rule = Self::new(
@@ -447,7 +647,7 @@ mod tests {
         Rule::new(
             RuleId::new("telemetry").expect("a plain word is an identifier"),
             "Telemetry out",
-            Trigger::new("sensor/+/temp").expect("a valid filter"),
+            Some(Trigger::new("sensor/+/temp").expect("a valid filter")),
             http_out(),
         )
         .expect("a named rule")
@@ -552,7 +752,7 @@ mod tests {
         let outcome = Rule::new(
             RuleId::new("r").expect("an identifier"),
             "",
-            Trigger::new("a").expect("a filter"),
+            Some(Trigger::new("a").expect("a filter")),
             http_out(),
         );
         assert_eq!(outcome.unwrap_err(), RuleError::NoName);
@@ -562,14 +762,167 @@ mod tests {
     fn a_rule_round_trips_through_its_record() {
         let mut original = rule();
         original.enabled = false;
-        original.trigger = original
-            .trigger
-            .clone()
-            .at_least(QoS::ExactlyOnce)
-            .from_clients(ClientPattern::new("sensor-*"));
+        original.trigger = original.trigger.clone().map(|trigger| {
+            trigger
+                .at_least(QoS::ExactlyOnce)
+                .from_clients(ClientPattern::new("sensor-*"))
+        });
 
         let rebuilt = Rule::try_from(&original.to_record()).expect("our own record must rebuild");
         assert_eq!(rebuilt, original);
+    }
+
+    /// An ingest rule that can be built, for the tests below.
+    fn http_in() -> HttpIn {
+        HttpIn {
+            token: Secret::new("a-secret"),
+            topic: "ingest/one".to_owned(),
+            topic_from: Some(TopicFromRequest {
+                source: TopicSource::Query("t".to_owned()),
+                prefix: "ingest".to_owned(),
+            }),
+            qos: QoS::AtLeastOnce,
+            retain: true,
+        }
+    }
+
+    fn ingest_rule() -> Rule {
+        Rule::new(
+            RuleId::new("gateway").expect("an identifier"),
+            "Gateway in",
+            None,
+            Action::HttpIn(http_in()),
+        )
+        .expect("a named rule")
+    }
+
+    /// Section 9.2: the token is not optional.
+    ///
+    /// **Refused where a rule is accepted**, which is here, rather than
+    /// only where a route is registered. A rule stored without a token
+    /// is a rule that will be registered later, and by then the file
+    /// that produced it is not what anybody is looking at.
+    #[test]
+    fn an_ingest_rule_without_a_token_is_refused() {
+        let mut action = http_in();
+        action.token = Secret::new(String::new());
+        let outcome = Rule::new(
+            RuleId::new("gateway").expect("an identifier"),
+            "Gateway in",
+            None,
+            Action::HttpIn(action),
+        );
+        assert_eq!(outcome.unwrap_err(), RuleError::NoToken);
+    }
+
+    /// And the same rule, refused on the way back out of the store.
+    ///
+    /// The store is bytes on a disk and has been outside this process.
+    /// A record with an empty token would otherwise come back as a rule
+    /// the registry then has to refuse a second time, and this is the
+    /// refusal that makes that second one unreachable.
+    #[test]
+    fn a_stored_ingest_rule_without_a_token_is_refused() {
+        let mut record = ingest_rule().to_record();
+        let ActionRecord::HttpIn(http) = &mut record.action else {
+            panic!("this rule accepts posts");
+        };
+        http.token = Secret::new(String::new());
+        assert_eq!(Rule::try_from(&record).unwrap_err(), RuleError::NoToken);
+    }
+
+    /// A trigger belongs to an action that fires on messages, and to no
+    /// other.
+    ///
+    /// Both halves, because one alone passes against a rule that
+    /// ignores the pairing entirely.
+    #[test]
+    fn a_trigger_belongs_to_the_action_that_fires_on_messages() {
+        let missing = Rule::new(
+            RuleId::new("telemetry").expect("an identifier"),
+            "Telemetry out",
+            None,
+            http_out(),
+        );
+        assert_eq!(missing.unwrap_err(), RuleError::NoTrigger);
+
+        let spurious = Rule::new(
+            RuleId::new("gateway").expect("an identifier"),
+            "Gateway in",
+            Some(Trigger::new("a/#").expect("a filter")),
+            Action::HttpIn(http_in()),
+        );
+        assert_eq!(spurious.unwrap_err(), RuleError::TriggerOnIngest);
+    }
+
+    /// An ingest rule fires on no message, whatever is published.
+    #[test]
+    fn an_ingest_rule_fires_on_nothing_a_client_publishes() {
+        let rule = ingest_rule();
+        assert!(!rule.fires_on("ingest/one", QoS::ExactlyOnce, "anyone"));
+        assert!(!rule.fires_on("anything", QoS::AtMostOnce, ""));
+    }
+
+    #[test]
+    fn an_ingest_rule_round_trips_through_its_record() {
+        let mut original = ingest_rule();
+        original.enabled = false;
+        let record = original.to_record();
+        assert_eq!(
+            record.trigger.filter, "",
+            "an ingest rule stores the empty trigger"
+        );
+        let rebuilt = Rule::try_from(&record).expect("our own record must rebuild");
+        assert_eq!(rebuilt, original);
+    }
+
+    /// A stored ingest rule carrying a trigger is refused.
+    ///
+    /// The store's empty filter means "no trigger"; anything else
+    /// paired with an action that does not fire on messages is a record
+    /// that cannot mean what it says.
+    #[test]
+    fn a_stored_ingest_rule_with_a_trigger_is_refused() {
+        let mut record = ingest_rule().to_record();
+        record.trigger.filter = "a/#".to_owned();
+        assert_eq!(
+            Rule::try_from(&record).unwrap_err(),
+            RuleError::TriggerOnIngest
+        );
+    }
+
+    /// And a stored `http_out` rule with an empty one, from the other
+    /// side.
+    #[test]
+    fn a_stored_rule_that_fires_on_messages_needs_a_filter() {
+        let mut record = rule().to_record();
+        record.trigger.filter = String::new();
+        assert_eq!(Rule::try_from(&record).unwrap_err(), RuleError::NoTrigger);
+    }
+
+    /// A token does not print itself, wherever it is held.
+    ///
+    /// Section 12.3. The whole rule is logged at startup and printed by
+    /// a failing storage test, and an ingest rule's token is a secret
+    /// that lives in one.
+    #[test]
+    fn an_ingest_rule_does_not_print_its_token() {
+        let rule = Rule::new(
+            RuleId::new("gateway").expect("an identifier"),
+            "Gateway in",
+            None,
+            Action::HttpIn(HttpIn {
+                token: Secret::new("hunter2"),
+                ..http_in()
+            }),
+        )
+        .expect("a named rule");
+        for shown in [format!("{rule:?}"), format!("{:?}", rule.to_record())] {
+            assert!(
+                !shown.contains("hunter2"),
+                "section 12.3: a token must not reach a log line: {shown}"
+            );
+        }
     }
 
     #[test]

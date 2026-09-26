@@ -18,6 +18,24 @@ broker-core = { path = "../broker-core", version = "0.1.0" }
 # `broker-core` takes it that way: nothing here touches a disk.
 storage = { path = "../storage", version = "0.1.0", default-features = false }
 thiserror.workspace = true
+# Section 9.2's ingest endpoint publishes into the broker, through the
+# one publish every caller without a session goes through. That is
+# `sdmqtt-server`'s, and taking it here is the same direction the
+# dependency on `broker-core` above is: rules sit above the broker
+# rather than beside it.
+sdmqtt-server = { path = "../server", version = "0.1.0" }
+# The ingest route set. The same version and the same features the
+# admin crate names, because the `Router` this crate builds is served
+# by that crate's listener and the two must be one type. Nothing new
+# reaches the binary: axum is already in it.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "tokio",
+    "json",
+    "query",
+    "matched-path",
+    "tracing",
+] }
 # The HTTP client, and the TLS under it.
 #
 # Section 16 schedules the TLS stack for milestone 7; posting to an
@@ -48,6 +66,15 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # The outbox's and the envelope's tests build payloads; `Bytes` is what
 # a stored body carries and what the broker hands over without copying.
 bytes.workspace = true
+# The gated store, for the one assertion that needs a flush held open:
+# section 7.3 says an at-least-once publish is not answered until it is
+# durable, and that is only visible while a flush is in progress. The
+# same crate this already depends on, with a feature that is dev-only.
+sdmqtt-server = { path = "../server", version = "0.1.0", features = ["testing"] }
+# The ingest tests stand up a real MQTT listener and a real broker, and
+# assert what a subscriber receives. Dev only.
+storage = { path = "../storage", version = "0.1.0", default-features = false }
+broker-core = { path = "../broker-core", version = "0.1.0" }
 # The delivery tests stand up a real HTTP server on the loopback and
 # assert the envelope arrives, so they need a runtime with a listener
 # and a timer in it. Dev only: nothing of `net` ships.

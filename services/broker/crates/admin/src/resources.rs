@@ -124,7 +124,6 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequestParts, Query, State};
@@ -134,10 +133,10 @@ use axum::{Json, Router};
 use broker_core::broker::Broker;
 use broker_core::registry::SessionId;
 use broker_core::retained::RetainedMessage;
-use broker_core::session::message::Message;
 use broker_core::session::Session;
 use bytes::Bytes;
-use mqtt_codec::{Properties, QoS, Version};
+use mqtt_codec::{QoS, Version};
+use sdmqtt_server::publish::{Publication, PublishRefused};
 use serde::{Deserialize, Serialize};
 use storage::record::{Qos, RetainHandling, SubscriptionRecord};
 
@@ -508,6 +507,11 @@ pub enum ListenerProtocol {
     Mqtt,
     /// This API.
     Admin,
+    /// Section 9.2's ingest endpoint, on a listener of its own.
+    ///
+    /// Absent when the ingest routes are served on the admin listener,
+    /// because then there is no second socket to report.
+    Ingest,
 }
 
 /// A listener this node has bound.
@@ -1207,38 +1211,35 @@ fn qos_of(number: u8) -> Result<QoS, ApiError> {
     }
 }
 
+/// A refusal from the one publish, in this API's one shape.
+///
+/// The sentences are the publish path's own, so that two endpoints
+/// refusing the same topic say the same thing. What is added here is
+/// the code and the field, which are HTTP and belong to this crate.
+pub(crate) fn publish_refusal(refused: &PublishRefused) -> ApiError {
+    match refused {
+        // A form can mark the input that was wrong without reading the
+        // sentence.
+        PublishRefused::NotATopic(_) | PublishRefused::Reserved => {
+            ApiError::in_field(ErrorCode::InvalidRequest, "topic", refused.to_string())
+        }
+        PublishRefused::NotDurable => ApiError::new(ErrorCode::Internal, refused.to_string()),
+    }
+}
+
 /// Publish a message, through the path a connection publishes by.
 ///
 /// # There is no second publish here
 ///
-/// Retention, expiry, matching, shared-subscription selection, the
-/// per-session queue and its bounds are all rules, and a second set
-/// of them in this crate would drift from the first the day either
-/// was corrected. So this builds the same [`Message`] a connection's
-/// publish builds and hands it to the same [`Broker::publish`],
-/// under the same [`Shared::with_broker_committed`], and delivers
-/// what comes back with the same [`Shared::deliver`]. What is
-/// written here is the HTTP: a body to validate, and an answer.
-///
-/// # The response is the acknowledgement
-///
-/// Section 7.3: an acknowledgement of an at-least-once or
-/// exactly-once publication tells a publisher the broker has taken
-/// responsibility, so it must not be sent before the message is
-/// durable. A `200` here says the same thing to the same effect, so
-/// it waits for the same flush.
-///
-/// [`promises_durability`] is not what decides it. That function
-/// reads a batch's actions for a PUBACK, PUBREC or PUBCOMP, and
-/// there is no such packet here because there is no publishing
-/// session to send one to — the promise is the HTTP status. So the
-/// level is asked directly, and at-most-once, which promises nobody
-/// anything, waits for nothing.
-///
-/// [`Shared::with_broker_committed`]: sdmqtt_server::shared::Shared::with_broker_committed
-/// [`Shared::deliver`]: sdmqtt_server::shared::Shared::deliver
-/// [`promises_durability`]: sdmqtt_server::shared::promises_durability
-/// [`Message`]: broker_core::session::message::Message
+/// This is the HTTP and nothing else: a body to validate, and an
+/// answer. Everything that decides what a publication *means* —
+/// retention, expiry, matching, shared-subscription selection, the
+/// per-session queue and its bounds, and the wait that makes an
+/// acknowledged level's answer a promise — is
+/// [`sdmqtt_server::publish`], which is the one publish and is shared
+/// with section 9.2's ingest endpoint. It was extracted from here when
+/// that second caller arrived, which is the moment a copy would have
+/// been made instead.
 async fn publish(
     State(state): State<AdminState>,
     _authorized: Authorized,
@@ -1253,105 +1254,22 @@ async fn publish(
         ))
     })?;
 
-    let qos = qos_of(request.qos)?;
-    // Only at-most-once promises nobody anything. Both acknowledged
-    // levels are a promise, and both wait.
-    let promised = qos != QoS::AtMostOnce;
-    let properties = Properties {
-        message_expiry_interval: request.message_expiry_interval,
-        ..Properties::default()
-    };
-    let payload = Bytes::from(request.payload);
-
-    let (outcome, committed) = state.shared.with_broker_committed(
-        |broker| {
-            // Validated inside the lock only because the limits are
-            // the broker's: one acquisition rather than two, and the
-            // work is a scan of a short string.
-            mqtt_codec::topic::validate_name(&request.topic, &broker.config().limits).map_err(
-                |error| {
-                    ApiError::in_field(
-                        ErrorCode::InvalidRequest,
-                        "topic",
-                        format!("that is not a topic a message can be published to: {error}"),
-                    )
-                },
-            )?;
-
-            // Section 12.3: dollar-prefixed topics are not publishable.
-            //
-            // **This endpoint, and not yet a connection.** The rule is
-            // written about clients and the MQTT publish path does not
-            // enforce it; that is older than this endpoint and is
-            // deferred to milestone 7, where the authorization work it
-            // belongs with lives. What is not deferred is this, because
-            // this endpoint is a new way to write one — and a retained
-            // one, which stays until somebody finds it. A reserved
-            // namespace an operator can fill by accident from a form is
-            // worse than one a client can fill, because the form is the
-            // thing that looks sanctioned.
-            //
-            // Only the first level. `a/$b` is an ordinary topic and the
-            // matching layer already treats it as one.
-            if request.topic.starts_with('$') {
-                return Err(ApiError::in_field(
-                    ErrorCode::InvalidRequest,
-                    "topic",
-                    "the dollar-prefixed namespace is reserved for the broker and \
-                     is not publishable, so this endpoint will not write one. \
-                     Publish to a topic outside it.",
-                ));
-            }
-
-            let now = broker.clock().now();
-            let mut message = Message::new(&request.topic, payload, qos, request.retain);
-            // The same two lines a connection's publish uses, so the
-            // properties a subscriber receives and the deadline the
-            // broker enforces come from one rule.
-            message.properties = Arc::new(properties.clone().into());
-            message.expires_at = properties
-                .message_expiry_interval
-                .map(|interval| broker.clock().deadline(interval));
-
-            let mut out = Vec::new();
-            // `None`: this publication has no publishing session, so
-            // no-local cannot apply to it and it is not any
-            // subscriber's own message.
-            let delivered = broker.publish(message, None, now, &mut out);
-            Ok((delivered, out))
+    let published = sdmqtt_server::publish::publish(
+        &state.shared,
+        Publication {
+            topic: request.topic,
+            payload: Bytes::from(request.payload),
+            qos: qos_of(request.qos)?,
+            retain: request.retain,
+            message_expiry_interval: request.message_expiry_interval,
         },
-        // A batch that failed validation produced nothing and
-        // promised nothing.
-        |outcome: &Result<(usize, Vec<_>), ApiError>| promised && outcome.is_ok(),
-    );
-
-    let (delivered, actions) = outcome?;
-
-    if let Err(error) = committed.wait().await {
-        // The same partition a connection makes, with the easy half:
-        // nothing in this batch is addressed to the caller, because
-        // the caller has no session. So every action goes, exactly
-        // as it does for a publisher that is being closed — those
-        // subscribers are alive, were promised nothing, and have
-        // already had the delivery recorded against their windows.
-        // Leaving them undelivered would strand a window slot until
-        // the peer reconnected.
-        tracing::error!(
-            %error,
-            "a publication through the admin API could not be made durable; \
-             the caller is told so rather than answered"
-        );
-        state.shared.deliver(actions);
-        return Err(ApiError::new(
-            ErrorCode::Internal,
-            "the message could not be written to the store, so it is not acknowledged",
-        ));
-    }
-    state.shared.deliver(actions);
+    )
+    .await
+    .map_err(|refused| publish_refusal(&refused))?;
 
     Ok(Json(PublishAccepted {
-        delivered,
-        durable: promised,
+        delivered: published.delivered,
+        durable: published.durable,
     }))
 }
 

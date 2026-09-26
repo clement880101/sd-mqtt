@@ -63,11 +63,15 @@ use std::time::Duration;
 
 use broker_core::broker::BrokerConfig;
 use mqtt_codec::{Limits, QoS};
-use rules::rule::{Action, ClientPattern, HttpOut, Rule, RuleId, Trigger};
+use rules::http_in::HttpInError;
+use rules::rule::{
+    Action, ClientPattern, HttpIn, HttpOut, Rule, RuleId, TopicFromRequest, TopicSource, Trigger,
+};
 use sdmqtt_admin::config::{AdminConfig, AdminStartError, Token};
 use sdmqtt_server::connection::{outbox_depth_for, ConnectionConfig};
 use sdmqtt_server::listener::{ServerConfig, DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT};
 use serde::Deserialize;
+use storage::record::Secret;
 use storage::{RedbStorage, Storage, StorageError, WriterConfig};
 use thiserror::Error;
 
@@ -529,13 +533,22 @@ pub struct RuleSection {
     #[serde(default = "enabled_unless_said_otherwise")]
     pub enabled: bool,
     /// The topic filter a message must match.
-    pub filter: String,
+    ///
+    /// Required for an action that fires on published messages, and
+    /// **refused** for one that does not: section 9.2's `http_in` is
+    /// fired by a request, and a filter on it is a filter that can
+    /// never match. An operator who wrote one believes something about
+    /// when the rule runs that is not true, so it is said rather than
+    /// ignored.
+    pub filter: Option<String>,
     /// The lowest level that fires it, if it is narrowed.
     pub min_qos: Option<u8>,
     /// The client identifier pattern that fires it, if it is narrowed.
     pub client_id: Option<String>,
-    /// What it does. One action, section 9.1.
-    pub http_out: HttpOutSection,
+    /// Post a JSON envelope out, if that is what this rule does.
+    pub http_out: Option<HttpOutSection>,
+    /// Accept a post and publish its body, if that is what it does.
+    pub http_in: Option<HttpInSection>,
 }
 
 /// A rule left out of a file is on.
@@ -598,10 +611,12 @@ impl RuleSection {
     ///
     /// [`ConfigError::Rule`] naming the rule and what is wrong with it.
     /// Everything an operator can get wrong is checked here, once, at
-    /// startup: the identifier, the filter, the level, the URL, the
-    /// scheme, the method and every header. A rule that cannot post is
+    /// startup: the identifier, the filter, the level, and then
+    /// whichever action was written — the URL, the scheme, the method
+    /// and every header for `http_out`, and the token, the topic, the
+    /// source and the prefix for `http_in`. A rule that cannot work is
     /// a broker that does not start, rather than a rule that quietly
-    /// never fires.
+    /// never fires or an endpoint that quietly accepts anything.
     pub fn to_rule(&self) -> Result<Rule, ConfigError> {
         let wrong = |why: String| ConfigError::Rule {
             id: self.id.clone(),
@@ -609,45 +624,273 @@ impl RuleSection {
         };
 
         let id = RuleId::new(self.id.clone()).map_err(|error| wrong(error.to_string()))?;
-        let mut trigger =
-            Trigger::new(self.filter.clone()).map_err(|error| wrong(error.to_string()))?;
-        if let Some(level) = self.min_qos {
-            trigger.min_qos = Some(match level {
-                0 => QoS::AtMostOnce,
-                1 => QoS::AtLeastOnce,
-                2 => QoS::ExactlyOnce,
-                other => {
-                    return Err(wrong(format!(
-                        "min_qos = {other} is not a level; MQTT has 0, 1 and 2"
-                    )))
+        let action = self.to_action(&wrong)?;
+
+        // A filter belongs to an action that fires on messages. Which
+        // of the two mistakes an operator made is said here, where both
+        // halves are visible, rather than as one sentence about a
+        // mismatch.
+        let trigger = match (&self.filter, action.fires_on_messages()) {
+            (Some(filter), true) => {
+                let mut trigger =
+                    Trigger::new(filter.clone()).map_err(|error| wrong(error.to_string()))?;
+                if let Some(level) = self.min_qos {
+                    trigger.min_qos = Some(match level {
+                        0 => QoS::AtMostOnce,
+                        1 => QoS::AtLeastOnce,
+                        2 => QoS::ExactlyOnce,
+                        other => {
+                            return Err(wrong(format!(
+                                "min_qos = {other} is not a level; MQTT has 0, 1 and 2"
+                            )))
+                        }
+                    });
                 }
-            });
-        }
-        if let Some(pattern) = &self.client_id {
-            trigger.client_id = Some(ClientPattern::new(pattern.clone()));
-        }
-
-        let action = HttpOut {
-            url: self.http_out.url.clone(),
-            method: self.http_out.method.clone(),
-            headers: self
-                .http_out
-                .headers
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect(),
-            timeout_ms: self.http_out.timeout_ms,
-            max_concurrency: self.http_out.max_concurrency,
-            retries: self.http_out.retries,
-            backoff_ms: self.http_out.backoff_ms,
+                if let Some(pattern) = &self.client_id {
+                    trigger.client_id = Some(ClientPattern::new(pattern.clone()));
+                }
+                Some(trigger)
+            }
+            (None, true) => {
+                return Err(wrong(
+                    "this rule fires on published messages and has no filter; set filter"
+                        .to_owned(),
+                ))
+            }
+            (Some(_), false) => {
+                return Err(wrong(
+                    "an http_in rule is fired by a request rather than by a published \
+                     message, so it has no filter; remove it"
+                        .to_owned(),
+                ))
+            }
+            (None, false) => {
+                // The two narrowings belong to a filter, so writing one
+                // without a filter is the same mistake said smaller.
+                if self.min_qos.is_some() || self.client_id.is_some() {
+                    return Err(wrong(
+                        "min_qos and client_id narrow a filter, and an http_in rule has \
+                         none; remove them"
+                            .to_owned(),
+                    ));
+                }
+                None
+            }
         };
-        // Before anything is stored and long before anything is posted.
-        rules::http_out::check(&action).map_err(|error| wrong(error.to_string()))?;
 
-        let mut rule = Rule::new(id, self.name.clone(), trigger, Action::HttpOut(action))
+        let mut rule = Rule::new(id, self.name.clone(), trigger, action)
             .map_err(|error| wrong(error.to_string()))?;
         rule.enabled = self.enabled;
         Ok(rule)
+    }
+
+    /// The one action this section declares.
+    ///
+    /// Section 9.1: **one** action. Two tables is an operator who means
+    /// two rules, and none is a rule that does nothing; both are
+    /// refused rather than resolved by a precedence nobody wrote down.
+    fn to_action(&self, wrong: &impl Fn(String) -> ConfigError) -> Result<Action, ConfigError> {
+        match (&self.http_out, &self.http_in) {
+            (Some(_), Some(_)) => Err(wrong(
+                "a rule has one action, section 9.1, and this one declares both \
+                 [rules.http_out] and [rules.http_in]; write two rules"
+                    .to_owned(),
+            )),
+            (None, None) => Err(wrong(
+                "a rule needs an action; write a [rules.http_out] or a [rules.http_in] table"
+                    .to_owned(),
+            )),
+            (Some(out), None) => {
+                let action = HttpOut {
+                    url: out.url.clone(),
+                    method: out.method.clone(),
+                    headers: out
+                        .headers
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect(),
+                    timeout_ms: out.timeout_ms,
+                    max_concurrency: out.max_concurrency,
+                    retries: out.retries,
+                    backoff_ms: out.backoff_ms,
+                };
+                // Before anything is stored and long before anything is
+                // posted.
+                rules::http_out::check(&action).map_err(|error| wrong(error.to_string()))?;
+                Ok(Action::HttpOut(action))
+            }
+            (None, Some(into)) => Ok(Action::HttpIn(into.to_action(wrong)?)),
+        }
+    }
+}
+
+/// How an `http_in` rule accepts a post.
+///
+/// Every field section 9.2 lists, and no field it does not. The token
+/// has no default because a default token is a secret in a repository,
+/// and the topic has none because a default that publishes somewhere is
+/// worse than one that publishes nowhere. Both are refused when left
+/// out.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HttpInSection {
+    /// The bearer token a request must present.
+    ///
+    /// **Not optional.** Section 9.2: the endpoint publishes, so an
+    /// unguarded one is a hole rather than a degraded mode.
+    ///
+    /// A [`Secret`], so that the configuration this binary logs at
+    /// startup does not carry it.
+    pub token: Secret,
+    /// Where the body is published when the request does not choose.
+    pub topic: String,
+    /// The header a request may name a topic in.
+    ///
+    /// Requires `topic_prefix`, and excludes `topic_query`.
+    pub topic_header: Option<String>,
+    /// The query parameter a request may name a topic in.
+    ///
+    /// Requires `topic_prefix`, and excludes `topic_header`.
+    pub topic_query: Option<String>,
+    /// The prefix a topic the request chose must lie at or under.
+    ///
+    /// **This is the whole safety of a rule that lets a request choose
+    /// a topic.** Without it whoever holds this rule's token can
+    /// publish anywhere on the broker.
+    pub topic_prefix: Option<String>,
+    /// The level the body is published at, as MQTT numbers it.
+    pub qos: u8,
+    /// Whether it is retained.
+    pub retain: bool,
+}
+
+impl Default for HttpInSection {
+    /// No token, nowhere to publish, and the level that promises
+    /// nothing.
+    fn default() -> Self {
+        Self {
+            token: Secret::new(String::new()),
+            topic: String::new(),
+            topic_header: None,
+            topic_query: None,
+            topic_prefix: None,
+            qos: 0,
+            retain: false,
+        }
+    }
+}
+
+impl HttpInSection {
+    /// This table as the rules crate's own type.
+    fn to_action(&self, wrong: &impl Fn(String) -> ConfigError) -> Result<HttpIn, ConfigError> {
+        let qos = rules::http_in::qos_of(self.qos).ok_or_else(|| {
+            wrong(format!(
+                "http_in.qos = {} is not a level; MQTT has 0, 1 and 2",
+                self.qos
+            ))
+        })?;
+
+        // Two sources, or a prefix with nothing to bound, are refused
+        // here rather than in the rules crate, because that crate's
+        // type cannot express either: a source carries its prefix, so
+        // the invalid combinations are the two keys' and not the
+        // model's.
+        let source = match (&self.topic_header, &self.topic_query) {
+            (Some(_), Some(_)) => return Err(wrong(HttpInError::TwoSources.to_string())),
+            (Some(name), None) => Some(TopicSource::Header(name.clone())),
+            (None, Some(name)) => Some(TopicSource::Query(name.clone())),
+            (None, None) => None,
+        };
+        let topic_from = match (source, &self.topic_prefix) {
+            (Some(source), Some(prefix)) => Some(TopicFromRequest {
+                source,
+                prefix: prefix.clone(),
+            }),
+            (Some(source), None) => {
+                let key = match source {
+                    TopicSource::Header(_) => "topic_header",
+                    TopicSource::Query(_) => "topic_query",
+                };
+                return Err(wrong(HttpInError::NoPrefix { key }.to_string()));
+            }
+            (None, Some(_)) => return Err(wrong(HttpInError::NoSource.to_string())),
+            (None, None) => None,
+        };
+
+        let action = HttpIn {
+            token: self.token.clone(),
+            topic: self.topic.clone(),
+            topic_from,
+            qos,
+            retain: self.retain,
+        };
+        // Before anything is stored and long before anything is served.
+        rules::http_in::check(&action).map_err(|error| wrong(error.to_string()))?;
+        Ok(action)
+    }
+}
+
+/// The port the ingest listener binds by default.
+///
+/// Adjacent to the admin listener's so that an operator who knows one
+/// knows the other. It is not registered for this and does not need to
+/// be: it is bound on loopback by default, and an operator who exposes
+/// it is configuring it anyway.
+pub const DEFAULT_INGEST_PORT: u16 = 1885;
+
+/// Which listener serves section 9.2's ingest routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestListener {
+    /// A listener of its own, which is the default.
+    ///
+    /// Section 9.2: "it defaults to a separate ingest listener rather
+    /// than the admin listener, so that publishing data does not
+    /// require exposing the administrative surface."
+    #[default]
+    Own,
+    /// The admin listener.
+    ///
+    /// "Permitted but must be chosen explicitly", which is what writing
+    /// this value is. A route set served there takes that listener's
+    /// rules with it, including the host check the ingest listener
+    /// deliberately has none of.
+    Admin,
+}
+
+/// Where the ingest endpoint is served.
+///
+/// # There is no `enabled` key, and no address rule either
+///
+/// A listener of its own is bound when this node holds an ingest rule
+/// with a route, and not otherwise, so turning it off is deleting the
+/// rules rather than a second switch that can disagree with them.
+///
+/// And unlike `[admin]`, a non-loopback address here is **not** refused
+/// without a token. Section 9.2: "the ingest listener needs no address
+/// rule of its own, because every route on it is individually
+/// guarded." A rule without a token is refused where rules are
+/// accepted, so a route that exists is a route with a secret in front
+/// of it; there is nothing left for an address rule to protect.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct IngestConfig {
+    /// Where a listener of its own binds.
+    ///
+    /// Loopback by default, which is the right default for a broker
+    /// behind an ingress and the wrong one for a webhook sender on
+    /// another host; an operator who wants the second writes it.
+    pub address: SocketAddr,
+    /// Which listener serves the routes.
+    pub listener: IngestListener,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_INGEST_PORT),
+            listener: IngestListener::Own,
+        }
     }
 }
 
@@ -678,6 +921,8 @@ pub struct Config {
     /// loopback address, or the refusal in `AdminConfig::check` guards
     /// a different configuration from the one that is served.
     pub admin: AdminConfig,
+    /// Where section 9.2's ingest endpoint is served.
+    pub ingest: IngestConfig,
     /// The log section.
     pub log: Log,
     /// The rules this node holds, section 9.1.
@@ -1124,6 +1369,376 @@ mod tests {
             .expect_err("this configuration must be refused")
     }
 
+    /// An ingest rule whose only stated keys are the required ones.
+    const MINIMAL_INGEST: &str = r#"
+        [[rules]]
+        id = "gateway"
+        name = "Gateway in"
+
+        [rules.http_in]
+        token = "a-secret"
+        topic = "ingest/gateway"
+    "#;
+
+    // ---- http_in -------------------------------------------------------
+
+    #[test]
+    fn an_ingest_rule_takes_the_defaults_for_everything_it_does_not_say() {
+        let config = Config::from_toml(&with_rule(MINIMAL_INGEST)).expect("every key is known");
+        config.validate().expect("a minimal ingest rule is usable");
+
+        let rule = config.rules[0].to_rule().expect("it converts");
+        assert_eq!(rule.id.as_str(), "gateway");
+        assert!(
+            rule.trigger.is_none(),
+            "an ingest rule is fired by a request and has no trigger"
+        );
+        let Action::HttpIn(action) = &rule.action else {
+            panic!("this rule accepts posts");
+        };
+        assert_eq!(action.topic, "ingest/gateway");
+        assert_eq!(
+            action.qos,
+            QoS::AtMostOnce,
+            "the level that promises nothing"
+        );
+        assert!(!action.retain);
+        assert!(
+            action.topic_from.is_none(),
+            "and no caller may choose a topic unless the rule says so"
+        );
+    }
+
+    #[test]
+    fn every_part_of_an_ingest_rule_can_be_said() {
+        let text = with_rule(
+            r#"
+            [[rules]]
+            id = "gateway"
+            name = "Gateway in"
+            enabled = false
+
+            [rules.http_in]
+            token = "a-secret"
+            topic = "ingest/gateway/default"
+            topic_header = "x-topic"
+            topic_prefix = "ingest/gateway"
+            qos = 1
+            retain = true
+        "#,
+        );
+        let config = Config::from_toml(&text).expect("every key is known");
+        config.validate().expect("it is usable");
+        let rule = config.rules[0].to_rule().expect("it converts");
+
+        assert!(!rule.enabled);
+        let Action::HttpIn(action) = &rule.action else {
+            panic!("this rule accepts posts");
+        };
+        assert_eq!(action.token.expose(), "a-secret");
+        assert_eq!(action.topic, "ingest/gateway/default");
+        assert_eq!(action.qos, QoS::AtLeastOnce);
+        assert!(action.retain);
+        let from = action.topic_from.as_ref().expect("a caller may choose");
+        assert_eq!(from.source, TopicSource::Header("x-topic".to_owned()));
+        assert_eq!(from.prefix, "ingest/gateway");
+    }
+
+    /// Everything an operator can get wrong about an ingest rule,
+    /// refused at startup with the rule named.
+    ///
+    /// One test rather than eleven, because what is being asserted is
+    /// the same thing in each case — the broker does not start and says
+    /// which rule — and a table makes the list of cases readable as a
+    /// list. Each entry carries the fragment of the refusal that says
+    /// *which* mistake it was, so this is not convention 2's "assert
+    /// the category" wearing a table.
+    #[test]
+    fn what_an_ingest_rule_may_not_say_is_refused_by_name() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "no token at all",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                topic = "ingest/gateway"
+                "#,
+                "token",
+            ),
+            (
+                "a token that is present and empty",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = ""
+                topic = "ingest/gateway"
+                "#,
+                "token",
+            ),
+            (
+                "a header the caller may choose a topic in, with nothing to bound it",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                topic_header = "x-topic"
+                "#,
+                "topic_prefix",
+            ),
+            (
+                "a query parameter, with nothing to bound it",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                topic_query = "t"
+                "#,
+                "topic_prefix",
+            ),
+            (
+                "a prefix with nothing to bound",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                topic_prefix = "ingest"
+                "#,
+                "topic_prefix",
+            ),
+            (
+                "both a header and a query parameter",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                topic_header = "x-topic"
+                topic_query = "t"
+                topic_prefix = "ingest"
+                "#,
+                "one of them",
+            ),
+            (
+                "a prefix in the reserved namespace",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                topic_query = "t"
+                topic_prefix = "$sd"
+                "#,
+                "dollar-prefixed",
+            ),
+            (
+                "a prefix with a wildcard in it",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                topic_query = "t"
+                topic_prefix = "ingest/#"
+                "#,
+                "topic_prefix",
+            ),
+            (
+                "a topic that is not one",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/+"
+                "#,
+                "http_in.topic",
+            ),
+            (
+                "a level MQTT does not have",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                qos = 3
+                "#,
+                "http_in.qos",
+            ),
+            (
+                "a filter, which an ingest rule is not fired by",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                filter = "sensor/+/temp"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                "#,
+                "remove it",
+            ),
+            (
+                "both actions, where section 9.1 allows one",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                filter = "sensor/+/temp"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                [rules.http_out]
+                url = "https://example.invalid/hook"
+                "#,
+                "two rules",
+            ),
+            (
+                "no action at all",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                filter = "sensor/+/temp"
+                "#,
+                "needs an action",
+            ),
+            (
+                "an http_out rule with no filter",
+                r#"
+                [[rules]]
+                id = "telemetry"
+                name = "Telemetry out"
+                [rules.http_out]
+                url = "https://example.invalid/hook"
+                "#,
+                "set filter",
+            ),
+        ];
+
+        for (what, text, fragment) in cases {
+            let error = refuse(&with_rule(text));
+            let said = error.to_string();
+            assert!(
+                said.contains("gateway") || said.contains("telemetry"),
+                "{what}: the refusal must name the rule: {said}"
+            );
+            assert!(
+                said.contains(fragment),
+                "{what}: the refusal must say which mistake it was, and {fragment:?} is \
+                 not in {said:?}"
+            );
+        }
+    }
+
+    /// The minimal rules above are accepted, so the table is not
+    /// passing against a check that refuses everything.
+    #[test]
+    fn a_complete_ingest_rule_is_accepted() {
+        Config::from_toml(&with_rule(MINIMAL_INGEST))
+            .expect("every key is known")
+            .validate()
+            .expect("a minimal ingest rule is usable");
+        let bounded = with_rule(
+            r#"
+            [[rules]]
+            id = "gateway"
+            name = "Gateway in"
+            [rules.http_in]
+            token = "a-secret"
+            topic = "ingest/gateway/default"
+            topic_query = "t"
+            topic_prefix = "ingest/gateway"
+            "#,
+        );
+        Config::from_toml(&bounded)
+            .expect("every key is known")
+            .validate()
+            .expect("a rule that lets a caller choose, bounded, is usable");
+    }
+
+    /// Section 12.3, on the way in: the configuration is logged at
+    /// startup and this is in it.
+    #[test]
+    fn an_ingest_token_does_not_print_itself() {
+        let config = Config::from_toml(&with_rule(MINIMAL_INGEST)).expect("every key is known");
+        let shown = format!("{config:?}");
+        assert!(
+            !shown.contains("a-secret"),
+            "a token must not reach the first log line this binary writes: {shown}"
+        );
+    }
+
+    // ---- the ingest listener -------------------------------------------
+
+    #[test]
+    fn the_ingest_listener_defaults_to_one_of_its_own_on_loopback() {
+        let config = Config::default();
+        assert_eq!(config.ingest.listener, IngestListener::Own);
+        assert!(
+            config.ingest.address.ip().is_loopback(),
+            "section 9.2: a listener of its own, and loopback until an operator says \
+             otherwise"
+        );
+        assert_eq!(config.ingest.address.port(), DEFAULT_INGEST_PORT);
+    }
+
+    #[test]
+    fn the_ingest_listener_can_be_moved_or_put_on_the_admin_listener() {
+        let config = Config::from_toml(
+            r#"
+            [ingest]
+            address = "0.0.0.0:9000"
+            listener = "admin"
+            "#,
+        )
+        .expect("every key is known");
+        assert_eq!(config.ingest.address.to_string(), "0.0.0.0:9000");
+        assert_eq!(config.ingest.listener, IngestListener::Admin);
+    }
+
+    /// A non-loopback ingest address with nothing else set is accepted.
+    ///
+    /// Deliberately unlike `[admin]`, and the difference is the point.
+    /// Section 9.2: the ingest listener needs no address rule of its
+    /// own, because every route on it is guarded by its own rule's
+    /// token and a rule without one is refused. A refusal here would be
+    /// a rule protecting something that is already protected, and would
+    /// stop the deployment the feature exists for — a webhook sender on
+    /// another host.
+    #[test]
+    fn a_non_loopback_ingest_address_needs_no_token_of_its_own() {
+        let text = format!(
+            "[ingest]\naddress = \"0.0.0.0:9000\"\n{}",
+            with_rule(MINIMAL_INGEST)
+        );
+        Config::from_toml(&text)
+            .expect("every key is known")
+            .validate()
+            .expect("every ingest route is individually guarded");
+    }
+
     #[test]
     fn a_rule_takes_the_rules_crate_defaults_for_everything_it_does_not_say() {
         let config = Config::from_toml(&with_rule(MINIMAL)).expect("every key is known");
@@ -1136,15 +1751,19 @@ mod tests {
         assert_eq!(section.client_id, None);
 
         let defaults = HttpOut::default();
-        assert_eq!(section.http_out.method, defaults.method);
-        assert_eq!(section.http_out.timeout_ms, defaults.timeout_ms);
-        assert_eq!(section.http_out.retries, defaults.retries);
-        assert_eq!(section.http_out.backoff_ms, defaults.backoff_ms);
-        assert_eq!(section.http_out.max_concurrency, defaults.max_concurrency);
+        let out = section.http_out.as_ref().expect("this rule posts out");
+        assert_eq!(out.method, defaults.method);
+        assert_eq!(out.timeout_ms, defaults.timeout_ms);
+        assert_eq!(out.retries, defaults.retries);
+        assert_eq!(out.backoff_ms, defaults.backoff_ms);
+        assert_eq!(out.max_concurrency, defaults.max_concurrency);
 
         let rule = section.to_rule().expect("it converts");
         assert_eq!(rule.id.as_str(), "telemetry");
-        assert_eq!(rule.trigger.filter(), "sensor/+/temp");
+        assert_eq!(
+            rule.trigger.as_ref().map(Trigger::filter),
+            Some("sensor/+/temp")
+        );
         assert_eq!(rule.id.dead_letter_topic(), "$sd/rules/telemetry/dlq");
     }
 
@@ -1175,12 +1794,15 @@ mod tests {
         let rule = config.rules[0].to_rule().expect("it converts");
 
         assert!(!rule.enabled);
-        assert_eq!(rule.trigger.min_qos, Some(QoS::ExactlyOnce));
+        let trigger = rule.trigger.as_ref().expect("this rule fires on messages");
+        assert_eq!(trigger.min_qos, Some(QoS::ExactlyOnce));
         assert_eq!(
-            rule.trigger.client_id.as_ref().map(ClientPattern::as_str),
+            trigger.client_id.as_ref().map(ClientPattern::as_str),
             Some("sensor-*")
         );
-        let Action::HttpOut(action) = &rule.action;
+        let Action::HttpOut(action) = &rule.action else {
+            panic!("this rule posts out");
+        };
         assert_eq!(action.method, "PUT");
         assert_eq!(action.timeout_ms, 2_500);
         assert_eq!(action.max_concurrency, 8);

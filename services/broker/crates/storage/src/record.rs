@@ -36,6 +36,8 @@
 //!
 //! [`tests::golden`]: self::tests::golden
 
+use std::fmt;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -445,6 +447,103 @@ pub struct HttpOutRecord {
     pub backoff_ms: u32,
 }
 
+/// A secret in a record, which will not print itself.
+///
+/// Section 12.3: passwords and tokens are held in a wrapper that
+/// refuses to print itself, so they cannot reach logs or crash output.
+/// A record is printed by the storage tests' failure messages and by
+/// anything that logs what it is about to write, and an ingest rule's
+/// bearer token is a secret that lives in one.
+///
+/// `transparent` for serde, so the stored bytes are the string's and
+/// nothing else: the wrapper is about [`fmt::Debug`] and not about the
+/// format.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    /// A secret from the text an operator configured.
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self(secret.into())
+    }
+
+    /// The secret itself, for the one comparison that needs it.
+    ///
+    /// Deliberately not [`fmt::Display`] and deliberately not
+    /// `AsRef<str>`: the only way to get the characters out is to name
+    /// this method, so a secret cannot reach a formatter by accident.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether an operator wrote the key and left it blank.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Not the length either. A length is a real, if small, hint
+        // about a secret, and nothing debugging a record needs it.
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+/// Where a request may name the topic it is publishing to.
+///
+/// Section 9.2: a named header **or** a query parameter. An enum
+/// rather than two optional fields, because two fields can both be set
+/// and nothing says which wins; the ambiguity is refused by not being
+/// storable.
+///
+/// **Variant order is the format.**
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TopicFromRecord {
+    /// The named request header.
+    Header(String),
+    /// The named query parameter.
+    Query(String),
+}
+
+/// A topic the request chose, and the prefix that bounds it.
+///
+/// **The prefix is not optional, and that is the whole safety of the
+/// feature.** Section 9.2: the topic may be taken from a header or a
+/// query parameter, "restricted by a prefix so a caller cannot publish
+/// anywhere". Without it an ingest rule is a way for whoever holds one
+/// rule's token to publish to any topic on the broker, including the
+/// reserved namespace. Held together with the source rather than beside
+/// it so that a source without a prefix cannot be written down at all,
+/// here or anywhere that reads this back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicFromRequestRecord {
+    /// Where the request says it.
+    pub source: TopicFromRecord,
+    /// The prefix the topic must be at or under, by topic level.
+    pub prefix: String,
+}
+
+/// How an `http_in` action accepts a post, section 9.2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpInRecord {
+    /// The bearer token a request must present.
+    ///
+    /// Section 9.2: **not optional, and a rule without one is
+    /// refused.** The endpoint publishes, so an unguarded one is a hole
+    /// rather than a degraded mode.
+    pub token: Secret,
+    /// Where the body is published when the request does not choose.
+    pub topic: String,
+    /// Where the request may choose instead, and what bounds it.
+    pub topic_from: Option<TopicFromRequestRecord>,
+    /// The level the body is published at.
+    pub qos: Qos,
+    /// Whether it is retained.
+    pub retain: bool,
+}
+
 /// What a rule does when it fires. One, section 9.1.
 ///
 /// **Variant order is the format**, as it is for [`Record`]: the other
@@ -454,6 +553,11 @@ pub struct HttpOutRecord {
 pub enum ActionRecord {
     /// Post a JSON envelope to a URL.
     HttpOut(HttpOutRecord),
+    /// Accept a post and publish its body. Section 9.2's `http_in`.
+    ///
+    /// Appended, so every `HttpOut` record written before this build
+    /// still reads back as one and [`FORMAT_VERSION`] does not move.
+    HttpIn(HttpInRecord),
 }
 
 /// A rule, section 9.1.
@@ -470,6 +574,28 @@ pub struct RuleRecord {
     /// Whether it fires at all.
     pub enabled: bool,
     /// When it fires.
+    ///
+    /// # An action that nothing publishes fires stores an empty filter
+    ///
+    /// Section 9.1 gives every rule a trigger, and section 9.2's
+    /// `http_in` has nothing to trigger on: an ingest rule is fired by
+    /// an HTTP request rather than by a message. Such a rule stores a
+    /// trigger whose filter is the empty string.
+    ///
+    /// That is an absence written as a value the reader already
+    /// rejects, which is the one shape of sentinel this project will
+    /// take: `""` is not a topic filter — `validate_filter` refuses it
+    /// — so it cannot be mistaken for a trigger somebody meant, and the
+    /// crate that reads this back refuses a rule that pairs an empty
+    /// filter with an action that fires on messages, or a non-empty one
+    /// with an action that does not.
+    ///
+    /// `Option<TriggerRecord>` is the honest encoding and would move
+    /// [`FORMAT_VERSION`], which makes every store written before it
+    /// unreadable. That is a cost worth paying **the next time the
+    /// version moves for a reason of its own**, and it is named here
+    /// rather than left to be discovered, so that it is a deferral and
+    /// not an oversight.
     pub trigger: TriggerRecord,
     /// What it does.
     pub action: ActionRecord,
@@ -794,6 +920,17 @@ impl Record {
                                     .iter()
                                     .map(|(name, value)| name.len() + value.len())
                                     .sum::<usize>()
+                        }
+                        ActionRecord::HttpIn(http) => {
+                            http.token.expose().len()
+                                + http.topic.len()
+                                + http.topic_from.as_ref().map_or(0, |from| {
+                                    from.prefix.len()
+                                        + match &from.source {
+                                            TopicFromRecord::Header(name)
+                                            | TopicFromRecord::Query(name) => name.len(),
+                                        }
+                                })
                         }
                     }
             }

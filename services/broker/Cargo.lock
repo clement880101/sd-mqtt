@@ -1033,6 +1033,7 @@ dependencies = [
 name = "rules"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64",
  "broker-core",
  "bytes",
@@ -1041,6 +1042,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "mqtt-codec",
+ "sdmqtt-server",
  "serde",
  "serde_json",
  "storage",

@@ -387,6 +387,27 @@ impl AdminServer {
         config: &AdminConfig,
         state: AdminState,
     ) -> Result<AdminRunning, AdminStartError> {
+        Self::bind_with(config, state, Router::new()).await
+    }
+
+    /// The same, serving `extra` beside the admin routes.
+    ///
+    /// For section 9.2's ingest endpoint, which an operator may choose
+    /// to serve here rather than on a listener of its own. What is
+    /// merged here **is** behind everything the admin route set is
+    /// behind, the host check included; see [`host`]. That is the right
+    /// way round: an operator who puts a route set on this listener
+    /// takes this listener's rules with it, and the alternative would
+    /// be a hole in a layer that is documented as having no exceptions.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`AdminServer::bind`].
+    pub async fn bind_with(
+        config: &AdminConfig,
+        state: AdminState,
+        extra: Router<AdminState>,
+    ) -> Result<AdminRunning, AdminStartError> {
         config.check()?;
         // The configuration is the authority on the token, not
         // whatever the caller happened to build into the state. The
@@ -420,7 +441,7 @@ impl AdminServer {
         let sampler = events::spawn_sampler(state.clone(), state.events_interval);
         let reaper = taps::spawn_reaper(state.clone(), taps::REAP_INTERVAL);
         let signal = state.shutdown.clone();
-        let serving = bound.serve(router(state), move || {
+        let serving = bound.serve(router(state, extra), move || {
             // **Before hyper starts waiting, not after.** An events
             // body does not finish on its own, and telling the streams
             // first is what makes that wait terminate. See
@@ -451,7 +472,7 @@ impl AdminServer {
 /// The `404` half of that now lives in [`assets`], because the same
 /// fallback has to decide whether the path is a document of the
 /// interface first.
-fn router(state: AdminState) -> Router {
+fn router(state: AdminState, extra: Router<AdminState>) -> Router {
     // **No compression layer, deliberately.** Section 11.1: a
     // compression layer applied across this listener would turn the
     // events stream into batch delivery. The events route is not
@@ -461,6 +482,9 @@ fn router(state: AdminState) -> Router {
         .merge(resources::routes())
         .merge(events::routes())
         .merge(taps::routes())
+        // Whatever the caller asked to be served here as well, inside
+        // the layer below rather than outside it.
+        .merge(extra)
         // The interface, and the one error shape for everything that
         // is neither a route above nor a document. See [`assets`]:
         // the set of documents is not known until the build script

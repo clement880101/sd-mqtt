@@ -18,10 +18,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use broker_core::broker::Broker;
 use clap::{Args, Parser, Subcommand};
-use config::{Config, ConfigError, LogLevel, Overrides};
+use config::{Config, ConfigError, IngestListener, LogLevel, Overrides};
+use rules::Ingest;
 use sdmqtt_admin::{
-    AdminRunning, AdminServer, AdminStartError, AdminState, ListenerProtocol, ListenerView,
-    Readiness,
+    AdminRunning, AdminServer, AdminStartError, AdminState, Bound, ListenerProtocol, ListenerView,
+    Readiness, Router, Serving,
 };
 use sdmqtt_server::listener::{Running, Server};
 use sdmqtt_server::shared::Shared;
@@ -428,33 +429,109 @@ async fn start_admin(
     config: &Config,
     running: &Running,
     readiness: Arc<Readiness>,
+    ingest: &Arc<Ingest>,
+    ingest_listener: Option<&Serving>,
 ) -> Result<Option<AdminRunning>, StartupError> {
     if !config.admin.enabled {
         tracing::warn!(
             "the admin listener is disabled, so this node serves no health endpoints, \
              no metrics and no API"
         );
+        if config.ingest.listener == IngestListener::Admin && !ingest.is_empty() {
+            // Not a warning attached to the rules: the operator asked
+            // for both things and they contradict each other, so the
+            // one that silently does nothing is said out loud.
+            tracing::error!(
+                "ingest.listener = \"admin\" and the admin listener is disabled, so this \
+                 node's ingest rules are served nowhere"
+            );
+        }
         return Ok(None);
+    }
+    // What this process bound, which nothing can discover: a socket
+    // does not know what it is for and the broker does not know a
+    // listener exists. The admin listener adds its own row once it
+    // knows its port.
+    let mut listeners = vec![ListenerView {
+        name: "mqtt".to_owned(),
+        protocol: ListenerProtocol::Mqtt,
+        address: running.address(),
+        mountpoint: config.listener.mountpoint.clone(),
+        max_connections: Some(config.listener.max_connections),
+    }];
+    if let Some(serving) = ingest_listener {
+        listeners.push(ListenerView {
+            name: "ingest".to_owned(),
+            protocol: ListenerProtocol::Ingest,
+            address: serving.address(),
+            // An ingest listener has no topic namespace and no
+            // connection limit of its own.
+            mountpoint: String::new(),
+            max_connections: None,
+        });
     }
     let state = AdminState::new(Arc::clone(running.shared()))
         .with_readiness(readiness)
-        // What this process bound, which nothing can discover: a
-        // socket does not know what it is for and the broker does
-        // not know a listener exists. The admin listener adds its
-        // own row once it knows its port.
-        .with_listeners(vec![ListenerView {
-            name: "mqtt".to_owned(),
-            protocol: ListenerProtocol::Mqtt,
-            address: running.address(),
-            mountpoint: config.listener.mountpoint.clone(),
-            max_connections: Some(config.listener.max_connections),
-        }]);
-    let admin = AdminServer::bind(&config.admin, state).await?;
+        .with_listeners(listeners);
+
+    // Section 9.2: serving the ingest routes here is permitted and
+    // must be chosen explicitly. `Router::new()` is the ordinary case.
+    let extra = if config.ingest.listener == IngestListener::Admin && !ingest.is_empty() {
+        tracing::info!(
+            rules = ingest.len(),
+            "the ingest routes are served on the admin listener, as this configuration \
+             asked for; they are behind the admin listener's host check as well as their \
+             own tokens"
+        );
+        rules::http_in::routes::<AdminState>(Arc::clone(running.shared()), Arc::clone(ingest))
+    } else {
+        Router::new()
+    };
+
+    let admin = AdminServer::bind_with(&config.admin, state, extra).await?;
     tracing::info!(
         address = %admin.address(),
         "the admin API, metrics and health endpoints are serving"
     );
     Ok(Some(admin))
+}
+
+/// Start the ingest listener, when this node has one.
+///
+/// `Ok(None)` is a node with no ingest rule that has a route, or one
+/// whose configuration puts the routes on the admin listener. A
+/// listener with no route on it would be a socket answering `404` to
+/// everything, which is worth nothing and is one more port an operator
+/// has to explain.
+///
+/// **Before the MQTT listener's caller binds anything else**, in the
+/// same sense the rules are installed first: a post that arrives is a
+/// publication, and the broker it publishes into has already been
+/// restored.
+async fn start_ingest(
+    config: &Config,
+    shared: &Arc<Shared>,
+    ingest: &Arc<Ingest>,
+) -> Result<Option<Serving>, StartupError> {
+    if config.ingest.listener != IngestListener::Own || ingest.is_empty() {
+        return Ok(None);
+    }
+    let bound = Bound::at("ingest", config.ingest.address).await?;
+    tracing::info!(
+        address = %bound.address(),
+        rules = ingest.len(),
+        "the ingest listener is serving, with every route behind its own rule's token"
+    );
+    let routes = rules::http_in::routes::<()>(Arc::clone(shared), Arc::clone(ingest))
+        // Section 13's one shape, for a path this listener does not
+        // serve. Registered rather than left to axum's default, which
+        // is an empty body a client cannot tell from a proxy that
+        // swallowed the request.
+        .fallback(rules::http_in::not_found)
+        .method_not_allowed_fallback(rules::http_in::method_not_allowed);
+    // Nothing served here holds a connection open past its response,
+    // so there is nothing to tell before hyper starts waiting.
+    Ok(Some(bound.serve(routes, || {})))
 }
 
 /// Configure, restore, bind, and serve until told to stop.
@@ -527,8 +604,21 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         "sdmqtt is serving MQTT over TCP"
     );
 
-    let admin = start_admin(&config, &running, Arc::clone(&readiness)).await?;
-    // Both of them, and only once both are bound. A node that said
+    // **After the MQTT listener, not before.** An ingest post is a
+    // publication, and a publication that reaches subscribers before
+    // the listener they are attached through is bound reaches none of
+    // them. The broker itself is already restored, which is what
+    // matters for durability.
+    let ingest = start_ingest(&config, running.shared(), connectors.ingest()).await?;
+    let admin = start_admin(
+        &config,
+        &running,
+        Arc::clone(&readiness),
+        connectors.ingest(),
+        ingest.as_ref(),
+    )
+    .await?;
+    // All of them, and only once all are bound. A node that said
     // it was ready with one listener up would be sent traffic for
     // the other.
     readiness.listeners_are_bound();
@@ -553,6 +643,14 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     if let Some(admin) = admin {
         admin.shutdown().await;
         tracing::info!("the admin listener has stopped");
+    }
+    // And the ingest listener beside it, for the same reason: it
+    // publishes, so nothing may enter a broker that is being torn
+    // down. Before the MQTT listener stops, so that a post already in
+    // flight is still delivered to the subscribers that are attached.
+    if let Some(ingest) = ingest {
+        ingest.shutdown().await;
+        tracing::info!("the ingest listener has stopped");
     }
     running.shutdown().await;
     // After the listener, so that nothing can enter an outbox while its

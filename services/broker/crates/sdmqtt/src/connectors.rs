@@ -44,8 +44,8 @@ use broker_core::session::message::Message;
 use bytes::Bytes;
 use mqtt_codec::QoS;
 use rules::http_out::{client, DeadLetters, Delivery, Poster};
-use rules::rule::{Action, Rule};
-use rules::Outbox;
+use rules::rule::{Action, Rule, Trigger};
+use rules::{Ingest, Outbox};
 use sdmqtt_server::shared::Shared;
 use storage::record::{BodyRecord, MessageId, Qos, Record};
 use storage::{Storage, Writer};
@@ -172,12 +172,28 @@ impl DeadLetters for BrokerDeadLetters {
 /// only thing that ends it.
 pub struct Connectors {
     pumps: Vec<tokio::task::JoinHandle<()>>,
+    /// How many rules were installed, of either kind.
+    ///
+    /// Not `pumps.len()`: an ingest rule has no pump, and a node whose
+    /// only rule was an ingest one would otherwise report none.
+    rules: usize,
+    /// The ingest rules, for whoever serves their routes.
+    ///
+    /// Built here because this is where a rule is turned into the thing
+    /// that runs it, and handed out rather than served here because
+    /// which listener serves it is configuration; see section 9.2.
+    ingest: Arc<Ingest>,
 }
 
 impl Connectors {
-    /// How many rules are running.
+    /// How many rules are installed.
     pub fn len(&self) -> usize {
-        self.pumps.len()
+        self.rules
+    }
+
+    /// The ingest rules this node serves.
+    pub fn ingest(&self) -> &Arc<Ingest> {
+        &self.ingest
     }
 
     /// Stop every pump.
@@ -210,7 +226,11 @@ impl Connectors {
 /// Its own function rather than an `Option<Connectors>`, because what
 /// the caller does with it afterwards is identical.
 pub fn start_without_rules() -> Connectors {
-    Connectors { pumps: Vec::new() }
+    Connectors {
+        pumps: Vec::new(),
+        rules: 0,
+        ingest: Arc::new(Ingest::new()),
+    }
 }
 
 /// Install the configured rules and start their pumps.
@@ -230,7 +250,7 @@ pub async fn start(
     writer: &Arc<Writer>,
 ) -> Result<Connectors, StartupError> {
     if config.rules.is_empty() {
-        return Ok(Connectors { pumps: Vec::new() });
+        return Ok(start_without_rules());
     }
 
     // One client for every rule: the connection pool is the thing worth
@@ -244,6 +264,7 @@ pub async fn start(
     let mut configured = BTreeSet::new();
     let mut fired = Vec::new();
     let mut pumps = Vec::new();
+    let mut ingest = Ingest::new();
 
     for section in &config.rules {
         // `Config::validate` has already refused anything that cannot
@@ -266,48 +287,91 @@ pub async fn start(
             .await
             .map_err(|error| StartupError::Connector(error.to_string()))?;
 
-        let outbox = Arc::new(
-            Outbox::open(rule.id.clone(), store.as_ref())
-                .map_err(|error| StartupError::Connector(error.to_string()))?,
-        );
-        let waiting = outbox
-            .depth(store.as_ref())
-            .map_err(|error| StartupError::Connector(error.to_string()))?;
+        match &rule.action {
+            Action::HttpOut(action) => {
+                // An outbox hangs off an `http_out` rule and off no
+                // other: an ingest rule has nothing to queue, because
+                // what it does is finished by the time its caller is
+                // answered.
+                let outbox = Arc::new(
+                    Outbox::open(rule.id.clone(), store.as_ref())
+                        .map_err(|error| StartupError::Connector(error.to_string()))?,
+                );
+                let waiting = outbox
+                    .depth(store.as_ref())
+                    .map_err(|error| StartupError::Connector(error.to_string()))?;
 
-        let Action::HttpOut(action) = &rule.action;
-        let poster = Poster::new(client.clone(), action)
-            .map_err(|error| StartupError::Connector(error.to_string()))?;
-        let delivery = Delivery::new(
-            Arc::clone(&outbox),
-            Arc::clone(store),
-            Arc::clone(writer),
-            poster,
-            action,
-            Arc::clone(&dead_letters),
-        );
+                let poster = Poster::new(client.clone(), action)
+                    .map_err(|error| StartupError::Connector(error.to_string()))?;
+                let delivery = Delivery::new(
+                    Arc::clone(&outbox),
+                    Arc::clone(store),
+                    Arc::clone(writer),
+                    poster,
+                    action,
+                    Arc::clone(&dead_letters),
+                );
 
-        tracing::info!(
-            rule = rule.id.as_str(),
-            name = %rule.name,
-            enabled = rule.enabled,
-            filter = rule.trigger.filter(),
-            url = %action.url,
-            waiting,
-            "a rule is installed"
-        );
-        if waiting > 0 {
-            // The whole point of the milestone, said out loud: these
-            // are messages accepted before the last stop and not yet
-            // delivered.
-            tracing::info!(
-                rule = rule.id.as_str(),
-                waiting,
-                "envelopes were waiting in this rule's outbox and are being delivered now"
-            );
+                tracing::info!(
+                    rule = rule.id.as_str(),
+                    name = %rule.name,
+                    enabled = rule.enabled,
+                    filter = rule.trigger.as_ref().map_or("", Trigger::filter),
+                    url = %action.url,
+                    waiting,
+                    "a rule is installed"
+                );
+                if waiting > 0 {
+                    // The whole point of the milestone, said out loud:
+                    // these are messages accepted before the last stop
+                    // and not yet delivered.
+                    tracing::info!(
+                        rule = rule.id.as_str(),
+                        waiting,
+                        "envelopes were waiting in this rule's outbox and are being \
+                         delivered now"
+                    );
+                }
+
+                pumps.push(tokio::spawn(delivery.run()));
+                fired.push(Fired { rule, outbox });
+            }
+            Action::HttpIn(action) => {
+                // **A disabled rule gets no route.** `enabled` is what
+                // an operator reaches for to turn a connector off, and
+                // an ingest rule left serving while it was switched off
+                // would be the one connector that ignored the switch.
+                if rule.enabled {
+                    ingest.register(&rule.id, action.clone());
+                } else {
+                    tracing::info!(
+                        rule = rule.id.as_str(),
+                        "this ingest rule is switched off and has no route"
+                    );
+                }
+                tracing::info!(
+                    rule = rule.id.as_str(),
+                    name = %rule.name,
+                    enabled = rule.enabled,
+                    path = format!("/ingest/{}", rule.id),
+                    topic = %action.topic,
+                    // What a caller may choose, and what bounds it.
+                    // Logged because the prefix is the whole safety of
+                    // the feature and an operator should be able to see
+                    // from the startup line what this endpoint can
+                    // reach.
+                    topic_from = action
+                        .topic_from
+                        .as_ref()
+                        .map_or_else(String::new, |from| from.source.name().to_owned()),
+                    topic_prefix = action
+                        .topic_from
+                        .as_ref()
+                        .map_or("", |from| from.prefix.as_str()),
+                    "a rule is installed"
+                );
+            }
         }
-
-        pumps.push(tokio::spawn(delivery.run()));
-        fired.push(Fired { rule, outbox });
     }
 
     // A rule in the store that nothing names any more. Kept, because
@@ -336,7 +400,11 @@ pub async fn start(
         }));
     });
 
-    Ok(Connectors { pumps })
+    Ok(Connectors {
+        pumps,
+        rules: config.rules.len(),
+        ingest: Arc::new(ingest),
+    })
 }
 
 /// A live level as the store spells it.

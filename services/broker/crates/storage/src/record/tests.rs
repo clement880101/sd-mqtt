@@ -471,6 +471,77 @@ mod golden {
         pins(&Record::RulePut { rule: rule() }, expected);
     }
 
+    /// The ingest rule the vector below is of.
+    ///
+    /// Section 9.2's `http_in`. Its trigger is the empty one an ingest
+    /// rule stores — see [`RuleRecord::trigger`] — so three zero bytes
+    /// sit together in the middle of it. A transposition among them is
+    /// invisible here and is pinned by [`rule_put`] instead, where the
+    /// three fields carry values that differ; what this vector is for
+    /// is the action.
+    fn ingest_rule() -> RuleRecord {
+        RuleRecord {
+            id: "gateway".to_owned(),
+            name: "Gateway in".to_owned(),
+            enabled: true,
+            trigger: TriggerRecord {
+                filter: String::new(),
+                min_qos: None,
+                client_id: None,
+            },
+            action: ActionRecord::HttpIn(HttpInRecord {
+                token: Secret::new("a-secret"),
+                topic: "from/the/web".to_owned(),
+                topic_from: Some(TopicFromRequestRecord {
+                    source: TopicFromRecord::Query("t".to_owned()),
+                    prefix: "ingest/gateway".to_owned(),
+                }),
+                qos: Qos::AtLeastOnce,
+                retain: false,
+            }),
+        }
+    }
+
+    /// The independence property, for this vector: every string in it
+    /// is a different length — 7, 10, 8, 12, 1, 14 — so a transposition
+    /// of any pair changes the bytes; the query parameter's name is one
+    /// character and the variant index beside it is `0x01`, which are
+    /// the same byte, so the name is `t` rather than a character that
+    /// would make the pair look interchangeable; and `qos` and `retain`
+    /// are the two adjacent one-byte fields and differ.
+    #[test]
+    fn rule_put_http_in() {
+        let expected: &[u8] = &[
+            0x0e, // Record::RulePut is variant 14
+            0x07, b'g', b'a', b't', b'e', b'w', b'a', b'y', // id
+            0x0a, b'G', b'a', b't', b'e', b'w', b'a', b'y', b' ', b'i',
+            b'n', // name "Gateway in"
+            0x01, // enabled true
+            0x00, // trigger filter "", the empty trigger of an ingest rule
+            0x00, // min_qos None
+            0x00, // client_id None
+            0x01, // ActionRecord::HttpIn is variant 1
+            // `Secret` is transparent, so the token is the string and
+            // nothing around it.
+            0x08, b'a', b'-', b's', b'e', b'c', b'r', b'e', b't', // token
+            0x0c, b'f', b'r', b'o', b'm', b'/', b't', b'h', b'e', b'/', b'w', b'e',
+            b'b', // topic "from/the/web"
+            0x01, // topic_from Some
+            0x01, // TopicFromRecord::Query is variant 1
+            0x01, b't', // the query parameter's name
+            0x0e, b'i', b'n', b'g', b'e', b's', b't', b'/', b'g', b'a', b't', b'e', b'w', b'a',
+            b'y', // prefix "ingest/gateway"
+            0x01, // qos AtLeastOnce
+            0x00, // retain false
+        ];
+        pins(
+            &Record::RulePut {
+                rule: ingest_rule(),
+            },
+            expected,
+        );
+    }
+
     #[test]
     fn rule_removed() {
         let expected: &[u8] = &[
