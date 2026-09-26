@@ -66,9 +66,11 @@
 //! anyway.
 
 pub mod backoff;
+pub mod connack;
 pub mod rewrite;
 pub mod topics;
 
 pub use backoff::{Backoff, Entropy};
+pub use connack::{negotiate, Asked, ConnAckError, Negotiated};
 pub use rewrite::{Rewrite, Rewritten};
 pub use topics::{intersects, TopicError};
