@@ -431,6 +431,7 @@ async fn start_admin(
     readiness: Arc<Readiness>,
     ingest: &Arc<Ingest>,
     ingest_listener: Option<&Serving>,
+    registry: Option<&Arc<rules::live::Registry>>,
 ) -> Result<Option<AdminRunning>, StartupError> {
     if !config.admin.enabled {
         tracing::warn!(
@@ -472,7 +473,11 @@ async fn start_admin(
     }
     let state = AdminState::new(Arc::clone(running.shared()))
         .with_readiness(readiness)
-        .with_listeners(listeners);
+        .with_listeners(listeners)
+        // Section 11.1 serves rules, and section 9.1 makes one
+        // durable metadata, so a node with no store has none to
+        // serve. See `sdmqtt_admin::rules`.
+        .with_rules(registry.map(Arc::clone));
 
     // Section 9.2: serving the ingest routes here is permitted and
     // must be chosen explicitly. `Router::new()` is the ordinary case.
@@ -616,6 +621,7 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         Arc::clone(&readiness),
         connectors.ingest(),
         ingest.as_ref(),
+        connectors.registry(),
     )
     .await?;
     // All of them, and only once all are bound. A node that said

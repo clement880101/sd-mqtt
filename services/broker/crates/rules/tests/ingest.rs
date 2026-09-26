@@ -96,7 +96,7 @@ async fn serve(shared: Arc<Shared>, ingest: Ingest) -> (SocketAddr, tokio::task:
 
 /// A rule publishing every body to one fixed topic.
 fn fixed_topic_rule(qos: QoS) -> Ingest {
-    let mut ingest = Ingest::new();
+    let ingest = Ingest::new();
     ingest.register(
         &RuleId::new("fixed").expect("an identifier"),
         HttpIn {
@@ -113,7 +113,7 @@ fn fixed_topic_rule(qos: QoS) -> Ingest {
 /// A rule letting the request choose a topic under [`PREFIX`], from
 /// `source`.
 fn chosen_topic_rule(source: TopicSource) -> Ingest {
-    let mut ingest = Ingest::new();
+    let ingest = Ingest::new();
     ingest.register(
         &RuleId::new("open").expect("an identifier"),
         HttpIn {
@@ -389,7 +389,7 @@ async fn no_token_and_a_wrong_token_are_refused_and_publish_nothing() {
 /// apart from outside.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rule_with_no_token_answers_as_though_it_does_not_exist() {
-    let mut ingest = Ingest::new();
+    let ingest = Ingest::new();
     ingest.register(
         &RuleId::new("tokenless").expect("an identifier"),
         HttpIn {

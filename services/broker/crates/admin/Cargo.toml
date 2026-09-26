@@ -16,6 +16,17 @@ build = "build.rs"
 broker-core = { path = "../broker-core", version = "0.1.0" }
 mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
 sdmqtt-server = { path = "../server", version = "0.1.0" }
+# Section 11.1 serves rules, and section 9.1 makes what a rule may be
+# the rules crate's to decide. This crate does the HTTP and nothing
+# else about a rule: it reads a `rules::spec::RuleSpec` out of a body
+# and hands it to the one conversion a configuration file goes
+# through, because a second validator here is a second set of refusals
+# that drifts the first time one is corrected.
+#
+# The direction is the layering rather than a cycle: `rules` sits above
+# `sdmqtt-server`, as this crate does, and knows nothing about the
+# administrative interface.
+rules = { path = "../rules", version = "0.1.0" }
 # Default features off, as `sdmqtt-server` does and for the same
 # reason: this crate needs the record vocabulary a session's
 # subscriptions are held in, and has no use for a disk.

@@ -279,6 +279,23 @@ pub enum TopicError {
     NoTopics,
 }
 
+impl TopicError {
+    /// Which field of an `mqtt_bridge` action this refusal is about.
+    pub fn field(&self) -> &'static str {
+        match self {
+            Self::StateTopicIsCarried { .. }
+            | Self::StateTopicIsSubscribed { .. }
+            | Self::StateTopicNotATopic { .. }
+            | Self::StateTopicReserved { .. } => "mqtt_bridge.state_topic",
+            // Everything else is about an entry, including the two
+            // that are about a *pair* of entries: a form marks the
+            // table, because neither of the two is the wrong one on
+            // its own.
+            _ => "mqtt_bridge.topics",
+        }
+    }
+}
+
 /// What one wildcard in a filter can capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capture {

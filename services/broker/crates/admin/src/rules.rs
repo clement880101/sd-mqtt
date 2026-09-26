@@ -1,0 +1,1065 @@
+//! Rules, read and written over the API. Sections 9.1 and 11.1.
+//!
+//! List, read, create, update, enable, disable and delete. Mutating
+//! requests need the token, as every mutating request on this listener
+//! does.
+//!
+//! # There is no second validator here
+//!
+//! This module does the HTTP and nothing else about what a rule is. A
+//! body is deserialised into a [`RuleSpec`] — the same type a
+//! `[[rules]]` table in the configuration file is read into — and
+//! handed to [`RuleSpec::to_rule`], which is the one place a rule is
+//! accepted in this process.
+//!
+//! That matters because the refusals have arguments behind them and
+//! the arguments are not obvious. An `http_in` action with no token is
+//! a hole rather than a degraded mode, because the endpoint publishes.
+//! A bridge whose inbound and outbound filters intersect after
+//! rewriting is a storm, caught at configuration time because the
+//! marker that would otherwise catch it does not exist in MQTT 3.1.1.
+//! A trigger on an action that is not fired by a message is an
+//! operator believing something about when their rule runs that is not
+//! true. A second set of those checks written here is a second set
+//! that drifts the first time one of them is corrected, which is the
+//! argument that already put publishing behind one shared call.
+//!
+//! What this module adds is the HTTP: a code, a status, and the name
+//! of the field at fault — which comes from the refusal itself, since
+//! every error type in the rules crate answers `field()`.
+//!
+//! # Nothing is walked under the broker lock
+//!
+//! Nothing here takes the broker lock at all. The installed rules are
+//! behind the registry's own lock, which is read to clone out a page
+//! and released before anything is serialised, exactly as
+//! [`crate::resources`] does with the broker's. The registry's write
+//! lock is taken by an install and never held across an `await`; see
+//! [`::rules::live`].
+//!
+//! **A rule's outbox depth is not read here at all.** It is a stored
+//! counter, and walking every rule's outbox to answer a listing is the
+//! mistake this crate's other resources were fixed for, with a new
+//! name. The one place a depth is read is a delete, which reads one
+//! rule's maintained number to decide whether it is about to throw
+//! away messages this broker accepted.
+//!
+//! # Secrets go in and do not come back out
+//!
+//! Section 12.3: a token or a password is held in a wrapper that
+//! refuses to print itself. A rule read back over this API therefore
+//! carries **no** `http_in.token` and **no** `mqtt_bridge.password`,
+//! and the read resources are not behind the token, so that is not a
+//! nicety.
+//!
+//! The consequence is that the obvious edit — read a rule, change one
+//! field, write it back — would otherwise erase the secret. So an
+//! update that leaves a secret out **keeps the stored one**. Clearing
+//! one means deleting the rule and creating it again, which is the
+//! right amount of ceremony for taking the guard off an endpoint that
+//! publishes.
+//!
+//! # A node with no store holds no rules
+//!
+//! Section 9.1 makes a rule durable metadata, and a broker started
+//! with no `storage.directory` writes nothing down. Such a node
+//! answers [`ErrorCode::NotFound`] here rather than an empty
+//! collection, for the reason [`crate::resources`] gives about the
+//! resources of later milestones: an interface reads an empty
+//! collection as "you have no rules" rather than "this node cannot
+//! have any".
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use ::rules::live::{InstallError, Registry};
+use ::rules::rule::{Rule, RuleId};
+use ::rules::spec::{RuleSpec, SpecError};
+use ::rules::Action;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{Path, State};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+
+use crate::error::{ApiError, ErrorCode};
+use crate::resources::{page, select, Authorized, Page, Paging};
+use crate::AdminState;
+
+/// The registry this node serves, or the refusal for a node with none.
+fn registry(state: &AdminState) -> Result<&Arc<Registry>, ApiError> {
+    state.rules.as_ref().ok_or_else(|| {
+        ApiError::not_found(
+            "this node has no store, so it holds no rules: section 9.1 makes a rule \
+             durable metadata, and a broker started without storage.directory writes \
+             nothing down",
+        )
+    })
+}
+
+/// A rule this node holds, as the API spells one.
+///
+/// The written shape and nothing beside it, so that what a listing
+/// gives back is what a create would take. What each rule has *been
+/// doing* is a resource of its own; a rule and its statistics change
+/// at completely different rates and joining them would make a page
+/// that only wants the second refetch the first.
+type RuleView = RuleSpec;
+
+/// What refusing a rule looks like over HTTP.
+///
+/// The sentence is the refusal's own, so that a configuration file and
+/// this API say the same thing about the same mistake; the field is
+/// the one the refusal named, so a form can mark the input rather than
+/// parse the sentence.
+fn refusal(error: SpecError) -> ApiError {
+    ApiError::in_field(ErrorCode::InvalidRequest, error.field, error.why)
+}
+
+/// What failing to install a rule looks like over HTTP.
+fn install_refusal(error: &InstallError) -> ApiError {
+    match error {
+        // The caller did nothing wrong and cannot fix it.
+        InstallError::Storage { .. } => ApiError::new(ErrorCode::Internal, error.to_string()),
+        InstallError::NoSuchRule { .. } => ApiError::not_found(error.to_string()),
+        // Well formed, and would succeed once the outbox has drained.
+        InstallError::OutboxNotEmpty { .. } => {
+            ApiError::in_field(ErrorCode::Conflict, "id", error.to_string())
+        }
+    }
+}
+
+/// Read a body in the one error shape.
+///
+/// Axum's own rejection is plain text, and section 13 says this API
+/// answers one shape and no other.
+fn body(body: Result<Json<RuleSpec>, JsonRejection>) -> Result<RuleSpec, ApiError> {
+    body.map(|Json(spec)| spec).map_err(|rejection| {
+        ApiError::invalid_request(format!(
+            "the request body is not a rule: {}",
+            rejection.body_text()
+        ))
+    })
+}
+
+/// The identifier in the path, or the refusal for one no rule can have.
+///
+/// Checked here as well as by [`RuleSpec::to_rule`], because a path is
+/// not a body: `GET /api/v1/rules/a/b` is a path that no rule could
+/// ever be at, and answering "no such rule" is the honest answer to it.
+fn identifier(id: &str) -> Result<RuleId, ApiError> {
+    RuleId::new(id)
+        .map_err(|error| ApiError::in_field(ErrorCode::NotFound, "id", error.to_string()))
+}
+
+/// Carry a secret the caller left out over from the stored rule.
+///
+/// See the module note. A spec arrives from a caller who read the rule
+/// back and changed one field, which means the secrets are missing
+/// because this API does not give them out, not because the caller
+/// means to remove them.
+///
+/// **Three of them**, not two. A header value is the third and is the
+/// one with no type saying so: a rule's headers are where its bearer
+/// token goes, they are written back out with their names and empty
+/// values, and an empty value here therefore means "the one you
+/// already have" rather than "send nothing".
+fn keep_secrets(spec: &mut RuleSpec, stored: &Rule) {
+    match (&mut spec.http_in, &stored.action) {
+        (Some(written), Action::HttpIn(held)) if written.token.is_empty() => {
+            written.token = held.token.clone();
+        }
+        _ => {}
+    }
+    match (&mut spec.mqtt_bridge, &stored.action) {
+        (Some(written), Action::MqttBridge(held)) if written.password.is_none() => {
+            written.password.clone_from(&held.password);
+        }
+        _ => {}
+    }
+    if let (Some(written), Action::HttpOut(held)) = (&mut spec.http_out, &stored.action) {
+        keep_headers(&mut written.headers, &held.headers);
+    }
+    if let (Some(written), Action::HttpPoll(held)) = (&mut spec.http_poll, &stored.action) {
+        keep_headers(&mut written.headers, &held.headers);
+    }
+}
+
+/// Fill in the value of every header the caller sent empty, from the
+/// header of that name the rule already had.
+///
+/// A header the stored rule does not have keeps its empty value, which
+/// is a legal header and is what an operator who wrote one means.
+fn keep_headers(written: &mut BTreeMap<String, String>, held: &[(String, String)]) {
+    for (name, value) in written {
+        if !value.is_empty() {
+            continue;
+        }
+        if let Some((_, had)) = held.iter().find(|(had, _)| had == name) {
+            value.clone_from(had);
+        }
+    }
+}
+
+/// Every rule this node holds, a page at a time.
+///
+/// Cloned out of the registry under its read lock and serialised long
+/// after it was released: this handler returns `Json` of an owned
+/// value and calls no serialiser itself, which is the shape
+/// [`crate::resources`] explains at length.
+async fn list(
+    State(state): State<AdminState>,
+    paging: Paging,
+) -> Result<Json<Page<RuleView>>, ApiError> {
+    let held = registry(&state)?.list();
+    let keys: Vec<_> = held
+        .iter()
+        .map(|rule| ([rule.id.as_str(), "", ""], rule))
+        .collect();
+    let selection = select(keys.into_iter(), paging.after.as_ref(), paging.limit);
+    Ok(Json(page(selection, |_, rule| RuleSpec::of(rule))))
+}
+
+/// One rule.
+async fn read(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Json<RuleView>, ApiError> {
+    let id = identifier(&id)?;
+    let rule = registry(&state)?
+        .get(&id)
+        .ok_or_else(|| ApiError::not_found(format!("there is no rule called {:?}", id.as_str())))?;
+    Ok(Json(RuleSpec::of(&rule)))
+}
+
+/// Create a rule.
+///
+/// Refused when one of that name already exists, rather than quietly
+/// replacing it: a create that overwrote something would make two
+/// operators writing the same identifier a race whose loser never
+/// finds out. Changing one is [`update`].
+async fn create(
+    State(state): State<AdminState>,
+    _authorized: Authorized,
+    request: Result<Json<RuleSpec>, JsonRejection>,
+) -> Result<Json<RuleView>, ApiError> {
+    let registry = registry(&state)?;
+    let spec = body(request)?;
+    // Through the one conversion, before anything is looked up: a
+    // body that is not a rule is refused whatever is already stored.
+    let rule = spec.to_rule().map_err(refusal)?;
+    if registry.get(&rule.id).is_some() {
+        return Err(ApiError::in_field(
+            ErrorCode::Conflict,
+            "id",
+            format!(
+                "this node already holds a rule called {:?}; change it with a PUT to \
+                 /api/v1/rules/{}",
+                rule.id.as_str(),
+                rule.id.as_str()
+            ),
+        ));
+    }
+    registry
+        .install(rule.clone())
+        .await
+        .map_err(|error| install_refusal(&error))?;
+    Ok(Json(RuleSpec::of(&rule)))
+}
+
+/// Replace a rule, or create one at a name nothing holds.
+///
+/// The whole rule, not a patch. A partial update of a rule would mean
+/// deciding what an absent action table means — leave the action
+/// alone, or remove it — and neither answer is one an operator could
+/// guess. The one exception is a secret, which this API never gives
+/// out and therefore cannot ask a caller to send back; see the module
+/// note.
+async fn update(
+    State(state): State<AdminState>,
+    _authorized: Authorized,
+    Path(id): Path<String>,
+    request: Result<Json<RuleSpec>, JsonRejection>,
+) -> Result<Json<RuleView>, ApiError> {
+    let registry = registry(&state)?;
+    let id = identifier(&id)?;
+    let mut spec = body(request)?;
+    if spec.id != id.as_str() {
+        return Err(ApiError::in_field(
+            ErrorCode::InvalidRequest,
+            "id",
+            format!(
+                "this is /api/v1/rules/{} and the body calls the rule {:?}; a rule's \
+                 identifier is what names its outbox and its dead-letter topic, so it is \
+                 not something an update changes",
+                id.as_str(),
+                spec.id
+            ),
+        ));
+    }
+    if let Some(stored) = registry.get(&id) {
+        keep_secrets(&mut spec, &stored);
+    }
+    let rule = spec.to_rule().map_err(refusal)?;
+    registry
+        .install(rule.clone())
+        .await
+        .map_err(|error| install_refusal(&error))?;
+    Ok(Json(RuleSpec::of(&rule)))
+}
+
+/// Turn a rule on.
+async fn enable(
+    State(state): State<AdminState>,
+    _authorized: Authorized,
+    Path(id): Path<String>,
+) -> Result<Json<RuleView>, ApiError> {
+    switch(&state, &id, true).await
+}
+
+/// Turn a rule off, without deleting it.
+async fn disable(
+    State(state): State<AdminState>,
+    _authorized: Authorized,
+    Path(id): Path<String>,
+) -> Result<Json<RuleView>, ApiError> {
+    switch(&state, &id, false).await
+}
+
+/// What both of the two above do.
+async fn switch(state: &AdminState, id: &str, enabled: bool) -> Result<Json<RuleView>, ApiError> {
+    let id = identifier(id)?;
+    let rule = registry(state)?
+        .set_enabled(&id, enabled)
+        .await
+        .map_err(|error| install_refusal(&error))?;
+    Ok(Json(RuleSpec::of(&rule)))
+}
+
+/// Delete a rule and everything running for it.
+///
+/// Refused while its outbox holds anything, because deleting a rule
+/// deletes its outbox and what is in one is messages this broker told
+/// somebody it had accepted. See [`::rules::live`].
+async fn delete(
+    State(state): State<AdminState>,
+    _authorized: Authorized,
+    Path(id): Path<String>,
+) -> Result<Json<Deleted>, ApiError> {
+    let id = identifier(&id)?;
+    registry(&state)?
+        .remove(&id)
+        .await
+        .map_err(|error| install_refusal(&error))?;
+    Ok(Json(Deleted {
+        id: id.as_str().to_owned(),
+    }))
+}
+
+/// What a delete that happened answers.
+///
+/// A body rather than an empty `204`, so that every answer this API
+/// gives is JSON and a client has one thing to parse.
+#[derive(Debug, serde::Serialize)]
+struct Deleted {
+    /// What is gone.
+    id: String,
+}
+
+/// The routes this module owns.
+pub(crate) fn routes() -> Router<AdminState> {
+    Router::new()
+        .route("/api/v1/rules", get(list).post(create))
+        .route("/api/v1/rules/{id}", get(read).put(update).delete(delete))
+        .route("/api/v1/rules/{id}/enable", post(enable))
+        .route("/api/v1/rules/{id}/disable", post(disable))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use broker_core::broker::{Broker, BrokerConfig};
+    use rules::singleton::{Membership, NodeId};
+    use sdmqtt_server::shared::Shared;
+    use storage::{MemoryStorage, Storage, Writer, WriterConfig};
+
+    use super::*;
+    use crate::testing;
+    use crate::{AdminConfig, AdminRunning, AdminServer, AdminState};
+
+    /// How long a thing that should happen is waited for.
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    /// An admin listener, the registry behind it, and the store under
+    /// both.
+    struct Node {
+        admin: AdminRunning,
+        store: Arc<dyn Storage>,
+        registry: Arc<Registry>,
+    }
+
+    impl Node {
+        /// A broker with a store, a registry over it with its hook
+        /// installed, and an admin listener serving both.
+        async fn start(token: Option<&str>) -> Self {
+            let store: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+            let writer = Arc::new(
+                Writer::spawn(Arc::clone(&store), WriterConfig::default())
+                    .expect("a writer thread"),
+            );
+            let shared = Arc::new(Shared::with_store(
+                Broker::new(BrokerConfig::default()),
+                Arc::clone(&writer),
+            ));
+            let registry = Registry::new(
+                Arc::clone(&shared),
+                Arc::clone(&store),
+                writer,
+                Arc::new(Membership::alone(NodeId::new("local"))),
+            );
+            // The same wiring the binary does, and the reason a rule
+            // created below actually fires: without it there is no
+            // hook and the test would be about a list in memory.
+            shared.with_broker(|broker| {
+                broker.hooks_mut().install(registry.hook());
+            });
+            let config = AdminConfig {
+                address: "127.0.0.1:0".parse().expect("a valid address"),
+                token: token.map(crate::Token::new),
+                ..AdminConfig::default()
+            };
+            let admin = AdminServer::bind(
+                &config,
+                AdminState::new(shared).with_rules(Some(Arc::clone(&registry))),
+            )
+            .await
+            .expect("loopback needs no token");
+            Self {
+                admin,
+                store,
+                registry,
+            }
+        }
+
+        /// A node with no store, which is a node that holds no rules.
+        async fn without_a_store() -> AdminRunning {
+            let shared = Arc::new(Shared::new(BrokerConfig::default()));
+            let config = AdminConfig {
+                address: "127.0.0.1:0".parse().expect("a valid address"),
+                ..AdminConfig::default()
+            };
+            AdminServer::bind(&config, AdminState::new(shared))
+                .await
+                .expect("loopback needs no token")
+        }
+
+        async fn post(&self, path: &str, body: &str) -> testing::Response {
+            testing::post_json(self.admin.address(), path, None, body).await
+        }
+
+        async fn put(&self, path: &str, body: &str) -> testing::Response {
+            testing::with_body(self.admin.address(), "PUT", path, None, Some(body)).await
+        }
+
+        async fn get(&self, path: &str) -> testing::Response {
+            testing::get(self.admin.address(), path).await
+        }
+
+        async fn delete(&self, path: &str) -> testing::Response {
+            testing::request(self.admin.address(), "DELETE", path, None).await
+        }
+
+        /// Wait until `rule`'s outbox holds `expected` envelopes.
+        ///
+        /// A poll rather than a sleep, because what is being waited
+        /// for is the writer's next batch and not a duration.
+        async fn until_outbox(&self, rule: &str, expected: u64) -> bool {
+            let deadline = Instant::now() + PATIENCE;
+            while Instant::now() < deadline {
+                if self.store.outbox_depth(rule).expect("the store answers") == expected {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        }
+
+        async fn stop(self) {
+            self.registry.shutdown().await;
+            self.admin.shutdown().await;
+        }
+    }
+
+    /// A rule that posts what it sees on `sensor/+/temp` somewhere
+    /// nothing is listening.
+    ///
+    /// **The endpoint is deliberately dead and the backoff is an
+    /// hour**, so an envelope that reaches the outbox stays there: the
+    /// first attempt is refused, the pump waits, and nothing removes
+    /// the entry the assertion is about. A rule whose endpoint
+    /// answered would be a race between the assertion and the pump.
+    fn posting_rule(id: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","name":"Telemetry out","filter":"sensor/+/temp",
+                 "http_out":{{"url":"http://127.0.0.1:1/","timeout_ms":100,
+                              "retries":5,"backoff_ms":3600000}}}}"#
+        )
+    }
+
+    /// One publication through the API, which goes through the broker
+    /// and therefore through the hook.
+    fn publication(topic: &str) -> String {
+        format!(r#"{{"topic":"{topic}","payload":"25.5","qos":0}}"#)
+    }
+
+    /// Percent-encode a cursor for a query string.
+    ///
+    /// The separator a cursor is built with is a control character,
+    /// which does not survive a request line unescaped.
+    fn escape(value: &str) -> String {
+        let mut out = String::new();
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(char::from(byte));
+                }
+                other => out.push_str(&format!("%{other:02X}")),
+            }
+        }
+        out
+    }
+
+    /// What the `error` object of a failure said.
+    fn error_of(body: &str) -> (String, String) {
+        let value: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
+        let error = value.get("error").expect("a failure is nested under error");
+        (
+            error["code"].as_str().unwrap_or_default().to_owned(),
+            error["field"].as_str().unwrap_or_default().to_owned(),
+        )
+    }
+
+    // -----------------------------------------------------------
+    // The one that proves it went all the way
+    // -----------------------------------------------------------
+
+    /// Convention 5: a rule added to a list in memory satisfies any
+    /// assertion about what the API returned. The only thing that
+    /// cannot be satisfied that way is a message published afterwards
+    /// putting an envelope in that rule's outbox, because reaching the
+    /// outbox means going through the broker's publish path and the
+    /// hook installed on it.
+    #[tokio::test]
+    async fn a_rule_created_over_the_api_fires() {
+        let node = Node::start(None).await;
+        let created = node.post("/api/v1/rules", &posting_rule("telemetry")).await;
+        assert_eq!(created.status, 200, "{}", created.body);
+
+        let published = node
+            .post("/api/v1/publish", &publication("sensor/1/temp"))
+            .await;
+        assert_eq!(published.status, 200, "{}", published.body);
+
+        assert!(
+            node.until_outbox("telemetry", 1).await,
+            "the rule created over the API did not fire: nothing reached its outbox"
+        );
+        node.stop().await;
+    }
+
+    /// The other half of the same question: a rule fires on what its
+    /// filter says and on nothing else. A rule that fired on
+    /// everything would pass the test above.
+    #[tokio::test]
+    async fn a_rule_created_over_the_api_does_not_fire_on_everything() {
+        let node = Node::start(None).await;
+        node.post("/api/v1/rules", &posting_rule("telemetry")).await;
+
+        let published = node
+            .post("/api/v1/publish", &publication("something/else"))
+            .await;
+        assert_eq!(published.status, 200, "{}", published.body);
+        // The one the rule does want, published second, so that the
+        // assertion is about which of the two arrived rather than
+        // about whether the writer has caught up.
+        node.post("/api/v1/publish", &publication("sensor/1/temp"))
+            .await;
+
+        assert!(node.until_outbox("telemetry", 1).await);
+        assert_eq!(
+            node.store.outbox_depth("telemetry").expect("the store"),
+            1,
+            "the rule fired on a topic its filter does not match"
+        );
+        node.stop().await;
+    }
+
+    /// `enabled` is what an operator reaches for to turn a connector
+    /// off, and it has to reach all the way to the hook.
+    #[tokio::test]
+    async fn a_rule_disabled_over_the_api_stops_firing() {
+        let node = Node::start(None).await;
+        node.post("/api/v1/rules", &posting_rule("telemetry")).await;
+        node.post("/api/v1/publish", &publication("sensor/1/temp"))
+            .await;
+        assert!(node.until_outbox("telemetry", 1).await);
+
+        let off = node.post("/api/v1/rules/telemetry/disable", "").await;
+        assert_eq!(off.status, 200, "{}", off.body);
+        assert!(
+            off.body.contains("\"enabled\":false"),
+            "a disabled rule should say so: {}",
+            off.body
+        );
+
+        node.post("/api/v1/publish", &publication("sensor/2/temp"))
+            .await;
+        // Long enough that a rule which was still firing would have
+        // reached the outbox: the writer's interval is two
+        // milliseconds.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            node.store.outbox_depth("telemetry").expect("the store"),
+            1,
+            "a disabled rule fired"
+        );
+
+        let on = node.post("/api/v1/rules/telemetry/enable", "").await;
+        assert_eq!(on.status, 200, "{}", on.body);
+        node.post("/api/v1/publish", &publication("sensor/3/temp"))
+            .await;
+        assert!(
+            node.until_outbox("telemetry", 2).await,
+            "a rule switched back on did not fire"
+        );
+        node.stop().await;
+    }
+
+    // -----------------------------------------------------------
+    // The refusals, each one actually tried
+    // -----------------------------------------------------------
+
+    /// Section 9.2: the token is not optional, because the endpoint
+    /// publishes.
+    #[tokio::test]
+    async fn an_ingest_rule_with_no_token_is_refused() {
+        let node = Node::start(None).await;
+        let answered = node
+            .post(
+                "/api/v1/rules",
+                r#"{"id":"gateway","name":"Gateway in",
+                    "http_in":{"topic":"ingest/across","qos":1}}"#,
+            )
+            .await;
+        assert_eq!(answered.status, 400, "{}", answered.body);
+        assert_eq!(
+            error_of(&answered.body),
+            ("invalid_request".to_owned(), "http_in.token".to_owned()),
+            "{}",
+            answered.body
+        );
+        assert!(
+            node.registry.is_empty(),
+            "a refused rule was installed anyway"
+        );
+        node.stop().await;
+    }
+
+    /// Section 9.2's first line of defence against a bridge loop, and
+    /// the one that works on MQTT 3.1.1.
+    #[tokio::test]
+    async fn a_bridge_whose_filters_intersect_is_refused() {
+        let node = Node::start(None).await;
+        let answered = node
+            .post(
+                "/api/v1/rules",
+                r#"{"id":"across","name":"A bridge that loops",
+                    "mqtt_bridge":{"address":"mqtts://remote.example:8883",
+                                   "client_id":"bridge-one",
+                                   "topics":[{"filter":"site/+/data","direction":"out"},
+                                             {"filter":"site/+/data","direction":"in"}]}}"#,
+            )
+            .await;
+        assert_eq!(answered.status, 400, "{}", answered.body);
+        assert_eq!(
+            error_of(&answered.body),
+            (
+                "invalid_request".to_owned(),
+                "mqtt_bridge.topics".to_owned()
+            ),
+            "{}",
+            answered.body
+        );
+        assert!(
+            answered.body.contains("site/"),
+            "the refusal should name a topic both sides match: {}",
+            answered.body
+        );
+        assert!(node.registry.is_empty());
+        node.stop().await;
+    }
+
+    /// An operator who put a filter on a rule a message does not fire
+    /// believes something about when it runs that is not true.
+    #[tokio::test]
+    async fn a_trigger_on_an_action_that_does_not_fire_on_messages_is_refused() {
+        let node = Node::start(None).await;
+        let answered = node
+            .post(
+                "/api/v1/rules",
+                r#"{"id":"gateway","name":"Gateway in","filter":"sensor/+/temp",
+                    "http_in":{"token":"a-secret","topic":"ingest/across","qos":1}}"#,
+            )
+            .await;
+        assert_eq!(answered.status, 400, "{}", answered.body);
+        assert_eq!(
+            error_of(&answered.body),
+            ("invalid_request".to_owned(), "filter".to_owned()),
+            "{}",
+            answered.body
+        );
+        assert!(node.registry.is_empty());
+        node.stop().await;
+    }
+
+    /// The same rule without the filter is accepted, which is what
+    /// makes the refusal above about the filter rather than about
+    /// ingest rules.
+    #[tokio::test]
+    async fn the_same_ingest_rule_without_a_filter_is_accepted_and_served() {
+        let node = Node::start(None).await;
+        let answered = node
+            .post(
+                "/api/v1/rules",
+                r#"{"id":"gateway","name":"Gateway in",
+                    "http_in":{"token":"a-secret","topic":"ingest/across","qos":1}}"#,
+            )
+            .await;
+        assert_eq!(answered.status, 200, "{}", answered.body);
+        assert_eq!(
+            node.registry.ingest().len(),
+            1,
+            "an ingest rule created over the API got no route"
+        );
+        node.stop().await;
+    }
+
+    // -----------------------------------------------------------
+    // Reading, writing and the shapes in between
+    // -----------------------------------------------------------
+
+    /// Convention 1, from the other side: what a listing gives back is
+    /// what a create takes.
+    #[tokio::test]
+    async fn a_rule_read_back_is_one_that_can_be_written_back() {
+        let node = Node::start(None).await;
+        node.post("/api/v1/rules", &posting_rule("telemetry")).await;
+
+        let read = node.get("/api/v1/rules/telemetry").await;
+        assert_eq!(read.status, 200, "{}", read.body);
+
+        let written = node.put("/api/v1/rules/telemetry", &read.body).await;
+        assert_eq!(
+            written.status, 200,
+            "a rule read back was refused on the way in: {}",
+            written.body
+        );
+        assert_eq!(
+            node.get("/api/v1/rules/telemetry").await.body,
+            read.body,
+            "writing a rule back changed it"
+        );
+        node.stop().await;
+    }
+
+    /// Section 12.3: a secret goes in and does not come back out.
+    #[tokio::test]
+    async fn a_rule_read_back_carries_no_secret() {
+        let node = Node::start(None).await;
+        node.post(
+            "/api/v1/rules",
+            r#"{"id":"gateway","name":"Gateway in",
+                "http_in":{"token":"a-secret-nobody-may-read","topic":"ingest/across"}}"#,
+        )
+        .await;
+
+        let read = node.get("/api/v1/rules/gateway").await;
+        assert!(
+            !read.body.contains("a-secret-nobody-may-read"),
+            "the API gave out a bearer token: {}",
+            read.body
+        );
+        let listed = node.get("/api/v1/rules").await;
+        assert!(
+            !listed.body.contains("a-secret-nobody-may-read"),
+            "the listing gave out a bearer token: {}",
+            listed.body
+        );
+        node.stop().await;
+    }
+
+    /// A rule's headers are where its bearer token goes, and the read
+    /// resources are not behind the admin token, so the values are
+    /// redacted and the names are not.
+    #[tokio::test]
+    async fn a_rules_header_values_do_not_come_back_but_their_names_do() {
+        let node = Node::start(None).await;
+        let created = node
+            .post(
+                "/api/v1/rules",
+                r#"{"id":"telemetry","name":"Telemetry out","filter":"sensor/+/temp",
+                    "http_out":{"url":"http://127.0.0.1:1/",
+                                "headers":{"x-token":"the-bearer-token"}}}"#,
+            )
+            .await;
+        assert_eq!(created.status, 200, "{}", created.body);
+
+        let read = node.get("/api/v1/rules/telemetry").await;
+        assert!(
+            !read.body.contains("the-bearer-token"),
+            "the API gave out a header value: {}",
+            read.body
+        );
+        assert!(
+            read.body.contains("x-token"),
+            "the API hid the header name as well as the value: {}",
+            read.body
+        );
+
+        // And writing it back keeps the value, which is what stops a
+        // read, change and write from quietly taking the guard off
+        // the endpoint this rule posts to.
+        let written = node.put("/api/v1/rules/telemetry", &read.body).await;
+        assert_eq!(written.status, 200, "{}", written.body);
+        let held = node
+            .registry
+            .get(&RuleId::new("telemetry").expect("an identifier"))
+            .expect("the rule is still there");
+        match &held.action {
+            Action::HttpOut(action) => assert_eq!(
+                action.headers,
+                vec![("x-token".to_owned(), "the-bearer-token".to_owned())],
+                "writing a rule back emptied the header it sends"
+            ),
+            other => panic!("the action changed: {other:?}"),
+        }
+        node.stop().await;
+    }
+
+    /// The consequence of the rule above: an update that leaves the
+    /// secret out keeps the stored one, because the caller was never
+    /// given it to send back.
+    #[tokio::test]
+    async fn an_update_that_leaves_a_secret_out_keeps_it() {
+        let node = Node::start(None).await;
+        node.post(
+            "/api/v1/rules",
+            r#"{"id":"gateway","name":"Gateway in",
+                "http_in":{"token":"a-secret-nobody-may-read","topic":"ingest/across"}}"#,
+        )
+        .await;
+        let renamed = node
+            .put(
+                "/api/v1/rules/gateway",
+                r#"{"id":"gateway","name":"Gateway in, renamed",
+                    "http_in":{"topic":"ingest/across"}}"#,
+            )
+            .await;
+        assert_eq!(
+            renamed.status, 200,
+            "an update with no token was refused, so the secret was lost: {}",
+            renamed.body
+        );
+        let held = node
+            .registry
+            .get(&RuleId::new("gateway").expect("an identifier"))
+            .expect("the rule is still there");
+        match &held.action {
+            Action::HttpIn(action) => assert_eq!(
+                action.token.expose(),
+                "a-secret-nobody-may-read",
+                "the update replaced the token with nothing"
+            ),
+            other => panic!("the action changed: {other:?}"),
+        }
+        node.stop().await;
+    }
+
+    /// A create that overwrote something would make two operators
+    /// writing the same identifier a race whose loser never finds out.
+    #[tokio::test]
+    async fn creating_a_rule_at_a_name_something_holds_is_refused() {
+        let node = Node::start(None).await;
+        node.post("/api/v1/rules", &posting_rule("telemetry")).await;
+        let again = node.post("/api/v1/rules", &posting_rule("telemetry")).await;
+        assert_eq!(again.status, 409, "{}", again.body);
+        assert_eq!(
+            error_of(&again.body),
+            ("conflict".to_owned(), "id".to_owned()),
+            "{}",
+            again.body
+        );
+        node.stop().await;
+    }
+
+    /// A rule's identifier names its outbox and its dead-letter topic,
+    /// so an update cannot change it.
+    #[tokio::test]
+    async fn an_update_that_renames_the_rule_is_refused() {
+        let node = Node::start(None).await;
+        node.post("/api/v1/rules", &posting_rule("telemetry")).await;
+        let answered = node
+            .put("/api/v1/rules/telemetry", &posting_rule("something-else"))
+            .await;
+        assert_eq!(answered.status, 400, "{}", answered.body);
+        assert_eq!(
+            error_of(&answered.body),
+            ("invalid_request".to_owned(), "id".to_owned()),
+            "{}",
+            answered.body
+        );
+        node.stop().await;
+    }
+
+    /// Deleting a rule deletes its outbox, and what is in one is
+    /// messages this broker told somebody it had accepted.
+    #[tokio::test]
+    async fn a_rule_with_something_waiting_is_not_deleted() {
+        let node = Node::start(None).await;
+        node.post("/api/v1/rules", &posting_rule("telemetry")).await;
+        node.post("/api/v1/publish", &publication("sensor/1/temp"))
+            .await;
+        assert!(node.until_outbox("telemetry", 1).await);
+
+        let refused = node.delete("/api/v1/rules/telemetry").await;
+        assert_eq!(refused.status, 409, "{}", refused.body);
+        assert_eq!(
+            error_of(&refused.body),
+            ("conflict".to_owned(), "id".to_owned()),
+            "{}",
+            refused.body
+        );
+        assert!(
+            node.registry
+                .get(&RuleId::new("telemetry").expect("an identifier"))
+                .is_some(),
+            "the refused delete took the rule anyway"
+        );
+        node.stop().await;
+    }
+
+    /// And one with nothing waiting is deleted, which is what makes
+    /// the refusal above about the outbox.
+    #[tokio::test]
+    async fn a_rule_with_an_empty_outbox_is_deleted_and_stops_firing() {
+        let node = Node::start(None).await;
+        node.post("/api/v1/rules", &posting_rule("telemetry")).await;
+
+        let gone = node.delete("/api/v1/rules/telemetry").await;
+        assert_eq!(gone.status, 200, "{}", gone.body);
+        assert!(node.registry.is_empty());
+        assert_eq!(node.get("/api/v1/rules/telemetry").await.status, 404);
+
+        node.post("/api/v1/publish", &publication("sensor/1/temp"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            node.store.outbox_depth("telemetry").expect("the store"),
+            0,
+            "a deleted rule fired"
+        );
+        node.stop().await;
+    }
+
+    /// Section 11.1: only mutating requests need the token.
+    ///
+    /// Convention 5: each on its own passes against a guard that is
+    /// not there, so every mutating route is tried and the reads are
+    /// tried beside them.
+    #[tokio::test]
+    async fn every_mutating_rule_request_needs_the_token() {
+        let node = Node::start(Some("a-secret-for-the-test")).await;
+        let address = node.admin.address();
+        let token = Some("a-secret-for-the-test");
+
+        // With it, so that the rule the rest of the test needs exists.
+        let created =
+            testing::post_json(address, "/api/v1/rules", token, &posting_rule("telemetry")).await;
+        assert_eq!(created.status, 200, "{}", created.body);
+
+        for (method, path, body) in [
+            ("POST", "/api/v1/rules", Some(posting_rule("another"))),
+            (
+                "PUT",
+                "/api/v1/rules/telemetry",
+                Some(posting_rule("telemetry")),
+            ),
+            ("POST", "/api/v1/rules/telemetry/enable", None),
+            ("POST", "/api/v1/rules/telemetry/disable", None),
+            ("DELETE", "/api/v1/rules/telemetry", None),
+        ] {
+            let without = testing::with_body(address, method, path, None, body.as_deref()).await;
+            assert_eq!(
+                without.status, 401,
+                "{method} {path} was served without the token: {}",
+                without.body
+            );
+            let wrong =
+                testing::with_body(address, method, path, Some("not-it"), body.as_deref()).await;
+            assert_eq!(
+                wrong.status, 401,
+                "{method} {path} was served with the wrong token: {}",
+                wrong.body
+            );
+        }
+
+        // And the reads are not guarded, which is what makes the
+        // assertions above about mutation rather than about the
+        // listener.
+        assert_eq!(testing::get(address, "/api/v1/rules").await.status, 200);
+        assert_eq!(
+            testing::get(address, "/api/v1/rules/telemetry")
+                .await
+                .status,
+            200
+        );
+        node.stop().await;
+    }
+
+    /// Section 9.1 makes a rule durable metadata, so a node that
+    /// writes nothing down holds none — and says so rather than
+    /// answering with an empty collection.
+    #[tokio::test]
+    async fn a_node_with_no_store_says_it_holds_no_rules() {
+        let admin = Node::without_a_store().await;
+        let answered = testing::get(admin.address(), "/api/v1/rules").await;
+        assert_eq!(answered.status, 404, "{}", answered.body);
+        assert_eq!(error_of(&answered.body).0, "not_found", "{}", answered.body);
+        admin.shutdown().await;
+    }
+
+    /// The listing is a page with the same envelope as every other
+    /// resource, in identifier order.
+    #[tokio::test]
+    async fn the_listing_is_a_page_in_identifier_order() {
+        let node = Node::start(None).await;
+        for id in ["charlie", "alpha", "bravo"] {
+            let created = node.post("/api/v1/rules", &posting_rule(id)).await;
+            assert_eq!(created.status, 200, "{}", created.body);
+        }
+        let listed = node.get("/api/v1/rules?limit=2").await;
+        let page: serde_json::Value = serde_json::from_str(&listed.body).expect("a page");
+        assert_eq!(page["total"], 3);
+        assert_eq!(page["items"][0]["id"], "alpha");
+        assert_eq!(page["items"][1]["id"], "bravo");
+        let next = page["next"].as_str().expect("a cursor").to_owned();
+        let rest = node
+            .get(&format!("/api/v1/rules?after={}", escape(&next)))
+            .await;
+        let page: serde_json::Value = serde_json::from_str(&rest.body).expect("a page");
+        assert_eq!(page["items"][0]["id"], "charlie");
+        assert!(page["next"].is_null());
+        node.stop().await;
+    }
+}

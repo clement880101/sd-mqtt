@@ -162,6 +162,23 @@ pub enum HttpPollError {
     },
 }
 
+impl HttpPollError {
+    /// Which field of an `http_poll` action this refusal is about.
+    ///
+    /// [`HttpPollError::Endpoint`] carries a sentence rather than the
+    /// [`HttpOutError`] it came from, so the field it names is the
+    /// URL: that is what all but one of those refusals is about, and
+    /// the one exception is a header whose own sentence says so.
+    pub fn field(&self) -> &'static str {
+        match self {
+            Self::Endpoint(_) => "http_poll.url",
+            Self::NoInterval => "http_poll.interval_ms",
+            Self::NoBody => "http_poll.max_body_bytes",
+            Self::NotATopic { .. } | Self::Reserved { .. } => "http_poll.topic",
+        }
+    }
+}
+
 /// Check a rule's configuration without building anything to fetch
 /// with.
 ///

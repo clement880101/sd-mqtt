@@ -95,6 +95,25 @@ const INGEST_TOPIC: &str = "ingest/across";
 /// What is posted before the broker is killed.
 const POSTED: &[u8] = b"posted before the broker was killed";
 
+/// The identifier of the rule this test creates over the API.
+///
+/// Nothing in any configuration file mentions it, which is the whole
+/// point: it exists because a request made it, and it survives because
+/// the request made it durable.
+const API_RULE: &str = "made-over-the-api";
+
+/// What that rule's trigger matches.
+const API_FILTER: &str = "api/+/temp";
+
+/// What is published to it.
+const API_TOPIC: &str = "api/1/temp";
+
+/// What is published before the broker is killed.
+const BEFORE_THE_RESTART: &[u8] = b"published to a rule the file never mentioned";
+
+/// What is published after it comes back.
+const AFTER_THE_RESTART: &[u8] = b"published after the broker was restarted";
+
 // ---- the endpoint -------------------------------------------------------
 
 /// One request, as the endpoint saw it.
@@ -1558,4 +1577,131 @@ fn a_poller_resumes_on_its_interval_after_a_restart() {
     assert_eq!(&delivered.payload[..], READING);
 
     broker.kill();
+}
+
+/// Section 11.1, against the real binary: a rule written over the API
+/// fires, and still fires after the process has been killed.
+///
+/// **The configuration file has no `[[rules]]` table at all.** That is
+/// what makes this test about the API rather than about the file: the
+/// only thing that ever said this rule exists is one HTTP request, and
+/// the only thing that can make it fire again after a `SIGKILL` is the
+/// store.
+///
+/// Convention 5, twice over. A rule appended to a list in memory
+/// satisfies every assertion about what the API answered, and is
+/// caught by the endpoint seeing a request; a rule installed but never
+/// stored satisfies that too, and is caught by the restart. Neither
+/// half is redundant, because each is the other's failure mode.
+#[test]
+fn a_rule_created_over_the_api_fires_and_still_fires_after_a_restart() {
+    let workspace = tempfile::tempdir().expect("a temporary directory");
+    let store = workspace.path().join("store");
+    let config = workspace.path().join("sdmqtt.toml");
+    let endpoint = Endpoint::start();
+    let mqtt = loopback(free_port());
+    let admin = loopback(free_port());
+    let ingest = loopback(free_port());
+
+    // No rules. Everything this test is about arrives over HTTP.
+    write_config(&config, &store, mqtt, admin, ingest, "");
+    let broker = BrokerProcess::start(
+        &config,
+        &store,
+        mqtt,
+        workspace.path().join("before-the-restart.log"),
+    );
+    accepting(admin, "the admin listener");
+
+    let listed = http(admin, "GET", "/api/v1/rules", ADMIN_TOKEN, None);
+    assert_eq!(listed.status, 200, "listing rules: {}", listed.body);
+    assert!(
+        listed.body.contains("\"total\":0"),
+        "this broker was started with no rules and says it has some: {}",
+        listed.body
+    );
+
+    let written = format!(
+        r#"{{"id":"{API_RULE}","name":"Made over the API","filter":"{API_FILTER}",
+             "http_out":{{"url":"{url}","timeout_ms":2000,"retries":2,"backoff_ms":200}}}}"#,
+        url = endpoint.url(),
+    );
+    let created = http_with(
+        admin,
+        "POST",
+        "/api/v1/rules",
+        ADMIN_TOKEN,
+        // The one header axum's JSON extractor insists on, which the
+        // ingest endpoint beside it deliberately does not.
+        &[("Content-Type", "application/json")],
+        Some(written.as_bytes()),
+    );
+    assert_eq!(created.status, 200, "creating a rule: {}", created.body);
+
+    // At least once, so the publication is durable before the
+    // acknowledgement — which is also what flushes the envelope the
+    // hook put in the outbox, since this configuration tells the
+    // writer never to flush on its own.
+    let mut client = Client::connect(mqtt, "before-the-restart");
+    client.publish_and_wait(API_TOPIC, BEFORE_THE_RESTART);
+    endpoint.wait_for(
+        1,
+        "a rule created over the API did not fire; it went into a list rather than \
+         into the broker",
+    );
+    assert_eq!(
+        endpoint.requests()[0].field("topic"),
+        API_TOPIC,
+        "the endpoint was posted something other than the message that fired the rule"
+    );
+
+    // No destructor, no final flush, no clean close of the store.
+    broker.kill();
+
+    let broker = BrokerProcess::start(
+        &config,
+        &store,
+        mqtt,
+        workspace.path().join("after-the-restart.log"),
+    );
+    accepting(admin, "the admin listener after the restart");
+
+    let read = http(
+        admin,
+        "GET",
+        &format!("/api/v1/rules/{API_RULE}"),
+        ADMIN_TOKEN,
+        None,
+    );
+    assert_eq!(
+        read.status, 200,
+        "the rule created over the API did not survive the restart: {}",
+        read.body
+    );
+    assert!(
+        read.body.contains(API_FILTER),
+        "the rule came back as something else: {}",
+        read.body
+    );
+
+    let mut client = Client::connect(mqtt, "after-the-restart");
+    client.publish_and_wait(API_TOPIC, AFTER_THE_RESTART);
+    endpoint.wait_for(
+        2,
+        "the rule was read back after the restart but did not fire, so it was restored \
+         as a row and not as a running rule",
+    );
+    let seen = endpoint.requests();
+    assert_eq!(
+        seen[1].field("topic"),
+        API_TOPIC,
+        "the second post was not the message published after the restart"
+    );
+    assert_ne!(
+        seen[0].field("id"),
+        seen[1].field("id"),
+        "the endpoint saw the same envelope twice rather than two publications"
+    );
+
+    drop(broker);
 }

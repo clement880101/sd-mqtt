@@ -84,6 +84,33 @@ pub enum RuleError {
     NoToken,
 }
 
+impl RuleError {
+    /// Which field of a rule this refusal is about.
+    ///
+    /// **Here rather than at a caller**, because the caller that
+    /// wants it is an HTTP API that has to mark the input at fault,
+    /// and a table mapping variants to field names kept anywhere else
+    /// is a table that drifts the first time a variant is added. The
+    /// names are the ones a rule is written with — a configuration
+    /// file's keys and the API's JSON keys are the same word for the
+    /// same thing — so one answer serves both.
+    pub fn field(&self) -> &'static str {
+        match self {
+            Self::BadIdentifier(_) => "id",
+            Self::NoName => "name",
+            // Every remaining variant is about the presence, absence
+            // or shape of the trigger, which an operator writes as
+            // `filter`.
+            Self::BadFilter(_)
+            | Self::NoTrigger
+            | Self::TriggerOnIngest
+            | Self::TriggerOnPoll
+            | Self::TriggerOnBridge => "filter",
+            Self::NoToken => "http_in.token",
+        }
+    }
+}
+
 /// What names a rule, for as long as it exists.
 ///
 /// **Constrained to what one topic level can carry**, because section 9.2

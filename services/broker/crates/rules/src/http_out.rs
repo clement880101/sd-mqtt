@@ -158,6 +158,25 @@ pub enum HttpOutError {
     NoConcurrency,
 }
 
+impl HttpOutError {
+    /// Which field of an `http_out` action this refusal is about.
+    ///
+    /// Named here for the reason [`crate::rule::RuleError::field`]
+    /// gives: the HTTP API marks the input at fault, and a table of
+    /// variants to field names anywhere but beside the variants is a
+    /// table that drifts.
+    pub fn field(&self) -> &'static str {
+        match self {
+            Self::NotAUrl { .. } | Self::NotEncrypted { .. } | Self::NoHost { .. } => {
+                "http_out.url"
+            }
+            Self::NotAMethod { .. } => "http_out.method",
+            Self::BadHeader { .. } => "http_out.headers",
+            Self::NoConcurrency => "http_out.max_concurrency",
+        }
+    }
+}
+
 /// What one attempt did.
 ///
 /// Four outcomes rather than a `Result`, because the three failures are

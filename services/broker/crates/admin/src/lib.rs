@@ -37,6 +37,7 @@ pub mod events;
 pub mod health;
 pub mod host;
 pub mod resources;
+pub mod rules;
 pub mod taps;
 
 #[cfg(test)]
@@ -137,6 +138,14 @@ pub struct AdminState {
     /// same reason the token is: the value the guard reads and the
     /// value the operator wrote must be one thing.
     pub allowed_hosts: Arc<[String]>,
+    /// The rules this node is running, when it has somewhere to
+    /// keep one.
+    ///
+    /// `None` on a node with no store: section 9.1 makes a rule
+    /// durable metadata, so a broker that writes nothing down holds
+    /// no rules and says so rather than answering with an empty
+    /// collection. See [`rules`].
+    pub rules: Option<Arc<::rules::live::Registry>>,
     /// The live subscribers the interface reads.
     ///
     /// See [`taps`]: a tap is a real session inside the broker, so
@@ -165,6 +174,7 @@ impl AdminState {
             started: Instant::now(),
             token: None,
             allowed_hosts: Arc::from(Vec::new()),
+            rules: None,
             taps: Arc::new(Taps::new()),
         }
     }
@@ -208,6 +218,13 @@ impl AdminState {
     #[must_use]
     pub fn with_listeners(mut self, listeners: Vec<ListenerView>) -> Self {
         self.listeners = Arc::new(listeners);
+        self
+    }
+
+    /// Serve the rules this registry is running. See [`rules`].
+    #[must_use]
+    pub fn with_rules(mut self, registry: Option<Arc<::rules::live::Registry>>) -> Self {
+        self.rules = registry;
         self
     }
 }
@@ -480,6 +497,7 @@ fn router(state: AdminState, extra: Router<AdminState>) -> Router {
     Router::new()
         .merge(health::routes())
         .merge(resources::routes())
+        .merge(rules::routes())
         .merge(events::routes())
         .merge(taps::routes())
         // Whatever the caller asked to be served here as well, inside

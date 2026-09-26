@@ -161,7 +161,7 @@ pub const MAX_LIMIT: usize = 1_000;
 /// resource with fewer leaves the rest empty, and the empty string
 /// sorts before everything, so a shorter key orders the way a reader
 /// would expect.
-const PARTS: usize = 3;
+pub(crate) const PARTS: usize = 3;
 
 /// What separates the parts of a cursor.
 ///
@@ -183,7 +183,7 @@ const SEPARATOR: char = '\u{1f}';
 /// only for the last row of a page; see [`encode_cursor`]. What is
 /// left on this path is nodes and listeners, which are a handful of
 /// rows held by the admin listener itself and not by the broker.
-type Key<'a> = [&'a str; PARTS];
+pub(crate) type Key<'a> = [&'a str; PARTS];
 
 /// One page of anything.
 ///
@@ -237,9 +237,9 @@ struct PageQuery {
 /// instead of axum's plain-text rejection. Section 13 and
 /// [`crate::error`]: one shape for every error the API returns.
 #[derive(Debug)]
-struct Paging {
-    limit: usize,
-    after: Option<[String; PARTS]>,
+pub(crate) struct Paging {
+    pub(crate) limit: usize,
+    pub(crate) after: Option<[String; PARTS]>,
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for Paging {
@@ -367,7 +367,7 @@ impl<T> PartialEq for Chosen<'_, T> {
 impl<T> Eq for Chosen<'_, T> {}
 
 /// What one pass over a resource found.
-struct Selection<'a, T> {
+pub(crate) struct Selection<'a, T> {
     /// The page, in ascending key order.
     chosen: Vec<Chosen<'a, T>>,
     /// Everything the resource holds.
@@ -391,7 +391,7 @@ struct Selection<'a, T> {
 /// did. What is left is nodes and listeners, which are a handful of
 /// rows the admin listener holds itself, are not behind the broker's
 /// lock, and want the same envelope as the other four.
-fn select<'a, T>(
+pub(crate) fn select<'a, T>(
     items: impl Iterator<Item = (Key<'a>, T)>,
     after: Option<&[String; PARTS]>,
     limit: usize,
@@ -433,7 +433,10 @@ fn is_after(key: &Key<'_>, cursor: &[String; PARTS]) -> bool {
 ///
 /// `row` runs once per returned row and not once per row in the
 /// broker, which is the whole reason [`select`] exists.
-fn page<'a, T, R>(selection: Selection<'a, T>, row: impl Fn(Key<'a>, T) -> R) -> Page<R> {
+pub(crate) fn page<'a, T, R>(
+    selection: Selection<'a, T>,
+    row: impl Fn(Key<'a>, T) -> R,
+) -> Page<R> {
     let Selection {
         chosen,
         total,

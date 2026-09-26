@@ -166,6 +166,15 @@ pub enum AddressError {
     },
 }
 
+impl AddressError {
+    /// Which field this refusal is about.
+    ///
+    /// Only one field is ever an address: the bridge's.
+    pub fn field(&self) -> &'static str {
+        "mqtt_bridge.address"
+    }
+}
+
 /// Where a bridge connects, and whether it does so in the clear.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Address {

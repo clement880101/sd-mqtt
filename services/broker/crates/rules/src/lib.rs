@@ -52,18 +52,24 @@ pub mod hops;
 pub mod http_in;
 pub mod http_out;
 pub mod http_poll;
+pub mod live;
 pub mod outbox;
 pub mod rule;
 pub mod singleton;
+pub mod spec;
 
 pub use bridge::TopicError;
 pub use envelope::Envelope;
 pub use http_in::{HttpInError, Ingest};
 pub use http_out::{Attempt, DeadLetters, Delivery, HttpOutError, Poster, Turn};
 pub use http_poll::{Fetched, Fetcher, HttpPollError, Polled, Poller};
+pub use live::{InstallError, Registry};
 pub use outbox::Outbox;
 pub use rule::{
     Action, BridgeTopic, ClientPattern, Direction, HttpIn, HttpOut, HttpPoll, MqttBridge, Rule,
     RuleError, RuleId, TopicFromRequest, TopicSource, Trigger,
 };
 pub use singleton::{Membership, NodeId, Ownership};
+pub use spec::{
+    BridgeTopicSpec, HttpInSpec, HttpOutSpec, HttpPollSpec, MqttBridgeSpec, RuleSpec, SpecError,
+};

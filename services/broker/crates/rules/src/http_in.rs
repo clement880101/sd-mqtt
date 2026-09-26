@@ -72,6 +72,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use mqtt_codec::QoS;
+use parking_lot::RwLock;
 use sdmqtt_server::publish::{publish, Publication, PublishRefused};
 use sdmqtt_server::shared::Shared;
 use serde::Serialize;
@@ -219,6 +220,26 @@ pub enum HttpInError {
     BadQuery,
 }
 
+impl HttpInError {
+    /// Which field of an `http_in` action this refusal is about.
+    pub fn field(&self) -> &'static str {
+        match self {
+            Self::NotATopic { .. } | Self::Reserved { .. } => "http_in.topic",
+            // The prefix is the field at fault in all three: one is
+            // missing, one has nothing to bound, and one is not a
+            // prefix a topic can lie under.
+            Self::NoPrefix { .. } | Self::NoSource | Self::BadPrefix { .. } => {
+                "http_in.topic_prefix"
+            }
+            // Two sources is the pair being wrong rather than either
+            // one, and a form can only mark one input; the header is
+            // named because it is the key listed first.
+            Self::TwoSources | Self::BadHeader { .. } => "http_in.topic_header",
+            Self::BadQuery { .. } => "http_in.topic_query",
+        }
+    }
+}
+
 /// Check an ingest rule without binding anything.
 ///
 /// For whatever reads an operator's configuration: a rule that cannot
@@ -312,14 +333,21 @@ pub fn check(action: &HttpIn) -> Result<(), HttpInError> {
 
 /// The ingest rules this node serves, by identifier.
 ///
-/// Built once at startup from the rules the node holds. Milestone 5
-/// replicates rules and will want this to change while the process is
-/// running; what it holds would then go behind the lock the rest of the
-/// replicated metadata is behind, and nothing about the route changes.
+/// **What it holds changes while the process is running**, because
+/// section 11.1's admin API creates, enables, disables and deletes
+/// rules, and an ingest rule's route is the thing an operator turns on
+/// and off. So the map is behind a lock and every method takes
+/// `&self`: the routes are built once, from an [`Arc`] of this, and a
+/// rule arriving afterwards is an insert rather than a router somebody
+/// has to rebuild.
+///
+/// The lock is held for a map lookup and for nothing else. A request
+/// clones the action it found and has released the lock before it
+/// publishes, so nothing that awaits is inside it.
 #[derive(Debug, Default)]
 pub struct Ingest {
     /// The rules with a route, by identifier.
-    rules: BTreeMap<String, HttpIn>,
+    rules: RwLock<BTreeMap<String, HttpIn>>,
 }
 
 impl Ingest {
@@ -334,7 +362,7 @@ impl Ingest {
     /// `POST /ingest/<some-http_out-rule>` answers as though the path
     /// does not exist.
     pub fn from_rules<'a>(rules: impl IntoIterator<Item = &'a Rule>) -> Self {
-        let mut ingest = Self::new();
+        let ingest = Self::new();
         for rule in rules {
             if let Action::HttpIn(action) = &rule.action {
                 ingest.register(&rule.id, action.clone());
@@ -352,7 +380,7 @@ impl Ingest {
     /// so the path answers as though it does not exist — which is the
     /// same answer an identifier nobody configured gets, and therefore
     /// tells a caller nothing.
-    pub fn register(&mut self, id: &RuleId, action: HttpIn) {
+    pub fn register(&self, id: &RuleId, action: HttpIn) {
         if action.token.is_empty() {
             tracing::error!(
                 rule = id.as_str(),
@@ -361,22 +389,36 @@ impl Ingest {
             );
             return;
         }
-        self.rules.insert(id.as_str().to_owned(), action);
+        self.rules.write().insert(id.as_str().to_owned(), action);
+    }
+
+    /// Take `id`'s route away.
+    ///
+    /// What deleting a rule does, and what disabling one does: a
+    /// switched-off ingest rule has no route, which is the same answer
+    /// an identifier nobody configured gets. Returns whether there was
+    /// one, so a caller can tell "switched off" from "already off".
+    pub fn withdraw(&self, id: &str) -> bool {
+        self.rules.write().remove(id).is_some()
     }
 
     /// The rule served at `id`, if one is.
-    pub fn rule(&self, id: &str) -> Option<&HttpIn> {
-        self.rules.get(id)
+    ///
+    /// Cloned rather than borrowed, because the map is behind a lock
+    /// and a borrow would hold it for as long as the handler runs —
+    /// which includes publishing, which awaits.
+    pub fn rule(&self, id: &str) -> Option<HttpIn> {
+        self.rules.read().get(id).cloned()
     }
 
     /// How many rules have a route.
     pub fn len(&self) -> usize {
-        self.rules.len()
+        self.rules.read().len()
     }
 
     /// Whether none has.
     pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
+        self.rules.read().is_empty()
     }
 }
 
@@ -671,7 +713,7 @@ async fn ingest_one(
     // cycle should be stopped by the cheapest check that can see it.
     let hops = hops_presented(&headers);
 
-    let topic = match topic_for(action, &headers, &query) {
+    let topic = match topic_for(&action, &headers, &query) {
         Ok(topic) => topic,
         Err(TopicRefused::Repeated) => {
             return ApiError::refusal(
@@ -1135,7 +1177,7 @@ mod tests {
     /// weakened.
     #[test]
     fn a_rule_with_no_token_is_given_no_route() {
-        let mut ingest = Ingest::new();
+        let ingest = Ingest::new();
         let id = RuleId::new("gateway").expect("an identifier");
         let mut action = bounded_by("a/b");
         action.token = Secret::new(String::new());

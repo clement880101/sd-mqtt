@@ -23,6 +23,10 @@ broker-core = { path = "../broker-core", version = "0.1.0" }
 # `broker-core` takes it that way: nothing here touches a disk.
 storage = { path = "../storage", version = "0.1.0", default-features = false }
 thiserror.workspace = true
+# The lock over the ingest routes and over the installed rules. The
+# same lock this workspace uses everywhere else, so that "never held
+# across an await" is one habit rather than two.
+parking_lot = "0.12"
 # Section 9.2's ingest endpoint publishes into the broker, through the
 # one publish every caller without a session goes through. That is
 # `sdmqtt-server`'s, and taking it here is the same direction the

@@ -97,6 +97,18 @@ pub enum ErrorCode {
     /// rather than where it is first thrown, because the set is meant
     /// to be readable in one place.
     Unauthorized,
+    /// The request is well formed and disagrees with what is there.
+    ///
+    /// Creating a rule at an identifier something already holds, and
+    /// deleting one whose outbox still has envelopes in it. Neither
+    /// caller has done anything wrong and neither is asking for
+    /// something impossible: the first has to choose another name or
+    /// mean an update, and the second has to wait or disable the rule
+    /// instead. Distinct from [`ErrorCode::InvalidRequest`] for that
+    /// reason — the body is fine — and from
+    /// [`ErrorCode::ResourceExhausted`], which is about a bound this
+    /// broker has rather than about a disagreement with its contents.
+    Conflict,
     /// A bounded thing this broker holds a fixed number of is full.
     ///
     /// Today that is taps: [`crate::taps::MAX_TAPS`] of them exist at
@@ -137,6 +149,8 @@ impl ErrorCode {
             ErrorCode::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             ErrorCode::NotAcceptable => StatusCode::NOT_ACCEPTABLE,
             ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
+            // 409, which is what "Conflict" is for.
+            ErrorCode::Conflict => StatusCode::CONFLICT,
             // 429 rather than 503. The broker is healthy and every
             // other request is being served; what the caller is
             // being told is "not this one, not now", which is the
