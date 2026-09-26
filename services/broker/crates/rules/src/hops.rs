@@ -11,23 +11,24 @@
 //! So every publication a connector originates carries a hop count, and
 //! one over the configured maximum is dropped and counted.
 //!
-//! # What is here and what is not
+//! # What is here, and where the dropping is
 //!
 //! Here: the property, the count a connector stamps on a message it
 //! originates, and reading one back.
 //!
-//! **Not here: the dropping.** A hop count is only useful to a
-//! connector that reads one *in* and decides whether to pass it on, and
-//! the connectors that do that are `http_out` — which today posts
-//! whatever fired it — and the bridge, which does not exist yet. Adding
-//! the maximum before there is anything to enforce it on would be a
-//! number in a configuration file that nothing reads, which is the
-//! shape of a feature people believe they have.
+//! **The dropping is the bridge's**, in [`crate::bridge::marker`],
+//! which is the connector that reads a count *in* and decides whether
+//! to pass it on. That was deferred while there was nothing to enforce
+//! a maximum on — a number in a configuration file that nothing reads
+//! is the shape of a feature people believe they have — and it is no
+//! longer deferred. `mqtt_bridge.max_hops` is the number, and
+//! [`crate::bridge::marker::carry`] is where a message over it is
+//! dropped and counted.
 //!
-//! This is a deferral and not an oversight, and it is written down here
-//! because convention 8 says the two look identical in a codebase and
-//! opposite in a review. The counting half lands with the connector
-//! that consumes it.
+//! `http_out` still posts whatever fired it, and that half **is** still
+//! deferred: an outbox envelope goes to a URL rather than to another
+//! broker, so the thing that would refuse it is the endpoint's own
+//! configuration rather than this count.
 //!
 //! # It is a user property, so 3.1.1 cannot carry it
 //!
