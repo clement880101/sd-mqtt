@@ -175,7 +175,7 @@ provide, and that list is the order to build in:
 Items 5 and 6 exist in this codebase in mirror image, typed for the server
 side. Read them before writing the client side; do not try to share them.
 
-- [ ] **Step 1: Refuse a looping configuration, before anything connects**
+- [x] **Step 1: Refuse a looping configuration, before anything connects**
 
 The first task, not the last. A bridge whose inbound and outbound filters
 intersect after rewriting is refused. So is one whose state topic matches its
@@ -185,7 +185,7 @@ Test the intersection with filters that overlap only through a wildcard,
 because two filters that are not equal can still both match one topic, and a
 string comparison would let that through.
 
-- [ ] **Step 2: The rewrite**
+- [x] **Step 2: The rewrite**
 
 A prefix on either side, and for the outbound direction a template capturing
 wildcard segments by position, so `sensors/+/temp` becomes
@@ -195,13 +195,13 @@ Test a template referring to a segment that does not exist, and one on a
 filter with a multi-level wildcard, where the capture is several segments
 rather than one. Decide what each does.
 
-- [ ] **Step 3 onwards: the session, in the order above**
+- [x] **Step 3 onwards: the session, in the order above**
 
 One commit per numbered item where it makes sense. Say in each what the
 remote would do if we got it wrong, because that is the reason each one is in
 the list.
 
-- [ ] **Step 4: Test against a real broker**
+- [x] **Step 4: Test against a real broker**
 
 This broker. Bridge one instance of `sdmqtt` to another, with real sockets,
 and move messages in both directions. That is a better test than any mock and
@@ -211,7 +211,7 @@ Then test against the conformance suite's own broker if that is possible, or
 say why not. A bridge that only works against itself has only proved the two
 halves agree.
 
-- [ ] **Step 5: Confirm teeth**
+- [x] **Step 5: Confirm teeth**
 
 Mutations, at least: the remote's receive maximum ignored; the keep-alive
 override ignored; a resumed publish given a new identifier; the loop marker
