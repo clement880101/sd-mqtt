@@ -152,8 +152,15 @@ pub enum AdminStartError {
     EmptyToken,
     /// The socket could not be bound, which is usually something else
     /// already on the port.
-    #[error("cannot bind the admin listener to {address}: {source}")]
+    ///
+    /// Names the listener as well as the address, because from
+    /// milestone 4 there is more than one: an operator reading
+    /// "cannot bind" against a port they did not choose should not
+    /// have to guess which of them failed.
+    #[error("cannot bind the {what} listener to {address}: {source}")]
     Bind {
+        /// Which listener could not be bound.
+        what: &'static str,
         /// The address that was asked for.
         address: SocketAddr,
         /// Why not.
