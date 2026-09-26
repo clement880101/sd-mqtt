@@ -39,6 +39,17 @@
 //!   embedded NUL, which is what the key escape exists for.
 //! - Packet identifiers either side of a byte boundary, so the inbound
 //!   and inflight keys are read in the same order by both backends.
+//! - An outbox appended to, attempted on and drained: an append for a
+//!   rule the store does not hold and one at a number already spent,
+//!   both refused; an attempt and a removal naming an envelope that has
+//!   left, both no-ops; a rule replaced while its outbox held
+//!   envelopes, which must keep them, and one deleted while it did,
+//!   which must take them; and an outbox whose sequence numbers a
+//!   little-endian key would reorder.
+//!
+//! The outbox is here because the previous plan added it to the store
+//! without adding it to this test, so it was covered by focused tests
+//! and not by the property that catches what nobody thought of.
 //!
 //! ## What it cannot produce
 //!
@@ -80,6 +91,12 @@
 //! high-water mark and the cursor read are compared separately, over
 //! every session in the universe including ones no plan created. A depth
 //! that drifts is otherwise invisible to a restore.
+//!
+//! **[`Restored`] does not carry an outbox at all**, so the whole of it
+//! is compared that way: the depth, the high-water mark, the head at
+//! cursors either side of the byte boundaries the key has to get right,
+//! and every envelope, walked by cursor from the start. Over every rule
+//! in the universe including one no plan creates.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -88,7 +105,7 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::{TestCaseResult, TestRunner};
 use storage::{
     ActionRecord, BodyRecord, DeliveryRecord, HttpOutRecord, InflightRecord, InflightState,
-    MemoryStorage, MessageId, ProtocolVersion, Qos, QueueEntry, Record, RedbStorage,
+    MemoryStorage, MessageId, OutboxRecord, ProtocolVersion, Qos, QueueEntry, Record, RedbStorage,
     RetainHandling, RetainedRecord, RuleRecord, SessionKey, SessionRecord, Storage,
     SubscriptionRecord, TriggerRecord, WillRecord,
 };
@@ -129,6 +146,10 @@ const TOPICS: [&str; 3] = ["a", "a/b", "sensor/1/temp"];
 /// the pair a backend that keyed rules by a prefix would confuse, and a
 /// rule's key is the identifier as text with nothing around it.
 const RULES: [&str; 3] = ["a", "ab", "telemetry"];
+
+/// A rule identifier that no plan ever creates, so that an outbox
+/// nobody filled is compared as well as one somebody did.
+const A_RULE_NO_PLAN_CREATES: &str = "never";
 
 /// How many distinct bodies a plan may store.
 const BODIES: usize = 4;
@@ -275,6 +296,44 @@ enum Op {
         /// Which rule.
         rule: usize,
     },
+    /// An envelope joins a rule's outbox, at the next free sequence
+    /// plus a gap.
+    OutboxAppended {
+        /// Whose outbox.
+        rule: usize,
+        /// The payload it names.
+        body: usize,
+        /// How far past the high-water mark to jump.
+        gap: u64,
+        /// Something to make the rest of the envelope distinguishable.
+        shape: u8,
+        /// Append at a number this outbox has already spent, which is
+        /// refused. Rare, and generated rather than left to chance:
+        /// aiming an append at the next free number is what keeps a
+        /// plan from being all refusals, and it also makes the one
+        /// refusal an append has unreachable.
+        reuse: bool,
+    },
+    /// An attempt is recorded against an envelope.
+    OutboxAttempted {
+        /// Whose outbox.
+        rule: usize,
+        /// Which envelope. `None` is the head, which is the one a pump
+        /// actually attempts; a number is usually one that has left,
+        /// which must be a no-op rather than a resurrection.
+        at: Option<u64>,
+        /// How many attempts have now been made and failed.
+        attempts: u32,
+        /// The coarse second before which the next must not be made.
+        next_attempt_at: u32,
+    },
+    /// An envelope leaves an outbox, delivered or dead-lettered.
+    OutboxRemoved {
+        /// Whose outbox.
+        rule: usize,
+        /// Which envelope. `None` is the head.
+        at: Option<u64>,
+    },
     /// Close the current batch here.
     ///
     /// Generated rather than fixed, so that the boundary falls between
@@ -317,6 +376,24 @@ fn any_gap() -> impl Strategy<Value = u64> {
     ]
 }
 
+/// Which envelope an attempt or a removal names.
+///
+/// Mostly the head, because that is what a pump touches and because an
+/// outbox that is never drained never produces a removal of something
+/// held. The numbers are the same ones a queue pop draws from: either
+/// side of the byte boundaries the key has to get right, and mostly
+/// naming an envelope that has already left.
+fn any_outbox_at() -> impl Strategy<Value = Option<u64>> {
+    prop_oneof![
+        6 => Just(None),
+        1 => Just(Some(0u64)),
+        1 => Just(Some(1)),
+        1 => Just(Some(2)),
+        1 => Just(Some(258)),
+        1 => Just(Some(60_001)),
+    ]
+}
+
 /// One operation.
 #[allow(clippy::too_many_lines)]
 fn any_op(session_count: usize) -> impl Strategy<Value = Op> {
@@ -353,7 +430,7 @@ fn any_op(session_count: usize) -> impl Strategy<Value = Op> {
         5 => session.clone().prop_map(|session| Op::QueuePoppedHead { session }),
         2 => (session.clone(), prop_oneof![Just(0u64), Just(1), Just(2), Just(258), Just(60_001)])
             .prop_map(|(session, sequence)| Op::QueuePoppedAt { session, sequence }),
-        5 => (session.clone(), any_packet_id(), body, 0u8..3).prop_map(
+        5 => (session.clone(), any_packet_id(), body.clone(), 0u8..3).prop_map(
             |(session, packet_id, body, state)| Op::InflightPut { session, packet_id, body, state }
         ),
         3 => (session, any_packet_id())
@@ -364,6 +441,32 @@ fn any_op(session_count: usize) -> impl Strategy<Value = Op> {
         3 => (0..RULES.len(), any::<bool>(), any::<u8>())
             .prop_map(|(rule, enabled, shape)| Op::RulePut { rule, enabled, shape }),
         2 => (0..RULES.len()).prop_map(|rule| Op::RuleRemoved { rule }),
+        6 => (
+            0..RULES.len(),
+            body.clone(),
+            any_gap(),
+            any::<u8>(),
+            proptest::bool::weighted(0.1),
+        )
+            .prop_map(|(rule, body, gap, shape, reuse)| Op::OutboxAppended {
+                rule,
+                body,
+                gap,
+                shape,
+                reuse,
+            }),
+        4 => (0..RULES.len(), any_outbox_at(), 0u32..8, 0u32..4).prop_map(
+            |(rule, at, attempts, step)| Op::OutboxAttempted {
+                rule,
+                at,
+                attempts,
+                // Zero is "now", so one of the four is the envelope
+                // that is due immediately and the rest are waiting.
+                next_attempt_at: if step == 0 { 0 } else { 1_700_000_000 + step * 30 },
+            },
+        ),
+        4 => (0..RULES.len(), any_outbox_at())
+            .prop_map(|(rule, at)| Op::OutboxRemoved { rule, at }),
         3 => Just(Op::EndBatch),
     ]
 }
@@ -449,6 +552,40 @@ struct Coverage {
     /// A rule removed while it was held, as against a removal of one
     /// that was not, which is a no-op.
     a_rule_removed_while_held: u64,
+    /// An outbox record naming a rule the store does not hold, which is
+    /// refused: an outbox is reached through the rule that owns it, so
+    /// one filed under a rule that is not there is reachable by
+    /// nothing.
+    an_outbox_record_for_a_rule_not_held: u64,
+    /// An append at a number this outbox has already spent, which is
+    /// refused. The number is never reused.
+    an_append_at_a_number_already_spent: u64,
+    /// An attempt recorded against an envelope that is still there,
+    /// which replaces its count and its deadline.
+    an_attempt_on_an_envelope_still_there: u64,
+    /// An attempt naming an envelope that has already left, which is a
+    /// no-op rather than a row nothing would ever remove.
+    an_attempt_on_an_envelope_that_has_left: u64,
+    /// An envelope removed while it was there, which is a delivery.
+    a_removal_of_an_envelope_still_there: u64,
+    /// A removal naming a sequence the outbox does not hold, which must
+    /// leave the depth where it is.
+    a_removal_of_a_sequence_not_held: u64,
+    /// A rule replaced by a put while its outbox held envelopes. They
+    /// must survive: an edit is how a connector is turned off and on
+    /// again, and a put that emptied the outbox would discard messages
+    /// somebody was told had been accepted.
+    a_rule_replaced_while_its_outbox_held_envelopes: u64,
+    /// A rule deleted while its outbox held envelopes. They must go
+    /// with it, because nothing could reach them afterwards.
+    a_rule_removed_while_its_outbox_held_envelopes: u64,
+    /// A rule put back after a removal that left a high-water mark
+    /// behind. Its outbox must inherit none of it.
+    a_rule_recreated_after_its_outbox_was_removed: u64,
+    /// An outbox holding two envelopes that a little-endian key would
+    /// sort in the wrong order, which is the one mistake this key can
+    /// make that nothing else would catch.
+    an_outbox_a_little_endian_key_would_reorder: u64,
 }
 
 impl Coverage {
@@ -467,11 +604,26 @@ impl Coverage {
         self.a_record_for_a_session_not_held += other.a_record_for_a_session_not_held;
         self.a_rule_put_over_one_already_held += other.a_rule_put_over_one_already_held;
         self.a_rule_removed_while_held += other.a_rule_removed_while_held;
+        self.an_outbox_record_for_a_rule_not_held += other.an_outbox_record_for_a_rule_not_held;
+        self.an_append_at_a_number_already_spent += other.an_append_at_a_number_already_spent;
+        self.an_attempt_on_an_envelope_still_there += other.an_attempt_on_an_envelope_still_there;
+        self.an_attempt_on_an_envelope_that_has_left +=
+            other.an_attempt_on_an_envelope_that_has_left;
+        self.a_removal_of_an_envelope_still_there += other.a_removal_of_an_envelope_still_there;
+        self.a_removal_of_a_sequence_not_held += other.a_removal_of_a_sequence_not_held;
+        self.a_rule_replaced_while_its_outbox_held_envelopes +=
+            other.a_rule_replaced_while_its_outbox_held_envelopes;
+        self.a_rule_removed_while_its_outbox_held_envelopes +=
+            other.a_rule_removed_while_its_outbox_held_envelopes;
+        self.a_rule_recreated_after_its_outbox_was_removed +=
+            other.a_rule_recreated_after_its_outbox_was_removed;
+        self.an_outbox_a_little_endian_key_would_reorder +=
+            other.an_outbox_a_little_endian_key_would_reorder;
     }
 
     /// Every counter, named, so that a zero can be reported as the name
     /// of the case the generator cannot reach rather than as a number.
-    fn named(&self) -> [(&'static str, u64); 12] {
+    fn named(&self) -> [(&'static str, u64); 22] {
         [
             (
                 "a pop of an already empty queue",
@@ -518,6 +670,46 @@ impl Coverage {
                 "a rule removed while it was held",
                 self.a_rule_removed_while_held,
             ),
+            (
+                "an outbox record for a rule that is not held",
+                self.an_outbox_record_for_a_rule_not_held,
+            ),
+            (
+                "an append at a number already spent",
+                self.an_append_at_a_number_already_spent,
+            ),
+            (
+                "an attempt on an envelope still there",
+                self.an_attempt_on_an_envelope_still_there,
+            ),
+            (
+                "an attempt on an envelope that has left",
+                self.an_attempt_on_an_envelope_that_has_left,
+            ),
+            (
+                "a removal of an envelope still there",
+                self.a_removal_of_an_envelope_still_there,
+            ),
+            (
+                "a removal of a sequence not held",
+                self.a_removal_of_a_sequence_not_held,
+            ),
+            (
+                "a rule replaced while its outbox held envelopes",
+                self.a_rule_replaced_while_its_outbox_held_envelopes,
+            ),
+            (
+                "a rule removed while its outbox held envelopes",
+                self.a_rule_removed_while_its_outbox_held_envelopes,
+            ),
+            (
+                "a rule recreated after its outbox was removed",
+                self.a_rule_recreated_after_its_outbox_was_removed,
+            ),
+            (
+                "an outbox a little-endian key would reorder",
+                self.an_outbox_a_little_endian_key_would_reorder,
+            ),
         ]
     }
 }
@@ -548,6 +740,39 @@ impl SessionModel {
     }
 }
 
+/// One rule's outbox, as much of it as choosing the next record needs.
+///
+/// The bodies its envelopes name are not here, because removing an
+/// envelope does not release one: the reference belongs to whoever took
+/// it, so nothing the outbox does can be the last reference to a body.
+#[derive(Debug, Clone, Default)]
+struct OutboxModel {
+    /// Held sequence numbers.
+    entries: BTreeSet<u64>,
+    /// The highest sequence ever appended, whether or not that envelope
+    /// is still held. Never reused.
+    highest: u64,
+}
+
+/// Why the store will refuse a record.
+///
+/// Named rather than sniffed out of the record's shape in [`compile`],
+/// because an append can be refused for either of two reasons and only
+/// the model knows which: the rule is not held, or the number is spent.
+/// Each one is a case the two backends have to agree on, and a coverage
+/// counter that could not tell them apart would report the pair as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refused {
+    /// A record naming a session the store does not hold.
+    NoSuchSession,
+    /// A release of a body the store does not hold.
+    BodyNotHeld,
+    /// An outbox record naming a rule the store does not hold.
+    NoSuchRule,
+    /// An append at a sequence this outbox has already spent.
+    OutboxSequenceReused,
+}
+
 /// Enough of the store to choose the next record and to say which case it
 /// is an instance of.
 ///
@@ -569,6 +794,64 @@ struct Model {
     removed_with_a_mark: BTreeMap<usize, u64>,
     /// Which rules the store holds, by index into the universe.
     rules: BTreeSet<usize>,
+    /// Each rule's outbox, by the same index.
+    ///
+    /// Separate from [`Self::rules`] because the two do not have the
+    /// same lifetime: a rule replaced by a put keeps the outbox it had,
+    /// and only a delete takes it.
+    outboxes: BTreeMap<usize, OutboxModel>,
+    /// Rules whose deletion left a high-water mark behind, so that a
+    /// rule put back under the same identifier can be recognised. Its
+    /// outbox must inherit none of it.
+    rules_removed_with_a_mark: BTreeMap<usize, u64>,
+}
+
+/// Which universe an operation's index has to name something held in.
+///
+/// Matched exhaustively, so that an operation added without a decision
+/// about what it names does not compile. That is the whole reason this
+/// is an enum rather than two matches with a catch-all in each: the
+/// hazard convention 5 records is an operation nobody aimed, which
+/// produces a plan of refusals and a case that never happens.
+enum Aimed<'a> {
+    /// It names a session.
+    Session(&'a mut usize),
+    /// It names a rule.
+    Rule(&'a mut usize),
+    /// It names neither, or it is what creates one.
+    Nothing,
+}
+
+impl<'a> Aimed<'a> {
+    /// What this operation has to be pointed at.
+    fn of(op: &'a mut Op) -> Self {
+        match op {
+            Op::SessionRemoved { session }
+            | Op::Subscribe { session, .. }
+            | Op::Unsubscribe { session, .. }
+            | Op::InboundReserved { session, .. }
+            | Op::InboundReleased { session, .. }
+            | Op::QueuePushed { session, .. }
+            | Op::QueuePoppedHead { session }
+            | Op::QueuePoppedAt { session, .. }
+            | Op::InflightPut { session, .. }
+            | Op::InflightRemoved { session, .. } => Self::Session(session),
+            Op::OutboxAppended { rule, .. }
+            | Op::OutboxAttempted { rule, .. }
+            | Op::OutboxRemoved { rule, .. } => Self::Rule(rule),
+            // `SessionPut` and `RulePut` are what create the thing the
+            // others are aimed at; aiming them at one that exists would
+            // mean no plan ever created the rest.
+            Op::SessionPut { .. }
+            | Op::BodyPut { .. }
+            | Op::BodyReleased { .. }
+            | Op::RetainedPut { .. }
+            | Op::RetainedRemoved { .. }
+            | Op::RulePut { .. }
+            | Op::RuleRemoved { .. }
+            | Op::EndBatch => Self::Nothing,
+        }
+    }
 }
 
 /// A plan compiled into batches, with what the compiler saw on the way.
@@ -588,30 +871,22 @@ impl Model {
     /// creates a session and aiming it at an existing one would mean no
     /// plan ever created the others.
     fn aim(&self, op: &mut Op, stray: bool) {
-        let session = match op {
-            Op::SessionRemoved { session }
-            | Op::Subscribe { session, .. }
-            | Op::Unsubscribe { session, .. }
-            | Op::InboundReserved { session, .. }
-            | Op::InboundReleased { session, .. }
-            | Op::QueuePushed { session, .. }
-            | Op::QueuePoppedHead { session }
-            | Op::QueuePoppedAt { session, .. }
-            | Op::InflightPut { session, .. }
-            | Op::InflightRemoved { session, .. } => Some(session),
-            Op::SessionPut { .. }
-            | Op::BodyPut { .. }
-            | Op::BodyReleased { .. }
-            | Op::RetainedPut { .. }
-            | Op::RetainedRemoved { .. }
-            | Op::RulePut { .. }
-            | Op::RuleRemoved { .. }
-            | Op::EndBatch => None,
-        };
-        if let Some(session) = session {
-            *session = self.nearest(*session, sessions().len(), stray, |index| {
-                self.sessions.contains_key(&index)
-            });
+        match Aimed::of(op) {
+            Aimed::Session(session) => {
+                *session = self.nearest(*session, sessions().len(), stray, |index| {
+                    self.sessions.contains_key(&index)
+                });
+            }
+            // An outbox is reached through the rule that owns it, so an
+            // operation aimed at a rule the store does not hold is a
+            // refusal in the same way a record for a missing session
+            // is, and is rare for the same reason.
+            Aimed::Rule(rule) => {
+                *rule = self.nearest(*rule, RULES.len(), stray, |index| {
+                    self.rules.contains(&index)
+                });
+            }
+            Aimed::Nothing => {}
         }
         if let Op::BodyReleased { body } = op {
             *body = self.nearest(*body, BODIES, stray, |index| {
@@ -649,7 +924,12 @@ impl Model {
     ///
     /// Returns the record and whether the store will accept it.
     #[allow(clippy::too_many_lines)]
-    fn step(&mut self, step: &Step, apply: bool, coverage: &mut Coverage) -> (Record, bool) {
+    fn step(
+        &mut self,
+        step: &Step,
+        apply: bool,
+        coverage: &mut Coverage,
+    ) -> (Record, Option<Refused>) {
         let keys = sessions();
         let mut op = step.op.clone();
         self.aim(&mut op, step.stray);
@@ -670,7 +950,7 @@ impl Model {
                 }
                 (
                     Record::SessionPut(session_record(&keys[session], expiry, will, five)),
-                    true,
+                    None,
                 )
             }
             Op::SessionRemoved { session } => {
@@ -686,7 +966,7 @@ impl Model {
                     Record::SessionRemoved {
                         session: keys[session].clone(),
                     },
-                    true,
+                    None,
                 )
             }
             Op::Subscribe {
@@ -695,7 +975,7 @@ impl Model {
                 qos,
                 id,
             } => {
-                let accepted = self.holds(session);
+                let refusal = self.session_refusal(session);
                 (
                     Record::SubscriptionAdded {
                         session: keys[session].clone(),
@@ -712,37 +992,37 @@ impl Model {
                             subscription_id: id,
                         },
                     },
-                    accepted,
+                    refusal,
                 )
             }
             Op::Unsubscribe { session, filter } => {
-                let accepted = self.holds(session);
+                let refusal = self.session_refusal(session);
                 (
                     Record::SubscriptionRemoved {
                         session: keys[session].clone(),
                         filter: FILTERS[filter].to_owned(),
                     },
-                    accepted,
+                    refusal,
                 )
             }
             Op::InboundReserved { session, packet_id } => {
-                let accepted = self.holds(session);
+                let refusal = self.session_refusal(session);
                 (
                     Record::InboundReserved {
                         session: keys[session].clone(),
                         packet_id,
                     },
-                    accepted,
+                    refusal,
                 )
             }
             Op::InboundReleased { session, packet_id } => {
-                let accepted = self.holds(session);
+                let refusal = self.session_refusal(session);
                 (
                     Record::InboundReleased {
                         session: keys[session].clone(),
                         packet_id,
                     },
-                    accepted,
+                    refusal,
                 )
             }
             Op::BodyPut { body, payload } => {
@@ -754,12 +1034,13 @@ impl Model {
                         id: body_id(body),
                         body: body_record(body, payload),
                     },
-                    true,
+                    None,
                 )
             }
             Op::BodyReleased { body } => {
                 let held = self.bodies.get(&body).copied().unwrap_or_default();
-                let accepted = held > 0;
+                let refusal = (held == 0).then_some(Refused::BodyNotHeld);
+                let accepted = refusal.is_none();
                 if apply && accepted {
                     if held == 1 {
                         coverage.release_of_the_last_reference += 1;
@@ -768,7 +1049,7 @@ impl Model {
                         self.bodies.insert(body, held - 1);
                     }
                 }
-                (Record::BodyReleased { id: body_id(body) }, accepted)
+                (Record::BodyReleased { id: body_id(body) }, refusal)
             }
             Op::QueuePushed {
                 session,
@@ -776,7 +1057,8 @@ impl Model {
                 gap,
                 packet_id,
             } => {
-                let accepted = self.holds(session);
+                let refusal = self.session_refusal(session);
+                let accepted = refusal.is_none();
                 let sequence = self
                     .sessions
                     .get(&session)
@@ -805,11 +1087,12 @@ impl Model {
                             delivery: delivery(body, sequence),
                         },
                     },
-                    accepted,
+                    refusal,
                 )
             }
             Op::QueuePoppedHead { session } => {
-                let accepted = self.holds(session);
+                let refusal = self.session_refusal(session);
+                let accepted = refusal.is_none();
                 let held = self.sessions.get(&session);
                 let head = held.and_then(|held| held.queue.keys().next().copied());
                 // A queue that holds nothing is popped at one past its
@@ -834,11 +1117,12 @@ impl Model {
                         session: keys[session].clone(),
                         sequence,
                     },
-                    accepted,
+                    refusal,
                 )
             }
             Op::QueuePoppedAt { session, sequence } => {
-                let accepted = self.holds(session);
+                let refusal = self.session_refusal(session);
+                let accepted = refusal.is_none();
                 if apply && accepted {
                     if let Some(held) = self.sessions.get_mut(&session) {
                         if held.queue.remove(&sequence).is_none() && sequence <= held.highest {
@@ -851,7 +1135,7 @@ impl Model {
                         session: keys[session].clone(),
                         sequence,
                     },
-                    accepted,
+                    refusal,
                 )
             }
             Op::InflightPut {
@@ -860,7 +1144,8 @@ impl Model {
                 body,
                 state,
             } => {
-                let accepted = self.holds(session);
+                let refusal = self.session_refusal(session);
+                let accepted = refusal.is_none();
                 let sequence = self.sessions.get(&session).map_or(0, |held| held.highest);
                 if apply && accepted {
                     let sharing = self
@@ -888,11 +1173,12 @@ impl Model {
                             delivery: delivery(body, sequence),
                         },
                     },
-                    accepted,
+                    refusal,
                 )
             }
             Op::InflightRemoved { session, packet_id } => {
-                let accepted = self.holds(session);
+                let refusal = self.session_refusal(session);
+                let accepted = refusal.is_none();
                 if apply && accepted {
                     if let Some(held) = self.sessions.get_mut(&session) {
                         held.inflight.remove(&packet_id);
@@ -903,7 +1189,7 @@ impl Model {
                         session: keys[session].clone(),
                         packet_id,
                     },
-                    accepted,
+                    refusal,
                 )
             }
             Op::RetainedPut { topic, payload } => (
@@ -916,38 +1202,154 @@ impl Model {
                         properties: bytes::Bytes::from_static(&[0x01, 0x00]),
                     },
                 },
-                true,
+                None,
             ),
             Op::RetainedRemoved { topic } => (
                 Record::RetainedRemoved {
                     topic: TOPICS[topic].to_owned(),
                 },
-                true,
+                None,
             ),
             Op::RulePut {
                 rule,
                 enabled,
                 shape,
             } => {
-                if apply && !self.rules.insert(rule) {
-                    coverage.a_rule_put_over_one_already_held += 1;
+                if apply {
+                    if !self.rules.insert(rule) {
+                        coverage.a_rule_put_over_one_already_held += 1;
+                        // A put replaces the rule whole and leaves the
+                        // outbox alone, which is what makes turning a
+                        // connector off and on again safe.
+                        if !self.outbox(rule).entries.is_empty() {
+                            coverage.a_rule_replaced_while_its_outbox_held_envelopes += 1;
+                        }
+                    } else if let Some(mark) = self.rules_removed_with_a_mark.remove(&rule) {
+                        if mark > 0 {
+                            coverage.a_rule_recreated_after_its_outbox_was_removed += 1;
+                        }
+                    }
                 }
                 (
                     Record::RulePut {
                         rule: rule_record(rule, enabled, shape),
                     },
-                    true,
+                    None,
                 )
             }
             Op::RuleRemoved { rule } => {
                 if apply && self.rules.remove(&rule) {
                     coverage.a_rule_removed_while_held += 1;
+                    // The outbox goes with the rule, counters included.
+                    let held = self.outboxes.remove(&rule).unwrap_or_default();
+                    if !held.entries.is_empty() {
+                        coverage.a_rule_removed_while_its_outbox_held_envelopes += 1;
+                    }
+                    self.rules_removed_with_a_mark.insert(rule, held.highest);
                 }
                 (
                     Record::RuleRemoved {
                         id: RULES[rule].to_owned(),
                     },
-                    true,
+                    None,
+                )
+            }
+            Op::OutboxAppended {
+                rule,
+                body,
+                gap,
+                shape,
+                reuse,
+            } => {
+                let outbox = self.outbox(rule);
+                // A reuse names the highest number this outbox has ever
+                // assigned, which is zero for one that has never been
+                // appended to and is not a number an append may take
+                // either. Both are refused, and both are the same
+                // refusal.
+                let sequence = if reuse {
+                    outbox.highest
+                } else {
+                    outbox.highest + 1 + gap
+                };
+                let refusal = if self.rules.contains(&rule) {
+                    (sequence <= outbox.highest).then_some(Refused::OutboxSequenceReused)
+                } else {
+                    Some(Refused::NoSuchRule)
+                };
+                if apply && refusal.is_none() {
+                    let held = self.outboxes.entry(rule).or_default();
+                    held.entries.insert(sequence);
+                    held.highest = sequence;
+                    if a_little_endian_key_would_reorder(held.entries.iter().copied()) {
+                        coverage.an_outbox_a_little_endian_key_would_reorder += 1;
+                    }
+                }
+                (
+                    Record::OutboxAppended {
+                        rule: RULES[rule].to_owned(),
+                        entry: outbox_record(sequence, body, shape),
+                    },
+                    refusal,
+                )
+            }
+            Op::OutboxAttempted {
+                rule,
+                at,
+                attempts,
+                next_attempt_at,
+            } => {
+                let refusal = (!self.rules.contains(&rule)).then_some(Refused::NoSuchRule);
+                let sequence = self.outbox_sequence(rule, at);
+                if apply && refusal.is_none() {
+                    // Nothing in the model moves: the attempt count and
+                    // the deadline are fields of the stored envelope,
+                    // and what the model needs is which sequences are
+                    // held. What is counted is which of the two cases
+                    // this was, because the no-op is the one a backend
+                    // could get wrong by putting the envelope back.
+                    if self.outbox(rule).entries.contains(&sequence) {
+                        coverage.an_attempt_on_an_envelope_still_there += 1;
+                    } else {
+                        coverage.an_attempt_on_an_envelope_that_has_left += 1;
+                    }
+                }
+                (
+                    Record::OutboxAttempted {
+                        rule: RULES[rule].to_owned(),
+                        sequence,
+                        attempts,
+                        next_attempt_at,
+                    },
+                    refusal,
+                )
+            }
+            Op::OutboxRemoved { rule, at } => {
+                let refusal = (!self.rules.contains(&rule)).then_some(Refused::NoSuchRule);
+                let sequence = self.outbox_sequence(rule, at);
+                if apply && refusal.is_none() {
+                    if self
+                        .outboxes
+                        .entry(rule)
+                        .or_default()
+                        .entries
+                        .remove(&sequence)
+                    {
+                        coverage.a_removal_of_an_envelope_still_there += 1;
+                    } else {
+                        // The depth must not move. A backend that
+                        // subtracted anyway would report an outbox
+                        // empty while it still held envelopes, and it
+                        // would stop draining.
+                        coverage.a_removal_of_a_sequence_not_held += 1;
+                    }
+                }
+                (
+                    Record::OutboxRemoved {
+                        rule: RULES[rule].to_owned(),
+                        sequence,
+                    },
+                    refusal,
                 )
             }
             Op::EndBatch => unreachable!("a batch boundary is not a record"),
@@ -961,6 +1363,39 @@ impl Model {
     /// rather than merely unwise.
     fn holds(&self, session: usize) -> bool {
         self.sessions.contains_key(&session)
+    }
+
+    /// Why a record naming this session would be refused, if it would.
+    fn session_refusal(&self, session: usize) -> Option<Refused> {
+        (!self.holds(session)).then_some(Refused::NoSuchSession)
+    }
+
+    /// This rule's outbox as the model has it, or an empty one.
+    ///
+    /// An outbox exists for a rule the store holds whether or not
+    /// anything was ever appended to it, which is why a rule with no
+    /// entry still answers a depth of zero rather than a refusal.
+    fn outbox(&self, rule: usize) -> OutboxModel {
+        self.outboxes.get(&rule).cloned().unwrap_or_default()
+    }
+
+    /// The sequence an attempt or a removal names.
+    ///
+    /// `None` is the head, which is what a pump touches. An outbox with
+    /// nothing in it is named at one past its high-water mark, which is
+    /// a number it has never assigned: that is the no-op the two
+    /// backends have to agree about, and it must not move the depth.
+    fn outbox_sequence(&self, rule: usize, at: Option<u64>) -> u64 {
+        let outbox = self.outbox(rule);
+        match at {
+            Some(sequence) => sequence,
+            None => outbox
+                .entries
+                .iter()
+                .next()
+                .copied()
+                .unwrap_or_else(|| outbox.highest.saturating_add(1)),
+        }
     }
 }
 
@@ -1057,6 +1492,35 @@ fn rule_record(rule: usize, enabled: bool, shape: u8) -> RuleRecord {
     }
 }
 
+/// An envelope whose every field depends on the operation that made it.
+///
+/// The identifier is derived from the sequence rather than minted, so
+/// that the two backends are given the same envelope and a difference
+/// between them is theirs. It is distinct from every body identifier
+/// because its first byte is the sequence and its second says which of
+/// the two kinds of identifier it is; a store that handed back a
+/// delivery identifier where an envelope's belongs would otherwise be
+/// invisible.
+fn outbox_record(sequence: u64, body: usize, shape: u8) -> OutboxRecord {
+    let mut id = [0u8; 16];
+    id[0] = u8::try_from(sequence % 251).expect("a remainder of 251 fits");
+    id[1] = 0xE1;
+    id[2] = shape;
+    OutboxRecord {
+        sequence,
+        id: MessageId(id),
+        body: body_id(body),
+        client_id: format!("sensor-{shape}"),
+        enqueued_at: 1_700_000_000 + u32::from(shape),
+        // Zero for an envelope that has never been tried, which is what
+        // an append always is: the count and the deadline only move on
+        // an attempt, and an append that carried them would be this
+        // test agreeing with a backend that ignored the distinction.
+        attempts: 0,
+        next_attempt_at: 0,
+    }
+}
+
 /// A session record with fields that are distinguishable from the
 /// defaults, so that an implementation dropping one is visible.
 fn session_record(key: &SessionKey, expiry: u32, will: bool, five: bool) -> SessionRecord {
@@ -1100,17 +1564,20 @@ fn compile(plan: &[Step]) -> Compiled {
 
     for step in plan {
         if !matches!(step.op, Op::EndBatch) {
-            let (record, accepted) = staged.step(step, !refused, &mut staged_coverage);
-            if !accepted && !refused {
+            let (record, refusal) = staged.step(step, !refused, &mut staged_coverage);
+            if let (Some(refusal), false) = (refusal, refused) {
                 refused = true;
                 // Counted here rather than in the model, and into the
                 // run's own counters rather than the staged ones: a
                 // refusal is exactly the case whose staged counters are
                 // about to be thrown away with the batch.
-                if matches!(record, Record::BodyReleased { .. }) {
-                    coverage.release_of_a_body_not_held += 1;
-                } else {
-                    coverage.a_record_for_a_session_not_held += 1;
+                match refusal {
+                    Refused::NoSuchSession => coverage.a_record_for_a_session_not_held += 1,
+                    Refused::BodyNotHeld => coverage.release_of_a_body_not_held += 1,
+                    Refused::NoSuchRule => coverage.an_outbox_record_for_a_rule_not_held += 1,
+                    Refused::OutboxSequenceReused => {
+                        coverage.an_append_at_a_number_already_spent += 1;
+                    }
                 }
                 if !batch.is_empty() {
                     coverage.a_batch_refused_after_earlier_records += 1;
@@ -1258,7 +1725,83 @@ fn agree(model: &dyn Storage, disk: &dyn Storage, when: &str) -> TestCaseResult 
             );
         }
     }
+
+    // The outboxes, which `Restored` does not carry at all, so all of
+    // this is reachable only through the accessors. Over a rule no plan
+    // ever created as well, so that an outbox nobody filled is compared
+    // like one somebody did.
+    let mut rules: Vec<&str> = RULES.to_vec();
+    rules.push(A_RULE_NO_PLAN_CREATES);
+    for rule in rules {
+        prop_assert_eq!(
+            model.outbox_depth(rule).expect("a depth"),
+            disk.outbox_depth(rule).expect("a depth"),
+            "{}: the depth of {:?}'s outbox differs",
+            when,
+            rule
+        );
+        prop_assert_eq!(
+            model.outbox_highest_sequence(rule).expect("a mark"),
+            disk.outbox_highest_sequence(rule).expect("a mark"),
+            "{}: the high-water mark of {:?}'s outbox differs",
+            when,
+            rule
+        );
+        for cursor in [0u64, 1, 2, 255, 256, 1_000, 65_536, u64::MAX] {
+            prop_assert_eq!(
+                model.outbox_head(rule, cursor).expect("a head"),
+                disk.outbox_head(rule, cursor).expect("a head"),
+                "{}: the head of {:?}'s outbox at cursor {} differs",
+                when,
+                rule,
+                cursor
+            );
+        }
+        // And every envelope, in the order the key puts them in. The
+        // fixed cursors above are the byte boundaries; this is the
+        // whole outbox, and it is the only comparison here that would
+        // see an envelope the two backends disagree about the contents
+        // of.
+        prop_assert_eq!(
+            outbox_entries(model, rule),
+            outbox_entries(disk, rule),
+            "{}: the envelopes in {:?}'s outbox differ, in contents or in order",
+            when,
+            rule
+        );
+    }
     Ok(())
+}
+
+/// Every envelope in a rule's outbox, walked from the start by cursor.
+///
+/// [`Storage::outbox_head`] is the only way to read one, so a whole
+/// outbox is a walk: the head at zero, then the head past the sequence
+/// that came back, and so on. Bounded and checked rather than trusted,
+/// because a backend that handed back a sequence at or below the cursor
+/// it was given would otherwise be an infinite loop instead of a
+/// failure.
+fn outbox_entries(store: &dyn Storage, rule: &str) -> Vec<OutboxRecord> {
+    let mut entries: Vec<OutboxRecord> = Vec::new();
+    let mut cursor = 0u64;
+    while let Some(entry) = store.outbox_head(rule, cursor).expect("a head") {
+        assert!(
+            entry.sequence >= cursor,
+            "{rule}'s outbox answered the cursor {cursor} with the earlier sequence {}",
+            entry.sequence
+        );
+        assert!(
+            entries.len() < 1_000,
+            "{rule}'s outbox did not end: a plan cannot append a thousand envelopes"
+        );
+        let Some(next) = entry.sequence.checked_add(1) else {
+            entries.push(entry);
+            break;
+        };
+        cursor = next;
+        entries.push(entry);
+    }
+    entries
 }
 
 // ---- the property -------------------------------------------------------
