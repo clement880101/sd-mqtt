@@ -64,6 +64,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::body::Bytes;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query};
 use axum::http::header::{HeaderMap, HeaderName, AUTHORIZATION};
 use axum::http::StatusCode;
@@ -619,11 +620,33 @@ async fn ingest_one(
     Extension(endpoint): Extension<Endpoint>,
     Path(rule): Path<String>,
     headers: HeaderMap,
-    Query(query): Query<Vec<(String, String)>>,
+    query: Result<Query<Vec<(String, String)>>, QueryRejection>,
     body: Bytes,
 ) -> Response {
     let Some(action) = endpoint.ingest.rule(&rule) else {
         return ApiError::no_such_rule();
+    };
+
+    // Taken as a `Result` rather than extracted, so that a query string
+    // that will not parse is answered in the one shape this listener
+    // answers in rather than in axum's own plain text.
+    //
+    // **No test reaches this branch, and that is written down rather
+    // than hidden.** The pairs are deserialised into a
+    // `Vec<(String, String)>`, and `form_urlencoded` decodes a
+    // malformed percent escape and a non-UTF-8 byte lossily rather than
+    // failing, so `?%ZZ=1` is an ordinary pair and there is nothing to
+    // reject. This is here against a decoder that is one day stricter,
+    // and it costs a match arm.
+    let query = match query {
+        Ok(Query(pairs)) => pairs,
+        Err(rejection) => {
+            return ApiError::refusal(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format!("the query string is not usable: {rejection}"),
+            )
+        }
     };
 
     let presented = headers

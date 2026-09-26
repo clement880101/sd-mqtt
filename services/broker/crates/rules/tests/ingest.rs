@@ -150,11 +150,23 @@ async fn post(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Response {
+    request(address, "POST", path, token, headers, body).await
+}
+
+/// The same, with a method of its own.
+async fn request(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Response {
     let mut stream = TcpStream::connect(address)
         .await
         .expect("the ingest listener accepts");
     let mut head = format!(
-        "POST {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\
          Content-Length: {}\r\n",
         body.len()
     );
@@ -857,5 +869,25 @@ async fn a_path_that_is_not_served_answers_in_the_one_shape() {
             answered.body
         );
     }
+
+    // A method the path does not accept, in the same shape.
+    let wrong = request(node.ingest, "GET", "/ingest/fixed", Some(TOKEN), &[], b"").await;
+    assert_eq!(wrong.status, 405, "{}", wrong.body);
+    assert!(
+        wrong.body.contains("\"code\":\"method_not_allowed\""),
+        "{}",
+        wrong.body
+    );
+
+    // **What this test cannot reach**, said rather than left as a gap.
+    // Convention 5. The handler answers a query string that will not
+    // parse in this shape too, and nothing here exercises that branch
+    // because no query string reaches it: the pairs are deserialised
+    // into a `Vec<(String, String)>`, and `form_urlencoded` decodes a
+    // malformed percent escape and a non-UTF-8 byte lossily rather than
+    // failing. `?%ZZ=1` and `?%FF=1` are both ordinary pairs. The
+    // branch is there against a decoder that one day is stricter, and
+    // it is unreachable today.
+
     node.stop().await;
 }
