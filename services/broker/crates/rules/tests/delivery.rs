@@ -684,6 +684,49 @@ async fn an_endpoint_that_asks_for_patience_is_given_it() {
     );
 }
 
+/// A new pump waits out a deadline the old one stored.
+///
+/// **The other half of the stored record, and the half a count alone
+/// does not give.** A restart that honoured the attempt count and
+/// forgot the deadline would still post the instant the process came
+/// back, which is exactly the node returning from an outage and hitting
+/// a still-dead endpoint. A pump that has just been built has made no
+/// attempts of its own and nothing but the record to tell it that it is
+/// too early.
+#[tokio::test]
+async fn a_new_pump_waits_out_the_deadline_the_old_one_stored() {
+    let endpoint = Endpoint::start(Behaviour::AlwaysRefuse {
+        status: 429,
+        retry_after: Some(120),
+    })
+    .await;
+    let mut action = action_for(endpoint.url());
+    action.retries = 5;
+    action.backoff_ms = 1;
+    let fixture = Fixture::new(action, &[("sensor-1", b"21.5" as &[u8])]);
+
+    assert!(matches!(
+        fixture.delivery().turn().await,
+        Turn::BackedOff(_)
+    ));
+    assert_eq!(endpoint.count(), 1);
+
+    // A different pump over the same outbox, as a restarted broker
+    // builds. It must not post.
+    let Turn::BackedOff(wait) = fixture.delivery().turn().await else {
+        panic!("a pump that is too early backs off rather than posting");
+    };
+    assert!(
+        wait >= Duration::from_secs(100),
+        "the stored deadline was ignored and the wait came from somewhere else: {wait:?}"
+    );
+    assert_eq!(
+        endpoint.count(),
+        1,
+        "a restarted pump posted immediately against an endpoint that asked for two minutes"
+    );
+}
+
 /// The attempt count in the store is what a restart comes back to.
 ///
 /// The pump holds nothing about an envelope between turns, so this is

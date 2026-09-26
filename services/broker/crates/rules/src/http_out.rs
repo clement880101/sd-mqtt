@@ -287,43 +287,13 @@ impl Poster {
         client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<hyper::body::Bytes>>,
         action: &HttpOut,
     ) -> Result<Self, HttpOutError> {
-        if action.max_concurrency == 0 {
-            return Err(HttpOutError::NoConcurrency);
-        }
-        let uri: Uri = action.url.parse().map_err(|_| HttpOutError::NotAUrl {
-            url: action.url.clone(),
-        })?;
-        check_scheme(&uri, &action.url)?;
-
-        let method =
-            Method::from_bytes(action.method.as_bytes()).map_err(|_| HttpOutError::NotAMethod {
-                method: action.method.clone(),
-            })?;
-
-        let mut headers = HeaderMap::new();
-        // Set first so that a rule configuring its own content type
-        // replaces this rather than being replaced by it.
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        for (name, value) in &action.headers {
-            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
-                HttpOutError::BadHeader {
-                    name: name.clone(),
-                    why: error.to_string(),
-                }
-            })?;
-            let value = HeaderValue::from_str(value).map_err(|error| HttpOutError::BadHeader {
-                name: name.as_str().to_owned(),
-                why: error.to_string(),
-            })?;
-            headers.insert(name, value);
-        }
-
+        let (uri, method, headers, timeout) = parts(action)?;
         Ok(Self {
             client,
             uri,
             method,
             headers,
-            timeout: Duration::from_millis(u64::from(action.timeout_ms)),
+            timeout,
         })
     }
 
@@ -382,6 +352,60 @@ impl Poster {
             }
         }
     }
+}
+
+/// Check a rule's endpoint without building anything to post with.
+///
+/// For whatever reads an operator's configuration: **a rule that cannot
+/// post should stop the broker starting**, said once with the rule
+/// named, rather than becoming a rule that quietly never fires. Exactly
+/// the checks [`Poster::new`] makes, because it is the same function.
+///
+/// # Errors
+///
+/// [`HttpOutError`], naming the part of the configuration that is wrong.
+pub fn check(action: &HttpOut) -> Result<(), HttpOutError> {
+    parts(action).map(|_| ())
+}
+
+/// Everything a request needs, from what an operator configured.
+fn parts(action: &HttpOut) -> Result<(Uri, Method, HeaderMap, Duration), HttpOutError> {
+    if action.max_concurrency == 0 {
+        return Err(HttpOutError::NoConcurrency);
+    }
+    let uri: Uri = action.url.parse().map_err(|_| HttpOutError::NotAUrl {
+        url: action.url.clone(),
+    })?;
+    check_scheme(&uri, &action.url)?;
+
+    let method =
+        Method::from_bytes(action.method.as_bytes()).map_err(|_| HttpOutError::NotAMethod {
+            method: action.method.clone(),
+        })?;
+
+    let mut headers = HeaderMap::new();
+    // Set first so that a rule configuring its own content type
+    // replaces this rather than being replaced by it.
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    for (name, value) in &action.headers {
+        let name =
+            HeaderName::from_bytes(name.as_bytes()).map_err(|error| HttpOutError::BadHeader {
+                name: name.clone(),
+                why: error.to_string(),
+            })?;
+        let value = HeaderValue::from_str(value).map_err(|error| HttpOutError::BadHeader {
+            name: name.as_str().to_owned(),
+            why: error.to_string(),
+        })?;
+        headers.insert(name, value);
+    }
+
+    Ok((
+        uri,
+        method,
+        headers,
+        Duration::from_millis(u64::from(action.timeout_ms)),
+    ))
 }
 
 /// Refuse a URL that would put the payload on a network in the clear.
@@ -542,6 +566,32 @@ impl Delivery {
                 return Turn::Stalled;
             }
         };
+
+        // **The deadline is honoured, not only the count.** Both halves
+        // of an attempt are in the stored record and a restart that
+        // respected the count and forgot the deadline would still post
+        // the moment the process came back — which is precisely the
+        // node returning from an outage and hitting a still-dead
+        // endpoint that the durable record exists to prevent. A pump
+        // that has just been built has made no attempts of its own and
+        // has no other way to know it is too early.
+        //
+        // Coarse seconds, because that is what the record holds: a
+        // backoff under a second rounds to no wait at all, which is the
+        // same answer the rule's own timer would have given by the time
+        // the process restarted.
+        let now = now_seconds();
+        if entry.next_attempt_at > now {
+            let wait = Duration::from_secs(u64::from(entry.next_attempt_at - now));
+            tracing::debug!(
+                rule = self.outbox.rule().as_str(),
+                sequence = entry.sequence,
+                attempts = entry.attempts,
+                wait_s = wait.as_secs(),
+                "the head of this outbox is not due yet"
+            );
+            return Turn::BackedOff(wait);
+        }
 
         let body = match self.store.body(&entry.body) {
             Ok(Some(body)) => body,
