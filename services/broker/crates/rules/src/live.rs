@@ -186,6 +186,21 @@ pub enum InstallError {
         /// What was asked for.
         id: String,
     },
+    /// There is already a rule by that name on this node.
+    ///
+    /// Only [`Registry::create`] raises it, and only under
+    /// [`Registry::changing`]: that is what makes it a fact rather
+    /// than something that was true a moment ago. A create that
+    /// replaced would make two operators writing one identifier a
+    /// race whose loser never finds out.
+    #[error(
+        "this node already holds a rule called {id:?}; change it with a PUT to \
+         /api/v1/rules/{id}"
+    )]
+    AlreadyExists {
+        /// What was asked for.
+        id: String,
+    },
     /// The rule still has envelopes nobody has been given.
     ///
     /// See the module note: deleting a rule deletes its outbox, and
@@ -372,6 +387,28 @@ impl Installed {
     }
 }
 
+impl Drop for Installed {
+    /// **Stop the pump, whether or not anybody asked.**
+    ///
+    /// Dropping a [`JoinHandle`] detaches the task rather than
+    /// aborting it, and this crate had no [`Drop`] anywhere, so an
+    /// installation that reached a drop with its pump still in it left
+    /// a task running that nothing held and nothing could stop. For a
+    /// bridge that is a second connection to the remote under one
+    /// client identifier, each closing the other, for the life of the
+    /// process.
+    ///
+    /// The drop that mattered is the map insert in
+    /// [`Registry::install_locked`]: it hands back whatever it
+    /// replaced, and two writers racing meant one of them replacing a
+    /// handle the other had just spawned. The lock above makes that
+    /// race impossible; this makes it harmless, which is the half that
+    /// does not depend on every future caller remembering the lock.
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// The rules this node is running.
 ///
 /// Read the module documentation before changing anything here: what
@@ -413,6 +450,28 @@ pub struct Registry {
     ingest_socket: OnceLock<Arc<dyn IngestListening>>,
     /// What is installed, by identifier.
     installed: RwLock<BTreeMap<RuleId, Installed>>,
+    /// Held for the whole of any change to what this node is running.
+    ///
+    /// **Not the same lock as [`Registry::installed`]**, and it cannot
+    /// be: installing makes a durable write and opens an outbox, and
+    /// the rule this module rests on is that nothing holds the map's
+    /// write lock across an `await` — a hook reads that lock under the
+    /// broker's own, so a disk flush inside it would stop every
+    /// publish in the process. This one is an asynchronous lock
+    /// precisely so that it *can* be held across those awaits, and
+    /// nothing reading a rule ever takes it.
+    ///
+    /// What it buys is that a change is one change. Installing
+    /// uninstalls, spawns and inserts, and two writers interleaving
+    /// those meant both spawned and the second insert dropped the
+    /// first handle — which detaches rather than aborts, leaving a
+    /// supervisor running that nothing could reach. It is also what
+    /// makes [`Registry::create`]'s refusal of a name something
+    /// already holds mean anything: a check outside this lock is a
+    /// check whose answer can be false by the time it is used, which
+    /// is the race that endpoint's comment says it refuses replacement
+    /// to avoid.
+    changing: tokio::sync::Mutex<()>,
     /// The task that closes one interval of every rule's series and
     /// starts the next. See [`crate::stats`].
     sampler: Mutex<Option<JoinHandle<()>>>,
@@ -435,6 +494,7 @@ impl Registry {
             ingest: Arc::new(Ingest::new()),
             ingest_socket: OnceLock::new(),
             installed: RwLock::new(BTreeMap::new()),
+            changing: tokio::sync::Mutex::new(()),
             sampler: Mutex::new(None),
         });
         *registry.sampler.lock() = Some(tokio::spawn(sample_forever(Arc::downgrade(&registry))));
@@ -566,6 +626,38 @@ impl Registry {
     /// than answered `Ok`, because what the caller is owed is whether
     /// its rule can be reached and not whether a map was written.
     pub async fn install(&self, rule: Rule) -> Result<(), InstallError> {
+        let _changing = self.changing.lock().await;
+        self.install_locked(rule).await
+    }
+
+    /// Store `rule` and start it, refusing a name this node already
+    /// holds.
+    ///
+    /// What the create endpoint needs, and the check has to be **here**
+    /// rather than in the handler: a `get` followed by an `install` is
+    /// two operations, and two operators writing the same identifier at
+    /// the same time both pass the first and both run the second, so
+    /// the loser is told it created a rule that another request
+    /// replaced. Under [`Registry::changing`] the look and the install
+    /// are one change and the refusal means what it says.
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::AlreadyExists`] when this node holds a rule of
+    /// that name, and whatever [`Registry::install`] can say otherwise.
+    pub async fn create(&self, rule: Rule) -> Result<(), InstallError> {
+        let _changing = self.changing.lock().await;
+        if self.installed.read().contains_key(&rule.id) {
+            return Err(InstallError::AlreadyExists {
+                id: rule.id.as_str().to_owned(),
+            });
+        }
+        self.install_locked(rule).await
+    }
+
+    /// The whole of an install, with [`Registry::changing`] already
+    /// held.
+    async fn install_locked(&self, rule: Rule) -> Result<(), InstallError> {
         let id = rule.id.clone();
         // **Before anything changes.** An address something else is
         // already on is then a refusal with the node exactly as it
@@ -639,13 +731,21 @@ impl Registry {
         // Out of the map, and stopped, before the replacement starts:
         // two supervisors for one bridge would be two connections to
         // the remote under one client identifier, which the remote
-        // resolves by closing one of them.
+        // resolves by closing one of them. This is also what withdraws
+        // an ingest route the replacement may not want back.
         self.uninstall(&rule.id);
 
+        // Whatever the insert hands back is dropped here, and a
+        // dropped [`Installed`] aborts its pump. Under
+        // [`Registry::changing`] there is never anything to hand back;
+        // see the [`Drop`] implementation for why it is written down
+        // anyway.
         let installed = self.start(rule, outbox, stats, dlq);
-        self.installed
-            .write()
-            .insert(installed.rule.id.clone(), installed);
+        drop(
+            self.installed
+                .write()
+                .insert(installed.rule.id.clone(), installed),
+        );
         Ok(())
     }
 
@@ -668,6 +768,10 @@ impl Registry {
     /// stored — in which case nothing changes, because a switch that
     /// does not survive a restart is a switch that lies.
     pub async fn set_enabled(&self, id: &RuleId, enabled: bool) -> Result<Rule, InstallError> {
+        // The read and the install are one change: a switch that read
+        // a rule, was overtaken by an edit, and then wrote back what it
+        // had read would undo the edit and report success.
+        let _changing = self.changing.lock().await;
         let Some(mut rule) = self.get(id) else {
             return Err(InstallError::NoSuchRule {
                 id: id.as_str().to_owned(),
@@ -677,7 +781,7 @@ impl Registry {
             return Ok(rule);
         }
         rule.enabled = enabled;
-        self.install(rule.clone()).await?;
+        self.install_locked(rule.clone()).await?;
         Ok(rule)
     }
 
@@ -695,6 +799,11 @@ impl Registry {
     /// gone and its socket did not close, which is a port serving
     /// nothing rather than anything a caller has lost.
     pub async fn remove(&self, id: &RuleId) -> Result<(), InstallError> {
+        // For the reason the others take it, and one of its own: the
+        // depth is read, the record is written and the rule is taken
+        // out of the map, and an install landing between the first two
+        // would delete a rule the node had just been given.
+        let _changing = self.changing.lock().await;
         if !self.installed.read().contains_key(id) {
             return Err(InstallError::NoSuchRule {
                 id: id.as_str().to_owned(),
@@ -1227,4 +1336,236 @@ fn now_seconds() -> u32 {
         .map_or(0, |since| {
             u32::try_from(since.as_secs()).unwrap_or(u32::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::time::Duration;
+
+    use broker_core::broker::{Broker, BrokerConfig};
+    use mqtt_codec::Version;
+    use storage::{MemoryStorage, WriterConfig};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    use crate::rule::{BridgeTopic, Direction, HttpOut, MqttBridge};
+    use crate::singleton::NodeId;
+
+    use super::*;
+
+    /// Sets a flag when it is dropped, which for a spawned task means
+    /// when the task ends or is aborted.
+    struct Ended(Arc<AtomicBool>);
+
+    impl Drop for Ended {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A rule with an action that starts nothing, for the one test
+    /// that supplies its own pump.
+    fn a_rule() -> Rule {
+        Rule {
+            id: RuleId::new("held").expect("a valid identifier"),
+            name: "Held".to_owned(),
+            enabled: true,
+            trigger: Some(crate::rule::Trigger::new("sensor/#").expect("a valid filter")),
+            action: Action::HttpOut(HttpOut {
+                url: "http://127.0.0.1:1/hook".to_owned(),
+                ..HttpOut::default()
+            }),
+        }
+    }
+
+    /// Dropping an installation stops what it was running.
+    ///
+    /// The whole of the reason this crate has a [`Drop`] at all.
+    /// Dropping a task handle **detaches** the task, so without this
+    /// an installation replaced in the map leaves a pump running that
+    /// nothing holds and nothing can stop; for a bridge that is a
+    /// second connection to the remote under one client identifier
+    /// until the process restarts.
+    ///
+    /// Asserted through the task itself rather than through the
+    /// handle: a handle says whether it was aborted, and what is
+    /// wanted is whether the *task* stopped.
+    #[tokio::test]
+    async fn dropping_an_installation_stops_its_pump() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = Ended(Arc::clone(&stopped));
+        let pump = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        });
+        // It is running before anything is dropped, so that the
+        // assertion below is about the drop rather than about a task
+        // that never started.
+        tokio::task::yield_now().await;
+        assert!(
+            !stopped.load(Ordering::SeqCst),
+            "the pump ended on its own, so this test would pass without a drop"
+        );
+
+        let installed = Installed {
+            rule: a_rule(),
+            outbox: None,
+            bridge_filters: Vec::new(),
+            wake: None,
+            pump: Some(pump),
+            dlq: Arc::new(DeadLetterLog::new()),
+            stats: Arc::new(RuleStats::new()),
+        };
+        drop(installed);
+
+        // An abort takes effect at the runtime's next pass over the
+        // task, not at the call.
+        for _ in 0..1_000 {
+            if stopped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "a dropped installation left its pump running, detached, with nothing \
+             holding it"
+        );
+    }
+
+    /// A registry over a memory store, with nothing installed.
+    fn registry() -> (Arc<Registry>, Arc<MemoryStorage>) {
+        let store = Arc::new(MemoryStorage::new());
+        let writer = Arc::new(
+            Writer::spawn(
+                Arc::clone(&store) as Arc<dyn Storage>,
+                WriterConfig::default(),
+            )
+            .expect("the writer starts"),
+        );
+        let shared = Arc::new(Shared::with_store(
+            Broker::new(BrokerConfig::default()),
+            Arc::clone(&writer),
+        ));
+        let registry = Registry::new(
+            shared,
+            Arc::clone(&store) as Arc<dyn Storage>,
+            writer,
+            Arc::new(Membership::alone(NodeId::new("local"))),
+        );
+        (registry, store)
+    }
+
+    /// A bridge to `address` that carries one filter outwards.
+    fn a_bridge(address: String) -> Rule {
+        Rule {
+            id: RuleId::new("hub").expect("a valid identifier"),
+            name: "To the hub".to_owned(),
+            enabled: true,
+            trigger: None,
+            action: Action::MqttBridge(Box::new(MqttBridge {
+                address,
+                client_id: "hub".to_owned(),
+                version: Version::V5,
+                topics: vec![BridgeTopic {
+                    filter: "sensor/#".to_owned(),
+                    direction: Direction::Out,
+                    remote_prefix: "from-here/".to_owned(),
+                    ..BridgeTopic::default()
+                }],
+                ..MqttBridge::default()
+            })),
+        }
+    }
+
+    /// Writing the same bridge rule several times at once leaves one
+    /// connection to the remote, not several.
+    ///
+    /// The symptom the lock and the drop exist for, and the only one
+    /// an operator ever sees: a bridge is a client identifier, and two
+    /// connections under one identifier is each closing the other for
+    /// ever.
+    ///
+    /// **Open connections, not accepted ones.** Eight installs start
+    /// eight supervisors and stop seven, so eight connections reaching
+    /// this listener is correct; what is not correct is two of them
+    /// still being there at the end. The remote answers nothing, so a
+    /// supervisor that is still running is still connected — its
+    /// connack timeout is far longer than this test — and one that was
+    /// aborted has had its socket closed, which the reader below sees.
+    ///
+    /// Multi-threaded on purpose. The window is between the spawn and
+    /// the insert and holds no await, so on one thread it cannot be
+    /// split at all and this would be a test about nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn writing_one_rule_from_several_places_at_once_leaves_one_pump() {
+        let remote = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        // Plain text, which is refused to anywhere but this
+        // machine and is what a loopback listener is.
+        let address = format!("mqtt://{}", remote.local_addr().expect("the port"));
+        let (registry, _store) = registry();
+
+        let open = Arc::new(AtomicI64::new(0));
+        let accepting = {
+            let open = Arc::clone(&open);
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = remote.accept().await {
+                    open.fetch_add(1, Ordering::SeqCst);
+                    let open = Arc::clone(&open);
+                    tokio::spawn(async move {
+                        // Read and answer nothing. What this is for is
+                        // noticing the close, which is what says a
+                        // supervisor is gone.
+                        let mut buffer = [0u8; 1024];
+                        loop {
+                            match stream.read(&mut buffer).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                        }
+                        open.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            })
+        };
+
+        let rule = a_bridge(address);
+        let writing: Vec<JoinHandle<Result<(), InstallError>>> = (0..8)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                let rule = rule.clone();
+                tokio::spawn(async move { registry.install(rule).await })
+            })
+            .collect();
+        for written in writing {
+            written
+                .await
+                .expect("the install did not panic")
+                .expect("the install succeeds");
+        }
+
+        // The surviving supervisor has to reach the socket and the
+        // aborted ones' closes have to arrive. Waited for rather than
+        // slept through, so that a slow machine does not read as a
+        // failure.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && open.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // And then long enough that a second connection, if there were
+        // one, would have arrived.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            open.load(Ordering::SeqCst),
+            1,
+            "this node holds one bridge rule and had more than one connection to its \
+             remote open, which is two supervisors under one client identifier"
+        );
+
+        registry.shutdown().await;
+        accepting.abort();
+    }
 }

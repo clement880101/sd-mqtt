@@ -128,6 +128,12 @@ fn install_refusal(error: &InstallError) -> ApiError {
         InstallError::OutboxNotEmpty { .. } => {
             ApiError::in_field(ErrorCode::Conflict, "id", error.to_string())
         }
+        // Well formed, and disagrees with what is there. Raised by the
+        // registry rather than here, because a check this handler made
+        // itself would be a check-then-act across an await.
+        InstallError::AlreadyExists { .. } => {
+            ApiError::in_field(ErrorCode::Conflict, "id", error.to_string())
+        }
         // The caller did nothing wrong either, and this is the
         // failure this endpoint used to hide: an ingest rule with
         // nowhere to be reached is refused here rather than created
@@ -257,20 +263,14 @@ async fn create(
     // Through the one conversion, before anything is looked up: a
     // body that is not a rule is refused whatever is already stored.
     let rule = spec.to_rule().map_err(refusal)?;
-    if registry.get(&rule.id).is_some() {
-        return Err(ApiError::in_field(
-            ErrorCode::Conflict,
-            "id",
-            format!(
-                "this node already holds a rule called {:?}; change it with a PUT to \
-                 /api/v1/rules/{}",
-                rule.id.as_str(),
-                rule.id.as_str()
-            ),
-        ));
-    }
+    // **The look and the install are one call**, because the registry
+    // is where they can be one change. A `get` here followed by an
+    // `install` is two, and two operators writing this identifier at
+    // the same moment both pass the first and both run the second —
+    // which is exactly the race this endpoint refuses replacement to
+    // avoid, with the refusal not doing it.
     registry
-        .install(rule.clone())
+        .create(rule.clone())
         .await
         .map_err(|error| install_refusal(&error))?;
     Ok(Json(RuleSpec::of(&rule)))
