@@ -73,7 +73,9 @@ pub mod inbound;
 pub mod keepalive;
 pub mod marker;
 pub mod rewrite;
+pub mod session;
 pub mod subs;
+pub mod supervisor;
 pub mod topics;
 
 pub use aliases::Aliases;
@@ -85,4 +87,5 @@ pub use keepalive::KeepAlive;
 pub use marker::{carry, Marker, Refused};
 pub use rewrite::{Rewrite, Rewritten};
 pub use subs::{Granted, SubscribeError, Subscriptions};
+pub use supervisor::{address, Address, AddressError, Supervisor};
 pub use topics::{intersects, TopicError};

@@ -53,6 +53,10 @@ use broker_core::hooks::{ClientInfo, Disposition, Hook};
 use broker_core::session::message::Message;
 use bytes::Bytes;
 use mqtt_codec::QoS;
+use rules::bridge::marker::Marker;
+use rules::bridge::rewrite::Rewrite;
+use rules::bridge::session::Bridge;
+use rules::bridge::supervisor::Supervisor;
 use rules::http_out::{client, DeadLetters, Delivery, Poster};
 use rules::http_poll::Poller;
 use rules::rule::{Action, Rule, Trigger};
@@ -61,6 +65,7 @@ use rules::{Ingest, Outbox};
 use sdmqtt_server::shared::Shared;
 use storage::record::{BodyRecord, MessageId, Qos, Record};
 use storage::{Storage, Writer};
+use tokio::sync::Notify;
 
 use crate::config::Config;
 use crate::StartupError;
@@ -71,6 +76,38 @@ struct Fired {
     rule: Rule,
     /// Where an envelope goes when it does.
     outbox: Arc<Outbox>,
+    /// The local filters a bridge's outbound entries fire on.
+    ///
+    /// Empty for every other kind of rule, which is fired by the
+    /// rule's own trigger. A bridge has no rule-level trigger — what
+    /// it carries is decided by its topic entries, each with a
+    /// direction and a rewrite that a single filter has nowhere to put
+    /// — so this is where its filters live instead.
+    bridge_filters: Vec<String>,
+    /// Woken when something has been put in this rule's outbox.
+    ///
+    /// `Some` for a bridge, whose pump is a live socket and should
+    /// send a message the moment it exists rather than on the next
+    /// turn of a poll. `None` for `http_out`, which polls: its pump
+    /// sleeps on a backoff that belongs to the rule, and waking it
+    /// early would mean posting inside a wait that exists to stop
+    /// exactly that.
+    wake: Option<Arc<Notify>>,
+}
+
+impl Fired {
+    /// Whether this message fires this rule.
+    fn fires(&self, topic: &str, qos: QoS, client_id: &str) -> bool {
+        if self.bridge_filters.is_empty() {
+            return self.rule.fires_on(topic, qos, client_id);
+        }
+        // A disabled rule fires on nothing, here as everywhere.
+        self.rule.enabled
+            && self
+                .bridge_filters
+                .iter()
+                .any(|filter| broker_core::topic::reference::matches(filter, topic))
+    }
 }
 
 /// The hook that turns a publication into envelopes.
@@ -113,11 +150,9 @@ impl Hook for RuleHook {
     fn message_received(&self, client: &ClientInfo<'_>, message: &mut Message) -> Disposition {
         let now = now_seconds();
         let mut records = Vec::new();
+        let mut wake = Vec::new();
         for fired in &self.rules {
-            if !fired
-                .rule
-                .fires_on(&message.topic, message.qos, client.client_id)
-            {
+            if !fired.fires(&message.topic, message.qos, client.client_id) {
                 continue;
             }
             let body = BodyRecord {
@@ -140,12 +175,22 @@ impl Hook for RuleHook {
                 now,
             );
             records.extend(more);
+            if let Some(notify) = &fired.wake {
+                wake.push(Arc::clone(notify));
+            }
         }
         if !records.is_empty() && self.writer.apply(records).is_err() {
             // Nothing else can be done from inside the lock, and the
             // alternative — refusing the publication — would take
             // subscribers down with the connector.
             tracing::error!("the storage writer stopped; a rule could not record an envelope");
+        }
+        // **After the batch has been handed over**, so a woken pump
+        // finds the entry rather than an empty outbox. A notify is an
+        // atomic store on a flag and is one of the two things a hook
+        // may do; see [`broker_core::hooks`].
+        for notify in wake {
+            notify.notify_one();
         }
         Disposition::Deliver
     }
@@ -366,7 +411,12 @@ pub async fn start(
                 }
 
                 pumps.push(tokio::spawn(delivery.run()));
-                fired.push(Fired { rule, outbox });
+                fired.push(Fired {
+                    rule,
+                    outbox,
+                    bridge_filters: Vec::new(),
+                    wake: None,
+                });
             }
             Action::HttpPoll(action) => {
                 // **No outbox**, and that is the connector rather than
@@ -404,18 +454,94 @@ pub async fn start(
                     );
                 }
             }
-            Action::MqttBridge(_) => {
-                // Nothing can reach here yet: `Config` has no
-                // `[rules.mqtt_bridge]` table, so no configuration
-                // produces this action, and the store's format version
-                // means no file holds one either. Refusing rather than
-                // logging, because the one thing worse than a connector
-                // that is not built is a connector that is installed
-                // and moves nothing. The wiring lands with the session.
-                return Err(StartupError::Connector(format!(
-                    "rule {} is an mqtt_bridge and this build cannot start one",
-                    rule.id
-                )));
+            Action::MqttBridge(action) => {
+                // **A bridge has an outbox, and an `http_poll` does
+                // not.** The difference is what the connector is
+                // given: a poller is given nothing and fetches, so a
+                // failed fetch has lost nothing, while a bridge is
+                // handed somebody else's message and losing it in a
+                // restart loses something this broker accepted.
+                let outbox = Arc::new(
+                    Outbox::open(rule.id.clone(), store.as_ref())
+                        .map_err(|error| StartupError::Connector(error.to_string()))?,
+                );
+                let waiting = outbox
+                    .depth(store.as_ref())
+                    .map_err(|error| StartupError::Connector(error.to_string()))?;
+                let wake = Arc::new(Notify::new());
+
+                let bridge = Bridge {
+                    rule: rule.id.clone(),
+                    action: (**action).clone(),
+                    rewrites: action.topics.iter().map(Rewrite::new).collect(),
+                    marker: Marker::new(&rule.id, action.version),
+                    outbox: Arc::clone(&outbox),
+                    store: Arc::clone(store),
+                    writer: Arc::clone(writer),
+                    shared: Arc::clone(shared),
+                    wake: Arc::clone(&wake),
+                };
+                let outbound: Vec<String> = bridge
+                    .rewrites
+                    .iter()
+                    .filter(|rewrite| rewrite.direction().outbound())
+                    .map(|rewrite| rewrite.local_filter().to_owned())
+                    .collect();
+                let supervisor = Supervisor::new(bridge, action)
+                    .map_err(|error| StartupError::Connector(error.to_string()))?;
+
+                tracing::info!(
+                    rule = rule.id.as_str(),
+                    name = %rule.name,
+                    enabled = rule.enabled,
+                    address = %supervisor.address().authority(),
+                    tls = supervisor.address().tls,
+                    protocol_level = action.version.level(),
+                    topics = action.topics.len(),
+                    state_topic = %action.state_topic,
+                    owner = %membership.owner(),
+                    waiting,
+                    "a rule is installed"
+                );
+                if !supervisor.address().tls {
+                    // Only a loopback address gets here; `address`
+                    // refuses a plain-text link to anywhere else. Said
+                    // out loud anyway, because an operator reading a
+                    // startup log should be able to see that a link
+                    // carrying their data is in the clear.
+                    tracing::warn!(
+                        rule = rule.id.as_str(),
+                        address = %supervisor.address().authority(),
+                        "this bridge is plain text; it is permitted because the address \
+                         is on this machine"
+                    );
+                }
+                if !Marker::new(&rule.id, action.version).available() {
+                    tracing::warn!(
+                        rule = rule.id.as_str(),
+                        "this bridge speaks MQTT 3.1.1, which has no user properties, so \
+                         the loop marker cannot travel. Loop prevention here is the \
+                         configuration refusal alone, which has already been made."
+                    );
+                }
+
+                // **A disabled rule connects to nothing.** The same
+                // rule the other three follow: `enabled` is what an
+                // operator reaches for to turn a connector off.
+                if rule.enabled {
+                    pumps.push(tokio::spawn(supervisor.run(membership.ownership())));
+                } else {
+                    tracing::info!(
+                        rule = rule.id.as_str(),
+                        "this bridge is switched off and connects to nothing"
+                    );
+                }
+                fired.push(Fired {
+                    rule,
+                    outbox,
+                    bridge_filters: outbound,
+                    wake: Some(wake),
+                });
             }
             Action::HttpIn(action) => {
                 // **A disabled rule gets no route.** `enabled` is what

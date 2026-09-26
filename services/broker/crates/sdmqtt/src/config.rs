@@ -65,8 +65,8 @@ use broker_core::broker::BrokerConfig;
 use mqtt_codec::{Limits, QoS};
 use rules::http_in::HttpInError;
 use rules::rule::{
-    Action, ClientPattern, HttpIn, HttpOut, HttpPoll, Rule, RuleId, TopicFromRequest, TopicSource,
-    Trigger,
+    Action, BridgeTopic, ClientPattern, Direction, HttpIn, HttpOut, HttpPoll, MqttBridge, Rule,
+    RuleId, TopicFromRequest, TopicSource, Trigger,
 };
 use sdmqtt_admin::config::{AdminConfig, AdminStartError, Token};
 use sdmqtt_server::connection::{outbox_depth_for, ConnectionConfig};
@@ -553,6 +553,9 @@ pub struct RuleSection {
     /// Fetch a URL on an interval and publish the body, if that is
     /// what it does.
     pub http_poll: Option<HttpPollSection>,
+    /// Connect to a remote broker as a client, if that is what it
+    /// does.
+    pub mqtt_bridge: Option<MqttBridgeSection>,
 }
 
 /// A rule left out of a file is on.
@@ -672,6 +675,12 @@ impl RuleSection {
                                             rather than by a published message, so it has \
                                             no filter; remove it"
                         .to_owned(),
+                    Action::MqttBridge(_) => "an mqtt_bridge rule decides what moves with \
+                                              its own topic entries, each of which has a \
+                                              direction and a rewrite, so it has no \
+                                              rule-level filter; put it in a \
+                                              [[rules.mqtt_bridge.topics]] entry instead"
+                        .to_owned(),
                     _ => "an http_in rule is fired by a request rather than by a published \
                           message, so it has no filter; remove it"
                         .to_owned(),
@@ -686,6 +695,7 @@ impl RuleSection {
                          none; remove them",
                         match &action {
                             Action::HttpPoll(_) => "http_poll",
+                            Action::MqttBridge(_) => "mqtt_bridge",
                             _ => "http_in",
                         }
                     )));
@@ -715,6 +725,7 @@ impl RuleSection {
             self.http_out.as_ref().map(|_| "[rules.http_out]"),
             self.http_in.as_ref().map(|_| "[rules.http_in]"),
             self.http_poll.as_ref().map(|_| "[rules.http_poll]"),
+            self.mqtt_bridge.as_ref().map(|_| "[rules.mqtt_bridge]"),
         ]
         .into_iter()
         .flatten()
@@ -722,7 +733,11 @@ impl RuleSection {
         if declared.len() > 1 {
             // Spelled as a word, because the sentence is read by a
             // person and because three is as many as there can be.
-            let count = if declared.len() == 2 { "two" } else { "three" };
+            let count = match declared.len() {
+                2 => "two",
+                3 => "three",
+                _ => "four",
+            };
             return Err(wrong(format!(
                 "a rule has one action, section 9.1, and this one declares {}; \
                  write {count} rules",
@@ -755,9 +770,12 @@ impl RuleSection {
         if let Some(poll) = &self.http_poll {
             return Ok(Action::HttpPoll(poll.to_action(wrong)?));
         }
+        if let Some(bridge) = &self.mqtt_bridge {
+            return Ok(Action::MqttBridge(Box::new(bridge.to_action(wrong)?)));
+        }
         Err(wrong(
-            "a rule needs an action; write a [rules.http_out], a [rules.http_in] or a \
-             [rules.http_poll] table"
+            "a rule needs an action; write a [rules.http_out], a [rules.http_in], an \
+             [rules.http_poll] or an [rules.mqtt_bridge] table"
                 .to_owned(),
         ))
     }
@@ -971,6 +989,254 @@ impl HttpPollSection {
         // Before anything is stored and long before anything is
         // fetched.
         rules::http_poll::check(&action).map_err(|error| wrong(error.to_string()))?;
+        Ok(action)
+    }
+}
+
+/// How an `mqtt_bridge` rule connects. Section 9.2.
+///
+/// The address has no default because a default that connects
+/// somewhere is worse than one that connects nowhere, and the topics
+/// have none because a bridge that carries nothing is a bridge nobody
+/// meant.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MqttBridgeSection {
+    /// Where the remote broker is: `mqtts://host:port`, or
+    /// `mqtt://host:port` to a loopback address.
+    ///
+    /// Plain text to anywhere but this machine is refused, on the same
+    /// reasoning `http_out` refuses a plain-text endpoint and with more
+    /// at stake: a bridge sends its password in the connect and then
+    /// everything it carries.
+    pub address: String,
+    /// What this bridge calls itself to the remote.
+    ///
+    /// May be left out on MQTT 5, where the remote assigns one and says
+    /// so. On 3.1.1 there is no way for it to say so, so it is
+    /// required.
+    pub client_id: String,
+    /// Which version to speak: 4 for MQTT 3.1.1, 5 for MQTT 5.
+    ///
+    /// The protocol level byte rather than a name, because that is what
+    /// goes on the wire and what every other tool an operator uses
+    /// calls it.
+    pub protocol_level: u8,
+    /// The user name to offer.
+    pub username: Option<String>,
+    /// The password to offer.
+    ///
+    /// A [`Secret`], so the configuration this binary logs at startup
+    /// does not carry it.
+    pub password: Option<Secret>,
+    /// The keep-alive to propose, in seconds.
+    ///
+    /// A proposal: MQTT 5 lets the remote override it, and the
+    /// override is what this bridge then uses.
+    pub keep_alive_secs: u16,
+    /// Whether to ask the remote to discard any session it holds.
+    ///
+    /// **The first connection of a process asks for a clean start
+    /// whatever this says.** The in-flight window is held in memory, so
+    /// a resumed session would hold packet identifiers the restarted
+    /// process no longer knows about; `rules::bridge::supervisor` has
+    /// the argument.
+    pub clean_start: bool,
+    /// How long the remote should keep the session after a disconnect.
+    pub session_expiry_secs: u32,
+    /// How many acknowledged publications this end will take at once.
+    pub receive_maximum: u16,
+    /// The largest packet this end will take, in bytes.
+    pub maximum_packet_size: u32,
+    /// The highest topic alias this end will accept from the remote.
+    ///
+    /// Above zero licenses a compliant remote to start using aliases at
+    /// any moment; `rules::bridge::aliases` is what makes that safe.
+    pub topic_alias_maximum: u16,
+    /// Where this bridge's connectivity is reported, on this broker.
+    ///
+    /// The same name is the will topic on the remote. A state topic
+    /// this bridge would itself carry is refused, because a bridge
+    /// republishing its own liveness is a loop with a heartbeat.
+    pub state_topic: String,
+    /// The first reconnection wait, in milliseconds.
+    pub reconnect_min_ms: u32,
+    /// The longest reconnection wait, in milliseconds.
+    pub reconnect_max_ms: u32,
+    /// The hop count above which a publication is dropped.
+    pub max_hops: u32,
+    /// What moves, and which way.
+    pub topics: Vec<BridgeTopicSection>,
+}
+
+/// One topic entry on a bridge. Section 9.2.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BridgeTopicSection {
+    /// The filter, carrying **neither** prefix.
+    ///
+    /// The local topics an outbound entry fires on are `local_prefix`
+    /// followed by something matching this; the remote filter an
+    /// inbound entry subscribes with is `remote_prefix` followed by the
+    /// same.
+    pub filter: String,
+    /// `"in"`, `"out"` or `"both"`.
+    ///
+    /// Note that `"both"` on one entry is a loop by construction and is
+    /// refused; `rules::bridge::topics` says why, and says what to
+    /// write instead.
+    pub direction: String,
+    /// The level to move messages at.
+    pub qos: u8,
+    /// The prefix this broker's half of the topic carries.
+    pub local_prefix: String,
+    /// The prefix the remote's half carries.
+    pub remote_prefix: String,
+    /// The outbound template, if the topic is rewritten by position.
+    ///
+    /// `sensors/+/temp` with `template = "site-a/temp/{1}"` publishes
+    /// `sensors/kitchen/temp` remotely as `site-a/temp/kitchen`.
+    pub template: Option<String>,
+}
+
+impl Default for BridgeTopicSection {
+    fn default() -> Self {
+        Self {
+            filter: String::new(),
+            direction: "out".to_owned(),
+            qos: 0,
+            local_prefix: String::new(),
+            remote_prefix: String::new(),
+            template: None,
+        }
+    }
+}
+
+impl Default for MqttBridgeSection {
+    /// Nowhere to connect to, nothing to carry, and bounds on
+    /// everything else.
+    fn default() -> Self {
+        let action = MqttBridge::default();
+        Self {
+            address: action.address,
+            client_id: action.client_id,
+            protocol_level: 5,
+            username: action.username,
+            password: action.password,
+            keep_alive_secs: action.keep_alive_secs,
+            clean_start: action.clean_start,
+            session_expiry_secs: action.session_expiry_secs,
+            receive_maximum: action.receive_maximum,
+            maximum_packet_size: action.maximum_packet_size,
+            topic_alias_maximum: action.topic_alias_maximum,
+            state_topic: action.state_topic,
+            reconnect_min_ms: action.reconnect_min_ms,
+            reconnect_max_ms: action.reconnect_max_ms,
+            max_hops: action.max_hops,
+            topics: Vec::new(),
+        }
+    }
+}
+
+impl MqttBridgeSection {
+    /// This table as the rules crate's own type.
+    fn to_action(&self, wrong: &impl Fn(String) -> ConfigError) -> Result<MqttBridge, ConfigError> {
+        let version = match self.protocol_level {
+            4 => mqtt_codec::Version::V311,
+            5 => mqtt_codec::Version::V5,
+            other => {
+                return Err(wrong(format!(
+                    "mqtt_bridge.protocol_level = {other} is not a version this bridge \
+                     speaks; write 4 for MQTT 3.1.1 or 5 for MQTT 5"
+                )))
+            }
+        };
+        // [MQTT-3.1.3-x]: 3.1.1 has no way for a server to tell a
+        // client what identifier it was given, so an empty one there is
+        // a session that can never be resumed and a bridge whose
+        // reconnections each get a new one. Refused when the
+        // configuration is read rather than discovered on the wire.
+        if self.client_id.is_empty() && version == mqtt_codec::Version::V311 {
+            return Err(wrong(
+                "mqtt_bridge.client_id is empty and protocol_level is 4. MQTT 3.1.1 has \
+                 no way for the remote to say what identifier it assigned, so the session \
+                 could never be resumed; set client_id, or speak MQTT 5."
+                    .to_owned(),
+            ));
+        }
+        if self.receive_maximum == 0 {
+            return Err(wrong(
+                "mqtt_bridge.receive_maximum is zero, which MQTT 5 makes a protocol error \
+                 and which would be a bridge that can receive nothing"
+                    .to_owned(),
+            ));
+        }
+        if self.max_hops == 0 {
+            return Err(wrong(
+                "mqtt_bridge.max_hops is zero, so every message would be over the limit \
+                 and this bridge would carry nothing"
+                    .to_owned(),
+            ));
+        }
+
+        let mut topics = Vec::with_capacity(self.topics.len());
+        for (index, topic) in self.topics.iter().enumerate() {
+            let direction = match topic.direction.as_str() {
+                "in" => Direction::In,
+                "out" => Direction::Out,
+                "both" => Direction::Both,
+                other => {
+                    return Err(wrong(format!(
+                        "mqtt_bridge topic {index}: direction = {other:?} is not a \
+                         direction; write \"in\", \"out\" or \"both\""
+                    )))
+                }
+            };
+            let qos = rules::http_in::qos_of(topic.qos).ok_or_else(|| {
+                wrong(format!(
+                    "mqtt_bridge topic {index}: qos = {} is not a level; MQTT has 0, 1 \
+                     and 2",
+                    topic.qos
+                ))
+            })?;
+            topics.push(BridgeTopic {
+                filter: topic.filter.clone(),
+                direction,
+                qos,
+                local_prefix: topic.local_prefix.clone(),
+                remote_prefix: topic.remote_prefix.clone(),
+                template: topic.template.clone(),
+            });
+        }
+
+        let action = MqttBridge {
+            address: self.address.clone(),
+            client_id: self.client_id.clone(),
+            version,
+            username: self.username.clone(),
+            password: self.password.clone(),
+            keep_alive_secs: self.keep_alive_secs,
+            clean_start: self.clean_start,
+            session_expiry_secs: self.session_expiry_secs,
+            receive_maximum: self.receive_maximum,
+            maximum_packet_size: self.maximum_packet_size,
+            topic_alias_maximum: self.topic_alias_maximum,
+            state_topic: self.state_topic.clone(),
+            reconnect_min_ms: self.reconnect_min_ms,
+            reconnect_max_ms: self.reconnect_max_ms,
+            max_hops: self.max_hops,
+            topics,
+        };
+
+        // **Before anything is stored and long before anything
+        // connects.** Both of them: the address, which is where a
+        // plain-text link to somewhere other than this machine is
+        // refused, and the topics, which is where a configuration that
+        // loops is refused. Section 9.2 puts the second first among the
+        // loop defences, and this is the moment it means.
+        rules::bridge::supervisor::address(&action.address)
+            .map_err(|error| wrong(error.to_string()))?;
+        rules::bridge::topics::check(&action).map_err(|error| wrong(error.to_string()))?;
         Ok(action)
     }
 }
