@@ -919,6 +919,7 @@ name = "rules"
 version = "0.1.0"
 dependencies = [
  "broker-core",
+ "bytes",
  "mqtt-codec",
  "storage",
  "thiserror",

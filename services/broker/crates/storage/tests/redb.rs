@@ -26,9 +26,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use storage::{
-    BodyRecord, DeliveryRecord, FormatMarker, MessageId, ProtocolVersion, Qos, QueueEntry, Record,
-    RedbStorage, SessionKey, SessionRecord, Storage, StorageError, SyncMode, FORMAT_MAGIC,
-    FORMAT_VERSION,
+    ActionRecord, BodyRecord, DeliveryRecord, FormatMarker, HttpOutRecord, MessageId, OutboxRecord,
+    ProtocolVersion, Qos, QueueEntry, Record, RedbStorage, RuleRecord, SessionKey, SessionRecord,
+    Storage, StorageError, SyncMode, TriggerRecord, FORMAT_MAGIC, FORMAT_VERSION,
 };
 
 // ---- building blocks ----------------------------------------------------
@@ -328,6 +328,209 @@ fn sessions_whose_keys_are_prefixes_of_each_other_do_not_share_a_queue() {
         store.queue_head(&key("a"), 0).expect("the head read"),
         None,
         "client a read an entry belonging to client ab"
+    );
+}
+
+// ---- the outbox across a restart ----------------------------------------
+
+/// A rule to hang an outbox from.
+fn rule(id: &str) -> RuleRecord {
+    RuleRecord {
+        id: id.to_owned(),
+        name: format!("rule {id}"),
+        enabled: true,
+        trigger: TriggerRecord {
+            filter: "sensor/+/temp".to_owned(),
+            min_qos: None,
+            client_id: None,
+        },
+        action: ActionRecord::HttpOut(HttpOutRecord {
+            url: "https://example.invalid/hook".to_owned(),
+            method: "POST".to_owned(),
+            headers: Vec::new(),
+            timeout_ms: 1_000,
+            max_concurrency: 1,
+            retries: 3,
+            backoff_ms: 500,
+        }),
+    }
+}
+
+/// An envelope comes back from the file with the attempts it had already
+/// cost, and the outbox drains in the order the rule fired.
+///
+/// **This is the reason the count is in the record.** Keeping it beside
+/// the task that posts is cheaper and works perfectly until the process
+/// restarts, at which point every envelope is back at zero attempts and
+/// a node returning from an outage throws its whole backlog at a
+/// still-dead endpoint as though none of it had ever been tried. Nothing
+/// inside one process can fail that; this reopens the file.
+///
+/// The sequence numbers cross byte boundaries for the reason the queue
+/// test above gives: redb orders by bytes, and a little-endian key sorts
+/// 256 before 2.
+#[test]
+fn an_envelope_comes_back_with_the_attempts_it_already_cost() {
+    let workspace = workspace();
+    let path = store_path(&workspace);
+    let appended = [1u64, 2, 255, 256, 257, 65_536];
+    {
+        let store = open(&path);
+        apply(&store, &[Record::RulePut { rule: rule("a") }]);
+        for sequence in appended {
+            apply(
+                &store,
+                &[
+                    Record::BodyPut {
+                        id: body_id(1),
+                        body: body(1),
+                    },
+                    Record::OutboxAppended {
+                        rule: "a".to_owned(),
+                        entry: OutboxRecord {
+                            sequence,
+                            id: body_id(9),
+                            body: body_id(1),
+                            client_id: "sensor".to_owned(),
+                            enqueued_at: 1_700_000_000,
+                            attempts: 0,
+                            next_attempt_at: 0,
+                        },
+                    },
+                ],
+            );
+        }
+        // The head has been tried twice and is not due again until a
+        // known second. Both numbers have to survive: a restart that
+        // kept the count and lost the deadline would still post
+        // immediately, which is the behaviour the count exists to stop.
+        apply(
+            &store,
+            &[Record::OutboxAttempted {
+                rule: "a".to_owned(),
+                sequence: 1,
+                attempts: 2,
+                next_attempt_at: 1_700_000_061,
+            }],
+        );
+        store.flush().expect("a flush must succeed");
+    }
+
+    let store = open(&path);
+    let head = store
+        .outbox_head("a", 0)
+        .expect("the head read must answer")
+        .expect("the envelope is still waiting");
+    assert_eq!(head.sequence, 1);
+    assert_eq!(
+        head.attempts, 2,
+        "the attempt count was reset by the restart"
+    );
+    assert_eq!(
+        head.next_attempt_at, 1_700_000_061,
+        "the next attempt's deadline was reset by the restart"
+    );
+    assert_eq!(head.id, body_id(9), "the envelope lost its identifier");
+    assert_eq!(store.outbox_depth("a").expect("depth"), 6);
+    assert_eq!(store.outbox_highest_sequence("a").expect("mark"), 65_536);
+
+    // And the rest of the outbox is in the order the rule fired, which
+    // is the key encoding's answer and nothing else's.
+    let mut cursor = 0;
+    let mut seen = Vec::new();
+    while let Some(entry) = store.outbox_head("a", cursor).expect("the head read") {
+        seen.push(entry.sequence);
+        cursor = entry.sequence + 1;
+    }
+    assert_eq!(seen, appended, "the outbox came back out of order");
+}
+
+/// Two rules whose identifiers are prefixes of each other keep their own
+/// outboxes across a restart.
+///
+/// The same hazard as two sessions whose keys are prefixes of each other,
+/// and the worse outcome here: a rule posting another rule's messages
+/// sends somebody's data to the wrong endpoint.
+#[test]
+fn rules_whose_identifiers_are_prefixes_of_each_other_do_not_share_an_outbox() {
+    let workspace = workspace();
+    let path = store_path(&workspace);
+    {
+        let store = open(&path);
+        apply(
+            &store,
+            &[
+                Record::RulePut { rule: rule("a") },
+                Record::RulePut { rule: rule("ab") },
+            ],
+        );
+        for (id, sequence, body) in [("a", 25_185_u64, 1_u8), ("ab", 1, 2)] {
+            apply(
+                &store,
+                &[
+                    Record::BodyPut {
+                        id: body_id(body),
+                        body: crate::body(body),
+                    },
+                    Record::OutboxAppended {
+                        rule: id.to_owned(),
+                        entry: OutboxRecord {
+                            sequence,
+                            id: body_id(body),
+                            body: body_id(body),
+                            client_id: id.to_owned(),
+                            enqueued_at: 1_700_000_000,
+                            attempts: 0,
+                            next_attempt_at: 0,
+                        },
+                    },
+                ],
+            );
+        }
+        store.flush().expect("a flush must succeed");
+    }
+
+    let store = open(&path);
+    assert_eq!(
+        store
+            .outbox_head("a", 0)
+            .expect("head")
+            .map(|entry| (entry.sequence, entry.body)),
+        Some((25_185, body_id(1))),
+        "rule a read the wrong outbox"
+    );
+    assert_eq!(
+        store
+            .outbox_head("ab", 0)
+            .expect("head")
+            .map(|entry| (entry.sequence, entry.body)),
+        Some((1, body_id(2))),
+        "rule ab read the wrong outbox"
+    );
+    assert_eq!(store.outbox_depth("a").expect("depth"), 1);
+    assert_eq!(store.outbox_depth("ab").expect("depth"), 1);
+
+    // The sharper half, across the file: once one rule's outbox is
+    // empty, it must read as empty rather than falling through into the
+    // rows of the rule whose identifier begins with the same bytes.
+    apply(
+        &store,
+        &[Record::OutboxRemoved {
+            rule: "a".to_owned(),
+            sequence: 25_185,
+        }],
+    );
+    assert_eq!(
+        store.outbox_head("a", 0).expect("head"),
+        None,
+        "a drained outbox handed over another rule's envelope"
+    );
+    assert_eq!(
+        store
+            .outbox_head("ab", 0)
+            .expect("head")
+            .map(|entry| entry.sequence),
+        Some(1)
     );
 }
 

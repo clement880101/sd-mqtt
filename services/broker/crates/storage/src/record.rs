@@ -63,7 +63,15 @@ use serde::{Deserialize, Serialize};
 /// version 3 store opened by a milestone 3 build would meet two record
 /// discriminants it has no meaning for. Nothing is released, so the cost
 /// is a line in the release notes rather than a migration.
-pub const FORMAT_VERSION: u16 = 3;
+///
+/// Version 4 added the per-rule outbox, section 9.2: three variants at
+/// the end of [`Record`], an [`OutboxRecord`] to go in the first of
+/// them, and a table and a counter row in each backend. The same
+/// argument as version 3 applies with one addition — a version 3 store
+/// opened by this build would come up with every rule's outbox empty,
+/// which is not an empty outbox but an undelivered message nobody will
+/// ever look for again.
+pub const FORMAT_VERSION: u16 = 4;
 
 /// What every sd-mqtt store begins with, so a file that is not one is
 /// refused as such rather than as a corrupt store.
@@ -467,6 +475,64 @@ pub struct RuleRecord {
     pub action: ActionRecord,
 }
 
+/// One envelope waiting in a rule's outbox, section 9.2.
+///
+/// # The attempt count is here, and that is the point of the record
+///
+/// It would be cheaper to keep the count beside the task that is doing
+/// the posting. **A restart would then reset every envelope to zero
+/// attempts**, and a node coming back after an outage would throw its
+/// whole backlog at a still-dead endpoint as though none of it had ever
+/// been tried. The count and the time of the next attempt are durable
+/// facts about the delivery, not state belonging to whichever process
+/// happens to be running.
+///
+/// # The payload is not here
+///
+/// [`Self::body`] names a [`BodyRecord`], which is the same row the
+/// broker's own queues reference and is stored once however many things
+/// name it. So a message that fires three rules is one payload and three
+/// envelopes.
+///
+/// The cost of that is the one [`crate::Storage::apply`] warns about:
+/// **taking a reference is explicit and so is releasing it.** Removing
+/// an envelope from an outbox does not release the body it named, for
+/// exactly the reason a queue pop does not, and an outbox that forgets
+/// the release leaks the payload for the life of the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxRecord {
+    /// The per-rule sequence number, assigned on append and monotonic
+    /// within the rule. It is the outbox's key, so reading in key order
+    /// is reading in the order the rule fired, and it is never reused.
+    pub sequence: u64,
+    /// What names this delivery, for as long as it exists.
+    ///
+    /// Stored rather than derived, and minted once when the envelope is
+    /// appended. Delivery is at least once — a timeout cannot be told
+    /// from a failure, so a retry after one may repeat a post that
+    /// arrived — and this is what lets a receiver notice the repeat. An
+    /// identifier minted per attempt would look like a new delivery each
+    /// time and would break exactly the deduplication it exists for.
+    pub id: MessageId,
+    /// The payload, stored once and referenced from here.
+    pub body: MessageId,
+    /// The client that published the message, which the envelope
+    /// carries and the body does not.
+    pub client_id: String,
+    /// When the rule fired, in coarse seconds.
+    pub enqueued_at: u32,
+    /// How many attempts have been made and have failed.
+    ///
+    /// Zero for an envelope that has never been tried.
+    pub attempts: u32,
+    /// The coarse second before which the next attempt must not be
+    /// made.
+    ///
+    /// Zero means "now": an envelope that has never been tried is due
+    /// immediately, and so is one whose backoff has been served.
+    pub next_attempt_at: u32,
+}
+
 /// A message held for future subscribers to a topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedRecord {
@@ -596,9 +662,58 @@ pub enum Record {
         rule: RuleRecord,
     },
     /// A rule was deleted.
+    ///
+    /// Takes its outbox with it, as [`Record::SessionRemoved`] takes a
+    /// session's queue: an outbox filed under a rule nothing holds is
+    /// reachable by nothing and would sit in the file forever. The
+    /// bodies those envelopes named are **not** released, for the same
+    /// reason a session's removal does not release its queue's: the
+    /// reference belongs to whoever took it, and a caller that emits
+    /// its own releases would otherwise release twice.
     RuleRemoved {
         /// Which rule.
         id: String,
+    },
+    /// An envelope joined a rule's outbox at this sequence number.
+    ///
+    /// Refused for a rule the store does not hold, for the reason
+    /// [`Rejection::NoSuchRule`] gives.
+    ///
+    /// [`Rejection::NoSuchRule`]: crate::Rejection::NoSuchRule
+    OutboxAppended {
+        /// Whose outbox.
+        rule: String,
+        /// What went into it.
+        entry: OutboxRecord,
+    },
+    /// An attempt was made on an envelope and did not succeed.
+    ///
+    /// The count and the time of the next attempt are replaced with what
+    /// this record carries rather than incremented by the store, so that
+    /// the backoff is the caller's policy and the store holds a fact.
+    /// An attempt on a sequence the outbox no longer holds is a no-op:
+    /// the envelope left, which is the one outcome that makes further
+    /// attempts pointless.
+    OutboxAttempted {
+        /// Whose outbox.
+        rule: String,
+        /// Which envelope.
+        sequence: u64,
+        /// How many attempts have now been made and failed.
+        attempts: u32,
+        /// The coarse second before which the next must not be made.
+        next_attempt_at: u32,
+    },
+    /// An envelope left an outbox, delivered or dead-lettered.
+    ///
+    /// **Does not release the body it named.** See [`OutboxRecord`] and
+    /// [`crate::Storage::apply`]: the release is the caller's, and it is
+    /// owed.
+    OutboxRemoved {
+        /// Whose outbox.
+        rule: String,
+        /// Which envelope.
+        sequence: u64,
     },
 }
 
@@ -683,6 +798,12 @@ impl Record {
                     }
             }
             Self::RuleRemoved { id } => id.len(),
+            // The client identifier is a peer's, and the rule
+            // identifier an operator's. The payload is not counted
+            // because it is not here: the `BodyPut` beside this record
+            // carries it and is weighed on its own.
+            Self::OutboxAppended { rule, entry } => rule.len() + entry.client_id.len(),
+            Self::OutboxAttempted { rule, .. } | Self::OutboxRemoved { rule, .. } => rule.len(),
         };
         std::mem::size_of::<Self>() + variable
     }

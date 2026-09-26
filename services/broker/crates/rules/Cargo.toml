@@ -19,5 +19,10 @@ broker-core = { path = "../broker-core", version = "0.1.0" }
 storage = { path = "../storage", version = "0.1.0", default-features = false }
 thiserror.workspace = true
 
+[dev-dependencies]
+# The outbox's tests build payloads; `Bytes` is what a stored body
+# carries and what the broker hands over without copying.
+bytes.workspace = true
+
 [lints]
 workspace = true

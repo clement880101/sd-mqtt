@@ -31,9 +31,9 @@ pub use memory::MemoryStorage;
 
 pub use record::{
     ActionRecord, BodyRecord, DeliveryRecord, FormatError, FormatMarker, HttpOutRecord,
-    InflightRecord, InflightState, MessageId, ProtocolVersion, Qos, QueueEntry, Record,
-    RetainHandling, RetainedRecord, RuleRecord, SessionKey, SessionRecord, SubscriptionRecord,
-    TriggerRecord, WillRecord, FORMAT_MAGIC, FORMAT_VERSION,
+    InflightRecord, InflightState, MessageId, OutboxRecord, ProtocolVersion, Qos, QueueEntry,
+    Record, RetainHandling, RetainedRecord, RuleRecord, SessionKey, SessionRecord,
+    SubscriptionRecord, TriggerRecord, WillRecord, FORMAT_MAGIC, FORMAT_VERSION,
 };
 pub use restore::{Restored, RestoredSession};
 pub use writer::{Applied, Durable, NotDurable, Writer, WriterConfig, WriterStopped};
@@ -190,6 +190,35 @@ pub enum Rejection {
         /// The highest ever assigned to that session.
         highest: u64,
     },
+    /// A record named a rule the store does not hold.
+    ///
+    /// The same argument as [`Rejection::NoSuchSession`], one level
+    /// across: an outbox is reached through the rule that owns it, so an
+    /// envelope filed under a rule the store does not hold is in the file
+    /// and reachable by nothing. Refusing is the only answer that does
+    /// not silently accept a message it will never deliver.
+    #[error("no rule is held under the identifier {id:?}")]
+    NoSuchRule {
+        /// Which rule was named.
+        id: String,
+    },
+    /// An outbox append reused a sequence number.
+    ///
+    /// Its own variant rather than [`Rejection::SequenceReused`], which
+    /// names a session: convention 2 says a test asserting a category is
+    /// not guarding the check it is named after, and a refusal that
+    /// could be either of these would be exactly that.
+    #[error(
+        "outbox sequence {sequence} was already assigned to rule {id:?}, whose highest is {highest}"
+    )]
+    OutboxSequenceReused {
+        /// Whose outbox.
+        id: String,
+        /// The number the append asked for.
+        sequence: u64,
+        /// The highest ever assigned to that rule.
+        highest: u64,
+    },
     /// A body was released more often than it was stored.
     ///
     /// The reference count is the only thing standing between a shared
@@ -330,6 +359,34 @@ pub trait Storage: Send + Sync + 'static {
     /// it. A store that kept the mark would be the same bug as a store
     /// that kept the queue, only quieter.
     fn highest_sequence(&self, session: &SessionKey) -> Result<u64, StorageError>;
+
+    /// The head of a rule's outbox, at or after `cursor`.
+    ///
+    /// A cursor for the reason [`Storage::queue_head`] is one, and the
+    /// same holes appear for the same reason: an envelope that has been
+    /// delivered leaves its sequence number spent.
+    ///
+    /// Returns `None` when the rule holds nothing at or after `cursor`,
+    /// which includes a rule the store does not hold at all. Reading is
+    /// not refused for an unknown rule although writing is: a read that
+    /// answered with an error would make "this rule has nothing waiting"
+    /// and "this rule is gone" two different shapes of answer to the one
+    /// question a pump asks.
+    fn outbox_head(&self, rule: &str, cursor: u64) -> Result<Option<OutboxRecord>, StorageError>;
+
+    /// How many envelopes a rule's outbox holds.
+    ///
+    /// A stored counter, for the reason [`Storage::queue_depth`] gives.
+    fn outbox_depth(&self, rule: &str) -> Result<u64, StorageError>;
+
+    /// The highest sequence number ever appended to this rule's outbox,
+    /// whether or not that envelope is still held.
+    ///
+    /// Nothing may reuse it, and a restart must not hand out a number
+    /// already spent: this is what a pump reads to know where to append
+    /// next. Zero for a rule that has never fired, which makes the first
+    /// assigned number one, and zero again once the rule is removed.
+    fn outbox_highest_sequence(&self, rule: &str) -> Result<u64, StorageError>;
 }
 
 #[cfg(test)]

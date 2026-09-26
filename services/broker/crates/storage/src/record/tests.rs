@@ -46,6 +46,13 @@ use super::*;
 ///   would produce, so the vector pins what was stored and not what a
 ///   default would have supplied.
 ///
+/// - `OutboxRecord`: `id` and `body` are both sixteen raw bytes and are
+///   filled with different ones, so a swap is visible; `attempts` is a
+///   one-byte varint and `enqueued_at` and `next_attempt_at` are
+///   five-byte ones that differ in their first byte; and the rule
+///   identifier outside the record is a different length from the
+///   client identifier inside it.
+///
 /// When adding a record type, check the same property before adding its
 /// vector.
 mod golden {
@@ -98,14 +105,15 @@ mod golden {
     #[test]
     fn the_format_marker() {
         // A fixed-size array is its elements with no length prefix, and a
-        // u16 is a varint, so version 3 is one byte. The version moved
+        // u16 is a varint, so version 4 is one byte. The version moved
         // from 1 when the reference count of a body left the body's own
-        // row, and from 2 when rules were added: a version 2 store has
-        // no rules table at all and would come up looking healthy with
-        // every rule missing.
+        // row, from 2 when rules were added, and from 3 when each rule
+        // gained an outbox: a version 3 store has no outbox table at
+        // all and would come up looking healthy with every undelivered
+        // envelope missing.
         let expected: &[u8] = &[
             b's', b'd', b'm', b'q', b't', b't', b's', b't', // magic "sdmqttst"
-            0x03, // version 3
+            0x04, // version 4
         ];
         assert_eq!(FormatMarker::current().encode(), expected);
         assert_eq!(
@@ -477,6 +485,88 @@ mod golden {
         );
     }
 
+    /// The envelope the three vectors below are of.
+    ///
+    /// `id` and `body` are sixteen bytes each of `0x11` and `0x22`, so
+    /// that reading one where the other belongs is legible rather than
+    /// hidden behind shared zeroes.
+    fn envelope() -> OutboxRecord {
+        OutboxRecord {
+            sequence: 300,
+            id: MessageId([0x11; 16]),
+            body: MessageId([0x22; 16]),
+            client_id: "sensor".to_owned(),
+            enqueued_at: 1_700_000_000,
+            attempts: 2,
+            next_attempt_at: 1_700_000_017,
+        }
+    }
+
+    #[test]
+    fn outbox_appended() {
+        // A newtype struct is its inner value, and a fixed-size array is
+        // its elements with no length prefix, so a `MessageId` is
+        // sixteen bare bytes. 300 = 2 * 128 + 44, so its varint is
+        // 44|0x80 then 2. 1_700_000_000 and 1_700_000_017 differ only in
+        // their lowest seven bits, which is the first byte of each.
+        let expected: &[u8] = &[
+            0x10, // Record::OutboxAppended is variant 16
+            0x09, b't', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y', // rule
+            0xac, 0x02, // sequence 300
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, // id, sixteen bytes
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+            0x22, 0x22, // body, sixteen bytes
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x06, b's', b'e', b'n', b's', b'o',
+            b'r', // client_id "sensor"
+            0x80, 0xe2, 0xcf, 0xaa, 0x06, // enqueued_at 1_700_000_000
+            0x02, // attempts 2
+            0x91, 0xe2, 0xcf, 0xaa, 0x06, // next_attempt_at 1_700_000_017
+        ];
+        pins(
+            &Record::OutboxAppended {
+                rule: "telemetry".to_owned(),
+                entry: envelope(),
+            },
+            expected,
+        );
+    }
+
+    #[test]
+    fn outbox_attempted() {
+        let expected: &[u8] = &[
+            0x11, // Record::OutboxAttempted is variant 17
+            0x09, b't', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y', // rule
+            0xac, 0x02, // sequence 300
+            0x04, // attempts 4
+            0x91, 0xe2, 0xcf, 0xaa, 0x06, // next_attempt_at 1_700_000_017
+        ];
+        pins(
+            &Record::OutboxAttempted {
+                rule: "telemetry".to_owned(),
+                sequence: 300,
+                attempts: 4,
+                next_attempt_at: 1_700_000_017,
+            },
+            expected,
+        );
+    }
+
+    #[test]
+    fn outbox_removed() {
+        let expected: &[u8] = &[
+            0x12, // Record::OutboxRemoved is variant 18
+            0x09, b't', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y', // rule
+            0xac, 0x02, // sequence 300
+        ];
+        pins(
+            &Record::OutboxRemoved {
+                rule: "telemetry".to_owned(),
+                sequence: 300,
+            },
+            expected,
+        );
+    }
+
     #[test]
     fn retained_removed() {
         let expected: &[u8] = &[
@@ -598,7 +688,7 @@ mod version {
 
     #[test]
     fn an_unknown_discriminant_does_not_decode() {
-        // The highest variant is 15. A record written by a build that has
+        // The highest variant is 18. A record written by a build that has
         // more of them must be refused rather than read as something else.
         let err = Record::decode(&[0x63]).expect_err("variant 99 is not ours");
         assert!(matches!(err, FormatError::Undecodable(_)), "said: {err:?}");
@@ -1009,6 +1099,31 @@ mod roundtrip {
             )
     }
 
+    fn outbox_entry() -> impl Strategy<Value = OutboxRecord> {
+        (
+            any::<u64>(),
+            message_id(),
+            message_id(),
+            text(),
+            any::<u32>(),
+            any::<u32>(),
+            any::<u32>(),
+        )
+            .prop_map(
+                |(sequence, id, body, client_id, enqueued_at, attempts, next_attempt_at)| {
+                    OutboxRecord {
+                        sequence,
+                        id,
+                        body,
+                        client_id,
+                        enqueued_at,
+                        attempts,
+                        next_attempt_at,
+                    }
+                },
+            )
+    }
+
     fn rule() -> impl Strategy<Value = RuleRecord> {
         (text(), text(), any::<bool>(), trigger(), action()).prop_map(
             |(id, name, enabled, trigger, action)| RuleRecord {
@@ -1065,6 +1180,18 @@ mod roundtrip {
             text().prop_map(|topic| Record::RetainedRemoved { topic }),
             rule().prop_map(|rule| Record::RulePut { rule }),
             text().prop_map(|id| Record::RuleRemoved { id }),
+            (text(), outbox_entry())
+                .prop_map(|(rule, entry)| Record::OutboxAppended { rule, entry }),
+            (text(), any::<u64>(), any::<u32>(), any::<u32>()).prop_map(
+                |(rule, sequence, attempts, next_attempt_at)| Record::OutboxAttempted {
+                    rule,
+                    sequence,
+                    attempts,
+                    next_attempt_at,
+                }
+            ),
+            (text(), any::<u64>())
+                .prop_map(|(rule, sequence)| Record::OutboxRemoved { rule, sequence }),
         ]
     }
 

@@ -636,7 +636,7 @@ pub mod gated {
     use std::time::Duration;
 
     use parking_lot::{Condvar, Mutex};
-    use storage::record::{QueueEntry, Record, SessionKey};
+    use storage::record::{OutboxRecord, QueueEntry, Record, SessionKey};
     use storage::{MemoryStorage, Restored, Storage, StorageError};
 
     /// What the gate is currently doing to a flush.
@@ -809,6 +809,22 @@ pub mod gated {
 
         fn highest_sequence(&self, session: &SessionKey) -> Result<u64, StorageError> {
             self.inner.highest_sequence(session)
+        }
+
+        fn outbox_head(
+            &self,
+            rule: &str,
+            cursor: u64,
+        ) -> Result<Option<OutboxRecord>, StorageError> {
+            self.inner.outbox_head(rule, cursor)
+        }
+
+        fn outbox_depth(&self, rule: &str) -> Result<u64, StorageError> {
+            self.inner.outbox_depth(rule)
+        }
+
+        fn outbox_highest_sequence(&self, rule: &str) -> Result<u64, StorageError> {
+            self.inner.outbox_highest_sequence(rule)
         }
     }
 }

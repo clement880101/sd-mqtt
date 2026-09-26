@@ -37,8 +37,8 @@ use std::sync::{Condvar, Mutex, PoisonError};
 
 use super::*;
 use crate::record::{
-    BodyRecord, DeliveryRecord, MessageId, ProtocolVersion, Qos, QueueEntry, RetainHandling,
-    SessionKey, SessionRecord, SubscriptionRecord,
+    BodyRecord, DeliveryRecord, MessageId, OutboxRecord, ProtocolVersion, Qos, QueueEntry,
+    RetainHandling, SessionKey, SessionRecord, SubscriptionRecord,
 };
 use crate::restore::Restored;
 use crate::{MemoryStorage, RedbStorage, Rejection};
@@ -347,6 +347,18 @@ impl Storage for Fake {
     fn highest_sequence(&self, _: &SessionKey) -> Result<u64, StorageError> {
         Ok(0)
     }
+
+    fn outbox_head(&self, _: &str, _: u64) -> Result<Option<OutboxRecord>, StorageError> {
+        Ok(None)
+    }
+
+    fn outbox_depth(&self, _: &str) -> Result<u64, StorageError> {
+        Ok(0)
+    }
+
+    fn outbox_highest_sequence(&self, _: &str) -> Result<u64, StorageError> {
+        Ok(0)
+    }
 }
 
 /// A store that dies rather than answering, for the one path where the
@@ -376,6 +388,18 @@ impl Storage for Unavailable {
     }
 
     fn highest_sequence(&self, _: &SessionKey) -> Result<u64, StorageError> {
+        Ok(0)
+    }
+
+    fn outbox_head(&self, _: &str, _: u64) -> Result<Option<OutboxRecord>, StorageError> {
+        Ok(None)
+    }
+
+    fn outbox_depth(&self, _: &str) -> Result<u64, StorageError> {
+        Ok(0)
+    }
+
+    fn outbox_highest_sequence(&self, _: &str) -> Result<u64, StorageError> {
         Ok(0)
     }
 }
@@ -1315,6 +1339,15 @@ fn the_thread_is_named() {
             Ok(0)
         }
         fn highest_sequence(&self, _: &SessionKey) -> Result<u64, StorageError> {
+            Ok(0)
+        }
+        fn outbox_head(&self, _: &str, _: u64) -> Result<Option<OutboxRecord>, StorageError> {
+            Ok(None)
+        }
+        fn outbox_depth(&self, _: &str) -> Result<u64, StorageError> {
+            Ok(0)
+        }
+        fn outbox_highest_sequence(&self, _: &str) -> Result<u64, StorageError> {
             Ok(0)
         }
     }

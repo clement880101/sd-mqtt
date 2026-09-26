@@ -32,9 +32,9 @@ use std::collections::BTreeSet;
 
 use storage::{
     ActionRecord, BodyRecord, DeliveryRecord, HttpOutRecord, InflightRecord, InflightState,
-    MessageId, ProtocolVersion, Qos, QueueEntry, Record, Rejection, Restored, RestoredSession,
-    RetainHandling, RetainedRecord, RuleRecord, SessionKey, SessionRecord, Storage, StorageError,
-    SubscriptionRecord, TriggerRecord,
+    MessageId, OutboxRecord, ProtocolVersion, Qos, QueueEntry, Record, Rejection, Restored,
+    RestoredSession, RetainHandling, RetainedRecord, RuleRecord, SessionKey, SessionRecord,
+    Storage, StorageError, SubscriptionRecord, TriggerRecord,
 };
 
 /// The contract, as functions over any backend.
@@ -98,6 +98,33 @@ mod contract {
                 backoff_ms: 750,
             }),
         }
+    }
+
+    /// An outbox envelope with no field left at its default, so that a
+    /// backend dropping one is visible.
+    ///
+    /// The attempt count and the next attempt's time are both non-zero
+    /// and different from each other, which is the pair this record
+    /// exists for: a backend that kept only one of them, or swapped
+    /// them, must not be able to pass.
+    fn envelope(sequence: u64, body: MessageId) -> OutboxRecord {
+        OutboxRecord {
+            sequence,
+            id: body_id(200 + u8::try_from(sequence % 50).expect("in range")),
+            body,
+            client_id: format!("sensor-{sequence}"),
+            enqueued_at: 1_700_000_000,
+            attempts: 2,
+            next_attempt_at: 1_700_000_017,
+        }
+    }
+
+    /// A store holding one rule, which every outbox test needs first.
+    #[track_caller]
+    fn with_rule<S: Storage>(new: impl Fn() -> S, id: &str) -> S {
+        let store = new();
+        apply(&store, &[Record::RulePut { rule: rule(id) }]);
+        store
     }
 
     /// A message identifier that differs from every other in its first
@@ -1694,6 +1721,456 @@ mod contract {
         assert_eq!(restored.rules, vec![rule("a")], "the rule did not");
     }
 
+    // ---- outboxes ---------------------------------------------------------
+
+    /// An envelope is held with every field it was given, and the
+    /// counters move with it. Section 9.2.
+    pub fn an_outbox_holds_an_envelope_with_every_field_and_counts_it<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = with_rule(new, "a");
+        assert_eq!(store.outbox_depth("a").expect("depth"), 0);
+        assert_eq!(store.outbox_highest_sequence("a").expect("mark"), 0);
+        assert_eq!(store.outbox_head("a", 0).expect("head"), None);
+
+        apply(
+            &store,
+            &[
+                Record::BodyPut {
+                    id: body_id(1),
+                    body: body(1),
+                },
+                Record::OutboxAppended {
+                    rule: "a".to_owned(),
+                    entry: envelope(1, body_id(1)),
+                },
+            ],
+        );
+        assert_eq!(
+            store.outbox_head("a", 0).expect("head"),
+            Some(envelope(1, body_id(1))),
+            "the envelope came back changed"
+        );
+        assert_eq!(store.outbox_depth("a").expect("depth"), 1);
+        assert_eq!(store.outbox_highest_sequence("a").expect("mark"), 1);
+    }
+
+    /// The attempt count and the next attempt's time are stored, and an
+    /// attempt replaces them.
+    ///
+    /// This is the record's whole reason for existing: a count kept
+    /// anywhere else resets when the process does, and a node coming
+    /// back after an outage throws its entire backlog at a still-dead
+    /// endpoint at once.
+    pub fn an_attempt_moves_the_stored_count_and_the_next_time<S: Storage>(new: impl Fn() -> S) {
+        let store = with_rule(new, "a");
+        let mut fresh = envelope(1, body_id(1));
+        fresh.attempts = 0;
+        fresh.next_attempt_at = 0;
+        apply(
+            &store,
+            &[
+                Record::BodyPut {
+                    id: body_id(1),
+                    body: body(1),
+                },
+                Record::OutboxAppended {
+                    rule: "a".to_owned(),
+                    entry: fresh.clone(),
+                },
+            ],
+        );
+        assert_eq!(store.outbox_head("a", 0).expect("head"), Some(fresh));
+
+        apply(
+            &store,
+            &[Record::OutboxAttempted {
+                rule: "a".to_owned(),
+                sequence: 1,
+                attempts: 3,
+                next_attempt_at: 1_700_000_031,
+            }],
+        );
+        let held = store
+            .outbox_head("a", 0)
+            .expect("head")
+            .expect("the envelope is still waiting");
+        assert_eq!(held.attempts, 3, "the attempt count was not stored");
+        assert_eq!(
+            held.next_attempt_at, 1_700_000_031,
+            "the next attempt's time was not stored"
+        );
+        // Nothing else moved: an attempt is not a rewrite of the
+        // envelope, and a backend that rebuilt the record would lose
+        // whichever field it forgot.
+        assert_eq!(held.id, envelope(1, body_id(1)).id);
+        assert_eq!(held.body, body_id(1));
+        assert_eq!(held.client_id, "sensor-1");
+        assert_eq!(held.enqueued_at, 1_700_000_000);
+
+        // An attempt on an envelope that has left is a no-op rather than
+        // a refusal or a resurrection.
+        apply(
+            &store,
+            &[Record::OutboxRemoved {
+                rule: "a".to_owned(),
+                sequence: 1,
+            }],
+        );
+        apply(
+            &store,
+            &[Record::OutboxAttempted {
+                rule: "a".to_owned(),
+                sequence: 1,
+                attempts: 9,
+                next_attempt_at: 1_700_000_099,
+            }],
+        );
+        assert_eq!(
+            store.outbox_head("a", 0).expect("head"),
+            None,
+            "an attempt on a delivered envelope put it back"
+        );
+        assert_eq!(store.outbox_depth("a").expect("depth"), 0);
+    }
+
+    /// Two rules' outboxes do not see each other.
+    ///
+    /// The identifiers are `"a"` and `"ab"`, which is the pair a backend
+    /// gluing the identifier to the sequence number would confuse: one
+    /// rule would post another rule's messages.
+    pub fn two_rules_outboxes_do_not_see_each_other<S: Storage>(new: impl Fn() -> S) {
+        let store = new();
+        apply(
+            &store,
+            &[
+                Record::RulePut { rule: rule("a") },
+                Record::RulePut { rule: rule("ab") },
+                Record::BodyPut {
+                    id: body_id(1),
+                    body: body(1),
+                },
+                Record::BodyPut {
+                    id: body_id(2),
+                    body: body(2),
+                },
+                Record::OutboxAppended {
+                    rule: "a".to_owned(),
+                    entry: envelope(1, body_id(1)),
+                },
+                Record::OutboxAppended {
+                    rule: "ab".to_owned(),
+                    entry: envelope(1, body_id(2)),
+                },
+            ],
+        );
+
+        assert_eq!(
+            store.outbox_head("a", 0).expect("head").map(|e| e.body),
+            Some(body_id(1)),
+            "rule a read somebody else's head"
+        );
+        assert_eq!(
+            store.outbox_head("ab", 0).expect("head").map(|e| e.body),
+            Some(body_id(2)),
+            "rule ab read somebody else's head"
+        );
+        assert_eq!(store.outbox_depth("a").expect("depth"), 1);
+        assert_eq!(store.outbox_depth("ab").expect("depth"), 1);
+
+        // Draining one does not drain the other, and the counters stay
+        // apart.
+        apply(
+            &store,
+            &[Record::OutboxRemoved {
+                rule: "a".to_owned(),
+                sequence: 1,
+            }],
+        );
+        assert_eq!(store.outbox_depth("a").expect("depth"), 0);
+        assert_eq!(store.outbox_depth("ab").expect("depth"), 1);
+        assert_eq!(
+            store.outbox_head("ab", 0).expect("head").map(|e| e.body),
+            Some(body_id(2))
+        );
+        // **And the drained outbox reads as empty.** This is the
+        // assertion the prefix-free key encoding is actually for, and
+        // the one an earlier version of this test was missing: while
+        // rule `a` still held something of its own, a backend keying by
+        // the identifier glued to the sequence answered correctly by
+        // luck, because `a`'s own rows happened to sort first. Ask it
+        // once `a` is empty and it hands over rule `ab`'s envelope,
+        // which is one rule posting another rule's messages to its own
+        // endpoint.
+        assert_eq!(
+            store.outbox_head("a", 0).expect("head"),
+            None,
+            "a drained outbox handed over another rule's envelope"
+        );
+
+        // Deleting one rule takes its own outbox and nobody else's.
+        apply(&store, &[Record::RuleRemoved { id: "a".to_owned() }]);
+        assert_eq!(
+            store.outbox_head("ab", 0).expect("head").map(|e| e.body),
+            Some(body_id(2)),
+            "deleting one rule emptied another rule's outbox"
+        );
+        assert_eq!(store.outbox_depth("ab").expect("depth"), 1);
+
+        // A rule nothing ever wrote to reads as empty rather than as an
+        // error, which is what lets a pump ask about every rule it holds.
+        assert_eq!(store.outbox_depth("never").expect("depth"), 0);
+        assert_eq!(store.outbox_head("never", 0).expect("head"), None);
+        assert_eq!(store.outbox_highest_sequence("never").expect("mark"), 0);
+    }
+
+    /// The head read at a cursor skips what has been delivered, and the
+    /// numbers it skipped are never handed out again.
+    pub fn the_outbox_head_at_a_cursor_skips_what_was_delivered<S: Storage>(new: impl Fn() -> S) {
+        let store = with_rule(new, "a");
+        let mut records = vec![Record::BodyPut {
+            id: body_id(1),
+            body: body(1),
+        }];
+        // Sequence numbers either side of a byte boundary, because a
+        // little-endian key sorts 256 before 2 and nothing else here
+        // would see it.
+        for sequence in [1_u64, 2, 300, 301] {
+            records.push(Record::BodyPut {
+                id: body_id(1),
+                body: body(1),
+            });
+            records.push(Record::OutboxAppended {
+                rule: "a".to_owned(),
+                entry: envelope(sequence, body_id(1)),
+            });
+        }
+        apply(&store, &records);
+        assert_eq!(store.outbox_depth("a").expect("depth"), 4);
+        assert_eq!(store.outbox_highest_sequence("a").expect("mark"), 301);
+
+        apply(
+            &store,
+            &[
+                Record::OutboxRemoved {
+                    rule: "a".to_owned(),
+                    sequence: 1,
+                },
+                Record::OutboxRemoved {
+                    rule: "a".to_owned(),
+                    sequence: 2,
+                },
+            ],
+        );
+        assert_eq!(
+            store
+                .outbox_head("a", 0)
+                .expect("head")
+                .map(|entry| entry.sequence),
+            Some(300),
+            "the head read did not skip what had been delivered"
+        );
+        assert_eq!(
+            store
+                .outbox_head("a", 301)
+                .expect("head")
+                .map(|entry| entry.sequence),
+            Some(301),
+            "a cursor past a hole must land on what follows it"
+        );
+        assert_eq!(store.outbox_head("a", 302).expect("head"), None);
+
+        // The mark outlives the envelopes, so a restarted pump cannot
+        // reuse a number: appending at one already spent is refused.
+        apply(
+            &store,
+            &[
+                Record::OutboxRemoved {
+                    rule: "a".to_owned(),
+                    sequence: 300,
+                },
+                Record::OutboxRemoved {
+                    rule: "a".to_owned(),
+                    sequence: 301,
+                },
+            ],
+        );
+        assert_eq!(store.outbox_depth("a").expect("depth"), 0);
+        assert_eq!(store.outbox_highest_sequence("a").expect("mark"), 301);
+        assert_eq!(
+            refusal(store.apply(&[Record::OutboxAppended {
+                rule: "a".to_owned(),
+                entry: envelope(301, body_id(1)),
+            }])),
+            Rejection::OutboxSequenceReused {
+                id: "a".to_owned(),
+                sequence: 301,
+                highest: 301,
+            }
+        );
+    }
+
+    /// An envelope for a rule the store does not hold is refused.
+    ///
+    /// The same argument as a record for an unknown session: an outbox
+    /// is read through the rule that owns it, so one filed under a rule
+    /// that is not there would be neither stored usefully nor reported
+    /// missing.
+    pub fn an_envelope_for_an_unknown_rule_is_refused<S: Storage>(new: impl Fn() -> S) {
+        let store = new();
+        assert_eq!(
+            refusal(store.apply(&[Record::OutboxAppended {
+                rule: "ghost".to_owned(),
+                entry: envelope(1, body_id(1)),
+            }])),
+            Rejection::NoSuchRule {
+                id: "ghost".to_owned()
+            }
+        );
+        assert_eq!(
+            refusal(store.apply(&[Record::OutboxAttempted {
+                rule: "ghost".to_owned(),
+                sequence: 1,
+                attempts: 1,
+                next_attempt_at: 5,
+            }])),
+            Rejection::NoSuchRule {
+                id: "ghost".to_owned()
+            }
+        );
+        assert_eq!(
+            refusal(store.apply(&[Record::OutboxRemoved {
+                rule: "ghost".to_owned(),
+                sequence: 1,
+            }])),
+            Rejection::NoSuchRule {
+                id: "ghost".to_owned()
+            }
+        );
+    }
+
+    /// An outbox survives its rule being edited, and goes with its rule
+    /// being deleted.
+    ///
+    /// Both halves matter and they pull in opposite directions. A rule
+    /// is replaced whole by a put — turning a connector off and on again
+    /// is the ordinary edit — and a put that emptied the outbox would
+    /// silently destroy every message waiting to go. A delete is the
+    /// operator saying the rule is finished, and an outbox left behind
+    /// would sit in the file with nothing able to reach it.
+    pub fn an_outbox_survives_an_edit_and_goes_with_a_delete<S: Storage>(new: impl Fn() -> S) {
+        let store = with_rule(new, "a");
+        apply(
+            &store,
+            &[
+                Record::BodyPut {
+                    id: body_id(1),
+                    body: body(1),
+                },
+                Record::OutboxAppended {
+                    rule: "a".to_owned(),
+                    entry: envelope(1, body_id(1)),
+                },
+            ],
+        );
+
+        let mut changed = rule("a");
+        changed.enabled = true;
+        changed.name = "renamed".to_owned();
+        apply(&store, &[Record::RulePut { rule: changed }]);
+        assert_eq!(
+            store.outbox_head("a", 0).expect("head"),
+            Some(envelope(1, body_id(1))),
+            "editing the rule threw away what was waiting to be delivered"
+        );
+        assert_eq!(store.outbox_depth("a").expect("depth"), 1);
+
+        apply(&store, &[Record::RuleRemoved { id: "a".to_owned() }]);
+        assert_eq!(store.outbox_head("a", 0).expect("head"), None);
+        assert_eq!(store.outbox_depth("a").expect("depth"), 0);
+        assert_eq!(
+            store.outbox_highest_sequence("a").expect("mark"),
+            0,
+            "the counters went with the rule"
+        );
+        // The body is still held: the reference belongs to whoever took
+        // it, and the store cannot tell a caller that releases its own
+        // from one that does not.
+        assert_eq!(restore(&store).bodies.get(&body_id(1)), Some(&body(1)));
+    }
+
+    /// Removing an envelope does not release the body it named.
+    ///
+    /// The same rule as a queue pop, and the reason this suite states it
+    /// twice: the caller owes the release, and a store that made it for
+    /// them would delete a payload out from under a rule that fired on
+    /// the same message.
+    pub fn removing_an_envelope_does_not_release_the_body_it_named<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = new();
+        apply(
+            &store,
+            &[
+                Record::RulePut { rule: rule("a") },
+                Record::RulePut { rule: rule("ab") },
+                // One message, two rules, two references.
+                Record::BodyPut {
+                    id: body_id(1),
+                    body: body(1),
+                },
+                Record::BodyPut {
+                    id: body_id(1),
+                    body: body(1),
+                },
+                Record::OutboxAppended {
+                    rule: "a".to_owned(),
+                    entry: envelope(1, body_id(1)),
+                },
+                Record::OutboxAppended {
+                    rule: "ab".to_owned(),
+                    entry: envelope(1, body_id(1)),
+                },
+            ],
+        );
+
+        // The first rule delivers and releases its own reference. The
+        // body must still be there for the second.
+        apply(
+            &store,
+            &[
+                Record::OutboxRemoved {
+                    rule: "a".to_owned(),
+                    sequence: 1,
+                },
+                Record::BodyReleased { id: body_id(1) },
+            ],
+        );
+        assert_eq!(
+            restore(&store).bodies.get(&body_id(1)),
+            Some(&body(1)),
+            "one rule's delivery deleted the payload another rule still had to send"
+        );
+
+        // And when the second releases, it goes: a store that released
+        // on removal would have been asked to release twice, which is
+        // the refusal that would have hidden this.
+        apply(
+            &store,
+            &[
+                Record::OutboxRemoved {
+                    rule: "ab".to_owned(),
+                    sequence: 1,
+                },
+                Record::BodyReleased { id: body_id(1) },
+            ],
+        );
+        assert!(
+            restore(&store).bodies.is_empty(),
+            "the payload was not reclaimed when the last rule had sent it"
+        );
+    }
+
     // ---- flush ------------------------------------------------------------
 
     /// A flush changes nothing about what the store holds, and a store
@@ -1765,6 +2242,13 @@ macro_rules! every_contract_test {
             a_pop_does_not_release_the_body_it_named,
             rules_are_held_replaced_and_removed,
             a_rule_survives_the_session_that_was_there_when_it_was_made,
+            an_outbox_holds_an_envelope_with_every_field_and_counts_it,
+            an_attempt_moves_the_stored_count_and_the_next_time,
+            two_rules_outboxes_do_not_see_each_other,
+            the_outbox_head_at_a_cursor_skips_what_was_delivered,
+            an_envelope_for_an_unknown_rule_is_refused,
+            an_outbox_survives_an_edit_and_goes_with_a_delete,
+            removing_an_envelope_does_not_release_the_body_it_named,
             a_flush_keeps_everything_and_leaves_the_store_usable,
         }
     };
@@ -1795,7 +2279,9 @@ every_contract_test!(run_against, redb, crate::on_disk::fresh);
 /// here is delegation: the backend under test is `storage::RedbStorage`,
 /// unchanged.
 mod on_disk {
-    use storage::{QueueEntry, Record, RedbStorage, Restored, SessionKey, Storage, StorageError};
+    use storage::{
+        OutboxRecord, QueueEntry, Record, RedbStorage, Restored, SessionKey, Storage, StorageError,
+    };
 
     /// A store, and the directory it lives in.
     pub struct OnDisk {
@@ -1842,6 +2328,22 @@ mod on_disk {
 
         fn highest_sequence(&self, session: &SessionKey) -> Result<u64, StorageError> {
             self.store.highest_sequence(session)
+        }
+
+        fn outbox_head(
+            &self,
+            rule: &str,
+            cursor: u64,
+        ) -> Result<Option<OutboxRecord>, StorageError> {
+            self.store.outbox_head(rule, cursor)
+        }
+
+        fn outbox_depth(&self, rule: &str) -> Result<u64, StorageError> {
+            self.store.outbox_depth(rule)
+        }
+
+        fn outbox_highest_sequence(&self, rule: &str) -> Result<u64, StorageError> {
+            self.store.outbox_highest_sequence(rule)
         }
     }
 }

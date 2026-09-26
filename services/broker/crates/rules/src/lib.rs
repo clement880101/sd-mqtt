@@ -14,6 +14,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod outbox;
 pub mod rule;
 
+pub use outbox::Outbox;
 pub use rule::{Action, ClientPattern, HttpOut, Rule, RuleError, RuleId, Trigger};
