@@ -65,6 +65,7 @@
 //! in-memory fields, so the durable bridge would have had to be written
 //! anyway.
 
+pub mod aliases;
 pub mod backoff;
 pub mod connack;
 pub mod flow;
@@ -73,6 +74,7 @@ pub mod keepalive;
 pub mod rewrite;
 pub mod topics;
 
+pub use aliases::Aliases;
 pub use backoff::{Backoff, Entropy};
 pub use connack::{negotiate, Asked, ConnAckError, Negotiated};
 pub use flow::{Flow, FlowError};
