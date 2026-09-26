@@ -574,6 +574,81 @@ pub struct HttpPollRecord {
     pub retain: bool,
 }
 
+/// Which way a bridge's topic rule moves messages, section 9.2.
+///
+/// **Variant order is the format.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirectionRecord {
+    /// Remote to local.
+    In,
+    /// Local to remote.
+    Out,
+    /// Both, which is one entry standing for two.
+    Both,
+}
+
+/// One topic rule on a bridge, section 9.2.
+///
+/// A filter, a direction, a level and a rewrite. The two prefixes are
+/// the rewrite's ordinary half and the template is the outbound-only
+/// half; `crates/rules/src/bridge/rewrite.rs` says what each does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeTopicRecord {
+    /// The filter, without either prefix on it.
+    pub filter: String,
+    /// Which way messages move.
+    pub direction: DirectionRecord,
+    /// The level they move at.
+    pub qos: Qos,
+    /// The prefix this broker's half of the topic carries.
+    pub local_prefix: String,
+    /// The prefix the remote's half carries.
+    pub remote_prefix: String,
+    /// The outbound template, if one was configured.
+    pub template: Option<String>,
+}
+
+/// How an `mqtt_bridge` action connects, section 9.2.
+///
+/// **The password is a [`Secret`]**, for the reason the ingest token is
+/// one: a record is printed by a failure message and by anything that
+/// logs what it is about to write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MqttBridgeRecord {
+    /// Where the remote broker is, as `host:port`.
+    pub address: String,
+    /// What this bridge calls itself to the remote.
+    pub client_id: String,
+    /// Which version it speaks to the remote.
+    pub version: ProtocolVersion,
+    /// The user name it offers, if any.
+    pub username: Option<String>,
+    /// The password it offers, if any.
+    pub password: Option<Secret>,
+    /// The keep-alive it proposes, in seconds.
+    pub keep_alive_secs: u16,
+    /// Whether it asks the remote to discard any existing session.
+    pub clean_start: bool,
+    /// How long the remote should keep the session after a disconnect.
+    pub session_expiry_secs: u32,
+    /// How many acknowledged publications it will accept at once.
+    pub receive_maximum: u16,
+    /// The largest packet it will accept, in bytes.
+    pub maximum_packet_size: u32,
+    /// The highest topic alias it will accept from the remote.
+    pub topic_alias_maximum: u16,
+    /// Where its connectivity is reported.
+    pub state_topic: String,
+    /// The first reconnection wait, in milliseconds.
+    pub reconnect_min_ms: u32,
+    /// The longest reconnection wait, in milliseconds.
+    pub reconnect_max_ms: u32,
+    /// The hop count above which a publication is dropped.
+    pub max_hops: u32,
+    /// What moves, and which way.
+    pub topics: Vec<BridgeTopicRecord>,
+}
+
 /// What a rule does when it fires. One, section 9.1.
 ///
 /// **Variant order is the format**, as it is for [`Record`]: the other
@@ -597,6 +672,14 @@ pub enum ActionRecord {
     /// it is a variant inserted anywhere but the end, because the index
     /// is the format.
     HttpPoll(HttpPollRecord),
+    /// Connect to a remote broker as a client and move messages both
+    /// ways. Section 9.2's `mqtt_bridge`.
+    ///
+    /// Appended, at the end, for the reason the two above give: the
+    /// index is the format, so a variant added last leaves every
+    /// record written before this build reading back as whatever it
+    /// was and [`FORMAT_VERSION`] stays where it is.
+    MqttBridge(MqttBridgeRecord),
 }
 
 /// A rule, section 9.1.
@@ -978,6 +1061,23 @@ impl Record {
                                     .headers
                                     .iter()
                                     .map(|(name, value)| name.len() + value.len())
+                                    .sum::<usize>()
+                        }
+                        ActionRecord::MqttBridge(bridge) => {
+                            bridge.address.len()
+                                + bridge.client_id.len()
+                                + bridge.username.as_ref().map_or(0, String::len)
+                                + bridge.password.as_ref().map_or(0, |p| p.expose().len())
+                                + bridge.state_topic.len()
+                                + bridge
+                                    .topics
+                                    .iter()
+                                    .map(|topic| {
+                                        topic.filter.len()
+                                            + topic.local_prefix.len()
+                                            + topic.remote_prefix.len()
+                                            + topic.template.as_ref().map_or(0, String::len)
+                                    })
                                     .sum::<usize>()
                         }
                     }

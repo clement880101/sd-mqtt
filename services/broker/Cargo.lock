@@ -1048,7 +1048,9 @@ dependencies = [
  "storage",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]

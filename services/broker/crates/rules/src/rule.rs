@@ -13,10 +13,11 @@
 
 use std::fmt;
 
-use mqtt_codec::QoS;
+use mqtt_codec::{QoS, Version};
 use storage::record::{
-    ActionRecord, HttpInRecord, HttpOutRecord, HttpPollRecord, Qos, RuleRecord, Secret,
-    TopicFromRecord, TopicFromRequestRecord, TriggerRecord,
+    ActionRecord, BridgeTopicRecord, DirectionRecord, HttpInRecord, HttpOutRecord, HttpPollRecord,
+    MqttBridgeRecord, ProtocolVersion, Qos, RuleRecord, Secret, TopicFromRecord,
+    TopicFromRequestRecord, TriggerRecord,
 };
 
 /// What can be wrong with a rule.
@@ -57,6 +58,19 @@ pub enum RuleError {
          message, so it has no trigger; remove the filter"
     )]
     TriggerOnPoll,
+    /// A bridge rule was given a trigger.
+    ///
+    /// Its own variant, like the two above, because it is its own
+    /// mistake: an operator who put a filter on a bridge meant it to
+    /// decide what goes out, and what goes out is decided by the
+    /// bridge's own topic entries, each of which carries a direction
+    /// and a rewrite that a rule-level filter has nowhere to put.
+    #[error(
+        "an mqtt_bridge rule decides what moves with its own topic entries, each of \
+         which has a direction and a rewrite, so it has no rule-level trigger; put the \
+         filter in a [[rules.mqtt_bridge.topics]] entry instead"
+    )]
+    TriggerOnBridge,
     /// An ingest rule was given no bearer token.
     ///
     /// Section 9.2: **the token is not optional and a rule without one
@@ -272,9 +286,9 @@ impl Trigger {
 
 /// What a rule does when it fires.
 ///
-/// One action, section 9.1. Three today: `http_out` posts an envelope
-/// out, `http_in` accepts a post in, and `http_poll` fetches on an
-/// interval. `mqtt_bridge` is the fourth and is a later task's.
+/// One action, section 9.1. Four: `http_out` posts an envelope out,
+/// `http_in` accepts a post in, `http_poll` fetches on an interval, and
+/// `mqtt_bridge` connects to a remote broker as a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Post a JSON envelope to a URL. Section 9.2.
@@ -283,6 +297,8 @@ pub enum Action {
     HttpIn(HttpIn),
     /// Fetch a URL on an interval and publish the body. Section 9.2.
     HttpPoll(HttpPoll),
+    /// Connect to a remote broker as a client. Section 9.2.
+    MqttBridge(Box<MqttBridge>),
 }
 
 impl Action {
@@ -291,10 +307,15 @@ impl Action {
     /// The question a trigger answers. `http_out` is; `http_in` is
     /// fired by a request and `http_poll` by a clock, and neither has
     /// anything to trigger on.
+    /// A bridge is not, and that is worth saying because half of one
+    /// is: its outbound direction is fired by a published message. It
+    /// is fired by the bridge's **own** filters rather than by the
+    /// rule's trigger, though, so the rule-level answer is no, and
+    /// [`RuleError::TriggerOnBridge`] says so to whoever writes one.
     pub fn fires_on_messages(&self) -> bool {
         match self {
             Self::HttpOut(_) => true,
-            Self::HttpIn(_) | Self::HttpPoll(_) => false,
+            Self::HttpIn(_) | Self::HttpPoll(_) | Self::MqttBridge(_) => false,
         }
     }
 
@@ -307,7 +328,7 @@ impl Action {
     /// is reachable wherever it is served.
     pub fn is_singleton(&self) -> bool {
         match self {
-            Self::HttpPoll(_) => true,
+            Self::HttpPoll(_) | Self::MqttBridge(_) => true,
             Self::HttpOut(_) | Self::HttpIn(_) => false,
         }
     }
@@ -321,6 +342,7 @@ impl Action {
         match self {
             Self::HttpIn(_) => RuleError::TriggerOnIngest,
             Self::HttpPoll(_) => RuleError::TriggerOnPoll,
+            Self::MqttBridge(_) => RuleError::TriggerOnBridge,
             // [`Self::fires_on_messages`] is true for this one, so a
             // trigger on it is required rather than refused and the
             // caller never asks. The arm is here because the compiler
@@ -518,6 +540,167 @@ impl Default for HttpOut {
     }
 }
 
+/// Which way a bridge's topic entry moves messages. Section 9.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Remote to local: the bridge subscribes on the remote and
+    /// publishes here.
+    In,
+    /// Local to remote: a local publication is forwarded out.
+    Out,
+    /// Both, which is one entry standing for two.
+    ///
+    /// **Almost every `both` entry is refused**, and that is the loop
+    /// prevention working rather than a defect. See
+    /// [`crate::bridge::topics`].
+    Both,
+}
+
+impl Direction {
+    /// Whether this entry moves messages from the remote to here.
+    pub fn inbound(self) -> bool {
+        matches!(self, Self::In | Self::Both)
+    }
+
+    /// Whether this entry moves messages from here to the remote.
+    pub fn outbound(self) -> bool {
+        matches!(self, Self::Out | Self::Both)
+    }
+}
+
+/// One topic entry on a bridge. Section 9.2.
+///
+/// A filter, a direction, a level and a rewrite. `filter` carries
+/// **neither** prefix: the local topics an outbound entry fires on are
+/// `local_prefix` followed by something matching `filter`, and the
+/// remote filter an inbound entry subscribes with is `remote_prefix`
+/// followed by the same. That is the shape every bridge configuration
+/// people already know uses, and it is what makes one filter able to
+/// describe two namespaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeTopic {
+    /// The filter, without either prefix on it.
+    pub filter: String,
+    /// Which way messages move.
+    pub direction: Direction,
+    /// The level they move at.
+    pub qos: QoS,
+    /// The prefix this broker's half of the topic carries.
+    pub local_prefix: String,
+    /// The prefix the remote's half carries.
+    pub remote_prefix: String,
+    /// The outbound template, if one was configured.
+    ///
+    /// `sensors/+/temp` with a template of `site-a/temp/{1}` publishes
+    /// `sensors/kitchen/temp` remotely as `site-a/temp/kitchen`. See
+    /// [`crate::bridge::rewrite`]; inbound entries have no template,
+    /// because an inbound message is published into the local broker
+    /// where any rule can act on it.
+    pub template: Option<String>,
+}
+
+impl Default for BridgeTopic {
+    /// Nothing moves, in neither direction, at the level that promises
+    /// nothing.
+    ///
+    /// The filter is deliberately empty rather than `#`: a default that
+    /// bridges everything is a default nobody meant, and the empty
+    /// string is not a filter, so it is refused rather than run.
+    fn default() -> Self {
+        Self {
+            filter: String::new(),
+            direction: Direction::Out,
+            qos: QoS::AtMostOnce,
+            local_prefix: String::new(),
+            remote_prefix: String::new(),
+            template: None,
+        }
+    }
+}
+
+/// How an `mqtt_bridge` action connects. Section 9.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MqttBridge {
+    /// Where the remote broker is, as `host:port`.
+    pub address: String,
+    /// What this bridge calls itself to the remote.
+    ///
+    /// May be empty on MQTT 5, where the remote then assigns one and
+    /// says so in its acknowledgement. On 3.1.1 an empty identifier
+    /// asks for a session that cannot be resumed, so it is refused
+    /// there; see [`crate::bridge::connack`].
+    pub client_id: String,
+    /// Which version it speaks to the remote.
+    pub version: Version,
+    /// The user name it offers, if any.
+    pub username: Option<String>,
+    /// The password it offers, if any.
+    pub password: Option<Secret>,
+    /// The keep-alive it proposes, in seconds.
+    ///
+    /// A proposal: MQTT 5 lets the remote override it, and the
+    /// override is what the bridge then uses. See
+    /// [`crate::bridge::connack`].
+    pub keep_alive_secs: u16,
+    /// Whether it asks the remote to discard any existing session.
+    pub clean_start: bool,
+    /// How long the remote should keep the session after a disconnect.
+    pub session_expiry_secs: u32,
+    /// How many acknowledged publications it will accept at once.
+    pub receive_maximum: u16,
+    /// The largest packet it will accept, in bytes.
+    pub maximum_packet_size: u32,
+    /// The highest topic alias it will accept from the remote.
+    pub topic_alias_maximum: u16,
+    /// Where its connectivity is reported, on this broker.
+    ///
+    /// The same name is the will topic on the remote, so the far end
+    /// learns of a bridge that died without saying goodbye. See
+    /// [`crate::bridge::topics`] for why this topic is refused when it
+    /// is one the bridge itself would carry.
+    pub state_topic: String,
+    /// The first reconnection wait, in milliseconds.
+    pub reconnect_min_ms: u32,
+    /// The longest reconnection wait, in milliseconds.
+    pub reconnect_max_ms: u32,
+    /// The hop count above which a publication is dropped. Section 9.2.
+    pub max_hops: u32,
+    /// What moves, and which way.
+    pub topics: Vec<BridgeTopic>,
+}
+
+impl Default for MqttBridge {
+    /// Nowhere to connect to, and bounds on everything else.
+    ///
+    /// The address is empty for the reason [`HttpOut::default`] gives
+    /// about its url: a default that reaches somewhere is worse than
+    /// one that reaches nowhere.
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+            client_id: String::new(),
+            version: Version::V5,
+            username: None,
+            password: None,
+            keep_alive_secs: 60,
+            clean_start: false,
+            session_expiry_secs: 3_600,
+            receive_maximum: 32,
+            maximum_packet_size: 1024 * 1024,
+            topic_alias_maximum: 16,
+            state_topic: String::new(),
+            reconnect_min_ms: 1_000,
+            reconnect_max_ms: 60_000,
+            // One hop is what a connector stamps on what it
+            // originates, so a default of eight leaves room for a
+            // chain nobody would build on purpose and still stops one
+            // that has started going round.
+            max_hops: 8,
+            topics: Vec::new(),
+        }
+    }
+}
+
 /// A rule: what fires, and what it does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
@@ -649,6 +832,24 @@ impl Rule {
                     qos: stored_qos(http.qos),
                     retain: http.retain,
                 }),
+                Action::MqttBridge(bridge) => ActionRecord::MqttBridge(MqttBridgeRecord {
+                    address: bridge.address.clone(),
+                    client_id: bridge.client_id.clone(),
+                    version: stored_version(bridge.version),
+                    username: bridge.username.clone(),
+                    password: bridge.password.clone(),
+                    keep_alive_secs: bridge.keep_alive_secs,
+                    clean_start: bridge.clean_start,
+                    session_expiry_secs: bridge.session_expiry_secs,
+                    receive_maximum: bridge.receive_maximum,
+                    maximum_packet_size: bridge.maximum_packet_size,
+                    topic_alias_maximum: bridge.topic_alias_maximum,
+                    state_topic: bridge.state_topic.clone(),
+                    reconnect_min_ms: bridge.reconnect_min_ms,
+                    reconnect_max_ms: bridge.reconnect_max_ms,
+                    max_hops: bridge.max_hops,
+                    topics: bridge.topics.iter().map(stored_topic).collect(),
+                }),
                 Action::HttpIn(http) => ActionRecord::HttpIn(HttpInRecord {
                     token: http.token.clone(),
                     topic: http.topic.clone(),
@@ -699,6 +900,24 @@ impl TryFrom<&RuleRecord> for Rule {
                 qos: live_qos(http.qos),
                 retain: http.retain,
             }),
+            ActionRecord::MqttBridge(bridge) => Action::MqttBridge(Box::new(MqttBridge {
+                address: bridge.address.clone(),
+                client_id: bridge.client_id.clone(),
+                version: live_version(bridge.version),
+                username: bridge.username.clone(),
+                password: bridge.password.clone(),
+                keep_alive_secs: bridge.keep_alive_secs,
+                clean_start: bridge.clean_start,
+                session_expiry_secs: bridge.session_expiry_secs,
+                receive_maximum: bridge.receive_maximum,
+                maximum_packet_size: bridge.maximum_packet_size,
+                topic_alias_maximum: bridge.topic_alias_maximum,
+                state_topic: bridge.state_topic.clone(),
+                reconnect_min_ms: bridge.reconnect_min_ms,
+                reconnect_max_ms: bridge.reconnect_max_ms,
+                max_hops: bridge.max_hops,
+                topics: bridge.topics.iter().map(live_topic).collect(),
+            })),
             ActionRecord::HttpIn(http) => Action::HttpIn(HttpIn {
                 token: http.token.clone(),
                 topic: http.topic.clone(),
@@ -738,6 +957,54 @@ impl TryFrom<&RuleRecord> for Rule {
         )?;
         rule.enabled = record.enabled;
         Ok(rule)
+    }
+}
+
+/// A live topic entry as the store spells it.
+fn stored_topic(topic: &BridgeTopic) -> BridgeTopicRecord {
+    BridgeTopicRecord {
+        filter: topic.filter.clone(),
+        direction: match topic.direction {
+            Direction::In => DirectionRecord::In,
+            Direction::Out => DirectionRecord::Out,
+            Direction::Both => DirectionRecord::Both,
+        },
+        qos: stored_qos(topic.qos),
+        local_prefix: topic.local_prefix.clone(),
+        remote_prefix: topic.remote_prefix.clone(),
+        template: topic.template.clone(),
+    }
+}
+
+/// A stored topic entry as the broker spells it.
+fn live_topic(topic: &BridgeTopicRecord) -> BridgeTopic {
+    BridgeTopic {
+        filter: topic.filter.clone(),
+        direction: match topic.direction {
+            DirectionRecord::In => Direction::In,
+            DirectionRecord::Out => Direction::Out,
+            DirectionRecord::Both => Direction::Both,
+        },
+        qos: live_qos(topic.qos),
+        local_prefix: topic.local_prefix.clone(),
+        remote_prefix: topic.remote_prefix.clone(),
+        template: topic.template.clone(),
+    }
+}
+
+/// A live protocol version as the store spells it.
+fn stored_version(version: Version) -> ProtocolVersion {
+    match version {
+        Version::V311 => ProtocolVersion::V311,
+        Version::V5 => ProtocolVersion::V5,
+    }
+}
+
+/// A stored protocol version as the broker spells it.
+fn live_version(version: ProtocolVersion) -> Version {
+    match version {
+        ProtocolVersion::V311 => Version::V311,
+        ProtocolVersion::V5 => Version::V5,
     }
 }
 

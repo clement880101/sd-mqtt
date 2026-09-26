@@ -404,6 +404,19 @@ pub async fn start(
                     );
                 }
             }
+            Action::MqttBridge(_) => {
+                // Nothing can reach here yet: `Config` has no
+                // `[rules.mqtt_bridge]` table, so no configuration
+                // produces this action, and the store's format version
+                // means no file holds one either. Refusing rather than
+                // logging, because the one thing worse than a connector
+                // that is not built is a connector that is installed
+                // and moves nothing. The wiring lands with the session.
+                return Err(StartupError::Connector(format!(
+                    "rule {} is an mqtt_bridge and this build cannot start one",
+                    rule.id
+                )));
+            }
             Action::HttpIn(action) => {
                 // **A disabled rule gets no route.** `enabled` is what
                 // an operator reaches for to turn a connector off, and
