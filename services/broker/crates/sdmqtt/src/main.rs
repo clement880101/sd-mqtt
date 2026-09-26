@@ -8,6 +8,7 @@
 
 mod config;
 mod connectors;
+mod ingest;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -19,10 +20,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use broker_core::broker::Broker;
 use clap::{Args, Parser, Subcommand};
 use config::{Config, ConfigError, IngestListener, LogLevel, Overrides};
+use ingest::IngestSocket;
+use rules::live::IngestListening;
 use rules::Ingest;
 use sdmqtt_admin::{
-    AdminRunning, AdminServer, AdminStartError, AdminState, Bound, ListenerProtocol, ListenerView,
-    Readiness, Router, Serving,
+    listener_list, AdminRunning, AdminServer, AdminStartError, AdminState, ListenerProtocol,
+    ListenerView, Listeners, Readiness, Router,
 };
 use sdmqtt_server::listener::{Running, Server};
 use sdmqtt_server::shared::Shared;
@@ -429,8 +432,8 @@ async fn start_admin(
     config: &Config,
     running: &Running,
     readiness: Arc<Readiness>,
+    listeners: Listeners,
     ingest: &Arc<Ingest>,
-    ingest_listener: Option<&Serving>,
     registry: Option<&Arc<rules::live::Registry>>,
 ) -> Result<Option<AdminRunning>, StartupError> {
     if !config.admin.enabled {
@@ -438,38 +441,21 @@ async fn start_admin(
             "the admin listener is disabled, so this node serves no health endpoints, \
              no metrics and no API"
         );
-        if config.ingest.listener == IngestListener::Admin && !ingest.is_empty() {
+        if config.ingest.listener == IngestListener::Admin {
             // Not a warning attached to the rules: the operator asked
             // for both things and they contradict each other, so the
             // one that silently does nothing is said out loud.
+            //
+            // **Whether or not this node holds an ingest rule yet.**
+            // It used to be said only when one existed, which made it
+            // a line nobody saw on exactly the node where a rule
+            // created later would be served nowhere.
             tracing::error!(
                 "ingest.listener = \"admin\" and the admin listener is disabled, so this \
                  node's ingest rules are served nowhere"
             );
         }
         return Ok(None);
-    }
-    // What this process bound, which nothing can discover: a socket
-    // does not know what it is for and the broker does not know a
-    // listener exists. The admin listener adds its own row once it
-    // knows its port.
-    let mut listeners = vec![ListenerView {
-        name: "mqtt".to_owned(),
-        protocol: ListenerProtocol::Mqtt,
-        address: running.address(),
-        mountpoint: config.listener.mountpoint.clone(),
-        max_connections: Some(config.listener.max_connections),
-    }];
-    if let Some(serving) = ingest_listener {
-        listeners.push(ListenerView {
-            name: "ingest".to_owned(),
-            protocol: ListenerProtocol::Ingest,
-            address: serving.address(),
-            // An ingest listener has no topic namespace and no
-            // connection limit of its own.
-            mountpoint: String::new(),
-            max_connections: None,
-        });
     }
     let state = AdminState::new(Arc::clone(running.shared()))
         .with_readiness(readiness)
@@ -481,7 +467,18 @@ async fn start_admin(
 
     // Section 9.2: serving the ingest routes here is permitted and
     // must be chosen explicitly. `Router::new()` is the ordinary case.
-    let extra = if config.ingest.listener == IngestListener::Admin && !ingest.is_empty() {
+    //
+    // **Merged whether or not this node holds an ingest rule.** A
+    // route set with nothing registered in it answers every
+    // identifier the way it answers one nobody configured, so serving
+    // it costs a node with no ingest rules nothing at all — and the
+    // alternative is the defect this listener's own socket used to
+    // have, because an axum router cannot grow a route once it is
+    // being served and a rule created later would have nowhere to
+    // go until the next restart. The one route here has the rule
+    // identifier as a path segment for exactly that reason; see
+    // `rules::http_in::INGEST_PATH`.
+    let extra = if config.ingest.listener == IngestListener::Admin {
         tracing::info!(
             rules = ingest.len(),
             "the ingest routes are served on the admin listener, as this configuration \
@@ -501,42 +498,46 @@ async fn start_admin(
     Ok(Some(admin))
 }
 
-/// Start the ingest listener, when this node has one.
+/// Take charge of the ingest listener, when the routes are served on
+/// a socket of this node's own.
 ///
-/// `Ok(None)` is a node with no ingest rule that has a route, or one
-/// whose configuration puts the routes on the admin listener. A
-/// listener with no route on it would be a socket answering `404` to
-/// everything, which is worth nothing and is one more port an operator
-/// has to explain.
+/// `Ok(None)` is a configuration that puts the routes on the admin
+/// listener, which is bound whatever this node holds and so has
+/// nothing for anybody to take charge of.
 ///
-/// **Before the MQTT listener's caller binds anything else**, in the
-/// same sense the rules are installed first: a post that arrives is a
-/// publication, and the broker it publishes into has already been
-/// restored.
+/// What comes back is **the socket rather than a listener**, because
+/// whether anything is bound is a question about what this node holds
+/// now and the answer changes while it runs: read [`ingest`] for why.
+/// This binds it if there is already an ingest rule to serve, which is
+/// what keeps an unavailable address a startup failure, and hands it
+/// to the registry so that the first rule created afterwards binds it
+/// too.
+///
+/// **After the MQTT listener has bound**, which is the order section
+/// 9.2 wants and the reason the registry is given this here rather
+/// than when it is built: a post is a publication, and a publication
+/// that reaches subscribers before the listener they are attached
+/// through is bound reaches none of them.
 async fn start_ingest(
     config: &Config,
     shared: &Arc<Shared>,
-    ingest: &Arc<Ingest>,
-) -> Result<Option<Serving>, StartupError> {
-    if config.ingest.listener != IngestListener::Own || ingest.is_empty() {
+    connectors: &connectors::Connectors,
+    listeners: &Listeners,
+) -> Result<Option<Arc<IngestSocket>>, StartupError> {
+    if config.ingest.listener != IngestListener::Own {
         return Ok(None);
     }
-    let bound = Bound::at("ingest", config.ingest.address).await?;
-    tracing::info!(
-        address = %bound.address(),
-        rules = ingest.len(),
-        "the ingest listener is serving, with every route behind its own rule's token"
-    );
-    let routes = rules::http_in::routes::<()>(Arc::clone(shared), Arc::clone(ingest))
-        // Section 13's one shape, for a path this listener does not
-        // serve. Registered rather than left to axum's default, which
-        // is an empty body a client cannot tell from a proxy that
-        // swallowed the request.
-        .fallback(rules::http_in::not_found)
-        .method_not_allowed_fallback(rules::http_in::method_not_allowed);
-    // Nothing served here holds a connection open past its response,
-    // so there is nothing to tell before hyper starts waiting.
-    Ok(Some(bound.serve(routes, || {})))
+    let socket = Arc::new(IngestSocket::new(
+        config.ingest.address,
+        Arc::clone(shared),
+        Arc::clone(connectors.ingest()),
+        Arc::clone(listeners),
+    ));
+    socket.bind_if_wanted().await?;
+    if let Some(registry) = connectors.registry() {
+        registry.serve_ingest_on(Arc::clone(&socket) as Arc<dyn IngestListening>);
+    }
+    Ok(Some(socket))
 }
 
 /// Configure, restore, bind, and serve until told to stop.
@@ -609,18 +610,32 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         "sdmqtt is serving MQTT over TCP"
     );
 
+    // What this process bound, which nothing can discover: a socket
+    // does not know what it is for and the broker does not know a
+    // listener exists. The other two listeners add their own rows,
+    // the admin one once it knows its port and the ingest one
+    // whenever it is bound — which is not only at startup; see
+    // `ingest`.
+    let listeners = listener_list(vec![ListenerView {
+        name: "mqtt".to_owned(),
+        protocol: ListenerProtocol::Mqtt,
+        address: running.address(),
+        mountpoint: config.listener.mountpoint.clone(),
+        max_connections: Some(config.listener.max_connections),
+    }]);
+
     // **After the MQTT listener, not before.** An ingest post is a
     // publication, and a publication that reaches subscribers before
     // the listener they are attached through is bound reaches none of
     // them. The broker itself is already restored, which is what
     // matters for durability.
-    let ingest = start_ingest(&config, running.shared(), connectors.ingest()).await?;
+    let ingest = start_ingest(&config, running.shared(), &connectors, &listeners).await?;
     let admin = start_admin(
         &config,
         &running,
         Arc::clone(&readiness),
+        Arc::clone(&listeners),
         connectors.ingest(),
-        ingest.as_ref(),
         connectors.registry(),
     )
     .await?;
@@ -654,9 +669,17 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     // publishes, so nothing may enter a broker that is being torn
     // down. Before the MQTT listener stops, so that a post already in
     // flight is still delivered to the subscribers that are attached.
+    //
+    // **Here rather than with the pumps below**, although the socket
+    // is now the registry's to open: what decides this ordering is
+    // what the listener does to the broker, and that has not changed
+    // because the moment it is bound has. A socket this node bound
+    // ten seconds ago over the API stops exactly where one bound at
+    // startup did.
     if let Some(ingest) = ingest {
-        ingest.shutdown().await;
-        tracing::info!("the ingest listener has stopped");
+        if ingest.close().await {
+            tracing::info!("the ingest listener has stopped");
+        }
     }
     running.shutdown().await;
     // After the listener, so that nothing can enter an outbox while its

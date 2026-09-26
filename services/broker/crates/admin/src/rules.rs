@@ -128,6 +128,13 @@ fn install_refusal(error: &InstallError) -> ApiError {
         InstallError::OutboxNotEmpty { .. } => {
             ApiError::in_field(ErrorCode::Conflict, "id", error.to_string())
         }
+        // The caller did nothing wrong either, and this is the
+        // failure this endpoint used to hide: an ingest rule with
+        // nowhere to be reached is refused here rather than created
+        // and reported as working. Not `invalid_request`, because
+        // the same body on a node whose ingest address is free is
+        // accepted.
+        InstallError::Listener { .. } => ApiError::new(ErrorCode::Internal, error.to_string()),
     }
 }
 

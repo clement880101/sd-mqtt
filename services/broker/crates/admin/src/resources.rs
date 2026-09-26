@@ -541,7 +541,10 @@ pub struct ListenerView {
 }
 
 async fn listeners(State(state): State<AdminState>, paging: Paging) -> Json<Page<ListenerView>> {
-    let all = state.listeners.clone();
+    // Copied out under the lock and paged outside it, which is the
+    // shape every read resource here has. A handful of rows, so the
+    // copy costs nothing worth arranging around.
+    let all = state.listeners.read().clone();
     let selection = select(
         all.iter()
             .map(|listener| ([listener.name.as_str(), "", ""], listener)),
@@ -1371,7 +1374,7 @@ mod tests {
             &config,
             AdminState::new(shared)
                 .with_node_id("node-under-test")
-                .with_listeners(listeners),
+                .with_listeners(crate::listener_list(listeners)),
         )
         .await
         .expect("loopback needs no token")

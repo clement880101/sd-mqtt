@@ -100,11 +100,35 @@
 //! stop *now* wants [`Registry::set_enabled`], which is what that is
 //! for.
 //!
+//! # An ingest rule's socket is bound with the rule, not before it
+//!
+//! Every other kind of rule runs on something this crate can start: a
+//! task, a client, a timer. An `http_in` rule runs on a **listening
+//! socket**, which this crate cannot bind — the listener lives in the
+//! admin crate, which depends on this one rather than the other way
+//! round — and which for a while was bound at startup and only if this
+//! node held an ingest rule at that moment.
+//!
+//! That made the first ingest rule created over the API a rule that
+//! was stored, installed, answered `200` and reachable by nobody until
+//! the process was restarted. It is worse than not supporting it: a
+//! route in a map with no socket in front of it is the one failure
+//! that looks exactly like success.
+//!
+//! So the socket is the registry's to ask for, through
+//! [`IngestListening`], and it is asked **before** the rule is
+//! installed and again after anything that could have taken the last
+//! route away. What comes out of that is the only property worth
+//! stating: **an enabled ingest rule this node holds is one that can
+//! be reached**, whether it arrived in a file or in a request.
+//!
 //! [`http_out`]: crate::http_out
 //! [`Record::RulePut`]: storage::record::Record::RulePut
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Weak};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use broker_core::hooks::{ClientInfo, Disposition, Hook};
@@ -177,6 +201,20 @@ pub enum InstallError {
         /// How many envelopes are still waiting.
         waiting: u64,
     },
+    /// The socket its route would be served on is not there.
+    ///
+    /// An ingest rule with no listener in front of it is a rule that
+    /// answers nothing, so this is a refusal rather than a warning.
+    /// Raised **before** anything is stored or installed, so the
+    /// ordinary reading of it is that this node is exactly as it was;
+    /// see [`Registry::install`] for the one ordering that is not.
+    #[error("the rule {id:?} accepts posts and this node has nowhere to serve it: {why}")]
+    Listener {
+        /// Which rule.
+        id: String,
+        /// What the listener said.
+        why: String,
+    },
 }
 
 impl InstallError {
@@ -187,6 +225,63 @@ impl InstallError {
             why: why.to_string(),
         }
     }
+
+    /// A listener failure about `id`.
+    fn listener(id: &RuleId, why: String) -> Self {
+        Self::Listener {
+            id: id.as_str().to_owned(),
+            why,
+        }
+    }
+}
+
+/// What an [`IngestListening`] method gives back.
+///
+/// Hand written rather than a dependency: one boxed future in one
+/// trait is not worth a crate, and this crate's budget is counted.
+type Asking<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Where this node's ingest routes are actually served.
+///
+/// # Why the registry has a say in a socket at all
+///
+/// Read the module note first. The short version is that an `http_in`
+/// rule runs on a listening socket the way an `http_out` rule runs on
+/// a task, and a rule installed without the thing it runs on is a rule
+/// that reports itself as working and is not.
+///
+/// This crate cannot bind one — the listener is `sdmqtt_admin`'s and
+/// that crate depends on this one — so the binary implements this and
+/// hands it over with [`Registry::serve_ingest_on`]. What stays here
+/// is the part that has to be a fact rather than a habit: the call is
+/// in [`Registry::install`], which is the one door every rule comes
+/// through, and not in whichever caller happened to think of it.
+///
+/// # One method, because there is one question
+///
+/// [`IngestListening::reconcile`] is told what is wanted and leaves
+/// the socket that way, whatever it was doing before. Separate `bind`
+/// and `close` calls would be two states for a caller to keep in step
+/// and would need it to know which one it was already in.
+///
+/// It is asynchronous because binding is, and the answer has to be
+/// known **before** the request that caused it is answered: a `200`
+/// sent while a socket was still being bound somewhere else is the
+/// same lie in a shorter window.
+pub trait IngestListening: Send + Sync {
+    /// Serve the ingest routes if `wanted`, and stop serving them if
+    /// not.
+    ///
+    /// Idempotent in both directions, and told what is wanted rather
+    /// than asked to work it out: the registry knows a route is about
+    /// to exist before the route does.
+    ///
+    /// # Errors
+    ///
+    /// The address could not be bound, or this node is stopping and
+    /// will bind nothing more. A string, because the type of the
+    /// failure belongs to whoever does the binding.
+    fn reconcile(&self, wanted: bool) -> Asking<'_, Result<(), String>>;
 }
 
 /// One installed rule and everything running for it.
@@ -301,6 +396,21 @@ pub struct Registry {
     client: HttpClient,
     /// The ingest routes, which this installs into and withdraws from.
     ingest: Arc<Ingest>,
+    /// The socket those routes are served on, once something is
+    /// serving them.
+    ///
+    /// Set once, by the binary, and **after the MQTT listener has
+    /// bound**: a post is a publication, and section 9.2's ordering
+    /// says the subscribers it reaches must be attachable first. That
+    /// ordering is why this is handed over afterwards rather than
+    /// given to [`Registry::new`].
+    ///
+    /// Never set on a node whose configuration serves the routes on
+    /// the admin listener — that listener is bound whatever this node
+    /// holds, so there is nothing to reconcile — nor in the tests of
+    /// everything below the shell, where an unset socket means the
+    /// registry asks nobody for one.
+    ingest_socket: OnceLock<Arc<dyn IngestListening>>,
     /// What is installed, by identifier.
     installed: RwLock<BTreeMap<RuleId, Installed>>,
     /// The task that closes one interval of every rule's series and
@@ -323,6 +433,7 @@ impl Registry {
             membership,
             client: client(),
             ingest: Arc::new(Ingest::new()),
+            ingest_socket: OnceLock::new(),
             installed: RwLock::new(BTreeMap::new()),
             sampler: Mutex::new(None),
         });
@@ -336,6 +447,54 @@ impl Registry {
     /// serves them is configuration; see section 9.2.
     pub fn ingest(&self) -> &Arc<Ingest> {
         &self.ingest
+    }
+
+    /// Serve this node's ingest routes on `socket` from here on.
+    ///
+    /// Handed over once, by whoever bound the listeners, and after
+    /// the one the ingest routes publish through; see
+    /// [`Registry::ingest_socket`]. Until it is, a rule with a route
+    /// is installed without one being asked for, which is what
+    /// startup wants: the rules a configuration names are installed
+    /// before anything binds at all, and the binary binds the socket
+    /// for them the moment it is allowed to.
+    ///
+    /// Twice is a defect in the caller rather than a state to
+    /// support, and is said rather than silently ignored.
+    pub fn serve_ingest_on(&self, socket: Arc<dyn IngestListening>) {
+        if self.ingest_socket.set(socket).is_err() {
+            tracing::error!(
+                "this node was given a second ingest socket; the first is still the one \
+                 being served and the second is bound to nothing"
+            );
+        }
+    }
+
+    /// Leave the ingest socket bound if `wanted` and closed if not.
+    ///
+    /// `Ok(())` when nothing has handed one over, which is a node
+    /// that serves its ingest routes somewhere that is bound
+    /// regardless — the admin listener — or one that has not finished
+    /// starting.
+    async fn reconcile_ingest(&self, id: &RuleId, wanted: bool) -> Result<(), InstallError> {
+        let Some(socket) = self.ingest_socket.get() else {
+            return Ok(());
+        };
+        socket
+            .reconcile(wanted)
+            .await
+            .map_err(|why| InstallError::listener(id, why))
+    }
+
+    /// Whether installing `rule` gives this node a route to serve.
+    ///
+    /// A **disabled** ingest rule needs no socket, for the same
+    /// reason it gets no route: `enabled` is the switch an operator
+    /// reaches for, and a listener that stayed up for a rule that was
+    /// switched off would be the one part of a connector that ignored
+    /// it.
+    fn wants_a_route(rule: &Rule) -> bool {
+        rule.enabled && matches!(rule.action, Action::HttpIn(_))
     }
 
     /// The hook that turns a publication into envelopes.
@@ -397,7 +556,39 @@ impl Registry {
     /// [`InstallError::Storage`] when the store would not hold the
     /// rule or would not open its outbox. Nothing is installed in that
     /// case, and whatever was installed before is left running.
+    ///
+    /// [`InstallError::Listener`] when an ingest rule's socket could
+    /// not be bound. Asked for **first**, before the store is even
+    /// written to, so that the usual reading of this error is that
+    /// nothing about this node changed. The exception is the second
+    /// call below: a rule that installed perfectly and then lost a
+    /// race with a delete that closed the socket is reported rather
+    /// than answered `Ok`, because what the caller is owed is whether
+    /// its rule can be reached and not whether a map was written.
     pub async fn install(&self, rule: Rule) -> Result<(), InstallError> {
+        let id = rule.id.clone();
+        // **Before anything changes.** An address something else is
+        // already on is then a refusal with the node exactly as it
+        // was, rather than a stored rule nothing can reach.
+        if Self::wants_a_route(&rule) {
+            self.reconcile_ingest(&id, true).await?;
+        }
+        let installed = self.install_now(rule).await;
+        // And again afterwards, because installing a rule can take a
+        // route away as well as add one: the rule this replaced may
+        // have been the last one with a route, and an install that
+        // failed after the bind above leaves a socket nothing needs.
+        // What is wanted is read from the routes rather than from the
+        // rule, so that the socket follows what is actually served.
+        let settled = self.reconcile_ingest(&id, !self.ingest.is_empty()).await;
+        installed.and(settled)
+    }
+
+    /// Store `rule`, start it, and put it in the map.
+    ///
+    /// Split from [`Registry::install`] so that the socket is settled
+    /// on every path out of this, including the ones that fail.
+    async fn install_now(&self, rule: Rule) -> Result<(), InstallError> {
         // **Durable before anything hangs off it**, and before the old
         // one is taken away: a store that refuses the record leaves
         // the node exactly as it was.
@@ -499,6 +690,10 @@ impl Registry {
     /// away envelopes this broker accepted — see the module note — and
     /// [`InstallError::Storage`] when the store would not take the
     /// removal.
+    ///
+    /// [`InstallError::Listener`] is possible and means the rule is
+    /// gone and its socket did not close, which is a port serving
+    /// nothing rather than anything a caller has lost.
     pub async fn remove(&self, id: &RuleId) -> Result<(), InstallError> {
         if !self.installed.read().contains_key(id) {
             return Err(InstallError::NoSuchRule {
@@ -527,7 +722,11 @@ impl Registry {
             .map_err(|error| InstallError::storage(id, error))?;
 
         self.uninstall(id);
-        Ok(())
+        // Its route went with it, and it may have been the last one:
+        // a node that holds no ingest rule holds no ingest socket
+        // either, which is the same answer it gives before the first
+        // one is created.
+        self.reconcile_ingest(id, !self.ingest.is_empty()).await
     }
 
     /// What every rule has done since this process started, and the

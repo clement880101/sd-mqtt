@@ -556,9 +556,15 @@ pub enum IngestListener {
 ///
 /// # There is no `enabled` key, and no address rule either
 ///
-/// A listener of its own is bound when this node holds an ingest rule
-/// with a route, and not otherwise, so turning it off is deleting the
-/// rules rather than a second switch that can disagree with them.
+/// A listener of its own is bound **while** this node holds an ingest
+/// rule with a route, and not otherwise, so turning it off is deleting
+/// the rules rather than a second switch that can disagree with them.
+///
+/// "While", not "at startup". It is bound the moment the first such
+/// rule exists and closed when the last one goes, because section
+/// 11.1's API creates rules while this process runs and a rule that
+/// cannot be reached until the next restart is a rule this node
+/// reports as working and is not. See [`crate::ingest`].
 ///
 /// And unlike `[admin]`, a non-loopback address here is **not** refused
 /// without a token. Section 9.2: "the ingest listener needs no address

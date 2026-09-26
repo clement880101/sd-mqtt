@@ -189,14 +189,20 @@ the `$` namespace, and written without a trailing separator: with one
 it is a prefix of three levels ending in an empty one, which no caller
 could satisfy.
 
-**The ingest listener is bound at startup and only if this node holds
-an ingest rule then**, because a listener with no route is a port
-answering `404` that an operator has to explain. The consequence is
-worth knowing: the first ingest rule written over the API on a node
-that started with none is stored and installed, and is reachable after
-a restart rather than immediately. `ingest.listener = "admin"` serves
-the routes on the admin listener instead, which must be chosen
-explicitly and takes that listener's host check with it.
+**The ingest listener is bound while this node has an ingest rule to
+serve**, and not otherwise: it is bound the moment the first one
+exists — including one created over the API or on the Rules page,
+which is reachable at once and needs no restart — and closed again
+when the last one is deleted or switched off. A node that does no
+ingest holds no ingest port, which matters because the port is a fixed
+number: bound unconditionally it would be one every broker on a host
+contended for, whether or not any of them accepted a post.
+
+An address something else is already on is therefore refused where the
+rule is written, at startup or over the API, rather than accepted and
+served nowhere. `ingest.listener = "admin"` serves the routes on the
+admin listener instead, which must be chosen explicitly and takes that
+listener's host check with it.
 
 #### Fetch a URL on an interval: `[rules.http_poll]`
 

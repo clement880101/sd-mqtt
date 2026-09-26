@@ -1717,9 +1717,9 @@ export function Rules() {
       </p>
       <p class="hint">
         A rule this node stores runs whether or not the configuration file names it, and deleting a
-        table from the file no longer stops one: delete the rule here. An ingest rule is served on
-        the listener this node bound at startup, so one created here is reachable only if this node
-        was started with an ingest rule already.
+        table from the file no longer stops one: delete the rule here. An ingest rule created here
+        is reachable as soon as it is saved: the listener is bound for it, and closed again when the
+        last ingest rule is deleted or switched off.
       </p>
     </section>
   );

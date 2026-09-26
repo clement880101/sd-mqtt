@@ -77,6 +77,14 @@ const STARTUP: Duration = Duration::from_secs(20);
 /// How long to wait for something that should happen.
 const PATIENCE: Duration = Duration::from_secs(20);
 
+/// How long the broker has to exit after a stop signal.
+///
+/// Longer than `sdmqtt_admin::SHUTDOWN_GRACE`, deliberately: a
+/// listener that reached its own backstop and a listener that never
+/// finished are different failures, and a deadline shorter than the
+/// backstop could not tell them apart.
+const TO_STOP: Duration = Duration::from_secs(30);
+
 /// The admin listener's token, so a test can read what the broker
 /// thinks it holds.
 const ADMIN_TOKEN: &str = "a-secret-for-the-test";
@@ -362,6 +370,24 @@ fn write_config(
     ingest: SocketAddr,
     tables: &str,
 ) {
+    write_config_with(path, store, mqtt, admin, ingest, "own", tables);
+}
+
+/// The same, saying which listener serves the ingest routes.
+///
+/// Section 9.2 allows either, and the difference matters to more than
+/// which port answers: a listener of this node's own is bound while
+/// something needs it, and the admin listener is bound regardless. A
+/// rule created over the API has to be reachable on both.
+fn write_config_with(
+    path: &Path,
+    store: &Path,
+    mqtt: SocketAddr,
+    admin: SocketAddr,
+    ingest: SocketAddr,
+    ingest_listener: &str,
+    tables: &str,
+) {
     let text = format!(
         r#"
 [listener]
@@ -373,6 +399,7 @@ token = "{ADMIN_TOKEN}"
 
 [ingest]
 address = "{ingest}"
+listener = "{ingest_listener}"
 
 [storage]
 directory = "{store}"
@@ -525,6 +552,44 @@ impl BrokerProcess {
             "the broker must be killed rather than allowed to stop"
         );
     }
+
+    /// Ask it to stop the way a deployment does.
+    ///
+    /// `SIGTERM` rather than `Child::kill`, which is `SIGKILL` and
+    /// runs no destructor: what a test using this wants to know is
+    /// whether the **graceful** path terminates. Sent with `kill`
+    /// rather than a signalling crate, because a dependency for one
+    /// line of a test is a dependency to audit.
+    #[cfg(unix)]
+    fn terminate(&self) {
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(self.child.id().to_string())
+            .status()
+            .expect("kill runs");
+        assert!(status.success(), "the signal was delivered");
+    }
+
+    /// Wait for it to exit, and say how.
+    ///
+    /// Bounded, because the regression this guards is a process that
+    /// never exits and a test that hangs stalls a build instead of
+    /// reporting.
+    #[cfg(unix)]
+    fn wait_for_exit(&mut self) -> Result<std::process::ExitStatus, String> {
+        let deadline = Instant::now() + TO_STOP;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => return Err(format!("it could not be waited for: {error}")),
+            }
+        }
+        Err(format!(
+            "it was still running {TO_STOP:?} after the signal: {}",
+            self.logged()
+        ))
+    }
 }
 
 impl Drop for BrokerProcess {
@@ -656,6 +721,26 @@ fn between(text: &str, open: &str, close: &str) -> String {
         + open.len();
     let rest = &text[start..];
     rest[..rest.find(close).expect("the value is closed")].to_owned()
+}
+
+/// Wait until nothing is accepting on `address`.
+///
+/// The other half of [`accepting`], and it waits for the same reason:
+/// closing a listener is not the same instant as the request that
+/// caused it being answered, so a single attempt would be a race. It
+/// is an assertion about an absence, which convention 5 warns about —
+/// it is here beside the assertions that something *was* reachable,
+/// and it is those that carry the test.
+#[track_caller]
+fn refusing(address: SocketAddr, what: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline {
+        if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("{what} is still accepting on {address}");
 }
 
 /// Wait until something is accepting on `address`.
@@ -1782,4 +1867,550 @@ fn a_rule_created_over_the_api_fires_and_still_fires_after_a_restart() {
     );
 
     drop(broker);
+}
+
+// ---- the ingest listener follows the rules -------------------------------
+
+/// The identifier of the ingest rule these tests create over the API.
+///
+/// Nothing in any configuration file mentions it, and nothing in the
+/// store holds it when the broker starts: it exists because a request
+/// made it, which is what makes these tests about the listener rather
+/// than about startup.
+const LATE_RULE: &str = "made-over-the-api-in";
+
+/// Its own bearer token, which is not the admin one.
+const LATE_TOKEN: &str = "a-secret-for-the-late-rule";
+
+/// Where it publishes.
+const LATE_TOPIC: &str = "ingest/without-a-restart";
+
+/// What is posted to it.
+const POSTED_LATE: &[u8] = b"posted to a rule this broker did not start with";
+
+/// What is posted after it is switched off and on again.
+const POSTED_AGAIN: &[u8] = b"posted after the listener came back";
+
+/// The body that creates [`LATE_RULE`] over the admin API.
+fn late_ingest_rule() -> String {
+    format!(
+        r#"{{"id":"{LATE_RULE}","name":"Made over the API",
+             "http_in":{{"token":"{LATE_TOKEN}","topic":"{LATE_TOPIC}","qos":1,
+                         "retain":false}}}}"#
+    )
+}
+
+/// Create a rule over the admin API, and say what came back.
+fn create_rule(admin: SocketAddr, body: &str) -> Answered {
+    http_with(
+        admin,
+        "POST",
+        "/api/v1/rules",
+        ADMIN_TOKEN,
+        // The one header axum's JSON extractor insists on, which the
+        // ingest endpoint beside it deliberately does not.
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+}
+
+/// **The test milestone four's interface was failing.** An ingest rule
+/// created over the API accepts a post without the broker being
+/// restarted.
+///
+/// The broker starts with **no ingest rule at all**, so there is no
+/// listener and nothing in the store to make one. Then one request
+/// creates a rule and the very next request posts to it.
+///
+/// # What used to happen, and why it was worse than a refusal
+///
+/// The listener was bound during startup and only if this node held an
+/// ingest rule then. So the create was stored, installed, listed,
+/// counted and answered `200`, the Rules page drew it as live, and
+/// every post to it was refused by a socket nobody was listening on
+/// until the process was restarted. Every surface said it worked.
+///
+/// # Convention 5, and why the post is not the end of the test
+///
+/// A listener that answered `200` and published nothing would satisfy
+/// a test that stopped at the status line, and so would one that
+/// published to the wrong topic. The subscriber is attached before the
+/// post and is what the payload has to reach, so what is asserted is
+/// the thing an operator wanted rather than the answer they were
+/// given.
+#[test]
+fn an_ingest_rule_created_over_the_api_is_reachable_without_a_restart() {
+    let workspace = tempfile::tempdir().expect("a temporary directory");
+    let store = workspace.path().join("store");
+    let config = workspace.path().join("sdmqtt.toml");
+    let mqtt = loopback(free_port());
+    let admin = loopback(free_port());
+    let ingest = loopback(free_port());
+
+    // No rules. Everything this test is about arrives over HTTP.
+    write_config(&config, &store, mqtt, admin, ingest, "");
+    let broker = BrokerProcess::start(
+        &config,
+        &store,
+        mqtt,
+        workspace.path().join("without-a-restart.log"),
+    );
+    accepting(admin, "the admin listener");
+
+    // **Nothing on the ingest address yet**, which is the other half
+    // of the decision this test records: a broker that does no ingest
+    // binds no ingest port. The default port is a fixed number, so a
+    // socket bound unconditionally would be one every broker on a
+    // host contended for.
+    assert!(
+        TcpStream::connect_timeout(&ingest, Duration::from_millis(200)).is_err(),
+        "a broker with no ingest rule is listening on {ingest}"
+    );
+    let listed = http(admin, "GET", "/api/v1/listeners", ADMIN_TOKEN, None);
+    assert!(
+        !listed.body.contains("\"ingest\""),
+        "it reports an ingest listener it did not bind: {}",
+        listed.body
+    );
+
+    // Somebody who will be waiting for what is posted.
+    let mut subscriber = Client::connect(mqtt, "waiting-for-the-post");
+    subscriber.subscribe(LATE_TOPIC);
+
+    let created = create_rule(admin, &late_ingest_rule());
+    assert_eq!(created.status, 200, "creating a rule: {}", created.body);
+
+    // **No wait, no retry, no restart.** The answer to the create is
+    // a promise about what can be reached, so the next thing here is
+    // to reach it.
+    assert!(
+        TcpStream::connect_timeout(&ingest, PATIENCE).is_ok(),
+        "the rule was created and answered 200, and nothing is listening on {ingest}: \
+         a rule reported as live that no post can reach is the defect this test exists \
+         for"
+    );
+
+    let answered = http(
+        ingest,
+        "POST",
+        &format!("/ingest/{LATE_RULE}"),
+        LATE_TOKEN,
+        Some(POSTED_LATE),
+    );
+    assert_eq!(
+        answered.status, 200,
+        "posting to a rule created over the API: {}",
+        answered.body
+    );
+
+    let delivered = subscriber
+        .delivery_within(PATIENCE)
+        .expect("what was posted must reach the subscriber, not only be answered 200");
+    assert_eq!(
+        delivered.topic, LATE_TOPIC,
+        "it published somewhere other than where the rule says"
+    );
+    assert_eq!(
+        &delivered.payload[..],
+        POSTED_LATE,
+        "something other than what was posted arrived"
+    );
+
+    // And the inventory says the port exists, which it did not have
+    // to be asked about twice to get right.
+    let listed = http(admin, "GET", "/api/v1/listeners", ADMIN_TOKEN, None);
+    assert!(
+        listed.body.contains(&format!("\"address\":\"{ingest}\"")),
+        "the listener it bound for this rule is not in what it reports: {}",
+        listed.body
+    );
+
+    drop(broker);
+}
+
+/// The listener is closed again when the last rule that needs it goes,
+/// and bound again when one comes back.
+///
+/// The half of the decision that is not about reachability: a port
+/// answering `404` to everything is one more thing for an operator to
+/// explain, so a node that has stopped doing ingest stops holding the
+/// socket for it. Disabling rather than deleting, because that is the
+/// switch an operator reaches for and a listener that stayed up for a
+/// rule that was switched off would be the one part of a connector
+/// that ignored it.
+///
+/// **The rebind at the end is what makes this more than an assertion
+/// about an absence.** A socket that closed and could never come back
+/// would pass every line up to it.
+#[test]
+fn the_ingest_listener_comes_and_goes_with_the_rules_that_need_it() {
+    let workspace = tempfile::tempdir().expect("a temporary directory");
+    let store = workspace.path().join("store");
+    let config = workspace.path().join("sdmqtt.toml");
+    let mqtt = loopback(free_port());
+    let admin = loopback(free_port());
+    let ingest = loopback(free_port());
+
+    write_config(&config, &store, mqtt, admin, ingest, "");
+    let broker = BrokerProcess::start(
+        &config,
+        &store,
+        mqtt,
+        workspace.path().join("comes-and-goes.log"),
+    );
+    accepting(admin, "the admin listener");
+
+    let created = create_rule(admin, &late_ingest_rule());
+    assert_eq!(created.status, 200, "creating a rule: {}", created.body);
+    accepting(ingest, "the ingest listener the new rule needs");
+
+    // Switched off: the route goes, and with it the only reason the
+    // socket was open.
+    let disabled = http(
+        admin,
+        "POST",
+        &format!("/api/v1/rules/{LATE_RULE}/disable"),
+        ADMIN_TOKEN,
+        None,
+    );
+    assert_eq!(disabled.status, 200, "disabling it: {}", disabled.body);
+    refusing(
+        ingest,
+        "the ingest listener of a node whose only ingest rule is off",
+    );
+    let listed = http(admin, "GET", "/api/v1/listeners", ADMIN_TOKEN, None);
+    assert!(
+        !listed.body.contains(&format!("\"address\":\"{ingest}\"")),
+        "it still reports a listener it has closed: {}",
+        listed.body
+    );
+
+    // And on again, which is the assertion an absence cannot make.
+    let mut subscriber = Client::connect(mqtt, "waiting-after-the-rebind");
+    subscriber.subscribe(LATE_TOPIC);
+    let enabled = http(
+        admin,
+        "POST",
+        &format!("/api/v1/rules/{LATE_RULE}/enable"),
+        ADMIN_TOKEN,
+        None,
+    );
+    assert_eq!(enabled.status, 200, "enabling it again: {}", enabled.body);
+
+    let answered = http(
+        ingest,
+        "POST",
+        &format!("/ingest/{LATE_RULE}"),
+        LATE_TOKEN,
+        Some(POSTED_AGAIN),
+    );
+    assert_eq!(
+        answered.status, 200,
+        "posting to a rule that was switched off and on again: {}",
+        answered.body
+    );
+    let delivered = subscriber
+        .delivery_within(PATIENCE)
+        .expect("a rebound listener must publish what is posted to it, not only accept it");
+    assert_eq!(&delivered.payload[..], POSTED_AGAIN);
+
+    // And deleting the last one closes it too. A separate path from
+    // disabling: a delete goes through the store and takes the rule
+    // away entirely, and it would be perfectly possible to have taught
+    // one of the two to close the socket and not the other.
+    let deleted = http(
+        admin,
+        "DELETE",
+        &format!("/api/v1/rules/{LATE_RULE}"),
+        ADMIN_TOKEN,
+        None,
+    );
+    assert_eq!(deleted.status, 200, "deleting it: {}", deleted.body);
+    refusing(
+        ingest,
+        "the ingest listener of a node whose only ingest rule was deleted",
+    );
+
+    drop(broker);
+}
+
+/// A rule whose listener cannot be bound is refused, and this node is
+/// left exactly as it was.
+///
+/// The failure a listener bound after startup makes possible: the
+/// address may be taken by then. The answer is the one this project
+/// gives everywhere else — refuse rather than reinterpret — and the
+/// thing that would be worse than either is a rule that was created,
+/// stored and reported as live with nothing in front of it, which is
+/// the defect this listener had in the first place.
+///
+/// So the refusal has to leave **nothing** behind: the assertions
+/// below are that the rule is not readable, not counted, and that the
+/// same request succeeds once the address is free.
+#[test]
+fn an_ingest_rule_whose_listener_cannot_be_bound_is_refused_and_not_installed() {
+    let workspace = tempfile::tempdir().expect("a temporary directory");
+    let store = workspace.path().join("store");
+    let config = workspace.path().join("sdmqtt.toml");
+    let mqtt = loopback(free_port());
+    let admin = loopback(free_port());
+    let ingest = loopback(free_port());
+
+    // Something else is already on the ingest address, and stays
+    // there. A broker with no ingest rule starts perfectly happily
+    // beside it, which is the point: the address is only needed when
+    // a rule needs it.
+    let squatter = TcpListener::bind(ingest).expect("the test can hold the ingest address");
+
+    write_config(&config, &store, mqtt, admin, ingest, "");
+    let broker = BrokerProcess::start(
+        &config,
+        &store,
+        mqtt,
+        workspace.path().join("address-in-use.log"),
+    );
+    accepting(admin, "the admin listener");
+
+    // **A rule that is switched off needs no listener**, so this one
+    // is accepted although the address is taken: `enabled` is what
+    // decides whether an ingest rule has a route at all, and a rule
+    // with no route is a rule with nothing to serve. Created and
+    // deleted here rather than in a test of its own, because what it
+    // guards is the difference between the two requests below it.
+    let off = create_rule(
+        admin,
+        &late_ingest_rule().replace("\"name\"", "\"enabled\":false,\"name\""),
+    );
+    assert_eq!(
+        off.status, 200,
+        "a switched-off ingest rule needs no listener and must not be refused for \
+         wanting one: {}",
+        off.body
+    );
+    let deleted = http(
+        admin,
+        "DELETE",
+        &format!("/api/v1/rules/{LATE_RULE}"),
+        ADMIN_TOKEN,
+        None,
+    );
+    assert_eq!(deleted.status, 200, "deleting it again: {}", deleted.body);
+
+    let refused = create_rule(admin, &late_ingest_rule());
+    assert_eq!(
+        refused.status, 500,
+        "creating an ingest rule with nowhere to serve it: {}",
+        refused.body
+    );
+    assert!(
+        refused.body.contains("nowhere to serve it"),
+        "the refusal must say what is wrong rather than name a generic failure: {}",
+        refused.body
+    );
+
+    // Nothing was left behind by the refusal.
+    let read = http(
+        admin,
+        "GET",
+        &format!("/api/v1/rules/{LATE_RULE}"),
+        ADMIN_TOKEN,
+        None,
+    );
+    assert_eq!(
+        read.status, 404,
+        "a refused rule must not be readable afterwards: {}",
+        read.body
+    );
+    let listed = http(admin, "GET", "/api/v1/rules", ADMIN_TOKEN, None);
+    assert!(
+        listed.body.contains("\"total\":0"),
+        "a refused rule must not be counted: {}",
+        listed.body
+    );
+
+    // And the same request succeeds once the address is free, which
+    // is what says the refusal was about the address and not about
+    // the rule.
+    drop(squatter);
+    let created = create_rule(admin, &late_ingest_rule());
+    assert_eq!(
+        created.status, 200,
+        "the same rule, once the address is free: {}",
+        created.body
+    );
+    let answered = http(
+        ingest,
+        "POST",
+        &format!("/ingest/{LATE_RULE}"),
+        LATE_TOKEN,
+        Some(POSTED_LATE),
+    );
+    assert_eq!(
+        answered.status, 200,
+        "and it is reachable: {}",
+        answered.body
+    );
+
+    drop(broker);
+}
+
+/// The same defect on the other configuration: with the routes on the
+/// admin listener, a rule created over the API is reachable there too.
+///
+/// `ingest.listener = "admin"` binds no second socket, so there is no
+/// listener to bind lazily — but the route set was merged into the
+/// admin router only if this node held an ingest rule at startup, and
+/// an axum router cannot grow a route once it is being served. A node
+/// that started with none would therefore have answered `404` to every
+/// post until it was restarted, which is the same lie on a different
+/// port.
+///
+/// The route set is merged unconditionally instead, which costs a node
+/// with no ingest rules nothing: an identifier nothing has registered
+/// is answered exactly the way an identifier nobody configured is.
+#[test]
+fn an_ingest_rule_created_over_the_api_is_reachable_on_the_admin_listener() {
+    let workspace = tempfile::tempdir().expect("a temporary directory");
+    let store = workspace.path().join("store");
+    let config = workspace.path().join("sdmqtt.toml");
+    let mqtt = loopback(free_port());
+    let admin = loopback(free_port());
+    let ingest = loopback(free_port());
+
+    write_config_with(&config, &store, mqtt, admin, ingest, "admin", "");
+    let broker = BrokerProcess::start(
+        &config,
+        &store,
+        mqtt,
+        workspace.path().join("on-the-admin-listener.log"),
+    );
+    accepting(admin, "the admin listener");
+
+    let mut subscriber = Client::connect(mqtt, "waiting-on-the-admin-listener");
+    subscriber.subscribe(LATE_TOPIC);
+
+    let created = create_rule(admin, &late_ingest_rule());
+    assert_eq!(created.status, 200, "creating a rule: {}", created.body);
+
+    let answered = http(
+        admin,
+        "POST",
+        &format!("/ingest/{LATE_RULE}"),
+        LATE_TOKEN,
+        Some(POSTED_LATE),
+    );
+    assert_eq!(
+        answered.status, 200,
+        "posting to a rule created over the API, on the admin listener: {}",
+        answered.body
+    );
+    let delivered = subscriber
+        .delivery_within(PATIENCE)
+        .expect("what was posted must reach the subscriber");
+    assert_eq!(&delivered.payload[..], POSTED_LATE);
+
+    // And no second socket was bound, because this configuration
+    // asked for one listener rather than two.
+    assert!(
+        TcpStream::connect_timeout(&ingest, Duration::from_millis(200)).is_err(),
+        "the routes are on the admin listener and something bound {ingest} as well"
+    );
+
+    drop(broker);
+}
+
+/// A listener bound after startup stops on a signal like the ones
+/// bound during it.
+///
+/// **This project has been bitten here before.** Section 11.1's events
+/// stream does not end on its own, and graceful shutdown waits for
+/// every open connection, so one browser tab left open stopped the
+/// broker exiting — which is a data bug, because a clean stop is how
+/// sessions reach disk. A listener that now comes into existence
+/// halfway through the process's life is a new chance to make the same
+/// mistake: it is not in the list of things startup bound, so it is
+/// easy for it to be in nobody's shutdown sequence either.
+///
+/// **A client is connected to it when the signal arrives**, kept alive
+/// rather than closed, which is what makes this more than a test that
+/// an idle broker stops. Bounded, because the regression is a process
+/// that never exits and a test that hangs stalls a build instead of
+/// reporting.
+#[cfg(unix)]
+#[test]
+fn an_ingest_listener_bound_after_startup_stops_on_a_signal() {
+    let workspace = tempfile::tempdir().expect("a temporary directory");
+    let store = workspace.path().join("store");
+    let config = workspace.path().join("sdmqtt.toml");
+    let mqtt = loopback(free_port());
+    let admin = loopback(free_port());
+    let ingest = loopback(free_port());
+
+    write_config(&config, &store, mqtt, admin, ingest, "");
+    let mut broker = BrokerProcess::start(
+        &config,
+        &store,
+        mqtt,
+        workspace.path().join("stops-on-a-signal.log"),
+    );
+    accepting(admin, "the admin listener");
+
+    let created = create_rule(admin, &late_ingest_rule());
+    assert_eq!(created.status, 200, "creating a rule: {}", created.body);
+    accepting(ingest, "the ingest listener this rule needed");
+
+    // A caller that posted and has not gone away. `Connection:
+    // close` is what every other request in this file sends, so this
+    // one says the opposite deliberately: what is being tested is a
+    // connection the broker is holding when the signal arrives.
+    let mut posting = TcpStream::connect_timeout(&ingest, PATIENCE).expect("the listener accepts");
+    posting
+        .set_read_timeout(Some(PATIENCE))
+        .expect("a read deadline");
+    let head = format!(
+        "POST /ingest/{LATE_RULE} HTTP/1.1\r\nHost: {ingest}\r\nConnection: keep-alive\r\n\
+         Authorization: Bearer {LATE_TOKEN}\r\nContent-Length: {}\r\n\r\n",
+        POSTED_LATE.len()
+    );
+    posting.write_all(head.as_bytes()).expect("the head");
+    posting.write_all(POSTED_LATE).expect("and the body");
+    posting.flush().expect("and flushed");
+    let mut answer = [0u8; 15];
+    posting
+        .read_exact(&mut answer)
+        .expect("the response head begins");
+    assert!(
+        answer.starts_with(b"HTTP/1.1 200"),
+        "the post was refused: {}",
+        String::from_utf8_lossy(&answer)
+    );
+
+    let signalled = Instant::now();
+    broker.terminate();
+
+    let status = broker.wait_for_exit().expect(
+        "a signalled broker exits, with a lazily bound ingest listener and a \
+                 client still connected to it",
+    );
+    assert!(
+        status.success(),
+        "an orderly stop is not a failure: {status}, {}",
+        broker.logged()
+    );
+
+    // It stopped because the listener was told to, not because the
+    // backstop gave up on it. Reaching the backstop on every shutdown
+    // would be the defect the backstop exists to report.
+    let took = signalled.elapsed();
+    assert!(
+        took < sdmqtt_admin::SHUTDOWN_GRACE,
+        "it took {took:?}, which is the {:?} backstop rather than the signal: {}",
+        sdmqtt_admin::SHUTDOWN_GRACE,
+        broker.logged()
+    );
+    assert!(
+        broker.logged().contains("the ingest listener has stopped"),
+        "the listener this node bound after startup was in nobody's shutdown sequence: {}",
+        broker.logged()
+    );
 }

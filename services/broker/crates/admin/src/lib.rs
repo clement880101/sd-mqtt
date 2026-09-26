@@ -25,6 +25,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use parking_lot::RwLock;
 use sdmqtt_server::shared::Shared;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
@@ -75,6 +76,31 @@ pub const DEFAULT_EVENTS_INTERVAL: Duration = Duration::from_secs(1);
 /// than a slow client.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
+/// The listeners this node has bound, as they are now.
+///
+/// Shared and mutable rather than a list built at startup, because
+/// one of them is not a fact about startup: section 9.2's ingest
+/// listener is bound while an ingest rule needs it and closed when
+/// the last one is deleted or switched off, both of which can happen
+/// over the API while this process runs. A `/api/v1/listeners` fixed
+/// when the binary finished starting would answer with a port that
+/// had since closed, or leave out one that had since opened, and an
+/// inventory that is wrong about what is listening is worth less than
+/// no inventory at all.
+///
+/// The lock is held to clone the rows and for nothing else; see
+/// [`resources`].
+pub type Listeners = Arc<RwLock<Vec<ListenerView>>>;
+
+/// A [`Listeners`] holding `views`.
+///
+/// A constructor rather than a type everybody spells out, so that
+/// nothing outside this crate has to name the lock or depend on the
+/// crate it comes from.
+pub fn listener_list(views: Vec<ListenerView>) -> Listeners {
+    Arc::new(RwLock::new(views))
+}
+
 /// Everything a handler can reach.
 ///
 /// Cloned per request by axum, so everything in it is behind an
@@ -96,14 +122,18 @@ pub struct AdminState {
     ///
     /// Given rather than discovered: a bound socket does not know
     /// what it is for, and the broker does not know a listener
-    /// exists. What startup bound is what the API reports.
+    /// exists. What was bound is what the API reports.
     ///
-    /// The one exception is this listener itself, which
-    /// [`AdminServer::bind`] adds once it knows the port it was
-    /// given. A caller cannot supply that: it does not exist until
-    /// the socket is bound, and with a configured port of zero it is
-    /// the operating system's to choose.
-    pub listeners: Arc<Vec<ListenerView>>,
+    /// Two things add a row to it themselves. This listener does,
+    /// because a caller cannot supply a port that does not exist
+    /// until the socket is bound and that with a configured port of
+    /// zero is the operating system's to choose. And section 9.2's
+    /// ingest listener does, because **it is not a fact about
+    /// startup**: it is bound while this node holds an ingest rule
+    /// and closed when the last one goes, so a list fixed at startup
+    /// would report a port that is not there, or miss one that is.
+    /// See [`Listeners`].
+    pub listeners: Listeners,
     /// When this process started serving, for the uptime the
     /// Overview page shows.
     pub started: Instant,
@@ -170,7 +200,7 @@ impl AdminState {
             shared,
             readiness: Arc::new(Readiness::starting()),
             node_id: Arc::from("local"),
-            listeners: Arc::new(Vec::new()),
+            listeners: listener_list(Vec::new()),
             started: Instant::now(),
             token: None,
             allowed_hosts: Arc::from(Vec::new()),
@@ -214,10 +244,14 @@ impl AdminState {
         self
     }
 
-    /// Say what was bound.
+    /// Report the listeners in `listeners`, as they are when asked.
+    ///
+    /// The list itself is shared rather than copied, so that a
+    /// listener bound or closed after this call is one this API knows
+    /// about. See [`Listeners`].
     #[must_use]
-    pub fn with_listeners(mut self, listeners: Vec<ListenerView>) -> Self {
-        self.listeners = Arc::new(listeners);
+    pub fn with_listeners(mut self, listeners: Listeners) -> Self {
+        self.listeners = listeners;
         self
     }
 
@@ -440,8 +474,7 @@ impl AdminServer {
 
         // This listener knows what it bound better than its caller
         // does; see `AdminState::listeners`.
-        let mut listeners = (*state.listeners).clone();
-        listeners.push(ListenerView {
+        state.listeners.write().push(ListenerView {
             name: "admin".to_owned(),
             protocol: ListenerProtocol::Admin,
             address,
@@ -450,7 +483,6 @@ impl AdminServer {
             mountpoint: String::new(),
             max_connections: None,
         });
-        let state = state.with_listeners(listeners);
 
         let events = Arc::clone(&state.events);
         let taps = Arc::clone(&state.taps);
