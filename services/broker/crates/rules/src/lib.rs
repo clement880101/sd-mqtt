@@ -47,6 +47,7 @@
 #![warn(missing_docs)]
 
 pub mod bridge;
+pub mod dlq;
 pub mod envelope;
 pub mod hops;
 pub mod http_in;
@@ -60,6 +61,7 @@ pub mod spec;
 pub mod stats;
 
 pub use bridge::TopicError;
+pub use dlq::{DeadLetter, DeadLetterLog};
 pub use envelope::Envelope;
 pub use http_in::{HttpInError, Ingest};
 pub use http_out::{Attempt, DeadLetters, Delivery, HttpOutError, Poster, Turn};

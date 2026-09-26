@@ -480,6 +480,86 @@ async fn statistics_of(
     Ok(Json(stats_view(&id, totals, samples)))
 }
 
+// ---------------------------------------------------------------
+// Dead letters
+// ---------------------------------------------------------------
+
+/// What a rule has given up on.
+///
+/// **A resource rather than a subscription**, and the argument is
+/// [`::rules::dlq`]'s: a subscription only shows what is published
+/// while somebody is watching, and nobody watches a rules page waiting
+/// for a dead letter. An operator finds out from an alert and opens
+/// the page afterwards, by which time a tap would have nothing to
+/// show — which is indistinguishable from a rule that has never
+/// dead-lettered anything.
+///
+/// Section 9.2 is unchanged: the letter is still published to
+/// `$sd/rules/<id>/dlq`, so anything that wants every letter for ever
+/// subscribes durably. This is the recent history, bounded and in
+/// memory, for the page.
+#[derive(Debug, Serialize)]
+struct DeadLetterView {
+    /// Which letter this is for this rule, counting from one since
+    /// the process started.
+    sequence: u64,
+    /// When it was published, on the wall clock, in whole seconds.
+    at: u32,
+    /// The topic it went to.
+    topic: String,
+    /// What was published, as text, cut to what this broker keeps.
+    document: String,
+    /// Whether `document` is the whole of it. The whole of it is on
+    /// the topic.
+    truncated: bool,
+}
+
+/// One rule's dead letters, most recent first.
+///
+/// Most recent first because that is the order they are read in, and
+/// the ordering key is the sequence counted downwards so that the
+/// cursor, the page and the `total` behave exactly as every other
+/// resource's do. The collection is bounded by
+/// [`::rules::dlq::KEPT`], so a page is very nearly always the whole
+/// of it; it is paginated anyway, because one envelope for every
+/// resource is one thing for the interface to learn.
+async fn dead_letters(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    paging: Paging,
+) -> Result<Json<Page<DeadLetterView>>, ApiError> {
+    let id = identifier(&id)?;
+    let (_produced, kept) = registry(&state)?
+        .dead_letters_of(&id)
+        .ok_or_else(|| ApiError::not_found(format!("there is no rule called {:?}", id.as_str())))?;
+    let keys: Vec<_> = kept
+        .iter()
+        .map(|letter| (newest_first(letter.sequence), letter))
+        .collect();
+    let selection = select(
+        keys.iter()
+            .map(|(key, letter)| ([key.as_str(), "", ""], *letter)),
+        paging.after.as_ref(),
+        paging.limit,
+    );
+    Ok(Json(page(selection, |_, letter| DeadLetterView {
+        sequence: letter.sequence,
+        at: letter.at,
+        topic: letter.topic.clone(),
+        document: letter.document.clone(),
+        truncated: letter.truncated,
+    })))
+}
+
+/// A sort key that puts the newest letter first.
+///
+/// The ordering helpers sort ascending, and what an operator wants to
+/// see first is the letter that has just arrived. Counted downwards
+/// and zero-padded so that it sorts as a number rather than as text.
+fn newest_first(sequence: u64) -> String {
+    format!("{:020}", u64::MAX - sequence)
+}
+
 /// The routes this module owns.
 pub(crate) fn routes() -> Router<AdminState> {
     Router::new()
@@ -488,6 +568,7 @@ pub(crate) fn routes() -> Router<AdminState> {
         .route("/api/v1/rules/{id}/enable", post(enable))
         .route("/api/v1/rules/{id}/disable", post(disable))
         .route("/api/v1/rules/{id}/stats", get(statistics_of))
+        .route("/api/v1/rules/{id}/dead-letters", get(dead_letters))
         .route("/api/v1/rule-stats", get(statistics))
 }
 
@@ -498,6 +579,7 @@ mod tests {
 
     use broker_core::broker::{Broker, BrokerConfig};
     use rules::singleton::{Membership, NodeId};
+    use sdmqtt_server::publish::Publication;
     use sdmqtt_server::shared::Shared;
     use storage::{MemoryStorage, Storage, Writer, WriterConfig};
 
@@ -514,6 +596,7 @@ mod tests {
         admin: AdminRunning,
         store: Arc<dyn Storage>,
         registry: Arc<Registry>,
+        shared: Arc<Shared>,
     }
 
     impl Node {
@@ -548,7 +631,7 @@ mod tests {
             };
             let admin = AdminServer::bind(
                 &config,
-                AdminState::new(shared).with_rules(Some(Arc::clone(&registry))),
+                AdminState::new(Arc::clone(&shared)).with_rules(Some(Arc::clone(&registry))),
             )
             .await
             .expect("loopback needs no token");
@@ -556,6 +639,7 @@ mod tests {
                 admin,
                 store,
                 registry,
+                shared,
             }
         }
 
@@ -585,6 +669,15 @@ mod tests {
 
         async fn delete(&self, path: &str) -> testing::Response {
             testing::request(self.admin.address(), "DELETE", path, None).await
+        }
+
+        /// One rule's dead letters, as JSON.
+        async fn dead_letters(&self, rule: &str) -> serde_json::Value {
+            let answered = self
+                .get(&format!("/api/v1/rules/{rule}/dead-letters"))
+                .await;
+            assert_eq!(answered.status, 200, "{}", answered.body);
+            serde_json::from_str(&answered.body).expect("dead letters are JSON")
         }
 
         /// One rule's statistics, as JSON.
@@ -1334,6 +1427,197 @@ mod tests {
             "switching a rule off and on again started its numbers over"
         );
         node.stop().await;
+    }
+
+    // -----------------------------------------------------------
+    // Dead letters
+    // -----------------------------------------------------------
+
+    /// A rule that gives up on an envelope keeps the letter where
+    /// somebody who was not watching can find it.
+    ///
+    /// The whole argument for this being a resource is that the page
+    /// is opened **after** the letter was published, so the test
+    /// opens it after: nothing is subscribed to anything while the
+    /// rule is failing.
+    #[tokio::test]
+    async fn a_rule_that_gives_up_keeps_the_letter_for_a_page_nobody_had_open() {
+        let node = Node::start(None).await;
+        // No retries and an endpoint that is not there, so the first
+        // attempt is the last and the envelope is abandoned at once.
+        let created = node
+            .post(
+                "/api/v1/rules",
+                r#"{"id":"telemetry","name":"Telemetry out","filter":"sensor/+/temp",
+                    "http_out":{"url":"http://127.0.0.1:1/","timeout_ms":100,
+                                "retries":0,"backoff_ms":10}}"#,
+            )
+            .await;
+        assert_eq!(created.status, 200, "{}", created.body);
+
+        assert_eq!(
+            node.dead_letters("telemetry").await["total"],
+            0,
+            "a rule that has dead-lettered nothing reported a letter"
+        );
+
+        node.post("/api/v1/publish", &publication("sensor/1/temp"))
+            .await;
+
+        let deadline = Instant::now() + PATIENCE;
+        let mut kept = node.dead_letters("telemetry").await;
+        while kept["total"] == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            kept = node.dead_letters("telemetry").await;
+        }
+        assert_eq!(kept["total"], 1, "the letter never reached the resource");
+
+        let letter = &kept["items"][0];
+        assert_eq!(letter["sequence"], 1);
+        assert_eq!(letter["topic"], "$sd/rules/telemetry/dlq");
+        assert_eq!(letter["truncated"], false);
+        let document = letter["document"].as_str().expect("a document");
+        assert!(
+            document.contains("\"attempts\":1"),
+            "the kept document is not the letter that was published: {document}"
+        );
+        assert!(
+            document.contains("sensor/1/temp"),
+            "the kept document does not carry the message that was given up on: {document}"
+        );
+
+        // And it is the same event the counter counted, rather than a
+        // second one this ring invented.
+        assert_eq!(
+            node.stats("telemetry").await["totals"]["dead_lettered"],
+            1,
+            "the ring and the counter disagree about how many letters there were"
+        );
+        node.stop().await;
+    }
+
+    /// A rule's letters survive it being switched off and on again.
+    ///
+    /// Switching a connector off is what an operator does *because* of
+    /// a dead letter, so a switch that discarded the evidence would
+    /// take it away at the moment it was being read.
+    #[tokio::test]
+    async fn a_rules_letters_survive_being_switched_off_and_on() {
+        let node = Node::start(None).await;
+        node.post(
+            "/api/v1/rules",
+            r#"{"id":"telemetry","name":"Telemetry out","filter":"sensor/+/temp",
+                "http_out":{"url":"http://127.0.0.1:1/","timeout_ms":100,
+                            "retries":0,"backoff_ms":10}}"#,
+        )
+        .await;
+        node.post("/api/v1/publish", &publication("sensor/1/temp"))
+            .await;
+
+        let deadline = Instant::now() + PATIENCE;
+        while node.dead_letters("telemetry").await["total"] == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(node.dead_letters("telemetry").await["total"], 1);
+
+        node.post("/api/v1/rules/telemetry/disable", "").await;
+        node.post("/api/v1/rules/telemetry/enable", "").await;
+        assert_eq!(
+            node.dead_letters("telemetry").await["total"],
+            1,
+            "switching the rule off and on again discarded the letter that made \
+             somebody switch it off"
+        );
+        node.stop().await;
+    }
+
+    /// A rule that does not exist is not a rule with no letters.
+    #[tokio::test]
+    async fn the_dead_letters_of_a_rule_that_does_not_exist_are_not_an_empty_list() {
+        let node = Node::start(None).await;
+        let answered = node.get("/api/v1/rules/nothing/dead-letters").await;
+        assert_eq!(answered.status, 404, "{}", answered.body);
+        assert_eq!(error_of(&answered.body).0, "not_found", "{}", answered.body);
+        node.stop().await;
+    }
+
+    // -----------------------------------------------------------
+    // What any of this costs the broker
+    // -----------------------------------------------------------
+
+    /// What a publication costs with a great many rules installed,
+    /// and what a page of their statistics costs beside it.
+    ///
+    /// **A measurement, not an assertion**, which is why it is
+    /// ignored: a wall clock on a shared machine is not a thing to
+    /// gate a build on. It is here for the same reason
+    /// `what_a_page_costs_under_the_lock` is in [`crate::resources`],
+    /// and it answers the same question about a different lock.
+    ///
+    /// The first number is the one that matters. A publication goes
+    /// through the broker's one lock, and the hook this milestone
+    /// installs reads the registry's map while it is held, so the
+    /// work under that lock is proportional to the rules on the node.
+    /// The second number is not under the broker lock at all — the
+    /// statistics resource never takes it — and is here to say what
+    /// the series costs to copy out.
+    ///
+    ///     cargo test -p sdmqtt-admin --release -- --ignored --nocapture what_rules_cost
+    #[tokio::test]
+    #[ignore = "a measurement, not an assertion"]
+    async fn what_rules_cost_the_broker() {
+        for rules in [0_usize, 10, 200, 1_000] {
+            let node = Node::start(None).await;
+            for n in 0..rules {
+                let written = format!(
+                    r#"{{"id":"rule-{n}","name":"Rule {n}","filter":"bench/{n}/+",
+                         "http_out":{{"url":"http://127.0.0.1:1/","timeout_ms":50,
+                                      "retries":250,"backoff_ms":3600000}}}}"#
+                );
+                let created = node.post("/api/v1/rules", &written).await;
+                assert_eq!(created.status, 200, "{}", created.body);
+            }
+
+            // **The publish itself and not a socket round trip.**
+            // The handler does nothing but read a body and call this,
+            // and a connection per request is tens of microseconds of
+            // noise that would bury the number being measured.
+            let rounds = 2_000;
+            let mut missed = Duration::ZERO;
+            let mut matched = Duration::ZERO;
+            for (topic, into) in [("bench/none/x", &mut missed), ("bench/7/x", &mut matched)] {
+                let started = Instant::now();
+                for _ in 0..rounds {
+                    sdmqtt_server::publish::publish(
+                        &node.shared,
+                        Publication {
+                            topic: topic.to_owned(),
+                            payload: bytes::Bytes::from_static(b"25.5"),
+                            qos: mqtt_codec::QoS::AtMostOnce,
+                            retain: false,
+                            message_expiry_interval: None,
+                            user_properties: Vec::new(),
+                            origin: "measurement".to_owned(),
+                        },
+                    )
+                    .await
+                    .expect("the publication is accepted");
+                }
+                *into = started.elapsed() / rounds;
+            }
+
+            let started = Instant::now();
+            let page = node.get("/api/v1/rule-stats?limit=100").await;
+            let stats = started.elapsed();
+            assert_eq!(page.status, 200);
+
+            println!(
+                "{rules:>5} rules: {missed:>9.2?} per publication matching none, \
+                 {matched:>9.2?} matching one, \
+                 {stats:>9.2?} for a page of 100 statistics over a socket"
+            );
+            node.stop().await;
+        }
     }
 
     /// The listing is a page with the same envelope as every other

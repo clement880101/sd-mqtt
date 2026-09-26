@@ -45,6 +45,42 @@
 //! length of it, which is the same mistake the resources module
 //! documents at length about the broker's own lock.
 //!
+//! # What the pass costs, measured
+//!
+//! The hook matches a message against every installed rule, which is
+//! work proportional to the rule count with the broker's one lock
+//! held. That is inherent rather than an oversight — a rule is a
+//! filter, and a publication has to be offered to each of them — but
+//! it is a number worth having rather than a shrug. One publication
+//! through `sdmqtt_server::publish`, release build, no socket:
+//!
+//! | rules | matching none | matching one |
+//! |---:|---:|---:|
+//! | 0 | 1.49 µs | 1.46 µs |
+//! | 10 | 2.41 µs | 4.15 µs |
+//! | 200 | 20.9 µs | 23.4 µs |
+//! | 1,000 | 97.8 µs | 103 µs |
+//!
+//! Linear, at about a tenth of a microsecond per rule, on top of the
+//! 1.5 µs a publication costs with no rules at all. Two hundred rules
+//! is 20 µs under the lock, which is a fiftieth of what the read
+//! resources cost before they were fixed and three orders of magnitude
+//! under the measurements recorded in the design's open questions.
+//!
+//! **A thousand rules is 100 µs, and that is the number to watch.**
+//! Nothing in section 9 imagines a node with a thousand rules, and if
+//! one ever exists the answer is the one `broker-core` already uses
+//! for subscriptions: put the rule filters in a matching trie instead
+//! of a list. That is not done here because a trie for two hundred
+//! filters is slower than a list of them, and because what is being
+//! avoided is a structure nobody has needed yet.
+//!
+//! `what_rules_cost_the_broker`, in `sdmqtt_admin::rules`, is the
+//! measurement. **Nothing else added here is under that lock**: the
+//! statistics, the dead letters and every rule resource read their
+//! own locks and never the broker's, and the outbox depth is a
+//! maintained number rather than a store read per rule.
+//!
 //! # A rule is durable before anything hangs off it
 //!
 //! The store refuses an envelope for a rule it does not hold, and the
@@ -89,6 +125,7 @@ use crate::bridge::marker::Marker;
 use crate::bridge::rewrite::Rewrite;
 use crate::bridge::session::Bridge;
 use crate::bridge::supervisor::Supervisor;
+use crate::dlq::{DeadLetter, DeadLetterLog};
 use crate::http_out::{client, DeadLetters, Delivery, Poster};
 use crate::http_poll::Poller;
 use crate::rule::{Action, Rule, RuleId};
@@ -184,6 +221,12 @@ struct Installed {
     /// `None` for an ingest rule, which has no pump, and for a
     /// singleton that is switched off.
     pump: Option<JoinHandle<()>>,
+    /// The dead letters this rule has produced.
+    ///
+    /// Kept across an update for the reason the statistics are: a rule
+    /// being edited is the same rule, and a letter it produced ten
+    /// minutes ago is still the thing an operator came to look at.
+    dlq: Arc<DeadLetterLog>,
     /// What this rule has been doing, and the series of it.
     ///
     /// **Kept across an update**, which is why it is taken from the
@@ -247,8 +290,6 @@ pub struct Registry {
     store: Arc<dyn Storage>,
     /// How anything is written down.
     writer: Arc<Writer>,
-    /// Where an exhausted envelope goes.
-    dead_letters: Arc<dyn DeadLetters>,
     /// Who is live, which is who owns the singletons.
     ///
     /// Held because dropping it would leave every
@@ -275,15 +316,11 @@ impl Registry {
         writer: Arc<Writer>,
         membership: Arc<Membership>,
     ) -> Arc<Self> {
-        let dead_letters: Arc<dyn DeadLetters> = Arc::new(BrokerDeadLetters {
-            shared: Arc::clone(&shared),
-        });
         let registry = Arc::new(Self {
             shared,
             store,
             writer,
             membership,
-            dead_letters,
             client: client(),
             ingest: Arc::new(Ingest::new()),
             installed: RwLock::new(BTreeMap::new()),
@@ -391,6 +428,10 @@ impl Registry {
         // edited, disabled or enabled is the same rule, and an
         // operator watching its chart has not asked for it to start
         // over. A rule this node has not held before starts at zero.
+        let dlq = self.installed.read().get(&rule.id).map_or_else(
+            || Arc::new(DeadLetterLog::new()),
+            |held| Arc::clone(&held.dlq),
+        );
         let stats = self.installed.read().get(&rule.id).map_or_else(
             || {
                 // The same four numbers also reach Prometheus, and
@@ -410,7 +451,7 @@ impl Registry {
         // resolves by closing one of them.
         self.uninstall(&rule.id);
 
-        let installed = self.start(rule, outbox, stats);
+        let installed = self.start(rule, outbox, stats, dlq);
         self.installed
             .write()
             .insert(installed.rule.id.clone(), installed);
@@ -518,6 +559,18 @@ impl Registry {
             .map(|held| (held.stats.totals(held.waiting()), held.stats.series()))
     }
 
+    /// The dead letters one rule has kept, oldest first, and how many
+    /// it has produced altogether.
+    ///
+    /// `None` when there is no such rule, which a caller has to be
+    /// able to tell from a rule that has dead-lettered nothing.
+    pub fn dead_letters_of(&self, id: &RuleId) -> Option<(u64, Vec<DeadLetter>)> {
+        self.installed
+            .read()
+            .get(id)
+            .map(|held| (held.dlq.produced(), held.dlq.recent()))
+    }
+
     /// Close one interval of every rule's series.
     ///
     /// The handles and the depths are copied out under the read lock
@@ -582,7 +635,13 @@ impl Registry {
     ///
     /// Takes no lock and is called with none held. Everything it does
     /// is a spawn or a map insert on the ingest routes.
-    fn start(&self, rule: Rule, outbox: Option<Arc<Outbox>>, stats: Arc<RuleStats>) -> Installed {
+    fn start(
+        &self,
+        rule: Rule,
+        outbox: Option<Arc<Outbox>>,
+        stats: Arc<RuleStats>,
+        dlq: Arc<DeadLetterLog>,
+    ) -> Installed {
         match &rule.action {
             Action::HttpOut(action) => {
                 let outbox = outbox.expect("an http_out rule is opened with an outbox");
@@ -600,7 +659,10 @@ impl Registry {
                             Arc::clone(&self.writer),
                             poster,
                             action,
-                            Arc::clone(&self.dead_letters),
+                            Arc::new(BrokerDeadLetters {
+                                shared: Arc::clone(&self.shared),
+                                kept: Arc::clone(&dlq),
+                            }),
                         )
                         .with_stats(Arc::clone(&stats));
                         Some(tokio::spawn(delivery.run()))
@@ -623,6 +685,7 @@ impl Registry {
                     wake: None,
                     pump,
                     stats,
+                    dlq,
                 }
             }
             Action::HttpPoll(action) => {
@@ -670,6 +733,7 @@ impl Registry {
                     wake: None,
                     pump,
                     stats,
+                    dlq,
                 }
             }
             Action::MqttBridge(action) => {
@@ -724,6 +788,7 @@ impl Registry {
                     wake: Some(wake),
                     pump,
                     stats,
+                    dlq,
                 }
             }
             Action::HttpIn(action) => {
@@ -746,6 +811,7 @@ impl Registry {
                     wake: None,
                     pump: None,
                     stats,
+                    dlq,
                 }
             }
         }
@@ -898,7 +964,7 @@ impl Hook for RuleHook {
     }
 }
 
-/// Publishes a dead letter back into the broker.
+/// Publishes a dead letter back into the broker, and keeps it.
 ///
 /// Section 9.2 sends an envelope that ran out of attempts to
 /// `$sd/rules/<id>/dlq`. This is called from a pump's task rather than
@@ -916,14 +982,28 @@ impl Hook for RuleHook {
 /// rule with it would be a cycle with a guaranteed period, and one
 /// whose every turn writes another envelope into the outbox that is
 /// already backed up.
+///
+/// **And keeps it**, which is section 11.1's half of the same event:
+/// the letter goes on the topic for anything subscribed, and a copy
+/// goes in the rule's bounded ring for the page nobody had open when
+/// it happened. See [`crate::dlq`] for why that is a ring here rather
+/// than a subscription there.
+///
+/// One of these per rule rather than one for the node, so that the
+/// ring it fills is the rule's own and nothing has to work out whose
+/// letter this was from the topic it is going to.
 struct BrokerDeadLetters {
     shared: Arc<Shared>,
+    kept: Arc<DeadLetterLog>,
 }
 
 impl DeadLetters for BrokerDeadLetters {
     fn dead_letter(&self, topic: &str, payload: Vec<u8>) {
-        let message = Message::new(topic, Bytes::from(payload), QoS::AtMostOnce, false);
         let now = now_seconds();
+        // Kept before it is published, so that a page refreshed the
+        // instant a subscriber saw the letter finds it here too.
+        self.kept.record(topic, now, &payload);
+        let message = Message::new(topic, Bytes::from(payload), QoS::AtMostOnce, false);
         let mut out = Vec::new();
         self.shared.with_broker(|broker| {
             broker.publish(message, None, now, &mut out);

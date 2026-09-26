@@ -643,6 +643,21 @@ fn until(admin: SocketAddr, path: &str, what: &str, ready: impl Fn(&str) -> bool
     }
 }
 
+/// What lies between `open` and the next `close`.
+///
+/// A search rather than a parse, for the reason [`Received::field`]
+/// gives: a renamed key or a changed shape is a failure here too,
+/// which a tolerant parser would let through.
+#[track_caller]
+fn between(text: &str, open: &str, close: &str) -> String {
+    let start = text
+        .find(open)
+        .unwrap_or_else(|| panic!("no {open} in {text}"))
+        + open.len();
+    let rest = &text[start..];
+    rest[..rest.find(close).expect("the value is closed")].to_owned()
+}
+
 /// Wait until something is accepting on `address`.
 #[track_caller]
 fn accepting(address: SocketAddr, what: &str) {
@@ -927,11 +942,12 @@ fn the_attempt_count_survives_the_kill() {
     let config = workspace.path().join("sdmqtt.toml");
     let endpoint = Endpoint::start();
     let mqtt = loopback(free_port());
+    let admin = loopback(free_port());
     write_config(
         &config,
         &store,
         mqtt,
-        loopback(free_port()),
+        admin,
         loopback(free_port()),
         &rule_posting_to(&endpoint.url(), RETRIES, 50),
     );
@@ -957,6 +973,11 @@ fn the_attempt_count_survives_the_kill() {
 
     let _restarted =
         BrokerProcess::start(&config, &store, mqtt, workspace.path().join("second.log"));
+    // **The admin listener binds last**, after the MQTT listener this
+    // test's start already waited for and after the ingest one; a
+    // request made before it is bound is a connection refused rather
+    // than a retry.
+    accepting(admin, "the admin listener after the restart");
     let mut watcher = Client::connect(mqtt, "dead-letter-watcher");
     watcher.subscribe(DLQ);
 
@@ -968,6 +989,35 @@ fn the_attempt_count_survives_the_kill() {
     assert!(
         document.contains(&format!("\"attempts\":{}", u32::from(RETRIES) + 1)),
         "the dead letter must say the rule's number of attempts was reached: {document}"
+    );
+
+    // **And the same letter is in the resource**, which is where
+    // somebody who was not subscribed at the moment finds it. The two
+    // are one event: the topic is section 9.2's and the resource is
+    // section 11.1's, and a page showing one letter while a subscriber
+    // saw another would be two answers to one question.
+    //
+    // Matched on the envelope's own identifier rather than on the
+    // resource being non-empty, because non-empty is what a resource
+    // that invented a letter would also be.
+    let id = between(&document, "\"id\":\"", "\"");
+    let kept = until(
+        admin,
+        &format!("/api/v1/rules/{RULE}/dead-letters"),
+        "the dead letter reaches the resource",
+        |body| body.contains(&id),
+    );
+    assert!(
+        kept.contains("\\\"attempts\\\":4"),
+        "the resource kept something other than the document that was published: {kept}"
+    );
+    assert!(
+        kept.contains(DLQ),
+        "the resource does not say which topic the letter went to: {kept}"
+    );
+    assert!(
+        kept.contains("\"truncated\":false"),
+        "a letter that fits was reported as cut: {kept}"
     );
 
     // **The assertion the durable count exists for.** The endpoint has
@@ -1079,6 +1129,11 @@ fn an_http_post_reaches_a_subscriber_across_a_restart() {
 
     let broker = BrokerProcess::start(&config, &store, mqtt, workspace.path().join("first.log"));
     accepting(ingest, "the ingest listener");
+    // **The admin listener binds last**, after the MQTT listener this
+    // test's start already waited for and after the ingest one; a
+    // request made before it is bound is a connection refused rather
+    // than a retry.
+    accepting(admin, "the admin listener");
 
     // ---- a subscriber whose session outlives its connection --------
     {
@@ -1187,6 +1242,11 @@ fn the_ingest_listener_serves_ingest_and_nothing_else() {
 
     let _broker = BrokerProcess::start(&config, &store, mqtt, workspace.path().join("log"));
     accepting(ingest, "the ingest listener");
+    // **The admin listener binds last**, after the MQTT listener this
+    // test's start already waited for and after the ingest one; a
+    // request made before it is bound is a connection refused rather
+    // than a retry.
+    accepting(admin, "the admin listener");
 
     // Nothing of the admin listener's is on the ingest listener.
     for path in ["/", "/api/v1/publish", "/api/v1/retained", "/metrics"] {
@@ -1371,6 +1431,8 @@ fn a_cycle_of_connectors_is_driven_into_the_hop_limit() {
     );
     let broker = BrokerProcess::start(&config, &store, mqtt, workspace.path().join("broker.log"));
     accepting(ingest, "the ingest listener");
+    // The admin listener binds last; see the note in the test above.
+    accepting(admin, "the admin listener");
 
     let path = format!("/ingest/{CYCLE_INGEST}");
     let post = |hops: Option<u32>| {
@@ -1653,6 +1715,22 @@ fn a_rule_created_over_the_api_fires_and_still_fires_after_a_restart() {
         endpoint.requests()[0].field("topic"),
         API_TOPIC,
         "the endpoint was posted something other than the message that fired the rule"
+    );
+
+    // **Wait for the rule to be finished with it before killing the
+    // broker.** The endpoint records a request when it reads one,
+    // which is before it has answered and long before the pump has
+    // made the envelope's removal durable; a kill in that window
+    // leaves the envelope in the outbox, and the restarted broker
+    // delivers it again. The second request would then be the first
+    // envelope coming back rather than the second publication, which
+    // is a different test passing under this one's name — and is what
+    // the assertion on the two identifiers below caught.
+    until(
+        admin,
+        &format!("/api/v1/rules/{API_RULE}/stats"),
+        "the first envelope is delivered and out of the outbox",
+        |body| body.contains("\"delivered\":1") && body.contains("\"waiting\":0"),
     );
 
     // No destructor, no final flush, no clean close of the store.
