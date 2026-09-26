@@ -117,6 +117,30 @@ The reverse also holds: when a property fails, check whether it asserts
 something the protocol actually promises before assuming a defect. Once it
 did not, and the harness was wrong.
 
+## 7b. Restoring a mutation has two requirements that fight
+
+Three agents have lost an hour each to the same shape, in three
+disguises. Mutation testing means editing a file, building, running, and
+putting it back. Putting it back is where the time goes.
+
+- **A scripted replacement that matches nothing reports the mutation as
+  surviving**, when it was never applied. Assert that the replacement
+  changed something.
+- **A backup restored with a fresh modification time** can leave the
+  build believing a stale binary is current, so later runs silently test
+  mutated code. The symptom is unrelated tests failing for no reason.
+- **A backup restored with its original modification time** can leave the
+  restored file older than the object built from the mutated one, so the
+  build links the mutation you just undid. The symptom is a result about
+  nothing.
+
+The last two are the same requirement pointing in opposite directions:
+restore the contents exactly, and make the timestamp newer than the last
+build. Do both, and say in the runner why.
+
+And do not run two builds against this repository at once. One rewrites
+the binary the other's tests are spawning.
+
 ## 8. A spec section is not a task list
 
 Six features that section 5.4 of the design listed as in scope for v1 had
