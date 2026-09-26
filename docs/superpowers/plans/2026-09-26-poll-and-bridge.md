@@ -225,13 +225,17 @@ The last two are the pair that matters, and each alone leaves the loop open.
 
 **Files:**
 - Modify: `crates/sdmqtt/tests/rules.rs`
+- Modify: `crates/sdmqtt/tests/bridge.rs` — the bridge half went here
+  rather than in `rules.rs`, because two brokers over real sockets is
+  what `bridge.rs` already is and the alternative was a second copy of
+  that harness.
 
 A poller resumes on its interval after a restart. A bridge reconnects, and a
 message in flight when the broker was killed is not lost.
 
 Kill, do not stop.
 
-- [ ] **Step 1: Write them, run them, commit**
+- [x] **Step 1: Write them, run them, commit**
 
 ```bash
 git commit -m "test: a poller and a bridge come back"

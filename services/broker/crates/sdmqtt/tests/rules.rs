@@ -150,6 +150,13 @@ struct Endpoint {
     received: Arc<Mutex<Vec<Received>>>,
     accepting: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
+    /// What a request is answered with.
+    ///
+    /// Empty is the `204 No Content` this endpoint has always
+    /// answered, which is what a webhook does. A poller fetches rather
+    /// than posts and wants something back, so it sets this and gets a
+    /// `200` with a body.
+    body: Arc<Mutex<Vec<u8>>>,
 }
 
 impl Endpoint {
@@ -164,19 +171,22 @@ impl Endpoint {
         let received = Arc::new(Mutex::new(Vec::new()));
         let accepting = Arc::new(AtomicBool::new(true));
         let stopped = Arc::new(AtomicBool::new(false));
+        let body = Arc::new(Mutex::new(Vec::new()));
 
         std::thread::spawn({
             let received = Arc::clone(&received);
             let accepting = Arc::clone(&accepting);
             let stopped = Arc::clone(&stopped);
+            let body = Arc::clone(&body);
             move || {
                 while !stopped.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             let received = Arc::clone(&received);
                             let accepting = Arc::clone(&accepting);
+                            let body = Arc::clone(&body);
                             std::thread::spawn(move || {
-                                serve(stream, &received, &accepting);
+                                serve(stream, &received, &accepting, &body);
                             });
                         }
                         Err(_) => std::thread::sleep(Duration::from_millis(5)),
@@ -190,7 +200,13 @@ impl Endpoint {
             received,
             accepting,
             stopped,
+            body,
         }
+    }
+
+    /// Answer every request with this body from now on.
+    fn answers(&self, body: &[u8]) {
+        *self.body.lock().expect("not poisoned") = body.to_vec();
     }
 
     fn url(&self) -> String {
@@ -239,7 +255,12 @@ impl Drop for Endpoint {
 }
 
 /// Read one request, record it, and answer.
-fn serve(mut stream: TcpStream, received: &Arc<Mutex<Vec<Received>>>, accepting: &AtomicBool) {
+fn serve(
+    mut stream: TcpStream,
+    received: &Arc<Mutex<Vec<Received>>>,
+    accepting: &AtomicBool,
+    body_to_answer: &Arc<Mutex<Vec<u8>>>,
+) {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("a read deadline");
@@ -280,15 +301,24 @@ fn serve(mut stream: TcpStream, received: &Arc<Mutex<Vec<Received>>>, accepting:
         .expect("not poisoned")
         .push(Received { body });
 
-    let status = if accepting.load(Ordering::SeqCst) {
+    let answer = body_to_answer.lock().expect("not poisoned").clone();
+    let status = if !accepting.load(Ordering::SeqCst) {
+        "503 Service Unavailable"
+    } else if answer.is_empty() {
         "204 No Content"
     } else {
-        "503 Service Unavailable"
+        "200 OK"
     };
     let _ = stream.write_all(
-        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .as_bytes(),
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            answer.len()
+        )
+        .as_bytes(),
     );
+    if status.starts_with("200") {
+        let _ = stream.write_all(&answer);
+    }
     let _ = stream.flush();
 }
 
@@ -1403,6 +1433,129 @@ fn a_cycle_of_connectors_is_driven_into_the_hop_limit() {
         exposition.contains("sdmqtt_publications_over_hop_limit_total 1"),
         "the drop is counted: {exposition}"
     );
+
+    broker.kill();
+}
+
+// ---- task 4: a poller comes back -----------------------------------------
+
+/// How long between the start of one fetch and the next, for the poller
+/// below.
+///
+/// Short, because the test's evidence is a count of fetches over a
+/// handful of intervals and a long one would make the test a sleep.
+const POLL_INTERVAL: Duration = Duration::from_millis(300);
+
+/// The polling rule's identifier.
+const POLL_RULE: &str = "readings";
+
+/// Where the poller publishes what it fetched.
+const POLL_TOPIC: &str = "polled/readings";
+
+/// What the endpoint answers a fetch with.
+const READING: &[u8] = b"21.5";
+
+/// A `[[rules]]` table fetching `url` on [`POLL_INTERVAL`].
+fn rule_polling(url: &str) -> String {
+    format!(
+        r#"
+[[rules]]
+id = "{POLL_RULE}"
+name = "Readings in"
+
+[rules.http_poll]
+url = "{url}"
+interval_ms = {interval}
+timeout_ms = 2000
+topic = "{POLL_TOPIC}"
+qos = 1
+"#,
+        interval = POLL_INTERVAL.as_millis(),
+    )
+}
+
+/// **A poller resumes on its interval after a restart.** Task 4.
+///
+/// A poller has no outbox and nothing durable of its own — that is the
+/// connector rather than an omission, because a fetch that failed has
+/// lost nothing and is simply asked again. So what a restart has to
+/// prove here is not that something survived but that the schedule
+/// starts again by itself: the rule is read back out of the store, the
+/// singleton is claimed again, and the interval runs.
+///
+/// **Killed, not stopped.** A clean close of the store persists
+/// everything, so a politely restarted broker would prove nothing about
+/// what was written down — and the rule this poller is restored from is
+/// written down. [`BrokerProcess::kill`] asserts the signal.
+///
+/// The middle assertion is the one that makes this a restart test: the
+/// endpoint is asked nothing at all while the process is dead. Without
+/// it, an endpoint that had simply gone on being polled by a broker
+/// nobody killed would pass.
+#[test]
+fn a_poller_resumes_on_its_interval_after_a_restart() {
+    let endpoint = Endpoint::start();
+    endpoint.answers(READING);
+
+    let workspace = tempfile::tempdir().expect("a temporary directory");
+    let store = workspace.path().join("store");
+    let config = workspace.path().join("sdmqtt.toml");
+    let mqtt = loopback(free_port());
+    let admin = loopback(free_port());
+    let ingest = loopback(free_port());
+    write_config(
+        &config,
+        &store,
+        mqtt,
+        admin,
+        ingest,
+        &rule_polling(&endpoint.url()),
+    );
+
+    let broker = BrokerProcess::start(&config, &store, mqtt, workspace.path().join("first.log"));
+    endpoint.wait_for(2, "the poller fetches on its interval before the kill");
+
+    // A subscriber sees what was fetched, which is the half of the
+    // connector a count of requests cannot see.
+    let mut before = Client::connect(mqtt, "watcher-before");
+    before.subscribe(POLL_TOPIC);
+    let delivered = before
+        .delivery_within(PATIENCE)
+        .expect("the poller publishes what it fetched");
+    assert_eq!(delivered.topic, POLL_TOPIC);
+    assert_eq!(&delivered.payload[..], READING);
+    drop(before);
+
+    let fetched_by_the_kill = endpoint.count();
+    broker.kill();
+
+    // **Nothing is fetched while there is no broker.** Several
+    // intervals of it, so this is a real absence rather than a race
+    // with the next one.
+    std::thread::sleep(POLL_INTERVAL * 5);
+    assert_eq!(
+        endpoint.count(),
+        fetched_by_the_kill,
+        "a killed broker polls nothing; if this grew, the test is watching \
+         something it did not kill"
+    );
+
+    let broker = BrokerProcess::start(&config, &store, mqtt, workspace.path().join("again.log"));
+
+    // And the schedule runs again. Three more, so this is an interval
+    // rather than a single fetch at startup.
+    endpoint.wait_for(
+        fetched_by_the_kill + 3,
+        "the poller resumes on its interval after the restart",
+    );
+
+    let mut after = Client::connect(mqtt, "watcher-after");
+    after.subscribe(POLL_TOPIC);
+    let delivered = after
+        .delivery_within(PATIENCE)
+        .expect("and publishes what it fetched, to a subscriber that was not there before");
+    assert_eq!(delivered.topic, POLL_TOPIC);
+    assert_eq!(&delivered.payload[..], READING);
 
     broker.kill();
 }

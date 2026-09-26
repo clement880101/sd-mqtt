@@ -129,6 +129,39 @@ impl BrokerProcess {
     }
 }
 
+impl BrokerProcess {
+    /// Kill it, running no destructor, and prove that is what
+    /// happened.
+    ///
+    /// The same assertion `tests/rules.rs` makes and for the same
+    /// reason: a clean close of the store persists everything, so a
+    /// politely stopped broker proves nothing about what was written
+    /// down, and a kill that had quietly become an orderly shutdown
+    /// would go on passing and stop meaning anything.
+    fn kill_and_prove_it(&mut self) {
+        self.child
+            .kill()
+            .expect("the broker is still there to kill");
+        let status = self.child.wait().expect("it can be waited for");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(9),
+                "the broker must die of SIGKILL, which runs no destructor; \
+                 anything that lets it close its store proves nothing about \
+                 durability"
+            );
+        }
+        #[cfg(not(unix))]
+        assert!(
+            !status.success(),
+            "the broker must be killed rather than allowed to stop"
+        );
+    }
+}
+
 impl Drop for BrokerProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -155,6 +188,22 @@ fn loopback(port: u16) -> SocketAddr {
 /// their defaults, because two brokers in one test and several tests at
 /// once would otherwise all try to bind the same two.
 fn write_config(path: &Path, store: &Path, mqtt: SocketAddr, rules: &str) {
+    write_config_with_storage(path, store, mqtt, "", rules);
+}
+
+/// The same, with extra lines in the `[storage]` table.
+///
+/// One caller: the restart test below turns off both of the writer's
+/// own flush triggers, so that anything which survives a kill survived
+/// because somebody waited on it rather than because a timer went off.
+/// `tests/rules.rs` has the argument in full.
+fn write_config_with_storage(
+    path: &Path,
+    store: &Path,
+    mqtt: SocketAddr,
+    storage: &str,
+    rules: &str,
+) {
     let text = format!(
         r#"
 [listener]
@@ -170,6 +219,7 @@ address = "{ingest}"
 [storage]
 directory = "{store}"
 sync = "immediate"
+{storage}
 
 [log]
 level = "info"
@@ -237,11 +287,22 @@ struct Bridged {
     /// needs to be more than a socket reopening.
     far_config: PathBuf,
     far_store: PathBuf,
+    /// The same, for the near broker, so that the restart test can
+    /// kill the broker the bridge belongs to and start it again on
+    /// what it left behind.
+    near_config: PathBuf,
+    near_store: PathBuf,
     dir: tempfile::TempDir,
 }
 
 impl Bridged {
     fn start() -> Self {
+        Self::start_with_storage("")
+    }
+
+    /// The same, with extra `[storage]` lines on the **near** broker,
+    /// which is the one the restart test kills.
+    fn start_with_storage(storage: &str) -> Self {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let near_address = loopback(free_port());
         let far_address = loopback(free_port());
@@ -258,10 +319,11 @@ impl Bridged {
 
         let near_config = dir.path().join("near.toml");
         let near_store = dir.path().join("near-store");
-        write_config(
+        write_config_with_storage(
             &near_config,
             &near_store,
             near_address,
+            storage,
             &bridge_to(far_address),
         );
         let near = BrokerProcess::start(
@@ -279,8 +341,56 @@ impl Bridged {
             far,
             far_config,
             far_store,
+            near_config,
+            near_store,
             dir,
         }
+    }
+
+    /// Kill the far broker and leave it dead, so that the bridge has
+    /// nowhere to deliver and its outbox fills.
+    fn kill_far(&mut self) {
+        let _ = self.far.child.kill();
+        let _ = self.far.child.wait();
+    }
+
+    /// Kill the near broker — the one the bridge belongs to.
+    ///
+    /// **Killed, not stopped**, and the signal is asserted: a clean
+    /// close of the store persists everything, so a politely stopped
+    /// broker would prove nothing about what was written down.
+    ///
+    /// Separate from starting it again, because what happens between
+    /// the two is the whole of the test: a caller that killed and
+    /// restarted in one step could not put a subscriber on the far
+    /// broker while this one was dead, and the message would then be
+    /// carried to a broker nobody was listening on.
+    fn kill_near(&mut self) {
+        self.near.kill_and_prove_it();
+    }
+
+    /// Start the near broker again on the port and store it had.
+    fn start_near_again(&mut self, log: &str) {
+        let address = self.near.address;
+        // A fresh log, so an assertion about what the new process said
+        // cannot be satisfied by what the old one said.
+        self.near = BrokerProcess::start(
+            &self.near_config,
+            &self.near_store,
+            address,
+            self.dir.path().join(log),
+        );
+    }
+
+    /// Start the far broker again on the port and store it had.
+    fn start_far_again(&mut self, log: &str) {
+        let address = self.far.address;
+        self.far = BrokerProcess::start(
+            &self.far_config,
+            &self.far_store,
+            address,
+            self.dir.path().join(log),
+        );
     }
 
     /// Stop the far broker and start it again on the same port, with
@@ -987,4 +1097,90 @@ fn bridged_to_the_conformance_suites_own_broker() {
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+}
+
+// ---- task 4: the bridge comes back ---------------------------------------
+
+/// **A bridge reconnects after the broker is killed, and the message
+/// that was in flight arrives.** Task 4.
+///
+/// The sequence is the one that makes it a durability test rather than
+/// a reconnection test:
+///
+/// 1. The bridge is up, so there is nothing clever about the first
+///    connection.
+/// 2. The far broker is killed, so the bridge has nowhere to deliver.
+/// 3. A client publishes on the near broker, on the bridge's outbound
+///    filter, at least once. The acknowledgement it gets back is
+///    section 7.3's promise that the message is durable — and the
+///    bridge cannot have sent it, because there is nothing to send it
+///    to. **This is the message in flight.**
+/// 4. The near broker is killed with `SIGKILL`, which runs no
+///    destructor: no final flush, no clean close of the store. The
+///    exit status is checked, because a kill that had quietly become an
+///    orderly shutdown would go on passing and stop meaning anything.
+/// 5. Both brokers come back on the ports and stores they had.
+/// 6. The message arrives at the far broker.
+///
+/// The writer is told never to flush on its own — an hour between
+/// interval flushes and a billion records before a count flush — so
+/// nothing that survives here survived because a timer went off. What
+/// is left is a batch somebody waited on, and the waiter is the
+/// publishing client's own acknowledgement.
+///
+/// # And it asserts what the in-flight window's deferral costs
+///
+/// `rules::bridge::supervisor` rules that the window stays in memory,
+/// and that the first connection of a process therefore asks for a
+/// clean start whatever `mqtt_bridge.clean_start` says. That decision
+/// is what makes the outbox the only thing carrying this message
+/// across the restart, and it is asserted here rather than left as
+/// prose: the restarted broker must say it is doing it, because what
+/// it throws away — whatever the remote was holding for us — is a loss
+/// this broker cannot see and will never count.
+#[test]
+fn a_bridge_reconnects_and_the_message_in_flight_arrives() {
+    let mut bridged =
+        Bridged::start_with_storage("flush_interval_ms = 3600000\nflush_records = 1000000000");
+    let near_address = bridged.near.address;
+    let far_address = bridged.far.address;
+
+    // The far broker goes, so the bridge has nowhere to put anything.
+    bridged.kill_far();
+    bridged.near.wait_for_log("this connection is over");
+
+    // In flight: accepted by the near broker, promised durable to its
+    // publisher, and not yet carried.
+    let mut publisher = Client::connect(near_address, "near-publisher");
+    publisher.publish_and_wait("sensors/9/temp", b"in flight", Properties::default());
+    drop(publisher);
+
+    // **Killed, not stopped**, and killed **first**. A near broker
+    // still running when the far one came back would reconnect and
+    // deliver the message at once, to a far broker nobody is
+    // subscribed on, and the restart would then be carrying nothing.
+    // The first draft of this test had the two the other way round and
+    // passed on whichever won the race.
+    bridged.kill_near();
+
+    bridged.start_far_again("far-again.log");
+    let mut watcher = Client::connect(far_address, "far-watcher");
+    watcher.subscribe("from-a/#");
+
+    // And only now the broker that was killed, so that what crosses
+    // crosses after the restart, into a subscription already there.
+    bridged.start_near_again("near-again.log");
+
+    let arrived = watcher
+        .delivery_within(PATIENCE)
+        .unwrap_or_else(|| panic!("the message never crossed: {}", bridged.near.logged()));
+    assert_eq!(arrived.topic, "from-a/sensors/9/temp");
+    assert_eq!(&arrived.payload[..], b"in flight");
+
+    let logged = bridged.near.logged();
+    assert!(
+        logged.contains("this is the first connection of this process"),
+        "the restarted bridge must say it is asking for a clean start, because what \
+         that discards is a loss nothing here counts: {logged}"
+    );
 }
