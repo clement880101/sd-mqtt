@@ -77,6 +77,14 @@ jobs:
         run: npm ci
       - name: Types
         run: npm run typecheck
+      # The sparkline's geometry, run by the runtime rather than by a
+      # test framework: `node --test` is in Node and the function under
+      # test is pure, so this costs no dependency. It is not a test of
+      # the page -- see `src/drawing.test.ts` for what it does and does
+      # not guard -- but a test nobody runs guards nothing at all, so it
+      # runs here.
+      - name: Tests
+        run: npm test
       - name: Build
         run: npm run build
       - name: The notices may not drift from the bundle
