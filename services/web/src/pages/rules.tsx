@@ -1712,7 +1712,16 @@ export function Rules() {
       </div>
 
       {opened.value ? (
-        <section class="letters">
+        // **Keyed by the rule, and that is not a list-diffing nicety.**
+        // `DeadLetters` fetches inside an effect, and an effect tracks
+        // the signals its body read: `generation`, and nothing else.
+        // `id` is a plain prop, so opening one rule's letters and then
+        // another's would reuse this component instance, leave the
+        // effect un-run, and leave the first rule's letters on screen
+        // under a heading naming the second — which is the second time
+        // an operator uses this panel. The key makes the instance a new
+        // one, which runs the effect.
+        <section class="letters" key={opened.value}>
           <h2>What {opened.value} gave up on</h2>
           <DeadLetters id={opened.value} />
         </section>
