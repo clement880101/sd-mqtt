@@ -869,6 +869,37 @@ impl Config {
                 });
             }
         }
+
+        // **The loop no single rule is wrong in.** `to_rule` above has
+        // already refused a bridge whose own entries feed each other;
+        // this is the pair that feeds each other through one remote,
+        // which is invisible from inside either rule and which nothing
+        // closes on MQTT 3.1.1. Here rather than in `to_rule` because
+        // this is the first place that has the whole set.
+        let bridges: Vec<(String, rules::MqttBridge)> = self
+            .rules
+            .iter()
+            .filter_map(|section| {
+                let rule = section.to_rule().ok()?;
+                match rule.action {
+                    rules::Action::MqttBridge(action) => Some((section.id.clone(), *action)),
+                    _ => None,
+                }
+            })
+            .collect();
+        rules::bridge::topics::check_across(
+            bridges.iter().map(|(id, action)| (id.as_str(), action)),
+        )
+        .map_err(|error| ConfigError::Rule {
+            // The rule whose outbound entry starts the cycle. The
+            // message names both, because neither of the two is the
+            // wrong one on its own.
+            id: match &error {
+                rules::TopicError::LoopsAcrossRules(across) => across.out_rule.clone(),
+                _ => String::new(),
+            },
+            why: error.to_string(),
+        })?;
         Ok(())
     }
 
@@ -1446,6 +1477,67 @@ mod tests {
         assert_eq!(bridge.topics[0].qos, QoS::AtLeastOnce);
         assert_eq!(bridge.topics[0].remote_prefix, "from-a/");
         assert!(rule.trigger.is_none(), "a bridge has no rule-level filter");
+    }
+
+    /// Two bridge rules to one remote that feed each other do not
+    /// start the broker.
+    ///
+    /// The refusal below takes one bridge and runs once per rule, and
+    /// neither of these is wrong on its own — asserted, so that this
+    /// cannot be passing for that reason. What closes the cycle is
+    /// this broker: `to-b` carries `sensors/#` out under `from-a/`,
+    /// `from-b` reads `from-a/sensors/#` back off the same remote and
+    /// publishes it here as `sensors/#`, which is what `to-b` carries.
+    /// The marker catches that one turn late on MQTT 5 and not at all
+    /// on 3.1.1.
+    #[test]
+    fn two_bridges_to_one_remote_that_feed_each_other_do_not_start() {
+        const BACK: &str = r##"
+        [[rules]]
+        id = "from-b"
+        name = "Bridge back from B"
+
+        [rules.mqtt_bridge]
+        address = "mqtts://remote.invalid:8883"
+        client_id = "bridge-back"
+
+        [[rules.mqtt_bridge.topics]]
+        filter = "sensors/#"
+        direction = "in"
+        qos = 1
+        remote_prefix = "from-a/"
+        "##;
+
+        let both = Config::from_toml(&with_rule(&format!("{MINIMAL_BRIDGE}\n{BACK}")))
+            .expect("every key is known");
+        for rule in &both.rules {
+            rule.to_rule()
+                .unwrap_or_else(|error| panic!("{} is wrong on its own: {error:?}", rule.id));
+        }
+        let refused = both
+            .validate()
+            .expect_err("two bridges that loop through one remote must not start a broker");
+        let ConfigError::Rule { id, why } = &refused else {
+            panic!("the wrong refusal: {refused}");
+        };
+        assert_eq!(id, "to-b", "the refusal names the wrong rule");
+        assert!(
+            why.contains("from-b") && why.contains("are both connected to"),
+            "the refusal should name both rules and the remote: {why}"
+        );
+
+        // The same pair, pointed at two remotes, starts: nothing
+        // carries what one published onto the other. Without this the
+        // assertion above would be satisfied by refusing every second
+        // bridge.
+        let apart = Config::from_toml(&with_rule(&format!(
+            "{MINIMAL_BRIDGE}\n{}",
+            BACK.replace("remote.invalid", "elsewhere.invalid")
+        )))
+        .expect("every key is known");
+        apart
+            .validate()
+            .expect("two bridges to two remotes are not one cycle");
     }
 
     /// Every refusal the section makes, each named so a failure says

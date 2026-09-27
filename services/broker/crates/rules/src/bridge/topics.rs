@@ -213,6 +213,27 @@ pub enum TopicError {
         /// by hand.
         witness: String,
     },
+    /// Two bridge **rules** to one remote make a loop between them.
+    ///
+    /// The refusal above takes one bridge and is called once per rule,
+    /// which sees nothing at all here: rule A publishes to the remote,
+    /// rule B reads that back and publishes it into this broker, and
+    /// what it publishes locally is what rule A carries out. Nothing
+    /// in either rule's own entries is wrong.
+    ///
+    /// The marker closes it one turn later on MQTT 5 — the origin is
+    /// this bridge's rather than this broker's, so A's mark is not B's
+    /// and the message comes round once before A refuses it. **On
+    /// 3.1.1 nothing closes it at all**, and 3.1.1 is the version
+    /// people bridge to. So it is refused where the single-rule loop
+    /// is refused: when the configuration is read.
+    ///
+    /// Boxed because it carries twice what any other refusal here
+    /// does — two rules, two entries and a witness on each side — and
+    /// an enum is as large as its largest variant on every `Result`
+    /// this module returns.
+    #[error(transparent)]
+    LoopsAcrossRules(Box<AcrossLoop>),
     /// The state topic is one this bridge would forward.
     ///
     /// Section 9.2: "A bridge whose own state topic matches its
@@ -279,6 +300,45 @@ pub enum TopicError {
     NoTopics,
 }
 
+/// Two rules, one remote, and the cycle they close between them.
+///
+/// The payload of [`TopicError::LoopsAcrossRules`]; see
+/// [`check_across`] for what is being refused and why it is refused
+/// rather than detected.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "mqtt_bridge rules {out_rule:?} and {in_rule:?} are both connected to {address} and \
+     loop through it: {out_rule:?} topic {out} publishes to {publishes:?} there, \
+     {in_rule:?} topic {inbound} subscribes to {subscribes:?}, and both match {witness:?}; \
+     what {in_rule:?} then publishes here matches {local:?}, which is what {out_rule:?} \
+     carries out, and both match {local_witness:?}. MQTT 3.1.1 has no user property to \
+     mark a message with, so this is refused rather than detected; give the two rules \
+     remote namespaces that do not overlap, or local ones."
+)]
+pub struct AcrossLoop {
+    /// The rule whose outbound entry starts the cycle.
+    pub out_rule: String,
+    /// Which of its entries.
+    pub out: usize,
+    /// The rule that reads it back off the remote.
+    pub in_rule: String,
+    /// Which of its entries.
+    pub inbound: usize,
+    /// The remote both are connected to.
+    pub address: String,
+    /// The remote filter the outbound entry publishes into.
+    pub publishes: String,
+    /// The remote filter the inbound entry subscribes to.
+    pub subscribes: String,
+    /// One remote topic both of them match.
+    pub witness: String,
+    /// The local filter the inbound entry publishes into, which is
+    /// also the one the outbound entry fires on.
+    pub local: String,
+    /// One local topic both of those match.
+    pub local_witness: String,
+}
+
 impl TopicError {
     /// Which field of an `mqtt_bridge` action this refusal is about.
     pub fn field(&self) -> &'static str {
@@ -287,6 +347,9 @@ impl TopicError {
             | Self::StateTopicIsSubscribed { .. }
             | Self::StateTopicNotATopic { .. }
             | Self::StateTopicReserved { .. } => "mqtt_bridge.state_topic",
+            // A pair of rules, and the entries are what an operator
+            // changes to fix it.
+            Self::LoopsAcrossRules(_) => "mqtt_bridge.topics",
             // Everything else is about an entry, including the two
             // that are about a *pair* of entries: a form marks the
             // table, because neither of the two is the wrong one on
@@ -582,6 +645,134 @@ pub fn check(action: &MqttBridge) -> Result<(), TopicError> {
         }
     }
 
+    Ok(())
+}
+
+/// Refuse a set of bridges in which **two rules** loop through one
+/// remote.
+///
+/// [`check`] takes one bridge and is called once per rule, so it can
+/// only see a rule feeding itself. The cycle it cannot see is two of
+/// them: rule A carries a local topic out to the remote, rule B is
+/// subscribed to that topic on the same remote and publishes what it
+/// finds back into this broker, and what B publishes here is what A
+/// carries out. Neither rule is wrong on its own, and the readme's own
+/// worked example is a two-entry bridge — so "two rules to one remote"
+/// is the shape an operator generalises to.
+///
+/// # Why this is refused rather than detected
+///
+/// The same sentence section 9.2 gives for the single-rule case. The
+/// marker is per **bridge** rather than per broker, deliberately, so
+/// that two bridges to two remotes do not read each other's marks; the
+/// price is that a message going out through A and coming back through
+/// B is not marked with B's origin, so it reaches this broker once and
+/// is only refused when A sees its own mark on the way out again. On
+/// MQTT 5 that is one wasted turn. On **3.1.1 there is no user
+/// property at all**, so nothing closes it and the two rules storm the
+/// remote between them.
+///
+/// # Both halves, and why not just the remote one
+///
+/// A cycle needs the local hop as well. Rule A publishing to the same
+/// remote filter rule B subscribes to is a mirror, not a loop, when B
+/// delivers it somewhere locally that A does not carry — which is an
+/// ordinary hub-and-spoke configuration and one this must not refuse.
+/// So both are required: the remote filters must meet, **and** what B
+/// publishes locally must be something A fires on. Each is checked
+/// with the same algebra [`check`] uses, and each refusal names a
+/// witness on its own side so an operator can check it by hand.
+///
+/// For a single rule the local half is always true — the inbound and
+/// outbound rewrites of one entry are inverses — which is why [`check`]
+/// does not need it and this does.
+///
+/// # One remote means one address
+///
+/// Compared after parsing, so `mqtt://host` and `mqtt://host:1883` are
+/// one remote. Two spellings that resolve to one broker — a name and
+/// its address, two names for one host — are **not** caught, and
+/// cannot be from here: what a name resolves to is not known when a
+/// configuration is read and may not be the same thing twice. That is
+/// the gap the marker and the hop count are still for.
+///
+/// # Errors
+///
+/// [`TopicError::LoopsAcrossRules`], naming both rules, both entries
+/// and a witness on each side.
+pub fn check_across<'a>(
+    bridges: impl IntoIterator<Item = (&'a str, &'a MqttBridge)>,
+) -> Result<(), TopicError> {
+    let bridges: Vec<(&str, &MqttBridge)> = bridges.into_iter().collect();
+    for (first, (sender_id, sender)) in bridges.iter().enumerate() {
+        for (second, (reader_id, reader)) in bridges.iter().enumerate() {
+            // A rule against itself is [`check`]'s, and it has
+            // already run.
+            if first == second || !one_remote(sender, reader) {
+                continue;
+            }
+            check_between(sender_id, sender, reader_id, reader)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether two bridges are connected to the same remote broker.
+fn one_remote(a: &MqttBridge, b: &MqttBridge) -> bool {
+    match (
+        super::supervisor::address(&a.address),
+        super::supervisor::address(&b.address),
+    ) {
+        (Ok(a), Ok(b)) => a.port == b.port && a.host.eq_ignore_ascii_case(&b.host),
+        // One of them is not an address at all, which
+        // `supervisor::address` refuses on its own. Compared as written
+        // so that this says nothing new about it either way.
+        _ => a.address == b.address,
+    }
+}
+
+/// Refuse `out`'s outbound entries feeding `inbound`'s inbound ones
+/// and coming back round.
+fn check_between(
+    out_rule: &str,
+    out: &MqttBridge,
+    in_rule: &str,
+    inbound: &MqttBridge,
+) -> Result<(), TopicError> {
+    for (sending, sender) in out.topics.iter().enumerate() {
+        if !sender.direction.outbound() {
+            continue;
+        }
+        let publishes = publishes_to(sender);
+        let fires_on = local_filter(sender);
+        for (reading, reader) in inbound.topics.iter().enumerate() {
+            if !reader.direction.inbound() {
+                continue;
+            }
+            let subscribes = subscribes_to(reader);
+            let Some(witness) = intersection(&publishes, &subscribes) else {
+                continue;
+            };
+            // And back: what the inbound entry publishes into this
+            // broker against what the outbound entry carries out of it.
+            let delivers = local_filter(reader);
+            let Some(local_witness) = intersection(&delivers, &fires_on) else {
+                continue;
+            };
+            return Err(TopicError::LoopsAcrossRules(Box::new(AcrossLoop {
+                out_rule: out_rule.to_owned(),
+                out: sending,
+                in_rule: in_rule.to_owned(),
+                inbound: reading,
+                address: out.address.clone(),
+                publishes,
+                subscribes,
+                witness,
+                local: delivers,
+                local_witness,
+            })));
+        }
+    }
     Ok(())
 }
 
@@ -1023,5 +1214,174 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- two rules, one remote -----------------------------------------
+
+    /// A bridge to `address` with the given entries.
+    fn bridge_to(address: &str, topics: Vec<BridgeTopic>) -> MqttBridge {
+        MqttBridge {
+            address: address.to_owned(),
+            client_id: "bridge".to_owned(),
+            topics,
+            ..MqttBridge::default()
+        }
+    }
+
+    /// One entry, with prefixes.
+    fn entry(
+        filter: &str,
+        direction: Direction,
+        local_prefix: &str,
+        remote_prefix: &str,
+    ) -> BridgeTopic {
+        BridgeTopic {
+            filter: filter.to_owned(),
+            direction,
+            qos: QoS::AtLeastOnce,
+            local_prefix: local_prefix.to_owned(),
+            remote_prefix: remote_prefix.to_owned(),
+            ..BridgeTopic::default()
+        }
+    }
+
+    /// The cycle [`check`] cannot see: A out, the remote, B in, this
+    /// broker, A out again.
+    ///
+    /// Each rule passes [`check`] on its own — asserted first, because
+    /// otherwise this could be passing for the single-rule reason and
+    /// nobody would know.
+    #[test]
+    fn two_bridge_rules_to_one_remote_that_feed_each_other_are_refused() {
+        let out = bridge_to(
+            "mqtt://127.0.0.1:1883",
+            vec![entry("site/#", Direction::Out, "", "up/")],
+        );
+        let back = bridge_to(
+            "mqtt://127.0.0.1:1883",
+            vec![entry("site/#", Direction::In, "", "up/")],
+        );
+        check(&out).expect("the outbound rule loops through nothing of its own");
+        check(&back).expect("the inbound rule loops through nothing of its own");
+
+        let refused = check_across([("a", &out), ("b", &back)])
+            .expect_err("two rules to one remote that feed each other must be refused");
+        match refused {
+            TopicError::LoopsAcrossRules(across) => {
+                assert_eq!(
+                    (across.out_rule.as_str(), across.in_rule.as_str()),
+                    ("a", "b")
+                );
+                assert_eq!(
+                    across.witness, "up/site/any",
+                    "the remote witness is not a topic"
+                );
+                assert_eq!(
+                    across.local_witness, "site/any",
+                    "the local witness is not a topic"
+                );
+            }
+            other => panic!("the wrong refusal: {other}"),
+        }
+        // And the other order, because the pair is a pair: `check`
+        // walks every ordered pair and a walk that only went forwards
+        // would let the same two rules through when they were written
+        // the other way round.
+        assert!(check_across([("b", &back), ("a", &out)]).is_err());
+    }
+
+    /// The same two rules pointed at two remotes are not a loop.
+    ///
+    /// Nothing carries what A published to one broker onto the other,
+    /// so there is no cycle to close. The pair is otherwise identical
+    /// to the one above, which is what makes this an assertion about
+    /// the address rather than about the filters.
+    #[test]
+    fn two_bridge_rules_to_different_remotes_do_not_loop() {
+        let out = bridge_to(
+            "mqtt://127.0.0.1:1883",
+            vec![entry("site/#", Direction::Out, "", "up/")],
+        );
+        let back = bridge_to(
+            "mqtt://127.0.0.2:1883",
+            vec![entry("site/#", Direction::In, "", "up/")],
+        );
+        check_across([("a", &out), ("b", &back)]).expect("two remotes are not one cycle");
+    }
+
+    /// One remote written two ways is one remote.
+    ///
+    /// The default port is the port, so a pair that a string
+    /// comparison would call different brokers is refused.
+    #[test]
+    fn a_default_port_and_a_written_one_are_one_remote() {
+        let out = bridge_to(
+            "mqtt://localhost",
+            vec![entry("site/#", Direction::Out, "", "up/")],
+        );
+        let back = bridge_to(
+            "mqtt://LOCALHOST:1883",
+            vec![entry("site/#", Direction::In, "", "up/")],
+        );
+        assert!(check_across([("a", &out), ("b", &back)]).is_err());
+    }
+
+    /// Hub and spoke, which must not be refused.
+    ///
+    /// The remote filters meet — A publishes to `up/site/...` and B
+    /// subscribes to it — and B delivers it locally under a prefix
+    /// that A does not carry. Nothing comes round, and refusing this
+    /// would refuse the configuration a bridge publishing inbound
+    /// messages into the local broker exists for.
+    #[test]
+    fn a_rule_that_mirrors_what_another_sends_is_not_a_loop() {
+        let out = bridge_to(
+            "mqtt://127.0.0.1:1883",
+            vec![entry("site/#", Direction::Out, "", "up/")],
+        );
+        let mirror = bridge_to(
+            "mqtt://127.0.0.1:1883",
+            vec![entry("site/#", Direction::In, "mirror/", "up/")],
+        );
+        check_across([("a", &out), ("b", &mirror)])
+            .expect("a mirror onto a local namespace nothing carries out is not a cycle");
+    }
+
+    /// And the other half of the same point: two rules whose local
+    /// sides meet and whose remote sides do not.
+    ///
+    /// B delivers exactly where A fires, so the local hop closes — and
+    /// the remote hop does not, because B is subscribed to something A
+    /// never publishes. Both halves are required, and this is the test
+    /// that says the remote half is really being checked rather than
+    /// assumed.
+    #[test]
+    fn two_rules_that_meet_only_on_this_broker_do_not_loop() {
+        let out = bridge_to(
+            "mqtt://127.0.0.1:1883",
+            vec![entry("site/#", Direction::Out, "", "up/")],
+        );
+        let elsewhere = bridge_to(
+            "mqtt://127.0.0.1:1883",
+            vec![entry("site/#", Direction::In, "", "down/")],
+        );
+        check_across([("a", &out), ("b", &elsewhere)])
+            .expect("filters that do not meet on the remote are not a cycle");
+    }
+
+    /// One rule on its own is [`check`]'s and not this one's.
+    ///
+    /// A `both` entry is a loop and is refused when the rule is read;
+    /// walking it against itself here would refuse it a second time
+    /// under a message about a pair of rules, which names the wrong
+    /// thing to fix.
+    #[test]
+    fn a_rule_is_not_checked_against_itself() {
+        let both = bridge_to(
+            "mqtt://127.0.0.1:1883",
+            vec![entry("site/#", Direction::Both, "", "")],
+        );
+        check(&both).expect_err("a both entry with no template is a loop, and `check` says so");
+        check_across([("a", &both)]).expect("one rule is not a pair");
     }
 }

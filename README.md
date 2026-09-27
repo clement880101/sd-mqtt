@@ -306,6 +306,18 @@ chain of bridges nobody drew on a whiteboard.
 and is therefore refused unless the prefixes keep the two sets apart.
 Two entries, as above, is the ordinary way to carry a topic each way.
 
+**Two bridge _rules_ to one remote are checked against each other
+too.** The example above is one rule with two entries, and the obvious
+way to generalise it is two rules — one out, one back. If what one
+carries out to a remote is what the other reads back off it, and what
+the second publishes here is what the first carries out, that is the
+same cycle with a rule boundary through the middle, and neither rule
+is wrong on its own. It is refused at startup and by the API, naming
+both rules, both entries and a topic on each side. Two rules to two
+remotes are not a cycle and are accepted, and neither is a rule that
+mirrors another's traffic into a local namespace nothing carries back
+out.
+
 An outbound entry may rewrite by position:
 `filter = "sensors/+/temp"` with `template = "site-a/temp/{1}"`
 publishes `sensors/kitchen/temp` remotely as `site-a/temp/kitchen`. A

@@ -216,6 +216,22 @@ pub enum InstallError {
         /// How many envelopes are still waiting.
         waiting: u64,
     },
+    /// This rule and another this node holds loop through one remote.
+    ///
+    /// The refusal `crate::bridge::topics::check` makes of a single
+    /// bridge, across a pair of them: see
+    /// [`crate::bridge::topics::check_across`]. Raised **before**
+    /// anything is stored, so the node is exactly as it was.
+    #[error("{why}")]
+    Loops {
+        /// The rule being installed.
+        id: String,
+        /// The one it loops with.
+        other: String,
+        /// The whole of the refusal, which names both entries and a
+        /// witness on each side.
+        why: String,
+    },
     /// The socket its route would be served on is not there.
     ///
     /// An ingest rule with no listener in front of it is a rule that
@@ -659,6 +675,10 @@ impl Registry {
     /// held.
     async fn install_locked(&self, rule: Rule) -> Result<(), InstallError> {
         let id = rule.id.clone();
+        // **Before anything changes**, like the route below and for
+        // the same reason: a pair of bridges that would loop is a
+        // refusal with this node exactly as it was.
+        self.check_for_a_loop(&rule)?;
         // **Before anything changes.** An address something else is
         // already on is then a refusal with the node exactly as it
         // was, rather than a stored rule nothing can reach.
@@ -746,6 +766,45 @@ impl Registry {
                 .write()
                 .insert(installed.rule.id.clone(), installed),
         );
+        Ok(())
+    }
+
+    /// Refuse a bridge that loops through a remote with one this node
+    /// already holds.
+    ///
+    /// `crate::bridge::spec` refuses a bridge that loops through its
+    /// own entries when the rule is read, which is where a single
+    /// rule's loop belongs. A pair of rules cannot be seen from
+    /// there — neither rule is wrong — so it is seen here, which is
+    /// the one place that knows what else this node is running.
+    ///
+    /// **Whether or not either rule is enabled.** A disabled bridge
+    /// connects to nothing, and an operator who stored the pair and
+    /// switched one on would find out then; the moment to say so is
+    /// when it is written.
+    fn check_for_a_loop(&self, rule: &Rule) -> Result<(), InstallError> {
+        let Action::MqttBridge(action) = &rule.action else {
+            return Ok(());
+        };
+        let installed = self.installed.read();
+        for (id, held) in installed.iter() {
+            // The rule this one replaces is not another rule.
+            if id == &rule.id {
+                continue;
+            }
+            let Action::MqttBridge(other) = &held.rule.action else {
+                continue;
+            };
+            crate::bridge::topics::check_across([
+                (rule.id.as_str(), action.as_ref()),
+                (id.as_str(), other.as_ref()),
+            ])
+            .map_err(|error| InstallError::Loops {
+                id: rule.id.as_str().to_owned(),
+                other: id.as_str().to_owned(),
+                why: error.to_string(),
+            })?;
+        }
         Ok(())
     }
 

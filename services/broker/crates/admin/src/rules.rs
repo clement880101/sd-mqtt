@@ -142,6 +142,15 @@ fn install_refusal(error: &InstallError) -> ApiError {
         // the same body on a node whose ingest address is free is
         // accepted.
         InstallError::Listener { .. } => ApiError::new(ErrorCode::Internal, error.to_string()),
+        // The request would extend a cycle of connectors, which is
+        // what that code is for. Not `invalid_request`: this body is
+        // well formed and would be accepted on a node that did not
+        // hold the other rule.
+        InstallError::Loops { .. } => ApiError::in_field(
+            ErrorCode::LoopDetected,
+            "mqtt_bridge.topics",
+            error.to_string(),
+        ),
     }
 }
 
@@ -942,6 +951,77 @@ mod tests {
             answered.body
         );
         assert!(node.registry.is_empty());
+        node.stop().await;
+    }
+
+    /// The loop no single rule is wrong in: two bridges to one remote.
+    ///
+    /// The check above takes one bridge and is called once per rule,
+    /// so neither of these is refused on its own — asserted, because
+    /// otherwise this could pass for that reason. Rule A carries
+    /// `site/#` out to the remote under `up/`; rule B reads `up/site/#`
+    /// back off the same remote and publishes it here as `site/#`,
+    /// which is what A carries out. On MQTT 5 the marker closes that
+    /// one turn later; on 3.1.1 nothing closes it at all.
+    #[tokio::test]
+    async fn a_second_bridge_that_loops_through_the_first_is_refused() {
+        let node = Node::start(None).await;
+        let out = node
+            .post(
+                "/api/v1/rules",
+                r#"{"id":"upward","name":"Up to the hub",
+                    "mqtt_bridge":{"address":"mqtts://remote.example:8883",
+                                   "client_id":"bridge-out",
+                                   "topics":[{"filter":"site/#","direction":"out",
+                                              "remote_prefix":"up/"}]}}"#,
+            )
+            .await;
+        assert_eq!(out.status, 200, "{}", out.body);
+
+        let back = node
+            .post(
+                "/api/v1/rules",
+                r#"{"id":"downward","name":"Back from the hub",
+                    "mqtt_bridge":{"address":"mqtts://remote.example:8883",
+                                   "client_id":"bridge-in",
+                                   "topics":[{"filter":"site/#","direction":"in",
+                                              "remote_prefix":"up/"}]}}"#,
+            )
+            .await;
+        assert_eq!(back.status, 508, "{}", back.body);
+        assert_eq!(
+            error_of(&back.body),
+            ("loop_detected".to_owned(), "mqtt_bridge.topics".to_owned()),
+            "{}",
+            back.body
+        );
+        assert!(
+            back.body.contains("upward") && back.body.contains("downward"),
+            "the refusal should name both rules: {}",
+            back.body
+        );
+        assert_eq!(
+            node.registry.len(),
+            1,
+            "the refused bridge was installed anyway"
+        );
+
+        // The same second rule, delivering where the first does not
+        // carry from, is a mirror rather than a cycle and is accepted.
+        // Without this the assertion above would be satisfied by
+        // refusing every second bridge to one remote.
+        let mirrored = node
+            .post(
+                "/api/v1/rules",
+                r#"{"id":"mirrored","name":"A mirror",
+                    "mqtt_bridge":{"address":"mqtts://remote.example:8883",
+                                   "client_id":"bridge-mirror",
+                                   "topics":[{"filter":"site/#","direction":"in",
+                                              "remote_prefix":"up/",
+                                              "local_prefix":"mirror/"}]}}"#,
+            )
+            .await;
+        assert_eq!(mirrored.status, 200, "{}", mirrored.body);
         node.stop().await;
     }
 

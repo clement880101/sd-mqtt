@@ -94,4 +94,4 @@ pub use marker::{carry, Marker, Refused};
 pub use rewrite::{Rewrite, Rewritten};
 pub use subs::{Granted, SubscribeError, Subscriptions};
 pub use supervisor::{address, Address, AddressError, Supervisor};
-pub use topics::{intersects, TopicError};
+pub use topics::{intersects, AcrossLoop, TopicError};
