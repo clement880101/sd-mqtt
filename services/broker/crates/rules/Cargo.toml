@@ -1,0 +1,101 @@
+[package]
+name = "rules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rules and connectors for sd-mqtt"
+
+[dependencies]
+# The payload type the broker hands over without copying, and what a
+# bridge puts on the wire. Already in the binary through `mqtt-codec`
+# and `broker-core`; named here because this crate now uses it in its
+# own right rather than only in its tests.
+bytes.workspace = true
+# For `QoS` and for the filter validator, which is the one place a topic
+# filter's rules are written down.
+mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
+# For the reference matcher. Rules sit above the broker rather than
+# beside it, so this direction is the layering and not a cycle.
+broker-core = { path = "../broker-core", version = "0.1.0" }
+# The record vocabulary, with no backend, for the same reason
+# `broker-core` takes it that way: nothing here touches a disk.
+storage = { path = "../storage", version = "0.1.0", default-features = false }
+thiserror.workspace = true
+# The lock over the ingest routes and over the installed rules. The
+# same lock this workspace uses everywhere else, so that "never held
+# across an await" is one habit rather than two.
+parking_lot = "0.12"
+# Section 9.2's ingest endpoint publishes into the broker, through the
+# one publish every caller without a session goes through. That is
+# `sdmqtt-server`'s, and taking it here is the same direction the
+# dependency on `broker-core` above is: rules sit above the broker
+# rather than beside it.
+sdmqtt-server = { path = "../server", version = "0.1.0" }
+# The ingest route set. The same version and the same features the
+# admin crate names, because the `Router` this crate builds is served
+# by that crate's listener and the two must be one type. Nothing new
+# reaches the binary: axum is already in it.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "tokio",
+    "json",
+    "query",
+    "matched-path",
+    "tracing",
+] }
+# The HTTP client, and the TLS under it.
+#
+# Section 16 schedules the TLS stack for milestone 7; posting to an
+# HTTPS endpoint pulls it forward by three milestones. The client half
+# of `hyper-util` is nearly free because axum already brought hyper;
+# everything else in the jump is TLS. Measured, recorded and accepted in
+# `docs/research/component-selection.md`.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client", "client-legacy", "http1", "tokio"] }
+# `webpki-tokio` rather than `native-tokio`: a distroless image has no
+# operating-system trust store to read, and this broker is built to run
+# in one. `aws-lc-rs` rather than `ring` for the reasons in the research
+# notes; `ring` stays available for exotic targets.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "webpki-tokio", "aws-lc-rs"] }
+http-body-util = "0.1"
+# Section 9.2's bridge connects **out**, so it needs the client half of
+# a TLS stack directly rather than through a HTTP client. Nothing new
+# reaches the binary: `hyper-rustls` above already links all three, and
+# these lines make direct what was transitive. The same provider and
+# the same roots as the HTTP client, for the reason the comment on
+# `hyper-rustls` gives — one cryptography provider and one root-trust
+# mechanism in this binary, not two.
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "aws-lc-rs"] }
+webpki-roots = "1"
+# **Default features off.** Its SIMD engine became default-on in 0.23
+# and is `unsafe`, which every crate in this workspace forbids. Scalar
+# costs 16 KB.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `rt` and `time` for the task that does the posting, and `sync` for the
+# concurrency limit a rule's configuration sets.
+# `net` is the bridge's: it is the one connector that opens a socket of
+# its own rather than going through an HTTP client.
+tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros", "net", "io-util"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# The gated store, for the one assertion that needs a flush held open:
+# section 7.3 says an at-least-once publish is not answered until it is
+# durable, and that is only visible while a flush is in progress. The
+# same crate this already depends on, with a feature that is dev-only.
+sdmqtt-server = { path = "../server", version = "0.1.0", features = ["testing"] }
+# The ingest tests stand up a real MQTT listener and a real broker, and
+# assert what a subscriber receives. Dev only.
+storage = { path = "../storage", version = "0.1.0", default-features = false }
+broker-core = { path = "../broker-core", version = "0.1.0" }
+# The delivery tests stand up a real HTTP server on the loopback and
+# assert the envelope arrives, so they need a runtime with a listener
+# and a timer in it. Dev only: nothing of `net` ships.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
+
+[lints]
+workspace = true

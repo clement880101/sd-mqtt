@@ -55,6 +55,7 @@
 //! survive a restart. Silence is what would make this dangerous, not
 //! the default.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -154,6 +155,18 @@ pub enum ConfigError {
     /// nothing goes through this file.
     #[error("{0}")]
     Admin(#[from] AdminStartError),
+    /// A rule cannot mean what it says.
+    ///
+    /// Its own variant rather than [`ConfigError::Unusable`] because a
+    /// rule's key is not a fixed string: what an operator needs to see
+    /// is which rule, by the name they gave it.
+    #[error("the rule {id:?} cannot be used: {why}")]
+    Rule {
+        /// Which rule.
+        id: String,
+        /// What is wrong with it.
+        why: String,
+    },
     /// The store itself could not be opened.
     ///
     /// Separate from the directory failing, because the answers are
@@ -273,6 +286,18 @@ pub struct BrokerSection {
     /// How many bytes those messages may occupy in total. The one knob
     /// that bounds per-session memory.
     pub max_queue_bytes: usize,
+    /// How many connectors a publication may have been through.
+    ///
+    /// Section 9.2's third loop: a rule feeding a system that
+    /// publishes back through another rule is a cycle no single rule is
+    /// in the whole of. Every publication a connector originates
+    /// carries a hop count, and one over this is dropped and counted.
+    ///
+    /// Node-wide, and not the same number as `mqtt_bridge.max_hops`,
+    /// which is one bridge's own check on its own traffic. This one is
+    /// the door every publication without a session goes through, so it
+    /// is the one a connector written later cannot be written without.
+    pub max_hops: u32,
 }
 
 impl Default for BrokerSection {
@@ -288,6 +313,7 @@ impl Default for BrokerSection {
             max_inflight: broker.max_inflight,
             max_queue_messages: broker.max_queue_messages,
             max_queue_bytes: broker.max_queue_bytes,
+            max_hops: broker.max_hops,
         }
     }
 }
@@ -485,6 +511,89 @@ impl StorageSection {
     }
 }
 
+/// A rule as it is written down, and what turns one into a [`Rule`].
+///
+/// **Moved into the rules crate**, because section 11.1's admin API is
+/// a second way to write a rule and the admin crate cannot see this
+/// one. The refusals stayed with it: one description of what a rule
+/// may be, read from a TOML table and from a JSON body by the same
+/// derive, rather than two that drift. See [`rules::spec`].
+///
+/// Re-exported here so that `[[rules]]` is still spelled by a type
+/// this module names, and so that nothing outside has to learn where
+/// it went.
+pub use rules::spec::RuleSpec;
+
+/// The port the ingest listener binds by default.
+///
+/// Adjacent to the admin listener's so that an operator who knows one
+/// knows the other. It is not registered for this and does not need to
+/// be: it is bound on loopback by default, and an operator who exposes
+/// it is configuring it anyway.
+pub const DEFAULT_INGEST_PORT: u16 = 1885;
+
+/// Which listener serves section 9.2's ingest routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestListener {
+    /// A listener of its own, which is the default.
+    ///
+    /// Section 9.2: "it defaults to a separate ingest listener rather
+    /// than the admin listener, so that publishing data does not
+    /// require exposing the administrative surface."
+    #[default]
+    Own,
+    /// The admin listener.
+    ///
+    /// "Permitted but must be chosen explicitly", which is what writing
+    /// this value is. A route set served there takes that listener's
+    /// rules with it, including the host check the ingest listener
+    /// deliberately has none of.
+    Admin,
+}
+
+/// Where the ingest endpoint is served.
+///
+/// # There is no `enabled` key, and no address rule either
+///
+/// A listener of its own is bound **while** this node holds an ingest
+/// rule with a route, and not otherwise, so turning it off is deleting
+/// the rules rather than a second switch that can disagree with them.
+///
+/// "While", not "at startup". It is bound the moment the first such
+/// rule exists and closed when the last one goes, because section
+/// 11.1's API creates rules while this process runs and a rule that
+/// cannot be reached until the next restart is a rule this node
+/// reports as working and is not. See [`crate::ingest`].
+///
+/// And unlike `[admin]`, a non-loopback address here is **not** refused
+/// without a token. Section 9.2: "the ingest listener needs no address
+/// rule of its own, because every route on it is individually
+/// guarded." A rule without a token is refused where rules are
+/// accepted, so a route that exists is a route with a secret in front
+/// of it; there is nothing left for an address rule to protect.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct IngestConfig {
+    /// Where a listener of its own binds.
+    ///
+    /// Loopback by default, which is the right default for a broker
+    /// behind an ingress and the wrong one for a webhook sender on
+    /// another host; an operator who wants the second writes it.
+    pub address: SocketAddr,
+    /// Which listener serves the routes.
+    pub listener: IngestListener,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_INGEST_PORT),
+            listener: IngestListener::Own,
+        }
+    }
+}
+
 /// The log section.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -512,8 +621,18 @@ pub struct Config {
     /// loopback address, or the refusal in `AdminConfig::check` guards
     /// a different configuration from the one that is served.
     pub admin: AdminConfig,
+    /// Where section 9.2's ingest endpoint is served.
+    pub ingest: IngestConfig,
     /// The log section.
     pub log: Log,
+    /// The rules this node holds, section 9.1.
+    ///
+    /// Written as `[[rules]]` tables, which is why this is a list and
+    /// not a map: a map keyed by identifier would read better and would
+    /// put the identifier somewhere `deny_unknown_fields` cannot check
+    /// it, so a typo in a key would silently create a second rule.
+    #[serde(default)]
+    pub rules: Vec<RuleSpec>,
 }
 
 /// What the command line says, where it says anything.
@@ -632,6 +751,18 @@ impl Config {
                 why: "a queue that holds nothing drops every message an offline session is sent",
             });
         }
+        // The same refusal `mqtt_bridge.max_hops` makes, for the same
+        // reason: a maximum of zero is over-the-limit for the first
+        // hop, so every ingest post, every poll and every message a
+        // bridge brought in would be dropped, and the symptom is a
+        // broker that silently carries nothing a connector gives it.
+        if self.broker.max_hops == 0 {
+            return Err(ConfigError::Unusable {
+                key: "broker.max_hops",
+                value: "0".to_string(),
+                why: "every publication a connector originates has been through one                       connector, so a maximum of zero drops all of them",
+            });
+        }
 
         // The relation between the queue and the channel that drains
         // it. A session's writer reads one outbox, and the broker can
@@ -700,6 +831,96 @@ impl Config {
         if self.admin.enabled {
             self.admin.check()?;
         }
+
+        // **A rule with no store is a rule that silently loses
+        // messages.** An envelope goes into a durable outbox before the
+        // publisher is answered, and without `storage.directory` there
+        // is nothing durable to put it in: every message in flight when
+        // the process ends is gone, which is the one thing this
+        // connector exists not to do. Refused rather than warned about,
+        // unlike running with no store at all — that is a supported
+        // mode, and declaring a rule is an operator saying they want
+        // messages delivered somewhere else.
+        if !self.rules.is_empty() && self.storage.directory.is_none() {
+            return Err(ConfigError::Unusable {
+                key: "storage.directory",
+                value: "unset".to_string(),
+                why: "a rule needs a durable outbox, so rules require a store directory",
+            });
+        }
+
+        // Two rules under one identifier is one rule's outbox, one
+        // rule's dead-letter topic and two rules' messages. The store
+        // would accept it — a put replaces — and the second would
+        // silently take the first's place.
+        let mut seen = BTreeMap::new();
+        for section in &self.rules {
+            // Everything an operator can get wrong about a rule, said
+            // once here with the rule named, so that a broker never
+            // starts with a connector that cannot post.
+            section.to_rule().map_err(|error| ConfigError::Rule {
+                id: section.id.clone(),
+                why: error.why,
+            })?;
+            if seen.insert(section.id.clone(), ()).is_some() {
+                return Err(ConfigError::Rule {
+                    id: section.id.clone(),
+                    why: "two rules share this identifier; each rule needs its own".to_string(),
+                });
+            }
+        }
+
+        // **The one limit a rule is checked against that is not its
+        // own.** `http_in` derives its body limit from
+        // `broker.max_packet_size` and says why; a poller takes one
+        // from an operator, and one set above what this broker can
+        // carry is a rule that fetches every interval and publishes
+        // nothing. Here rather than in `to_rule` because the number
+        // belongs to the node.
+        for section in &self.rules {
+            let Ok(rule) = section.to_rule() else {
+                continue;
+            };
+            if let rules::Action::HttpPoll(action) = &rule.action {
+                rules::http_poll::check_body_limit(action, self.broker.max_packet_size).map_err(
+                    |error| ConfigError::Rule {
+                        id: section.id.clone(),
+                        why: error.to_string(),
+                    },
+                )?;
+            }
+        }
+
+        // **The loop no single rule is wrong in.** `to_rule` above has
+        // already refused a bridge whose own entries feed each other;
+        // this is the pair that feeds each other through one remote,
+        // which is invisible from inside either rule and which nothing
+        // closes on MQTT 3.1.1. Here rather than in `to_rule` because
+        // this is the first place that has the whole set.
+        let bridges: Vec<(String, rules::MqttBridge)> = self
+            .rules
+            .iter()
+            .filter_map(|section| {
+                let rule = section.to_rule().ok()?;
+                match rule.action {
+                    rules::Action::MqttBridge(action) => Some((section.id.clone(), *action)),
+                    _ => None,
+                }
+            })
+            .collect();
+        rules::bridge::topics::check_across(
+            bridges.iter().map(|(id, action)| (id.as_str(), action)),
+        )
+        .map_err(|error| ConfigError::Rule {
+            // The rule whose outbound entry starts the cycle. The
+            // message names both, because neither of the two is the
+            // wrong one on its own.
+            id: match &error {
+                rules::TopicError::LoopsAcrossRules(across) => across.out_rule.clone(),
+                _ => String::new(),
+            },
+            why: error.to_string(),
+        })?;
         Ok(())
     }
 
@@ -831,6 +1052,7 @@ impl Config {
                 max_inflight: self.broker.max_inflight,
                 max_queue_messages: self.broker.max_queue_messages,
                 max_queue_bytes: self.broker.max_queue_bytes,
+                max_hops: self.broker.max_hops,
             },
             connection: ConnectionConfig {
                 limits,
@@ -867,6 +1089,11 @@ fn parse<T: std::str::FromStr>(
 
 #[cfg(test)]
 mod tests {
+    use mqtt_codec::QoS;
+    use rules::rule::{
+        Action, ClientPattern, Direction, HttpOut, HttpPoll, Rule, TopicSource, Trigger,
+    };
+
     use super::*;
 
     #[test]
@@ -883,6 +1110,1118 @@ mod tests {
             config.listener.address,
             "and the defaults reach the server"
         );
+    }
+
+    // ---- rules ---------------------------------------------------------
+
+    /// A file with a store and one rule in it.
+    fn with_rule(rule: &str) -> String {
+        format!("[storage]\ndirectory = \"/tmp/sdmqtt-test\"\n\n{rule}")
+    }
+
+    /// A rule whose only stated keys are the required ones.
+    const MINIMAL: &str = r#"
+        [[rules]]
+        id = "telemetry"
+        name = "Telemetry out"
+        filter = "sensor/+/temp"
+
+        [rules.http_out]
+        url = "https://example.invalid/hook"
+    "#;
+
+    #[track_caller]
+    fn refuse(text: &str) -> ConfigError {
+        let mut config = Config::from_toml(text).expect("the file parses");
+        config
+            .storage
+            .directory
+            .get_or_insert_with(|| PathBuf::from("/tmp/sdmqtt-test"));
+        config
+            .validate()
+            .expect_err("this configuration must be refused")
+    }
+
+    /// An ingest rule whose only stated keys are the required ones.
+    const MINIMAL_INGEST: &str = r#"
+        [[rules]]
+        id = "gateway"
+        name = "Gateway in"
+
+        [rules.http_in]
+        token = "a-secret"
+        topic = "ingest/gateway"
+    "#;
+
+    // ---- http_in -------------------------------------------------------
+
+    #[test]
+    fn an_ingest_rule_takes_the_defaults_for_everything_it_does_not_say() {
+        let config = Config::from_toml(&with_rule(MINIMAL_INGEST)).expect("every key is known");
+        config.validate().expect("a minimal ingest rule is usable");
+
+        let rule = config.rules[0].to_rule().expect("it converts");
+        assert_eq!(rule.id.as_str(), "gateway");
+        assert!(
+            rule.trigger.is_none(),
+            "an ingest rule is fired by a request and has no trigger"
+        );
+        let Action::HttpIn(action) = &rule.action else {
+            panic!("this rule accepts posts");
+        };
+        assert_eq!(action.topic, "ingest/gateway");
+        assert_eq!(
+            action.qos,
+            QoS::AtMostOnce,
+            "the level that promises nothing"
+        );
+        assert!(!action.retain);
+        assert!(
+            action.topic_from.is_none(),
+            "and no caller may choose a topic unless the rule says so"
+        );
+    }
+
+    #[test]
+    fn every_part_of_an_ingest_rule_can_be_said() {
+        let text = with_rule(
+            r#"
+            [[rules]]
+            id = "gateway"
+            name = "Gateway in"
+            enabled = false
+
+            [rules.http_in]
+            token = "a-secret"
+            topic = "ingest/gateway/default"
+            topic_header = "x-topic"
+            topic_prefix = "ingest/gateway"
+            qos = 1
+            retain = true
+        "#,
+        );
+        let config = Config::from_toml(&text).expect("every key is known");
+        config.validate().expect("it is usable");
+        let rule = config.rules[0].to_rule().expect("it converts");
+
+        assert!(!rule.enabled);
+        let Action::HttpIn(action) = &rule.action else {
+            panic!("this rule accepts posts");
+        };
+        assert_eq!(action.token.expose(), "a-secret");
+        assert_eq!(action.topic, "ingest/gateway/default");
+        assert_eq!(action.qos, QoS::AtLeastOnce);
+        assert!(action.retain);
+        let from = action.topic_from.as_ref().expect("a caller may choose");
+        assert_eq!(from.source, TopicSource::Header("x-topic".to_owned()));
+        assert_eq!(from.prefix, "ingest/gateway");
+    }
+
+    /// Everything an operator can get wrong about an ingest rule,
+    /// refused at startup with the rule named.
+    ///
+    /// One test rather than eleven, because what is being asserted is
+    /// the same thing in each case — the broker does not start and says
+    /// which rule — and a table makes the list of cases readable as a
+    /// list. Each entry carries the fragment of the refusal that says
+    /// *which* mistake it was, so this is not convention 2's "assert
+    /// the category" wearing a table.
+    #[test]
+    fn what_an_ingest_rule_may_not_say_is_refused_by_name() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "no token at all",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                topic = "ingest/gateway"
+                "#,
+                "token",
+            ),
+            (
+                "a token that is present and empty",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = ""
+                topic = "ingest/gateway"
+                "#,
+                "token",
+            ),
+            (
+                "a header the caller may choose a topic in, with nothing to bound it",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                topic_header = "x-topic"
+                "#,
+                "topic_prefix",
+            ),
+            (
+                "a query parameter, with nothing to bound it",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                topic_query = "t"
+                "#,
+                "topic_prefix",
+            ),
+            (
+                "a prefix with nothing to bound",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                topic_prefix = "ingest"
+                "#,
+                "topic_prefix",
+            ),
+            (
+                "both a header and a query parameter",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                topic_header = "x-topic"
+                topic_query = "t"
+                topic_prefix = "ingest"
+                "#,
+                "one of them",
+            ),
+            (
+                "a prefix in the reserved namespace",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                topic_query = "t"
+                topic_prefix = "$sd"
+                "#,
+                "dollar-prefixed",
+            ),
+            (
+                "a prefix with a wildcard in it",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                topic_query = "t"
+                topic_prefix = "ingest/#"
+                "#,
+                "topic_prefix",
+            ),
+            (
+                "a topic that is not one",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/+"
+                "#,
+                "http_in.topic",
+            ),
+            (
+                "a level MQTT does not have",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                qos = 3
+                "#,
+                "http_in.qos",
+            ),
+            (
+                "a filter, which an ingest rule is not fired by",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                filter = "sensor/+/temp"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                "#,
+                "remove it",
+            ),
+            (
+                "both actions, where section 9.1 allows one",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                filter = "sensor/+/temp"
+                [rules.http_in]
+                token = "a-secret"
+                topic = "ingest/gateway"
+                [rules.http_out]
+                url = "https://example.invalid/hook"
+                "#,
+                "two rules",
+            ),
+            (
+                "no action at all",
+                r#"
+                [[rules]]
+                id = "gateway"
+                name = "Gateway in"
+                filter = "sensor/+/temp"
+                "#,
+                "needs an action",
+            ),
+            (
+                "an http_out rule with no filter",
+                r#"
+                [[rules]]
+                id = "telemetry"
+                name = "Telemetry out"
+                [rules.http_out]
+                url = "https://example.invalid/hook"
+                "#,
+                "set filter",
+            ),
+        ];
+
+        for (what, text, fragment) in cases {
+            let error = refuse(&with_rule(text));
+            let said = error.to_string();
+            assert!(
+                said.contains("gateway") || said.contains("telemetry"),
+                "{what}: the refusal must name the rule: {said}"
+            );
+            assert!(
+                said.contains(fragment),
+                "{what}: the refusal must say which mistake it was, and {fragment:?} is \
+                 not in {said:?}"
+            );
+        }
+    }
+
+    /// The minimal rules above are accepted, so the table is not
+    /// passing against a check that refuses everything.
+    #[test]
+    fn a_complete_ingest_rule_is_accepted() {
+        Config::from_toml(&with_rule(MINIMAL_INGEST))
+            .expect("every key is known")
+            .validate()
+            .expect("a minimal ingest rule is usable");
+        let bounded = with_rule(
+            r#"
+            [[rules]]
+            id = "gateway"
+            name = "Gateway in"
+            [rules.http_in]
+            token = "a-secret"
+            topic = "ingest/gateway/default"
+            topic_query = "t"
+            topic_prefix = "ingest/gateway"
+            "#,
+        );
+        Config::from_toml(&bounded)
+            .expect("every key is known")
+            .validate()
+            .expect("a rule that lets a caller choose, bounded, is usable");
+    }
+
+    /// A poller whose body limit is larger than this broker can
+    /// publish does not start it.
+    ///
+    /// `http_in` derives its limit from `broker.max_packet_size` and
+    /// says why. A poller takes one from an operator, and one set
+    /// above what the broker carries is a rule that fetches a document
+    /// every interval and publishes none of them. The refusal is here
+    /// rather than in the rule, because the number it is measured
+    /// against belongs to the node: the same rule under the default
+    /// packet size is accepted, which is the second half below and is
+    /// what stops this being a refusal of every poller.
+    #[test]
+    fn a_poller_that_could_not_publish_what_it_fetches_does_not_start() {
+        const BIG_POLLER: &str = r#"
+        [broker]
+        max_packet_size = 32768
+
+        [[rules]]
+        id = "weather"
+        name = "The weather"
+
+        [rules.http_poll]
+        url = "https://example.invalid/now"
+        topic = "weather/now"
+        max_body_bytes = 262144
+        "#;
+
+        let refused = Config::from_toml(&with_rule(BIG_POLLER))
+            .expect("every key is known")
+            .validate()
+            .expect_err("a poller that could publish nothing must not start a broker");
+        let ConfigError::Rule { id, why } = &refused else {
+            panic!("the wrong refusal: {refused}");
+        };
+        assert_eq!(id, "weather");
+        assert!(
+            why.contains("max_body_bytes") && why.contains("max_packet_size"),
+            "the refusal should name both settings: {why}"
+        );
+
+        // The same rule under a packet size that carries it.
+        Config::from_toml(&with_rule(
+            &BIG_POLLER.replace("max_packet_size = 32768", "max_packet_size = 2000000"),
+        ))
+        .expect("every key is known")
+        .validate()
+        .expect("a body limit the broker can carry is not refused");
+    }
+
+    /// Section 12.3, on the way in: the configuration is logged at
+    /// startup and this is in it.
+    #[test]
+    fn an_ingest_token_does_not_print_itself() {
+        let config = Config::from_toml(&with_rule(MINIMAL_INGEST)).expect("every key is known");
+        let shown = format!("{config:?}");
+        assert!(
+            !shown.contains("a-secret"),
+            "a token must not reach the first log line this binary writes: {shown}"
+        );
+    }
+
+    // ---- mqtt_bridge ---------------------------------------------------
+
+    /// A minimal bridge, which is the shape everything below is a
+    /// mistake in.
+    const MINIMAL_BRIDGE: &str = r##"
+        [[rules]]
+        id = "to-b"
+        name = "Bridge to B"
+
+        [rules.mqtt_bridge]
+        address = "mqtts://remote.invalid:8883"
+        client_id = "bridge-a"
+
+        [[rules.mqtt_bridge.topics]]
+        filter = "sensors/#"
+        direction = "out"
+        qos = 1
+        remote_prefix = "from-a/"
+        "##;
+
+    #[test]
+    fn a_bridge_table_reads_into_the_action() {
+        let config = Config::from_toml(&with_rule(MINIMAL_BRIDGE)).expect("every key is known");
+        let rule = config.rules[0].to_rule().expect("a usable bridge");
+        let Action::MqttBridge(bridge) = &rule.action else {
+            panic!("this rule bridges");
+        };
+        assert_eq!(bridge.address, "mqtts://remote.invalid:8883");
+        assert_eq!(bridge.client_id, "bridge-a");
+        assert_eq!(bridge.version, mqtt_codec::Version::V5);
+        assert_eq!(bridge.topics.len(), 1);
+        assert_eq!(bridge.topics[0].direction, Direction::Out);
+        assert_eq!(bridge.topics[0].qos, QoS::AtLeastOnce);
+        assert_eq!(bridge.topics[0].remote_prefix, "from-a/");
+        assert!(rule.trigger.is_none(), "a bridge has no rule-level filter");
+    }
+
+    /// Two bridge rules to one remote that feed each other do not
+    /// start the broker.
+    ///
+    /// The refusal below takes one bridge and runs once per rule, and
+    /// neither of these is wrong on its own — asserted, so that this
+    /// cannot be passing for that reason. What closes the cycle is
+    /// this broker: `to-b` carries `sensors/#` out under `from-a/`,
+    /// `from-b` reads `from-a/sensors/#` back off the same remote and
+    /// publishes it here as `sensors/#`, which is what `to-b` carries.
+    /// The marker catches that one turn late on MQTT 5 and not at all
+    /// on 3.1.1.
+    #[test]
+    fn two_bridges_to_one_remote_that_feed_each_other_do_not_start() {
+        const BACK: &str = r##"
+        [[rules]]
+        id = "from-b"
+        name = "Bridge back from B"
+
+        [rules.mqtt_bridge]
+        address = "mqtts://remote.invalid:8883"
+        client_id = "bridge-back"
+
+        [[rules.mqtt_bridge.topics]]
+        filter = "sensors/#"
+        direction = "in"
+        qos = 1
+        remote_prefix = "from-a/"
+        "##;
+
+        let both = Config::from_toml(&with_rule(&format!("{MINIMAL_BRIDGE}\n{BACK}")))
+            .expect("every key is known");
+        for rule in &both.rules {
+            rule.to_rule()
+                .unwrap_or_else(|error| panic!("{} is wrong on its own: {error:?}", rule.id));
+        }
+        let refused = both
+            .validate()
+            .expect_err("two bridges that loop through one remote must not start a broker");
+        let ConfigError::Rule { id, why } = &refused else {
+            panic!("the wrong refusal: {refused}");
+        };
+        assert_eq!(id, "to-b", "the refusal names the wrong rule");
+        assert!(
+            why.contains("from-b") && why.contains("are both connected to"),
+            "the refusal should name both rules and the remote: {why}"
+        );
+
+        // The same pair, pointed at two remotes, starts: nothing
+        // carries what one published onto the other. Without this the
+        // assertion above would be satisfied by refusing every second
+        // bridge.
+        let apart = Config::from_toml(&with_rule(&format!(
+            "{MINIMAL_BRIDGE}\n{}",
+            BACK.replace("remote.invalid", "elsewhere.invalid")
+        )))
+        .expect("every key is known");
+        apart
+            .validate()
+            .expect("two bridges to two remotes are not one cycle");
+    }
+
+    /// Every refusal the section makes, each named so a failure says
+    /// which mistake it was rather than only that there was one —
+    /// convention 2.
+    #[test]
+    fn a_bridge_that_cannot_work_is_refused_with_its_own_reason() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "a filter that loops through a wildcard",
+                r##"
+                [[rules.mqtt_bridge.topics]]
+                filter = "sensors/+/temp"
+                direction = "out"
+                [[rules.mqtt_bridge.topics]]
+                filter = "sensors/kitchen/#"
+                direction = "in"
+                "##,
+                "mqtt_bridge loops",
+            ),
+            (
+                "a direction that is not one",
+                r##"
+                [[rules.mqtt_bridge.topics]]
+                filter = "a/#"
+                direction = "sideways"
+                "##,
+                "is not a direction",
+            ),
+            (
+                "a level that is not one",
+                r##"
+                [[rules.mqtt_bridge.topics]]
+                filter = "a/#"
+                direction = "out"
+                qos = 3
+                "##,
+                "is not a level",
+            ),
+            ("a bridge that carries nothing", "", "no topic entries"),
+        ];
+        for (what, topics, fragment) in cases {
+            let text = with_rule(&format!(
+                r##"
+                [[rules]]
+                id = "to-b"
+                name = "Bridge to B"
+                [rules.mqtt_bridge]
+                address = "mqtts://remote.invalid:8883"
+                client_id = "bridge-a"
+                {topics}
+                "##
+            ));
+            let said = Config::from_toml(&text)
+                .expect("every key is known")
+                .validate()
+                .expect_err(&format!("{what} must be refused"))
+                .to_string();
+            assert!(
+                said.contains(fragment),
+                "{what}: the refusal must say which mistake it was, and {fragment:?} is \
+                 not in {said:?}"
+            );
+        }
+    }
+
+    /// Refused when the configuration is read rather than discovered
+    /// on the wire: MQTT 3.1.1 has no way for the remote to say what
+    /// identifier it assigned, so the session could never be resumed.
+    #[test]
+    fn a_3_1_1_bridge_with_no_client_identifier_is_refused() {
+        let text = with_rule(
+            r##"
+            [[rules]]
+            id = "to-b"
+            name = "Bridge to B"
+            [rules.mqtt_bridge]
+            address = "mqtts://remote.invalid:8883"
+            protocol_level = 4
+            [[rules.mqtt_bridge.topics]]
+            filter = "a/#"
+            direction = "out"
+            "##,
+        );
+        let said = Config::from_toml(&text)
+            .expect("every key is known")
+            .validate()
+            .expect_err("3.1.1 cannot assign one")
+            .to_string();
+        assert!(said.contains("client_id"), "{said}");
+
+        // And the same rule on MQTT 5 is accepted, because there the
+        // remote does say.
+        let five = text.replace("protocol_level = 4", "protocol_level = 5");
+        Config::from_toml(&five)
+            .expect("every key is known")
+            .validate()
+            .expect("MQTT 5 assigns one and says so");
+    }
+
+    /// Section 12.3, on the way in: the configuration is logged at
+    /// startup and a bridge's password is in it.
+    #[test]
+    fn a_bridge_password_does_not_print_itself() {
+        let text = with_rule(
+            r##"
+            [[rules]]
+            id = "to-b"
+            name = "Bridge to B"
+            [rules.mqtt_bridge]
+            address = "mqtts://remote.invalid:8883"
+            client_id = "bridge-a"
+            username = "user"
+            password = "a-bridge-secret"
+            [[rules.mqtt_bridge.topics]]
+            filter = "a/#"
+            direction = "out"
+            "##,
+        );
+        let config = Config::from_toml(&text).expect("every key is known");
+        let shown = format!("{config:?}");
+        assert!(
+            !shown.contains("a-bridge-secret"),
+            "a password must not reach the first log line this binary writes: {shown}"
+        );
+    }
+
+    /// Section 9.1: one action. A rule that declares a bridge and
+    /// something else is an operator who means two rules.
+    #[test]
+    fn a_rule_that_bridges_and_posts_is_refused() {
+        let text = with_rule(
+            r##"
+            [[rules]]
+            id = "two"
+            name = "Two things"
+            filter = "a/#"
+            [rules.http_out]
+            url = "https://example.invalid/hook"
+            [rules.mqtt_bridge]
+            address = "mqtts://remote.invalid:8883"
+            client_id = "bridge-a"
+            [[rules.mqtt_bridge.topics]]
+            filter = "a/#"
+            direction = "out"
+            "##,
+        );
+        let said = Config::from_toml(&text)
+            .expect("every key is known")
+            .validate()
+            .expect_err("a rule has one action")
+            .to_string();
+        assert!(said.contains("write two rules"), "{said}");
+    }
+
+    // ---- the ingest listener -------------------------------------------
+
+    #[test]
+    fn the_ingest_listener_defaults_to_one_of_its_own_on_loopback() {
+        let config = Config::default();
+        assert_eq!(config.ingest.listener, IngestListener::Own);
+        assert!(
+            config.ingest.address.ip().is_loopback(),
+            "section 9.2: a listener of its own, and loopback until an operator says \
+             otherwise"
+        );
+        assert_eq!(config.ingest.address.port(), DEFAULT_INGEST_PORT);
+    }
+
+    #[test]
+    fn the_ingest_listener_can_be_moved_or_put_on_the_admin_listener() {
+        let config = Config::from_toml(
+            r#"
+            [ingest]
+            address = "0.0.0.0:9000"
+            listener = "admin"
+            "#,
+        )
+        .expect("every key is known");
+        assert_eq!(config.ingest.address.to_string(), "0.0.0.0:9000");
+        assert_eq!(config.ingest.listener, IngestListener::Admin);
+    }
+
+    /// A non-loopback ingest address with nothing else set is accepted.
+    ///
+    /// Deliberately unlike `[admin]`, and the difference is the point.
+    /// Section 9.2: the ingest listener needs no address rule of its
+    /// own, because every route on it is guarded by its own rule's
+    /// token and a rule without one is refused. A refusal here would be
+    /// a rule protecting something that is already protected, and would
+    /// stop the deployment the feature exists for — a webhook sender on
+    /// another host.
+    #[test]
+    fn a_non_loopback_ingest_address_needs_no_token_of_its_own() {
+        let text = format!(
+            "[ingest]\naddress = \"0.0.0.0:9000\"\n{}",
+            with_rule(MINIMAL_INGEST)
+        );
+        Config::from_toml(&text)
+            .expect("every key is known")
+            .validate()
+            .expect("every ingest route is individually guarded");
+    }
+
+    // ---- http_poll -----------------------------------------------------
+
+    /// Every part of a polling rule can be said, and reaches the rules
+    /// crate's own type.
+    #[test]
+    fn every_part_of_a_polling_rule_can_be_said() {
+        let text = with_rule(
+            r#"
+            [[rules]]
+            id = "weather"
+            name = "Weather poll"
+
+            [rules.http_poll]
+            url = "https://example.invalid/now"
+            headers = { "accept" = "text/plain" }
+            interval_ms = 30000
+            timeout_ms = 2500
+            max_body_bytes = 65536
+            topic = "weather/now"
+            qos = 1
+            retain = true
+            "#,
+        );
+        let config = Config::from_toml(&text).expect("every key is known");
+        config
+            .validate()
+            .expect("a complete polling rule is usable");
+
+        let rule = config.rules[0].to_rule().expect("it converts");
+        assert_eq!(rule.id.as_str(), "weather");
+        assert!(
+            rule.trigger.is_none(),
+            "a poller is fired by its own interval and has no trigger"
+        );
+        let Action::HttpPoll(action) = &rule.action else {
+            panic!("this rule polls: {:?}", rule.action);
+        };
+        assert_eq!(action.url, "https://example.invalid/now");
+        assert_eq!(
+            action.headers,
+            vec![("accept".to_owned(), "text/plain".to_owned())]
+        );
+        assert_eq!(action.interval_ms, 30_000);
+        assert_eq!(action.timeout_ms, 2_500);
+        assert_eq!(action.max_body_bytes, 65_536);
+        assert_eq!(action.topic, "weather/now");
+        assert_eq!(action.qos, QoS::AtLeastOnce);
+        assert!(action.retain);
+
+        // And it survives the store, which is where it actually lives.
+        let stored = rule.to_record();
+        assert_eq!(
+            Rule::try_from(&stored).expect("it reads back"),
+            rule,
+            "a polling rule round trips through the record"
+        );
+    }
+
+    /// A polling rule says the two things it must and takes the rest
+    /// from the rules crate.
+    #[test]
+    fn a_polling_rule_takes_the_rules_crate_defaults() {
+        let text = with_rule(
+            r#"
+            [[rules]]
+            id = "weather"
+            name = "Weather poll"
+
+            [rules.http_poll]
+            url = "https://example.invalid/now"
+            topic = "weather/now"
+            "#,
+        );
+        let config = Config::from_toml(&text).expect("every key is known");
+        config.validate().expect("a minimal polling rule is usable");
+
+        let defaults = HttpPoll::default();
+        let poll = config.rules[0].http_poll.as_ref().expect("this rule polls");
+        assert_eq!(poll.interval_ms, defaults.interval_ms);
+        assert_eq!(poll.timeout_ms, defaults.timeout_ms);
+        assert_eq!(poll.max_body_bytes, defaults.max_body_bytes);
+        assert!(!poll.retain, "a retained default outlives the rule");
+    }
+
+    /// What a polling rule may not say is refused, with the rule named
+    /// and the mistake said.
+    ///
+    /// The accepted rule above is what stops this passing against a
+    /// check that refuses everything. Convention 5.
+    #[test]
+    fn what_a_polling_rule_may_not_say_is_refused_by_name() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "a plain-text url to somewhere that is not this machine",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                [rules.http_poll]
+                url = "http://example.invalid/now"
+                topic = "weather/now"
+                "#,
+                "in the clear",
+            ),
+            (
+                "an interval of zero",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "weather/now"
+                interval_ms = 0
+                "#,
+                "interval_ms is zero",
+            ),
+            (
+                "a body limit of zero",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "weather/now"
+                max_body_bytes = 0
+                "#,
+                "max_body_bytes is zero",
+            ),
+            (
+                "a topic with a wildcard in it",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "weather/+"
+                "#,
+                "http_poll.topic",
+            ),
+            (
+                "a topic in the reserved namespace",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "$sd/weather"
+                "#,
+                "dollar-prefixed",
+            ),
+            (
+                "a level MQTT does not have",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "weather/now"
+                qos = 3
+                "#,
+                "http_poll.qos",
+            ),
+            (
+                "a filter, on a rule nothing published fires",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                filter = "weather/#"
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "weather/now"
+                "#,
+                "its own interval",
+            ),
+            (
+                "a narrowing with no filter to narrow",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                min_qos = 1
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "weather/now"
+                "#,
+                "an http_poll rule has",
+            ),
+            (
+                "two actions, where section 9.1 allows one",
+                r#"
+                [[rules]]
+                id = "weather"
+                name = "Weather poll"
+                filter = "weather/#"
+                [rules.http_poll]
+                url = "https://example.invalid/now"
+                topic = "weather/now"
+                [rules.http_out]
+                url = "https://example.invalid/hook"
+                "#,
+                "two rules",
+            ),
+        ];
+
+        for (what, text, fragment) in cases {
+            let error = refuse(&with_rule(text));
+            let said = error.to_string();
+            assert!(
+                said.contains("weather"),
+                "{what}: the refusal must name the rule: {said}"
+            );
+            assert!(
+                said.contains(fragment),
+                "{what}: the refusal must say which mistake it was, and {fragment:?} is \
+                 not in {said:?}"
+            );
+        }
+    }
+
+    /// A rule with no action at all names every table it could have
+    /// been.
+    ///
+    /// An operator who wrote none needs the list, and a list that goes
+    /// stale as actions are added is worse than no list; this is what
+    /// notices.
+    #[test]
+    fn a_rule_with_no_action_names_every_action_there_is() {
+        let said = refuse(&with_rule(
+            r#"
+            [[rules]]
+            id = "weather"
+            name = "Weather poll"
+            "#,
+        ))
+        .to_string();
+        for table in ["[rules.http_out]", "[rules.http_in]", "[rules.http_poll]"] {
+            assert!(
+                said.contains(table),
+                "a rule with no action must name {table}: {said}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_takes_the_rules_crate_defaults_for_everything_it_does_not_say() {
+        let config = Config::from_toml(&with_rule(MINIMAL)).expect("every key is known");
+        config.validate().expect("a minimal rule is usable");
+
+        assert_eq!(config.rules.len(), 1);
+        let section = &config.rules[0];
+        assert!(section.enabled, "a rule left alone is on");
+        assert_eq!(section.min_qos, None, "and is not narrowed by level");
+        assert_eq!(section.client_id, None);
+
+        let defaults = HttpOut::default();
+        let out = section.http_out.as_ref().expect("this rule posts out");
+        assert_eq!(out.method, defaults.method);
+        assert_eq!(out.timeout_ms, defaults.timeout_ms);
+        assert_eq!(out.retries, defaults.retries);
+        assert_eq!(out.backoff_ms, defaults.backoff_ms);
+        assert_eq!(out.max_concurrency, defaults.max_concurrency);
+
+        let rule = section.to_rule().expect("it converts");
+        assert_eq!(rule.id.as_str(), "telemetry");
+        assert_eq!(
+            rule.trigger.as_ref().map(Trigger::filter),
+            Some("sensor/+/temp")
+        );
+        assert_eq!(rule.id.dead_letter_topic(), "$sd/rules/telemetry/dlq");
+    }
+
+    #[test]
+    fn every_part_of_a_rule_can_be_said() {
+        let text = with_rule(
+            r#"
+            [[rules]]
+            id = "telemetry"
+            name = "Telemetry out"
+            enabled = false
+            filter = "sensor/+/temp"
+            min_qos = 2
+            client_id = "sensor-*"
+
+            [rules.http_out]
+            url = "https://example.invalid/hook"
+            method = "PUT"
+            timeout_ms = 2500
+            max_concurrency = 8
+            retries = 5
+            backoff_ms = 750
+            headers = { "x-token" = "secret" }
+        "#,
+        );
+        let config = Config::from_toml(&text).expect("every key is known");
+        config.validate().expect("it is usable");
+        let rule = config.rules[0].to_rule().expect("it converts");
+
+        assert!(!rule.enabled);
+        let trigger = rule.trigger.as_ref().expect("this rule fires on messages");
+        assert_eq!(trigger.min_qos, Some(QoS::ExactlyOnce));
+        assert_eq!(
+            trigger.client_id.as_ref().map(ClientPattern::as_str),
+            Some("sensor-*")
+        );
+        let Action::HttpOut(action) = &rule.action else {
+            panic!("this rule posts out");
+        };
+        assert_eq!(action.method, "PUT");
+        assert_eq!(action.timeout_ms, 2_500);
+        assert_eq!(action.max_concurrency, 8);
+        assert_eq!(action.retries, 5);
+        assert_eq!(action.backoff_ms, 750);
+        assert_eq!(
+            action.headers,
+            vec![("x-token".to_owned(), "secret".to_owned())]
+        );
+    }
+
+    /// A rule with nowhere durable to put an envelope is refused.
+    ///
+    /// Running with no store at all stays a warning, because that is a
+    /// supported mode. Declaring a rule is an operator saying they want
+    /// messages delivered somewhere else, and an outbox that is not
+    /// written down loses every one that was in flight.
+    #[test]
+    fn a_rule_without_a_store_is_refused() {
+        let mut config = Config::from_toml(MINIMAL).expect("the file parses");
+        assert!(config.storage.directory.is_none());
+        let error = config
+            .validate()
+            .expect_err("a rule with no store must be refused");
+        assert!(
+            matches!(&error, ConfigError::Unusable { key, .. } if *key == "storage.directory"),
+            "said: {error}"
+        );
+
+        // And the same file with a store is fine, so the refusal is
+        // about the store and not about the rule.
+        config.storage.directory = Some(PathBuf::from("/tmp/sdmqtt-test"));
+        config.validate().expect("with a store it is usable");
+    }
+
+    #[test]
+    fn two_rules_under_one_identifier_are_refused() {
+        let error = refuse(&with_rule(&format!("{MINIMAL}\n{MINIMAL}")));
+        assert!(
+            matches!(&error, ConfigError::Rule { id, .. } if id == "telemetry"),
+            "said: {error}"
+        );
+    }
+
+    /// Everything a rule can be wrong about is refused at startup, by
+    /// name, rather than becoming a rule that quietly never fires.
+    #[test]
+    fn a_rule_that_cannot_post_stops_the_broker_starting() {
+        for (what, rule) in [
+            (
+                "a plain-text url to somewhere that is not this machine",
+                MINIMAL.replace(
+                    "https://example.invalid/hook",
+                    "http://example.invalid/hook",
+                ),
+            ),
+            (
+                "a url that is not one",
+                MINIMAL.replace("https://example.invalid/hook", "not a url"),
+            ),
+            (
+                "a method that is not one",
+                format!("{MINIMAL}\n        method = \"NOT A METHOD\"\n"),
+            ),
+            (
+                "a header name that cannot be sent",
+                format!("{MINIMAL}\n        headers = {{ \"not a name\" = \"v\" }}\n"),
+            ),
+            (
+                "an identifier with a topic separator in it",
+                MINIMAL.replace(r#"id = "telemetry""#, r#"id = "a/b""#),
+            ),
+            (
+                "a filter that is not one",
+                MINIMAL.replace(
+                    r#"filter = "sensor/+/temp""#,
+                    r#"filter = "sensor/+x/temp""#,
+                ),
+            ),
+            (
+                "a level MQTT does not have",
+                MINIMAL.replace(
+                    r#"filter = "sensor/+/temp""#,
+                    "filter = \"sensor/+/temp\"\n        min_qos = 3",
+                ),
+            ),
+            (
+                "a concurrency of zero, which is a rule that never posts",
+                format!("{MINIMAL}\n        max_concurrency = 0\n"),
+            ),
+        ] {
+            let error = refuse(&with_rule(&rule));
+            assert!(
+                matches!(&error, ConfigError::Rule { id, .. } if id == "telemetry" || id == "a/b"),
+                "{what}: said {error}"
+            );
+        }
     }
 
     #[test]

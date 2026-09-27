@@ -28,18 +28,59 @@
 # than no check, so an unbuilt interface is an error naming what to run
 # rather than a budget quietly met.
 #
+# # The tools it measures with are checked before it measures anything
+#
+# The rule above, applied to this script itself. A missing `cargo` or
+# `python3` is not a budget met; it is a budget nobody weighed, and
+# every path to that answer here now ends in an exit code that stops a
+# build. `scripts/test_budgets.sh` is what says so, because a check
+# whose failure path is never run is a check nobody has seen fail.
+#
+# Two habits go with it. Every measurement is a number before it is
+# compared, so a budget cannot pass because an empty string compared
+# oddly; and a command whose failure matters is tested with `if !`
+# rather than by reading `$?` afterwards, which is one inserted line
+# away from reading somebody else's status.
+#
 # # Usage
 #
 #   scripts/budgets.sh
 #
 # Exits non-zero when a budget is exceeded, naming which and by how
-# much. Needs cargo and python3; python3 reads `cargo metadata`'s JSON,
-# which is the only description of the dependency graph that is not a
-# manifest this script would have to parse by hand.
+# much; **2** when it could not measure at all, which is the case worth
+# telling apart. Needs cargo and python3; python3 reads
+# `cargo metadata`'s JSON, which is the only description of the
+# dependency graph that is not a manifest this script would have to
+# parse by hand.
+#
+# One warning for whoever runs it: `scripts/budgets.sh | tee log`
+# reports `tee`'s exit status and not this one. Run it on its own, or
+# set `pipefail` in the shell that pipes it.
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 broker="$here/services/broker"
+
+# Everything this measures with, checked before anything is measured.
+#
+# Named one at a time rather than as a list, because "python3 is not
+# installed" and "cargo is not on this PATH" have different answers and
+# the whole point of this section is that the person reading it is
+# about to do something about it.
+missing=0
+for tool in cargo python3 gzip find; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "  $tool is not on the PATH, and the budgets cannot be measured without it" >&2
+        missing=$((missing + 1))
+    fi
+done
+if [ "$missing" -gt 0 ]; then
+    echo >&2
+    echo "  A budget that quietly passes when it cannot measure is worse than no" >&2
+    echo "  budget, so this is an error rather than a skip. For cargo:" >&2
+    echo "    source \"\$HOME/.cargo/env\"" >&2
+    exit 2
+fi
 
 # ---------------------------------------------------------------------
 # The budgets, from section 15.
@@ -74,6 +115,16 @@ failures=()
 # MB, so exactly 15 MB is over.
 report() {
     local name="$1" measured="$2" limit="$3" render="$4"
+    # A measurement that is not a number is a measurement that did not
+    # happen. `[ "" -ge 15000000 ]` is an error bash reports as false,
+    # which would print a budget comfortably met on the strength of
+    # nothing at all.
+    case "$measured" in
+        '' | *[!0-9]*)
+            echo "  $name could not be measured: ${measured:-nothing came back}" >&2
+            exit 2
+            ;;
+    esac
     checked=$((checked + 1))
     local shown allowed
     shown="$("$render" "$measured")"
@@ -111,8 +162,11 @@ echo
 # The release binary.
 # ---------------------------------------------------------------------
 
-build_log="$(cd "$broker" && cargo build --release --all-features -p sdmqtt 2>&1)"
-if [ $? -ne 0 ]; then
+# `if !` rather than reading `$?` on the next line: the status is
+# consumed by the thing that cares about it, and no line inserted
+# between the two can quietly change which command is being asked
+# about.
+if ! build_log="$(cd "$broker" && cargo build --release --all-features -p sdmqtt 2>&1)"; then
     # Printed, not summarised. A gate that says only "it did not
     # build" makes the next person run the build again to find out
     # why, which is the whole of what this already knows.

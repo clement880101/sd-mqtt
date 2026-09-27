@@ -300,38 +300,158 @@ def allowed_licences() -> set[str]:
     return set(re.findall(r'"([^"]+)"', block.group(1)))
 
 
+# An SPDX expression's tokens: a bracket, or a run of anything else.
+# `WITH`, `AND` and `OR` come out as their own tokens and the parser
+# recognises them there; an identifier may carry a `+`.
+SPDX_TOKEN = re.compile(r"\(|\)|[^\s()]+")
+
+
+def parse_expression(expression: str) -> tuple:
+    """An SPDX licence expression, as a tree.
+
+    **Parsed rather than searched.** The thing this replaced looked
+    for the word "or" anywhere in the string, so
+    `ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND
+    BSD-3-Clause` — every one of which applies at once — was read as
+    a choice and resolved to one of them. A choice only counts where
+    it actually is: at the top level, outside brackets.
+
+    Precedence is SPDX annex D's: `+`, then `WITH`, then `AND`, then
+    `OR`. So `ISC AND Apache-2.0 OR ISC`, which is what `aws-lc-rs`
+    declares, is a choice between `ISC AND Apache-2.0` and `ISC`, and
+    not a conjunction with a choice in it.
+
+    A node is `("id", "MIT")`, `("and", [node, ...])` or
+    `("or", [node, ...])`.
+    """
+    tokens = SPDX_TOKEN.findall(expression)
+    position = 0
+
+    def fail(what: str) -> None:
+        raise SystemExit(f'"{expression}" is not a licence expression: {what}')
+
+    def peek() -> str | None:
+        return tokens[position] if position < len(tokens) else None
+
+    def licence() -> tuple:
+        nonlocal position
+        token = peek()
+        if token is None or token in ("(", ")") or token.upper() in ("AND", "OR", "WITH"):
+            fail("a licence identifier was expected")
+        position += 1
+        # `WITH` binds tighter than everything, and the pair is one
+        # identifier: "Apache-2.0 WITH LLVM-exception" is what the
+        # allow list spells, not two things joined.
+        name = token
+        if (following := peek()) is not None and following.upper() == "WITH":
+            position += 1
+            exception = peek()
+            if exception is None or exception in ("(", ")"):
+                fail("WITH names no exception")
+            position += 1
+            name = f"{name} WITH {exception}"
+        return ("id", name)
+
+    def term() -> tuple:
+        nonlocal position
+        if peek() == "(":
+            position += 1
+            inner = disjunction()
+            if peek() != ")":
+                fail("a bracket is not closed")
+            position += 1
+            return inner
+        return licence()
+
+    def conjunction() -> tuple:
+        nonlocal position
+        parts = [term()]
+        while (token := peek()) is not None and token.upper() == "AND":
+            position += 1
+            parts.append(term())
+        return parts[0] if len(parts) == 1 else ("and", parts)
+
+    def disjunction() -> tuple:
+        nonlocal position
+        parts = [conjunction()]
+        while (token := peek()) is not None and token.upper() == "OR":
+            position += 1
+            parts.append(conjunction())
+        return parts[0] if len(parts) == 1 else ("or", parts)
+
+    tree = disjunction()
+    if position != len(tokens):
+        fail(f"there is a stray {tokens[position]!r}")
+    return tree
+
+
+def _resolve(node: tuple, allowed: set[str]) -> list[str] | None:
+    """Which licences this subtree obliges us to, or `None` if it cannot.
+
+    `None` means no reading of this subtree stays inside the allow
+    list. For a conjunction that is any part off the list, because
+    there is no branch to take; for a disjunction it is every branch.
+    """
+    kind = node[0]
+    if kind == "id":
+        return [node[1]] if node[1] in allowed else None
+    if kind == "and":
+        obliged: list[str] = []
+        for child in node[1]:
+            part = _resolve(child, allowed)
+            if part is None:
+                return None
+            # Named once however many times the expression says it.
+            obliged.extend(name for name in part if name not in obliged)
+        return obliged
+    candidates = [
+        resolved
+        for child in node[1]
+        if (resolved := _resolve(child, allowed)) is not None
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=_obligation_cost)
+
+
+def _obligation_cost(branch: list[str]) -> tuple[int, int, str]:
+    """How much a branch of a choice asks of us. Least is taken.
+
+    Fewest licences first, because each one is a text to carry and a
+    notice to keep accurate, and then by [`PREFERENCE`]'s order of how
+    much the heaviest of them asks. The expression itself is the last
+    tie-break, so the answer does not depend on the order branches
+    happen to be written in.
+    """
+    worst = max(
+        (PREFERENCE.index(name) if name in PREFERENCE else len(PREFERENCE))
+        for name in branch
+    )
+    return (len(branch), worst, " AND ".join(branch))
+
+
 def effective(expression: str | None, allowed: set[str]) -> str:
     """Which licence we are actually under, given the allow list.
 
     A disjunction is a choice the copyright holder gave us, so the
     branch we take is the one we are obliged by, and the branches we
     did not take oblige us to nothing. A conjunction is not a choice;
-    every part of it applies.
+    every part of it applies, and so does every part's obligation.
     """
     if not expression:
         raise SystemExit("a package declares no licence at all; deny.toml should have caught it")
     if "/" in expression:
         # The old separator, still on a few crates.
         expression = expression.replace("/", " OR ")
-    if re.search(r"\bOR\b", expression):
-        branches = [
-            branch.strip(" ()")
-            for branch in re.split(r"\s+OR\s+", expression)
-            if branch.strip(" ()")
-        ]
-        candidates = [branch for branch in branches if branch in allowed]
-        if not candidates:
+    tree = parse_expression(expression)
+    obliged = _resolve(tree, allowed)
+    if obliged is None:
+        if tree[0] == "or":
             raise SystemExit(
                 f'no branch of "{expression}" is on deny.toml\'s allow list'
             )
-        for preferred in PREFERENCE:
-            if preferred in candidates:
-                return preferred
-        return sorted(candidates)[0]
-    for atom in re.split(r"\s+AND\s+", expression):
-        if atom.strip(" ()") not in allowed:
-            raise SystemExit(f'"{expression}" is not on deny.toml\'s allow list')
-    return expression
+        raise SystemExit(f'"{expression}" is not on deny.toml\'s allow list')
+    return " AND ".join(obliged)
 
 
 def in_the_build(target: str) -> set[tuple[str, str]]:

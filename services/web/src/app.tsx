@@ -14,6 +14,7 @@ import { useEffect } from 'preact/hooks';
 import { lastEventId, start, status } from './live.js';
 import { Clients } from './pages/clients.js';
 import { Overview } from './pages/overview.js';
+import { Rules } from './pages/rules.js';
 import { Topics } from './pages/topics.js';
 
 /** The pages section 11.2 names, in the order the navigation shows them. */
@@ -21,6 +22,7 @@ const PAGES = [
   { path: '/', label: 'Overview' },
   { path: '/clients', label: 'Clients' },
   { path: '/topics', label: 'Topics' },
+  { path: '/rules', label: 'Rules' },
 ] as const;
 
 /** What the page at `path` is called, for the tab and the navigation. */
@@ -114,6 +116,7 @@ export function App() {
           <Route path="/" component={Overview} />
           <Route path="/clients" component={Clients} />
           <Route path="/topics" component={Topics} />
+          <Route path="/rules" component={Rules} />
           <Route default component={() => <Placeholder title="Not found" />} />
         </Router>
       </main>

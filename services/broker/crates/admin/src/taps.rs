@@ -1029,7 +1029,9 @@ pub fn open(state: &AdminState, filter: &str) -> Result<Arc<Tap>, ApiError> {
         };
         let connect = tap_connect(&client_id);
         let mut out = Vec::new();
-        let registration = broker.connect(MOUNTPOINT, &connect, &mut out);
+        let registration = broker
+            .connect(MOUNTPOINT, &connect, &mut out)
+            .expect("the default decision authenticates");
         Ok((client_id, registration, out, depth))
     })?;
     let (client_id, registration, connect_actions, depth) = connected;

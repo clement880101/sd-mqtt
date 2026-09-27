@@ -406,3 +406,125 @@ input[aria-invalid='true'] {
 .rows .empty {
   padding: var(--size-3);
 }
+
+/* ------------------------------------------------------------------
+ * The Rules page: a table with a sparkline per row, a per-action
+ * form, and what each rule gave up on.
+ * ---------------------------------------------------------------- */
+
+/*
+ * A sparkline is a shape in a cell, so it has no axis and no legend
+ * and takes its colour from the same series token the charts use.
+ * `vector-effect` keeps the stroke one pixel wide whatever the box
+ * is scaled to, which matters because the cell is not a fixed width
+ * on a narrow screen.
+ */
+.spark {
+  display: block;
+  overflow: visible;
+}
+
+.spark-line {
+  stroke: var(--series-a);
+  stroke-width: 1.25;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.spark-dot {
+  fill: var(--series-a);
+}
+
+/*
+ * What no series at all looks like: words, not geometry. See
+ * `sparkline.tsx` — the one thing this cell must not do is draw
+ * something that reads as a measurement.
+ */
+.spark-empty {
+  color: var(--ink-quiet);
+  font-size: var(--font-size-00);
+  font-style: italic;
+}
+
+/*
+ * Ten columns do not fit a laptop window, and `.table` hides its
+ * overflow to keep its corners, so the last column — the one with the
+ * buttons in it — was clipped away rather than wrapped: measured at
+ * 1,104 pixels wanted against 974 available, with the delete button 84
+ * pixels past the edge of a 1,024-pixel viewport and unreachable. It
+ * scrolls sideways instead, which keeps every column at a width its
+ * contents can be read at.
+ */
+.rules-table {
+  overflow-x: auto;
+}
+
+.rules-table .row {
+  grid-template-columns:
+    minmax(7rem, 1.4fr) 7rem minmax(7rem, 1.6fr) 6.5rem
+    4rem 5rem 4rem 4rem 5rem minmax(14rem, auto);
+  min-block-size: var(--size-7);
+}
+
+.rules-table .doing {
+  display: flex;
+  gap: var(--size-1);
+  overflow: visible;
+}
+
+.rules-table .doing button {
+  padding-inline: var(--size-2);
+  font-size: var(--font-size-00);
+}
+
+/* The editor. A form of its own on the page, above the table. */
+.editor {
+  border: var(--border-size-1) solid var(--edge);
+  border-radius: var(--radius-2);
+  background: var(--surface-raised);
+  padding: var(--size-3) var(--size-4);
+  margin-block-end: var(--size-4);
+}
+
+.editor .fields {
+  margin-block-end: var(--size-3);
+}
+
+.editor input[readonly] {
+  color: var(--ink-quiet);
+}
+
+.headers,
+.bridge-topics {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-2);
+  inline-size: 100%;
+}
+
+.headers .label,
+.bridge-topics .label {
+  font-size: var(--font-size-0);
+  color: var(--ink-quiet);
+}
+
+.header-row,
+.topic-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-2);
+}
+
+/* What one rule gave up on. */
+.letters .letter {
+  border-block-end: var(--border-size-1) solid var(--edge);
+  padding-block: var(--size-2);
+}
+
+.letters pre {
+  margin: var(--size-1) 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: var(--font-size-0);
+}

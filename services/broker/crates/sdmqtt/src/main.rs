@@ -7,6 +7,8 @@
 //! is not get in the way.
 
 mod config;
+mod connectors;
+mod ingest;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -17,10 +19,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use broker_core::broker::Broker;
 use clap::{Args, Parser, Subcommand};
-use config::{Config, ConfigError, LogLevel, Overrides};
+use config::{Config, ConfigError, IngestListener, LogLevel, Overrides};
+use ingest::IngestSocket;
+use rules::live::IngestListening;
+use rules::Ingest;
 use sdmqtt_admin::{
-    AdminRunning, AdminServer, AdminStartError, AdminState, ListenerProtocol, ListenerView,
-    Readiness,
+    listener_list, AdminRunning, AdminServer, AdminStartError, AdminState, ListenerProtocol,
+    ListenerView, Listeners, Readiness, Router,
 };
 use sdmqtt_server::listener::{Running, Server};
 use sdmqtt_server::shared::Shared;
@@ -143,7 +148,7 @@ async fn main() -> ExitCode {
 
 /// Everything that can go wrong before the broker is serving.
 #[derive(Debug, thiserror::Error)]
-enum StartupError {
+pub enum StartupError {
     /// The configuration could not be assembled.
     #[error("{0}")]
     Config(#[from] ConfigError),
@@ -176,6 +181,15 @@ enum StartupError {
     /// to, and an operator who wanted one without them can say so.
     #[error("{0}")]
     Admin(#[from] AdminStartError),
+    /// A rule could not be installed.
+    ///
+    /// Fatal rather than a rule that is quietly missing. A broker that
+    /// started with a connector silently not running is a broker
+    /// dropping messages an operator believes are being delivered, and
+    /// the outbox those messages would have gone into is exactly what
+    /// this milestone exists to make trustworthy.
+    #[error("cannot start a rule: {0}")]
+    Connector(String),
 }
 
 /// Wait for whichever stop signal comes first, and name it.
@@ -243,11 +257,29 @@ fn now_seconds() -> u32 {
 /// `Ok(None)` means the configuration named no store directory, which
 /// is a supported mode and not a failure; see the documentation on
 /// [`config::StorageSection::directory`].
-fn restore_broker(config: &Config) -> Result<Option<Arc<Shared>>, StartupError> {
+fn restore_broker(config: &Config) -> Result<Option<Rebuilt>, StartupError> {
     let Some(store) = config.storage.open()? else {
         return Ok(None);
     };
     restore_from(store, config).map(Some)
+}
+
+/// A broker rebuilt from a store, and the two things that read and
+/// write it.
+///
+/// The store and the writer come back out because the connectors need
+/// them: a rule is written into the store at startup and its pump reads
+/// the outbox the hook fills. [`Shared`] holds a writer of its own and
+/// does not hand it out, deliberately — the only way to reach it
+/// through [`Shared`] is to hold the broker's lock, which is what keeps
+/// the store's order the order the broker produced.
+struct Rebuilt {
+    /// What a listener is given.
+    shared: Arc<Shared>,
+    /// What a rule's pump reads.
+    store: Arc<dyn Storage>,
+    /// What a rule's hook and pump write through.
+    writer: Arc<Writer>,
 }
 
 /// The same, against a store somebody else opened.
@@ -258,7 +290,7 @@ fn restore_broker(config: &Config) -> Result<Option<Arc<Shared>>, StartupError> 
 /// the two orders are indistinguishable, so a test that could not make
 /// the read slow could not tell them apart, and the rule section 7.5
 /// states would be guarded by nothing.
-fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Arc<Shared>, StartupError> {
+fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, StartupError> {
     // **Before the restore, not after.** Section 7.5: this is what
     // decides which sessions outlived the outage, and a clock read
     // afterwards would count the read of the store itself against
@@ -380,7 +412,11 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Arc<Shared>,
         );
     }
 
-    Ok(Arc::new(Shared::with_store(broker, writer)))
+    Ok(Rebuilt {
+        shared: Arc::new(Shared::with_store(broker, Arc::clone(&writer))),
+        store,
+        writer,
+    })
 }
 
 /// Start the admin listener beside the MQTT one.
@@ -396,33 +432,112 @@ async fn start_admin(
     config: &Config,
     running: &Running,
     readiness: Arc<Readiness>,
+    listeners: Listeners,
+    ingest: &Arc<Ingest>,
+    registry: Option<&Arc<rules::live::Registry>>,
 ) -> Result<Option<AdminRunning>, StartupError> {
     if !config.admin.enabled {
         tracing::warn!(
             "the admin listener is disabled, so this node serves no health endpoints, \
              no metrics and no API"
         );
+        if config.ingest.listener == IngestListener::Admin {
+            // Not a warning attached to the rules: the operator asked
+            // for both things and they contradict each other, so the
+            // one that silently does nothing is said out loud.
+            //
+            // **Whether or not this node holds an ingest rule yet.**
+            // It used to be said only when one existed, which made it
+            // a line nobody saw on exactly the node where a rule
+            // created later would be served nowhere.
+            tracing::error!(
+                "ingest.listener = \"admin\" and the admin listener is disabled, so this \
+                 node's ingest rules are served nowhere"
+            );
+        }
         return Ok(None);
     }
     let state = AdminState::new(Arc::clone(running.shared()))
         .with_readiness(readiness)
-        // What this process bound, which nothing can discover: a
-        // socket does not know what it is for and the broker does
-        // not know a listener exists. The admin listener adds its
-        // own row once it knows its port.
-        .with_listeners(vec![ListenerView {
-            name: "mqtt".to_owned(),
-            protocol: ListenerProtocol::Mqtt,
-            address: running.address(),
-            mountpoint: config.listener.mountpoint.clone(),
-            max_connections: Some(config.listener.max_connections),
-        }]);
-    let admin = AdminServer::bind(&config.admin, state).await?;
+        .with_listeners(listeners)
+        // Section 11.1 serves rules, and section 9.1 makes one
+        // durable metadata, so a node with no store has none to
+        // serve. See `sdmqtt_admin::rules`.
+        .with_rules(registry.map(Arc::clone));
+
+    // Section 9.2: serving the ingest routes here is permitted and
+    // must be chosen explicitly. `Router::new()` is the ordinary case.
+    //
+    // **Merged whether or not this node holds an ingest rule.** A
+    // route set with nothing registered in it answers every
+    // identifier the way it answers one nobody configured, so serving
+    // it costs a node with no ingest rules nothing at all — and the
+    // alternative is the defect this listener's own socket used to
+    // have, because an axum router cannot grow a route once it is
+    // being served and a rule created later would have nowhere to
+    // go until the next restart. The one route here has the rule
+    // identifier as a path segment for exactly that reason; see
+    // `rules::http_in::INGEST_PATH`.
+    let extra = if config.ingest.listener == IngestListener::Admin {
+        tracing::info!(
+            rules = ingest.len(),
+            "the ingest routes are served on the admin listener, as this configuration \
+             asked for; they are behind the admin listener's host check as well as their \
+             own tokens"
+        );
+        rules::http_in::routes::<AdminState>(Arc::clone(running.shared()), Arc::clone(ingest))
+    } else {
+        Router::new()
+    };
+
+    let admin = AdminServer::bind_with(&config.admin, state, extra).await?;
     tracing::info!(
         address = %admin.address(),
         "the admin API, metrics and health endpoints are serving"
     );
     Ok(Some(admin))
+}
+
+/// Take charge of the ingest listener, when the routes are served on
+/// a socket of this node's own.
+///
+/// `Ok(None)` is a configuration that puts the routes on the admin
+/// listener, which is bound whatever this node holds and so has
+/// nothing for anybody to take charge of.
+///
+/// What comes back is **the socket rather than a listener**, because
+/// whether anything is bound is a question about what this node holds
+/// now and the answer changes while it runs: read [`ingest`] for why.
+/// This binds it if there is already an ingest rule to serve, which is
+/// what keeps an unavailable address a startup failure, and hands it
+/// to the registry so that the first rule created afterwards binds it
+/// too.
+///
+/// **After the MQTT listener has bound**, which is the order section
+/// 9.2 wants and the reason the registry is given this here rather
+/// than when it is built: a post is a publication, and a publication
+/// that reaches subscribers before the listener they are attached
+/// through is bound reaches none of them.
+async fn start_ingest(
+    config: &Config,
+    shared: &Arc<Shared>,
+    connectors: &connectors::Connectors,
+    listeners: &Listeners,
+) -> Result<Option<Arc<IngestSocket>>, StartupError> {
+    if config.ingest.listener != IngestListener::Own {
+        return Ok(None);
+    }
+    let socket = Arc::new(IngestSocket::new(
+        config.ingest.address,
+        Arc::clone(shared),
+        Arc::clone(connectors.ingest()),
+        Arc::clone(listeners),
+    ));
+    socket.bind_if_wanted().await?;
+    if let Some(registry) = connectors.registry() {
+        registry.serve_ingest_on(Arc::clone(&socket) as Arc<dyn IngestListening>);
+    }
+    Ok(Some(socket))
 }
 
 /// Configure, restore, bind, and serve until told to stop.
@@ -444,10 +559,10 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
 
     // Section 7.2 and 7.5: the store is opened and the broker rebuilt
     // from it before anything binds.
-    let shared = match restore_broker(&config)? {
-        Some(shared) => {
+    let rebuilt = match restore_broker(&config)? {
+        Some(rebuilt) => {
             readiness.storage_is_open();
-            shared
+            Some(rebuilt)
         }
         None => {
             // Loud, because the alternative to a default is silence
@@ -464,9 +579,28 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             // running with no store is a supported mode, not a node
             // that is forever unready.
             readiness.storage_is_not_configured();
-            Arc::new(Shared::new(config.server().broker))
+            None
         }
     };
+    let shared = match &rebuilt {
+        Some(rebuilt) => Arc::clone(&rebuilt.shared),
+        None => Arc::new(Shared::new(config.server().broker)),
+    };
+
+    // **Before anything binds.** A rule half installed is a message
+    // that fires nothing, and the first thing a client does after a
+    // listener comes up could be to publish one. `Config::validate` has
+    // already refused a configuration with rules and no store, so a
+    // rule here always has somewhere durable to put an envelope.
+    let connectors = match &rebuilt {
+        Some(rebuilt) => {
+            connectors::start(&config, &shared, &rebuilt.store, &rebuilt.writer).await?
+        }
+        None => connectors::start_without_rules(),
+    };
+    if connectors.len() > 0 {
+        tracing::info!(rules = connectors.len(), "rules are running");
+    }
 
     let running = Server::bind_shared(config.server(), shared).await?;
     tracing::info!(
@@ -476,8 +610,36 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         "sdmqtt is serving MQTT over TCP"
     );
 
-    let admin = start_admin(&config, &running, Arc::clone(&readiness)).await?;
-    // Both of them, and only once both are bound. A node that said
+    // What this process bound, which nothing can discover: a socket
+    // does not know what it is for and the broker does not know a
+    // listener exists. The other two listeners add their own rows,
+    // the admin one once it knows its port and the ingest one
+    // whenever it is bound — which is not only at startup; see
+    // `ingest`.
+    let listeners = listener_list(vec![ListenerView {
+        name: "mqtt".to_owned(),
+        protocol: ListenerProtocol::Mqtt,
+        address: running.address(),
+        mountpoint: config.listener.mountpoint.clone(),
+        max_connections: Some(config.listener.max_connections),
+    }]);
+
+    // **After the MQTT listener, not before.** An ingest post is a
+    // publication, and a publication that reaches subscribers before
+    // the listener they are attached through is bound reaches none of
+    // them. The broker itself is already restored, which is what
+    // matters for durability.
+    let ingest = start_ingest(&config, running.shared(), &connectors, &listeners).await?;
+    let admin = start_admin(
+        &config,
+        &running,
+        Arc::clone(&readiness),
+        Arc::clone(&listeners),
+        connectors.ingest(),
+        connectors.registry(),
+    )
+    .await?;
+    // All of them, and only once all are bound. A node that said
     // it was ready with one listener up would be sent traffic for
     // the other.
     readiness.listeners_are_bound();
@@ -503,7 +665,27 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         admin.shutdown().await;
         tracing::info!("the admin listener has stopped");
     }
+    // And the ingest listener beside it, for the same reason: it
+    // publishes, so nothing may enter a broker that is being torn
+    // down. Before the MQTT listener stops, so that a post already in
+    // flight is still delivered to the subscribers that are attached.
+    //
+    // **Here rather than with the pumps below**, although the socket
+    // is now the registry's to open: what decides this ordering is
+    // what the listener does to the broker, and that has not changed
+    // because the moment it is bound has. A socket this node bound
+    // ten seconds ago over the API stops exactly where one bound at
+    // startup did.
+    if let Some(ingest) = ingest {
+        if ingest.close().await {
+            tracing::info!("the ingest listener has stopped");
+        }
+    }
     running.shutdown().await;
+    // After the listener, so that nothing can enter an outbox while its
+    // pump is being stopped, and before the process ends, so that a
+    // pump in the middle of a store write is joined rather than left.
+    connectors.shutdown().await;
     tracing::info!("stopped");
     Ok(())
 }
@@ -677,7 +859,8 @@ mod tests {
 
         let shared = restore_broker(&with_store(directory.path()))
             .expect("the store opens")
-            .expect("a directory was configured");
+            .expect("a directory was configured")
+            .shared;
         let (sessions, subscriptions, clock) = shared.with_broker(|broker| {
             (
                 broker.session_count(),
@@ -747,7 +930,8 @@ mod tests {
 
         let shared = restore_broker(&with_store(directory.path()))
             .expect("the store opens")
-            .expect("a directory was configured");
+            .expect("a directory was configured")
+            .shared;
         assert_eq!(
             shared.with_broker(|broker| broker.session_count()),
             0,
@@ -800,7 +984,8 @@ mod tests {
 
         let shared = restore_broker(&with_store(directory.path()))
             .expect("the store opens")
-            .expect("a directory was configured");
+            .expect("a directory was configured")
+            .shared;
         assert_eq!(
             shared.with_broker(|broker| broker.session_count()),
             1,
@@ -871,6 +1056,29 @@ mod tests {
         fn highest_sequence(&self, session: &SessionKey) -> Result<u64, storage::StorageError> {
             self.inner.highest_sequence(session)
         }
+
+        fn outbox_head(
+            &self,
+            rule: &str,
+            cursor: u64,
+        ) -> Result<Option<storage::OutboxRecord>, storage::StorageError> {
+            self.inner.outbox_head(rule, cursor)
+        }
+
+        fn outbox_depth(&self, rule: &str) -> Result<u64, storage::StorageError> {
+            self.inner.outbox_depth(rule)
+        }
+
+        fn outbox_highest_sequence(&self, rule: &str) -> Result<u64, storage::StorageError> {
+            self.inner.outbox_highest_sequence(rule)
+        }
+
+        fn body(
+            &self,
+            id: &storage::MessageId,
+        ) -> Result<Option<storage::BodyRecord>, storage::StorageError> {
+            self.inner.body(id)
+        }
     }
 
     #[test]
@@ -898,7 +1106,8 @@ mod tests {
             .expect("the store takes them");
 
         let shared = restore_from(Arc::new(store), &Config::default())
-            .expect("a store that is slow is not a store that failed");
+            .expect("a store that is slow is not a store that failed")
+            .shared;
         assert_eq!(
             shared.with_broker(|broker| broker.session_count()),
             1,

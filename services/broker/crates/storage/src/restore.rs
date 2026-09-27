@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use crate::record::{
-    BodyRecord, InflightRecord, MessageId, QueueEntry, RetainedRecord, SessionRecord,
+    BodyRecord, InflightRecord, MessageId, QueueEntry, RetainedRecord, RuleRecord, SessionRecord,
     SubscriptionRecord,
 };
 
@@ -80,6 +80,14 @@ pub struct Restored {
     /// appears here; a body with no reference left has been deleted and
     /// does not.
     pub bodies: HashMap<MessageId, BodyRecord>,
+    /// Every rule the node holds, in identifier order.
+    ///
+    /// Section 9.1: a rule is durable node-local metadata in milestone 4,
+    /// so it comes back with everything else rather than being read on
+    /// demand. Ordered, so that two backends restoring the same store
+    /// hand back the same value and the restart property can compare them
+    /// as one equality.
+    pub rules: Vec<RuleRecord>,
 }
 
 /// One session and everything that belongs to it.

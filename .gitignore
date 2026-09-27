@@ -7,3 +7,6 @@ dist/
 
 # proptest regression seeds produced by deliberate mutation runs
 *.proptest-regressions
+
+# bytecode the notices generator's tests leave behind when they import it
+__pycache__/

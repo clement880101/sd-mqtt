@@ -36,6 +36,8 @@
 //!
 //! [`tests::golden`]: self::tests::golden
 
+use std::fmt;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +56,24 @@ use serde::{Deserialize, Serialize};
 /// with eight bytes of count, which this build would read as the start
 /// of a payload, so they are refused as what they are: a store this
 /// build does not read.
-pub const FORMAT_VERSION: u16 = 2;
+///
+/// Version 3 added rules, section 9.1: two variants at the end of
+/// [`Record`] and a table of their own in each backend. Nothing already
+/// stored changes shape, and the version moves all the same, because
+/// this check is exact rather than a range — a version 2 store opened by
+/// this build would come up with no rules at all and look healthy, and a
+/// version 3 store opened by a milestone 3 build would meet two record
+/// discriminants it has no meaning for. Nothing is released, so the cost
+/// is a line in the release notes rather than a migration.
+///
+/// Version 4 added the per-rule outbox, section 9.2: three variants at
+/// the end of [`Record`], an [`OutboxRecord`] to go in the first of
+/// them, and a table and a counter row in each backend. The same
+/// argument as version 3 applies with one addition — a version 3 store
+/// opened by this build would come up with every rule's outbox empty,
+/// which is not an empty outbox but an undelivered message nobody will
+/// ever look for again.
+pub const FORMAT_VERSION: u16 = 4;
 
 /// What every sd-mqtt store begins with, so a file that is not one is
 /// refused as such rather than as a corrupt store.
@@ -384,6 +403,384 @@ pub struct BodyRecord {
     pub properties: Bytes,
 }
 
+/// When a rule fires, section 9.1.
+///
+/// The filter, optionally narrowed. An absent narrowing is not the same
+/// as a permissive one: `min_qos: None` says the operator did not narrow
+/// by level, and storing it as `Some(AtMostOnce)` would be this crate
+/// deciding that for them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerRecord {
+    /// The topic filter a message must match.
+    pub filter: String,
+    /// The lowest level that fires the rule, if it is narrowed.
+    pub min_qos: Option<Qos>,
+    /// The client identifier pattern that fires it, if it is narrowed.
+    ///
+    /// The pattern as written, not compiled. What its syntax means
+    /// belongs to the crate that evaluates it; storing a compiled form
+    /// would put a second description of that syntax on disk, where it
+    /// would outlive every build that agreed with it.
+    pub client_id: Option<String>,
+}
+
+/// How an `http_out` action posts, section 9.2.
+///
+/// Every field the design lists as configurable — method, headers,
+/// timeout, maximum concurrency, retry count and backoff — and no field
+/// it does not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpOutRecord {
+    /// Where to post.
+    pub url: String,
+    /// Which method to use.
+    pub method: String,
+    /// Headers to send, in the order they were configured.
+    pub headers: Vec<(String, String)>,
+    /// How long one attempt may take, in milliseconds.
+    pub timeout_ms: u32,
+    /// How many attempts may be in flight at once.
+    pub max_concurrency: u16,
+    /// How many times to retry after the first attempt fails.
+    pub retries: u8,
+    /// How long to wait before the first retry, in milliseconds.
+    pub backoff_ms: u32,
+}
+
+/// A secret in a record, which will not print itself.
+///
+/// Section 12.3: passwords and tokens are held in a wrapper that
+/// refuses to print itself, so they cannot reach logs or crash output.
+/// A record is printed by the storage tests' failure messages and by
+/// anything that logs what it is about to write, and an ingest rule's
+/// bearer token is a secret that lives in one.
+///
+/// `transparent` for serde, so the stored bytes are the string's and
+/// nothing else: the wrapper is about [`fmt::Debug`] and not about the
+/// format.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    /// A secret from the text an operator configured.
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self(secret.into())
+    }
+
+    /// The secret itself, for the one comparison that needs it.
+    ///
+    /// Deliberately not [`fmt::Display`] and deliberately not
+    /// `AsRef<str>`: the only way to get the characters out is to name
+    /// this method, so a secret cannot reach a formatter by accident.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether an operator wrote the key and left it blank.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Not the length either. A length is a real, if small, hint
+        // about a secret, and nothing debugging a record needs it.
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+/// Where a request may name the topic it is publishing to.
+///
+/// Section 9.2: a named header **or** a query parameter. An enum
+/// rather than two optional fields, because two fields can both be set
+/// and nothing says which wins; the ambiguity is refused by not being
+/// storable.
+///
+/// **Variant order is the format.**
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TopicFromRecord {
+    /// The named request header.
+    Header(String),
+    /// The named query parameter.
+    Query(String),
+}
+
+/// A topic the request chose, and the prefix that bounds it.
+///
+/// **The prefix is not optional, and that is the whole safety of the
+/// feature.** Section 9.2: the topic may be taken from a header or a
+/// query parameter, "restricted by a prefix so a caller cannot publish
+/// anywhere". Without it an ingest rule is a way for whoever holds one
+/// rule's token to publish to any topic on the broker, including the
+/// reserved namespace. Held together with the source rather than beside
+/// it so that a source without a prefix cannot be written down at all,
+/// here or anywhere that reads this back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicFromRequestRecord {
+    /// Where the request says it.
+    pub source: TopicFromRecord,
+    /// The prefix the topic must be at or under, by topic level.
+    pub prefix: String,
+}
+
+/// How an `http_in` action accepts a post, section 9.2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpInRecord {
+    /// The bearer token a request must present.
+    ///
+    /// Section 9.2: **not optional, and a rule without one is
+    /// refused.** The endpoint publishes, so an unguarded one is a hole
+    /// rather than a degraded mode.
+    pub token: Secret,
+    /// Where the body is published when the request does not choose.
+    pub topic: String,
+    /// Where the request may choose instead, and what bounds it.
+    pub topic_from: Option<TopicFromRequestRecord>,
+    /// The level the body is published at.
+    pub qos: Qos,
+    /// Whether it is retained.
+    pub retain: bool,
+}
+
+/// How an `http_poll` action fetches, section 9.2.
+///
+/// A GET on an interval, publishing the response body to a topic.
+///
+/// **There is no retry count and no backoff here**, and that is the
+/// shape of the connector rather than a field forgotten: a poller has
+/// no outbox, a fetch that failed is simply tried again on the next
+/// interval, and a body fetched late is worse than one not fetched at
+/// all. `crates/rules/src/http_poll.rs` has the argument.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpPollRecord {
+    /// Where to fetch from.
+    pub url: String,
+    /// Headers to send, in the order they were configured.
+    pub headers: Vec<(String, String)>,
+    /// How long between the start of one fetch and the next, in
+    /// milliseconds.
+    pub interval_ms: u32,
+    /// How long one fetch may take, in milliseconds.
+    pub timeout_ms: u32,
+    /// The most of a response body that will be read, in bytes.
+    pub max_body_bytes: u32,
+    /// Where the body is published.
+    pub topic: String,
+    /// The level it is published at.
+    pub qos: Qos,
+    /// Whether it is retained.
+    pub retain: bool,
+}
+
+/// Which way a bridge's topic rule moves messages, section 9.2.
+///
+/// **Variant order is the format.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirectionRecord {
+    /// Remote to local.
+    In,
+    /// Local to remote.
+    Out,
+    /// Both, which is one entry standing for two.
+    Both,
+}
+
+/// One topic rule on a bridge, section 9.2.
+///
+/// A filter, a direction, a level and a rewrite. The two prefixes are
+/// the rewrite's ordinary half and the template is the outbound-only
+/// half; `crates/rules/src/bridge/rewrite.rs` says what each does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeTopicRecord {
+    /// The filter, without either prefix on it.
+    pub filter: String,
+    /// Which way messages move.
+    pub direction: DirectionRecord,
+    /// The level they move at.
+    pub qos: Qos,
+    /// The prefix this broker's half of the topic carries.
+    pub local_prefix: String,
+    /// The prefix the remote's half carries.
+    pub remote_prefix: String,
+    /// The outbound template, if one was configured.
+    pub template: Option<String>,
+}
+
+/// How an `mqtt_bridge` action connects, section 9.2.
+///
+/// **The password is a [`Secret`]**, for the reason the ingest token is
+/// one: a record is printed by a failure message and by anything that
+/// logs what it is about to write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MqttBridgeRecord {
+    /// Where the remote broker is, as `host:port`.
+    pub address: String,
+    /// What this bridge calls itself to the remote.
+    pub client_id: String,
+    /// Which version it speaks to the remote.
+    pub version: ProtocolVersion,
+    /// The user name it offers, if any.
+    pub username: Option<String>,
+    /// The password it offers, if any.
+    pub password: Option<Secret>,
+    /// The keep-alive it proposes, in seconds.
+    pub keep_alive_secs: u16,
+    /// Whether it asks the remote to discard any existing session.
+    pub clean_start: bool,
+    /// How long the remote should keep the session after a disconnect.
+    pub session_expiry_secs: u32,
+    /// How many acknowledged publications it will accept at once.
+    pub receive_maximum: u16,
+    /// The largest packet it will accept, in bytes.
+    pub maximum_packet_size: u32,
+    /// The highest topic alias it will accept from the remote.
+    pub topic_alias_maximum: u16,
+    /// Where its connectivity is reported.
+    pub state_topic: String,
+    /// The first reconnection wait, in milliseconds.
+    pub reconnect_min_ms: u32,
+    /// The longest reconnection wait, in milliseconds.
+    pub reconnect_max_ms: u32,
+    /// The hop count above which a publication is dropped.
+    pub max_hops: u32,
+    /// What moves, and which way.
+    pub topics: Vec<BridgeTopicRecord>,
+}
+
+/// What a rule does when it fires. One, section 9.1.
+///
+/// **Variant order is the format**, as it is for [`Record`]: the other
+/// actions section 9.2 names are later milestones' variants, and each
+/// goes at the end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActionRecord {
+    /// Post a JSON envelope to a URL.
+    HttpOut(HttpOutRecord),
+    /// Accept a post and publish its body. Section 9.2's `http_in`.
+    ///
+    /// Appended, so every `HttpOut` record written before this build
+    /// still reads back as one and [`FORMAT_VERSION`] does not move.
+    HttpIn(HttpInRecord),
+    /// Fetch a URL on an interval and publish the body. Section 9.2's
+    /// `http_poll`.
+    ///
+    /// Appended for the same reason and with the same effect: a record
+    /// written before this build still reads back as whichever of the
+    /// two it was, so [`FORMAT_VERSION`] does not move. What would move
+    /// it is a variant inserted anywhere but the end, because the index
+    /// is the format.
+    HttpPoll(HttpPollRecord),
+    /// Connect to a remote broker as a client and move messages both
+    /// ways. Section 9.2's `mqtt_bridge`.
+    ///
+    /// Appended, at the end, for the reason the two above give: the
+    /// index is the format, so a variant added last leaves every
+    /// record written before this build reading back as whatever it
+    /// was and [`FORMAT_VERSION`] stays where it is.
+    MqttBridge(MqttBridgeRecord),
+}
+
+/// A rule, section 9.1.
+///
+/// Node-local in milestone 4 and replicated in milestone 5. Nothing here
+/// changes when replication arrives, which is why the record is written
+/// now rather than left until it does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleRecord {
+    /// What names it, for as long as it exists.
+    pub id: String,
+    /// What an operator calls it.
+    pub name: String,
+    /// Whether it fires at all.
+    pub enabled: bool,
+    /// When it fires.
+    ///
+    /// # An action that nothing publishes fires stores an empty filter
+    ///
+    /// Section 9.1 gives every rule a trigger, and section 9.2's
+    /// `http_in` has nothing to trigger on: an ingest rule is fired by
+    /// an HTTP request rather than by a message. Such a rule stores a
+    /// trigger whose filter is the empty string.
+    ///
+    /// That is an absence written as a value the reader already
+    /// rejects, which is the one shape of sentinel this project will
+    /// take: `""` is not a topic filter — `validate_filter` refuses it
+    /// — so it cannot be mistaken for a trigger somebody meant, and the
+    /// crate that reads this back refuses a rule that pairs an empty
+    /// filter with an action that fires on messages, or a non-empty one
+    /// with an action that does not.
+    ///
+    /// `Option<TriggerRecord>` is the honest encoding and would move
+    /// [`FORMAT_VERSION`], which makes every store written before it
+    /// unreadable. That is a cost worth paying **the next time the
+    /// version moves for a reason of its own**, and it is named here
+    /// rather than left to be discovered, so that it is a deferral and
+    /// not an oversight.
+    pub trigger: TriggerRecord,
+    /// What it does.
+    pub action: ActionRecord,
+}
+
+/// One envelope waiting in a rule's outbox, section 9.2.
+///
+/// # The attempt count is here, and that is the point of the record
+///
+/// It would be cheaper to keep the count beside the task that is doing
+/// the posting. **A restart would then reset every envelope to zero
+/// attempts**, and a node coming back after an outage would throw its
+/// whole backlog at a still-dead endpoint as though none of it had ever
+/// been tried. The count and the time of the next attempt are durable
+/// facts about the delivery, not state belonging to whichever process
+/// happens to be running.
+///
+/// # The payload is not here
+///
+/// [`Self::body`] names a [`BodyRecord`], which is the same row the
+/// broker's own queues reference and is stored once however many things
+/// name it. So a message that fires three rules is one payload and three
+/// envelopes.
+///
+/// The cost of that is the one [`crate::Storage::apply`] warns about:
+/// **taking a reference is explicit and so is releasing it.** Removing
+/// an envelope from an outbox does not release the body it named, for
+/// exactly the reason a queue pop does not, and an outbox that forgets
+/// the release leaks the payload for the life of the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxRecord {
+    /// The per-rule sequence number, assigned on append and monotonic
+    /// within the rule. It is the outbox's key, so reading in key order
+    /// is reading in the order the rule fired, and it is never reused.
+    pub sequence: u64,
+    /// What names this delivery, for as long as it exists.
+    ///
+    /// Stored rather than derived, and minted once when the envelope is
+    /// appended. Delivery is at least once — a timeout cannot be told
+    /// from a failure, so a retry after one may repeat a post that
+    /// arrived — and this is what lets a receiver notice the repeat. An
+    /// identifier minted per attempt would look like a new delivery each
+    /// time and would break exactly the deduplication it exists for.
+    pub id: MessageId,
+    /// The payload, stored once and referenced from here.
+    pub body: MessageId,
+    /// The client that published the message, which the envelope
+    /// carries and the body does not.
+    pub client_id: String,
+    /// When the rule fired, in coarse seconds.
+    pub enqueued_at: u32,
+    /// How many attempts have been made and have failed.
+    ///
+    /// Zero for an envelope that has never been tried.
+    pub attempts: u32,
+    /// The coarse second before which the next attempt must not be
+    /// made.
+    ///
+    /// Zero means "now": an envelope that has never been tried is due
+    /// immediately, and so is one whose backoff has been served.
+    pub next_attempt_at: u32,
+}
+
 /// A message held for future subscribers to a topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedRecord {
@@ -503,6 +900,69 @@ pub enum Record {
         /// Which topic.
         topic: String,
     },
+    /// A rule was created, or one that exists was changed.
+    ///
+    /// One record for both, as [`Record::SessionPut`] is: a rule is
+    /// whatever the last put said it was, so an edit needs no vocabulary
+    /// of its own and cannot half-apply.
+    RulePut {
+        /// The rule, whole.
+        rule: RuleRecord,
+    },
+    /// A rule was deleted.
+    ///
+    /// Takes its outbox with it, as [`Record::SessionRemoved`] takes a
+    /// session's queue: an outbox filed under a rule nothing holds is
+    /// reachable by nothing and would sit in the file forever. The
+    /// bodies those envelopes named are **not** released, for the same
+    /// reason a session's removal does not release its queue's: the
+    /// reference belongs to whoever took it, and a caller that emits
+    /// its own releases would otherwise release twice.
+    RuleRemoved {
+        /// Which rule.
+        id: String,
+    },
+    /// An envelope joined a rule's outbox at this sequence number.
+    ///
+    /// Refused for a rule the store does not hold, for the reason
+    /// [`Rejection::NoSuchRule`] gives.
+    ///
+    /// [`Rejection::NoSuchRule`]: crate::Rejection::NoSuchRule
+    OutboxAppended {
+        /// Whose outbox.
+        rule: String,
+        /// What went into it.
+        entry: OutboxRecord,
+    },
+    /// An attempt was made on an envelope and did not succeed.
+    ///
+    /// The count and the time of the next attempt are replaced with what
+    /// this record carries rather than incremented by the store, so that
+    /// the backoff is the caller's policy and the store holds a fact.
+    /// An attempt on a sequence the outbox no longer holds is a no-op:
+    /// the envelope left, which is the one outcome that makes further
+    /// attempts pointless.
+    OutboxAttempted {
+        /// Whose outbox.
+        rule: String,
+        /// Which envelope.
+        sequence: u64,
+        /// How many attempts have now been made and failed.
+        attempts: u32,
+        /// The coarse second before which the next must not be made.
+        next_attempt_at: u32,
+    },
+    /// An envelope left an outbox, delivered or dead-lettered.
+    ///
+    /// **Does not release the body it named.** See [`OutboxRecord`] and
+    /// [`crate::Storage::apply`]: the release is the caller's, and it is
+    /// owed.
+    OutboxRemoved {
+        /// Whose outbox.
+        rule: String,
+        /// Which envelope.
+        sequence: u64,
+    },
 }
 
 impl Record {
@@ -564,6 +1024,71 @@ impl Record {
                 topic.len() + message.payload.len() + message.properties.len()
             }
             Self::RetainedRemoved { topic } => topic.len(),
+            // An operator writes these, not a peer, so none of it is
+            // unbounded in the sense this estimate is about. Counted
+            // anyway, because the fields are strings and a bound that
+            // ignores strings is a bound waiting to be wrong.
+            Self::RulePut { rule } => {
+                rule.id.len()
+                    + rule.name.len()
+                    + rule.trigger.filter.len()
+                    + rule.trigger.client_id.as_ref().map_or(0, String::len)
+                    + match &rule.action {
+                        ActionRecord::HttpOut(http) => {
+                            http.url.len()
+                                + http.method.len()
+                                + http
+                                    .headers
+                                    .iter()
+                                    .map(|(name, value)| name.len() + value.len())
+                                    .sum::<usize>()
+                        }
+                        ActionRecord::HttpIn(http) => {
+                            http.token.expose().len()
+                                + http.topic.len()
+                                + http.topic_from.as_ref().map_or(0, |from| {
+                                    from.prefix.len()
+                                        + match &from.source {
+                                            TopicFromRecord::Header(name)
+                                            | TopicFromRecord::Query(name) => name.len(),
+                                        }
+                                })
+                        }
+                        ActionRecord::HttpPoll(http) => {
+                            http.url.len()
+                                + http.topic.len()
+                                + http
+                                    .headers
+                                    .iter()
+                                    .map(|(name, value)| name.len() + value.len())
+                                    .sum::<usize>()
+                        }
+                        ActionRecord::MqttBridge(bridge) => {
+                            bridge.address.len()
+                                + bridge.client_id.len()
+                                + bridge.username.as_ref().map_or(0, String::len)
+                                + bridge.password.as_ref().map_or(0, |p| p.expose().len())
+                                + bridge.state_topic.len()
+                                + bridge
+                                    .topics
+                                    .iter()
+                                    .map(|topic| {
+                                        topic.filter.len()
+                                            + topic.local_prefix.len()
+                                            + topic.remote_prefix.len()
+                                            + topic.template.as_ref().map_or(0, String::len)
+                                    })
+                                    .sum::<usize>()
+                        }
+                    }
+            }
+            Self::RuleRemoved { id } => id.len(),
+            // The client identifier is a peer's, and the rule
+            // identifier an operator's. The payload is not counted
+            // because it is not here: the `BodyPut` beside this record
+            // carries it and is weighed on its own.
+            Self::OutboxAppended { rule, entry } => rule.len() + entry.client_id.len(),
+            Self::OutboxAttempted { rule, .. } | Self::OutboxRemoved { rule, .. } => rule.len(),
         };
         std::mem::size_of::<Self>() + variable
     }

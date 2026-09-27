@@ -563,7 +563,9 @@ async fn in_process(publishers: usize, one_broker: bool) -> f64 {
             let Packet::Connect(connect) = connect_packet(&format!("sub-{n}")) else {
                 unreachable!()
             };
-            let registration = broker.connect("", &connect, &mut out);
+            let registration = broker
+                .connect("", &connect, &mut out)
+                .expect("the default decision authenticates");
             broker
                 .handle(
                     registration.subscriber,
@@ -589,7 +591,10 @@ async fn in_process(publishers: usize, one_broker: bool) -> f64 {
             let Packet::Connect(connect) = connect_packet(&format!("pub-{n}")) else {
                 unreachable!()
             };
-            broker.connect("", &connect, &mut out).subscriber
+            broker
+                .connect("", &connect, &mut out)
+                .expect("the default decision authenticates")
+                .subscriber
         });
 
         let (stop, handled) = (Arc::clone(&stop), Arc::clone(&handled));
@@ -645,7 +650,9 @@ fn one_tick_with_ten_thousand_sessions() {
         let Packet::Connect(connect) = connect_packet(&format!("session-{n}")) else {
             unreachable!()
         };
-        let registration = broker.connect("", &connect, &mut out);
+        let registration = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates");
         broker
             .handle(
                 registration.subscriber,
@@ -1024,7 +1031,9 @@ fn fan_out(subscribers: usize, properties: &Properties) -> (Duration, usize) {
         let Packet::Connect(connect) = durable_connect(&format!("fan-{n}")) else {
             unreachable!()
         };
-        let registration = broker.connect("", &connect, &mut out);
+        let registration = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates");
         broker
             .handle(
                 registration.subscriber,

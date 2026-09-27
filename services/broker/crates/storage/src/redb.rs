@@ -44,8 +44,8 @@ use ::redb::{
 use serde::Serialize;
 
 use crate::record::{
-    decode_exact, FormatError, FormatMarker, MessageId, QueueEntry, Record, SessionKey,
-    SessionRecord,
+    decode_exact, BodyRecord, FormatError, FormatMarker, MessageId, OutboxRecord, QueueEntry,
+    Record, SessionKey, SessionRecord,
 };
 use crate::restore::{Restored, RestoredSession};
 use crate::{Rejection, Storage, StorageError, SyncMode};
@@ -87,6 +87,23 @@ const BODIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("bodies");
 const BODY_REFERENCES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("body_references");
 /// Topic to [`RetainedRecord`].
 const RETAINED: TableDefinition<&str, &[u8]> = TableDefinition::new("retained");
+/// Rule identifier to [`crate::record::RuleRecord`].
+///
+/// Keyed by the identifier as text rather than by a composite, because a
+/// rule belongs to the node rather than to a session: there is no prefix
+/// to scope it under and nothing to escape.
+const RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("rules");
+/// Rule identifier and big-endian sequence, to [`OutboxRecord`].
+///
+/// Keyed like a queue and for the same reasons. The identifier is
+/// escaped and terminated by [`push_component`] rather than glued to
+/// the sequence, so that rule `a`'s sequence 25185 cannot be rule
+/// `ab`'s sequence 0 — one rule posting another's messages. And the
+/// sequence is **big-endian**, because redb orders by bytes and this is
+/// what decides whether an outbox drains in the order the rule fired.
+const OUTBOXES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("outboxes");
+/// Rule identifier to its outbox's depth and high-water mark.
+const OUTBOX_STATE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("outbox_state");
 
 /// A [`Storage`] backed by a redb database on a path.
 #[derive(Debug)]
@@ -252,6 +269,7 @@ impl Storage for RedbStorage {
         let retained = transaction
             .open_table(RETAINED)
             .map_err(StorageError::from)?;
+        let rules = transaction.open_table(RULES).map_err(StorageError::from)?;
 
         let mut restored = Restored::default();
         for entry in sessions.iter().map_err(StorageError::from)? {
@@ -299,6 +317,12 @@ impl Storage for RedbStorage {
                 .bodies
                 .insert(message_id(id.value())?, decode(value.value())?);
         }
+        // In key order, which is identifier order, which is what the
+        // in-memory backend's `BTreeMap` also produces.
+        for entry in rules.iter().map_err(StorageError::from)? {
+            let (_, value) = entry.map_err(StorageError::from)?;
+            restored.rules.push(decode(value.value())?);
+        }
         Ok(restored)
     }
 
@@ -329,6 +353,35 @@ impl Storage for RedbStorage {
     fn highest_sequence(&self, session: &SessionKey) -> Result<u64, StorageError> {
         Ok(self.state_of(session)?.highest_sequence)
     }
+
+    fn outbox_head(&self, rule: &str, cursor: u64) -> Result<Option<OutboxRecord>, StorageError> {
+        let transaction = self.database.begin_read().map_err(StorageError::from)?;
+        let outboxes = open_read(&transaction, OUTBOXES)?;
+        let prefix = rule_prefix(rule);
+        let from = queue_key(&prefix, cursor);
+        let Some(entry) = range_from(&outboxes, &prefix, &from)?.next() else {
+            return Ok(None);
+        };
+        let (_, value) = entry.map_err(StorageError::from)?;
+        Ok(Some(decode(value.value())?))
+    }
+
+    fn outbox_depth(&self, rule: &str) -> Result<u64, StorageError> {
+        Ok(self.outbox_state_of(rule)?.depth)
+    }
+
+    fn outbox_highest_sequence(&self, rule: &str) -> Result<u64, StorageError> {
+        Ok(self.outbox_state_of(rule)?.highest_sequence)
+    }
+
+    fn body(&self, id: &MessageId) -> Result<Option<BodyRecord>, StorageError> {
+        let transaction = self.database.begin_read().map_err(StorageError::from)?;
+        let bodies = open_read(&transaction, BODIES)?;
+        let Some(held) = bodies.get(&id.0[..]).map_err(StorageError::from)? else {
+            return Ok(None);
+        };
+        decode(held.value()).map(Some)
+    }
 }
 
 impl RedbStorage {
@@ -338,6 +391,13 @@ impl RedbStorage {
         let transaction = self.database.begin_read().map_err(StorageError::from)?;
         let queue_state = open_read(&transaction, QUEUE_STATE)?;
         read_queue_state(&queue_state, &session_prefix(session))
+    }
+
+    /// A rule's outbox counters, or zeroes for a rule that holds none.
+    fn outbox_state_of(&self, rule: &str) -> Result<QueueState, StorageError> {
+        let transaction = self.database.begin_read().map_err(StorageError::from)?;
+        let outbox_state = open_read(&transaction, OUTBOX_STATE)?;
+        read_queue_state(&outbox_state, &rule_prefix(rule))
     }
 }
 
@@ -369,6 +429,9 @@ struct Tables<'txn> {
     bodies: ByteTable<'txn>,
     body_references: ByteTable<'txn>,
     retained: Table<'txn, &'static str, &'static [u8]>,
+    rules: Table<'txn, &'static str, &'static [u8]>,
+    outboxes: ByteTable<'txn>,
+    outbox_state: ByteTable<'txn>,
 }
 
 impl<'txn> Tables<'txn> {
@@ -398,6 +461,13 @@ impl<'txn> Tables<'txn> {
             retained: transaction
                 .open_table(RETAINED)
                 .map_err(StorageError::from)?,
+            rules: transaction.open_table(RULES).map_err(StorageError::from)?,
+            outboxes: transaction
+                .open_table(OUTBOXES)
+                .map_err(StorageError::from)?,
+            outbox_state: transaction
+                .open_table(OUTBOX_STATE)
+                .map_err(StorageError::from)?,
         })
     }
 
@@ -421,6 +491,18 @@ impl<'txn> Tables<'txn> {
             .into());
         }
         Ok(prefix)
+    }
+
+    /// The rule a record names, as a key prefix, or a refusal.
+    ///
+    /// The same check [`Tables::prefix_of`] makes one level across: an
+    /// outbox filed under a rule the store does not hold is reachable by
+    /// nothing, because an outbox is read through the rule that owns it.
+    fn rule_prefix_of(&self, id: &str) -> Result<Vec<u8>, StorageError> {
+        if self.rules.get(id).map_err(StorageError::from)?.is_none() {
+            return Err(Rejection::NoSuchRule { id: id.to_owned() }.into());
+        }
+        Ok(rule_prefix(id))
     }
 
     /// Apply one record.
@@ -598,6 +680,86 @@ impl<'txn> Tables<'txn> {
                     .remove(topic.as_str())
                     .map_err(StorageError::from)?;
             }
+            Record::RulePut { rule } => {
+                self.rules
+                    .insert(rule.id.as_str(), encode(rule).as_slice())
+                    .map_err(StorageError::from)?;
+            }
+            Record::RuleRemoved { id } => {
+                // The outbox goes with the rule, as a session's queue
+                // goes with the session, counters included. The bodies
+                // its envelopes named are not released; the reference
+                // belongs to whoever took it.
+                self.rules.remove(id.as_str()).map_err(StorageError::from)?;
+                let prefix = rule_prefix(id);
+                self.outbox_state
+                    .remove(prefix.as_slice())
+                    .map_err(StorageError::from)?;
+                remove_prefixed(&mut self.outboxes, &prefix)?;
+            }
+            Record::OutboxAppended { rule, entry } => {
+                let prefix = self.rule_prefix_of(rule)?;
+                let mut state = read_queue_state(&self.outbox_state, &prefix)?;
+                if entry.sequence <= state.highest_sequence {
+                    return Err(Rejection::OutboxSequenceReused {
+                        id: rule.clone(),
+                        sequence: entry.sequence,
+                        highest: state.highest_sequence,
+                    }
+                    .into());
+                }
+                self.outboxes
+                    .insert(
+                        queue_key(&prefix, entry.sequence).as_slice(),
+                        encode(entry).as_slice(),
+                    )
+                    .map_err(StorageError::from)?;
+                state.depth += 1;
+                state.highest_sequence = entry.sequence;
+                self.write_outbox_state(&prefix, state)?;
+            }
+            Record::OutboxAttempted {
+                rule,
+                sequence,
+                attempts,
+                next_attempt_at,
+            } => {
+                let prefix = self.rule_prefix_of(rule)?;
+                let key = queue_key(&prefix, *sequence);
+                // A no-op for an envelope that has left: recording an
+                // attempt on it would write back a row nothing would
+                // ever remove.
+                let held = self
+                    .outboxes
+                    .get(key.as_slice())
+                    .map_err(StorageError::from)?
+                    .map(|value| value.value().to_vec());
+                if let Some(bytes) = held {
+                    let mut entry: OutboxRecord = decode(&bytes)?;
+                    entry.attempts = *attempts;
+                    entry.next_attempt_at = *next_attempt_at;
+                    self.outboxes
+                        .insert(key.as_slice(), encode(&entry).as_slice())
+                        .map_err(StorageError::from)?;
+                }
+            }
+            Record::OutboxRemoved { rule, sequence } => {
+                let prefix = self.rule_prefix_of(rule)?;
+                let mut state = read_queue_state(&self.outbox_state, &prefix)?;
+                // Only what was actually there is subtracted, for the
+                // reason a queue pop gives.
+                if self
+                    .outboxes
+                    .remove(queue_key(&prefix, *sequence).as_slice())
+                    .map_err(StorageError::from)?
+                    .is_some()
+                {
+                    state.depth -= 1;
+                    // The high-water mark is untouched. The number is
+                    // spent.
+                    self.write_outbox_state(&prefix, state)?;
+                }
+            }
         }
         Ok(())
     }
@@ -617,6 +779,20 @@ impl<'txn> Tables<'txn> {
     /// same identifier inherits nothing.
     fn write_queue_state(&mut self, prefix: &[u8], state: QueueState) -> Result<(), StorageError> {
         self.queue_state
+            .insert(prefix, state.encode().as_slice())
+            .map_err(StorageError::from)?;
+        Ok(())
+    }
+
+    /// Write a rule's outbox counters.
+    ///
+    /// The row is never removed by anything an outbox does, for the
+    /// reason [`Tables::write_queue_state`] gives: the high-water mark
+    /// outlives every envelope that carried one, and a row read back as
+    /// zero would hand out numbers the store has already spent. What
+    /// removes it is [`Record::RuleRemoved`].
+    fn write_outbox_state(&mut self, prefix: &[u8], state: QueueState) -> Result<(), StorageError> {
+        self.outbox_state
             .insert(prefix, state.encode().as_slice())
             .map_err(StorageError::from)?;
         Ok(())
@@ -783,6 +959,20 @@ fn session_prefix(session: &SessionKey) -> Vec<u8> {
     let mut prefix = Vec::with_capacity(session.mountpoint.len() + session.client_id.len() + 4);
     push_component(&mut prefix, &session.mountpoint);
     push_component(&mut prefix, &session.client_id);
+    prefix
+}
+
+/// The key prefix every per-rule table uses.
+///
+/// Escaped and terminated exactly as a session key's components are,
+/// although a rule identifier is one component rather than two and this
+/// crate's own [`crate::record::RuleRecord`] validator keeps separators
+/// out of it. Written this way anyway: the store is handed bytes and
+/// does not get to assume what validated them, and a prefix that is only
+/// prefix-free by somebody else's rule is prefix-free by luck.
+fn rule_prefix(id: &str) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(id.len() + 2);
+    push_component(&mut prefix, id);
     prefix
 }
 

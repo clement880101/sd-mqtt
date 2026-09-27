@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::Router;
+use parking_lot::RwLock;
 use sdmqtt_server::shared::Shared;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
@@ -38,6 +38,7 @@ pub mod events;
 pub mod health;
 pub mod host;
 pub mod resources;
+pub mod rules;
 pub mod taps;
 
 #[cfg(test)]
@@ -50,6 +51,12 @@ pub use events::{EventBody, EventId, Events};
 pub use health::Readiness;
 pub use resources::{ListenerProtocol, ListenerView};
 pub use taps::{Reservation, Tap, TapLimits, Taps, IDLE_TIMEOUT, MAX_TAPS, TAP_CAPACITY};
+
+// The seam's vocabulary, re-exported at the crate root beside the
+// admin listener it was factored out of: a caller serving a route set
+// of its own builds one of these, and should not have to name the
+// same version of axum in its own manifest to do it.
+pub use axum::Router;
 
 /// How often the events stream's numbers are sampled.
 ///
@@ -68,6 +75,31 @@ pub const DEFAULT_EVENTS_INTERVAL: Duration = Duration::from_secs(1);
 /// and it is generous because reaching it at all is a defect rather
 /// than a slow client.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// The listeners this node has bound, as they are now.
+///
+/// Shared and mutable rather than a list built at startup, because
+/// one of them is not a fact about startup: section 9.2's ingest
+/// listener is bound while an ingest rule needs it and closed when
+/// the last one is deleted or switched off, both of which can happen
+/// over the API while this process runs. A `/api/v1/listeners` fixed
+/// when the binary finished starting would answer with a port that
+/// had since closed, or leave out one that had since opened, and an
+/// inventory that is wrong about what is listening is worth less than
+/// no inventory at all.
+///
+/// The lock is held to clone the rows and for nothing else; see
+/// [`resources`].
+pub type Listeners = Arc<RwLock<Vec<ListenerView>>>;
+
+/// A [`Listeners`] holding `views`.
+///
+/// A constructor rather than a type everybody spells out, so that
+/// nothing outside this crate has to name the lock or depend on the
+/// crate it comes from.
+pub fn listener_list(views: Vec<ListenerView>) -> Listeners {
+    Arc::new(RwLock::new(views))
+}
 
 /// Everything a handler can reach.
 ///
@@ -90,14 +122,18 @@ pub struct AdminState {
     ///
     /// Given rather than discovered: a bound socket does not know
     /// what it is for, and the broker does not know a listener
-    /// exists. What startup bound is what the API reports.
+    /// exists. What was bound is what the API reports.
     ///
-    /// The one exception is this listener itself, which
-    /// [`AdminServer::bind`] adds once it knows the port it was
-    /// given. A caller cannot supply that: it does not exist until
-    /// the socket is bound, and with a configured port of zero it is
-    /// the operating system's to choose.
-    pub listeners: Arc<Vec<ListenerView>>,
+    /// Two things add a row to it themselves. This listener does,
+    /// because a caller cannot supply a port that does not exist
+    /// until the socket is bound and that with a configured port of
+    /// zero is the operating system's to choose. And section 9.2's
+    /// ingest listener does, because **it is not a fact about
+    /// startup**: it is bound while this node holds an ingest rule
+    /// and closed when the last one goes, so a list fixed at startup
+    /// would report a port that is not there, or miss one that is.
+    /// See [`Listeners`].
+    pub listeners: Listeners,
     /// When this process started serving, for the uptime the
     /// Overview page shows.
     pub started: Instant,
@@ -132,6 +168,14 @@ pub struct AdminState {
     /// same reason the token is: the value the guard reads and the
     /// value the operator wrote must be one thing.
     pub allowed_hosts: Arc<[String]>,
+    /// The rules this node is running, when it has somewhere to
+    /// keep one.
+    ///
+    /// `None` on a node with no store: section 9.1 makes a rule
+    /// durable metadata, so a broker that writes nothing down holds
+    /// no rules and says so rather than answering with an empty
+    /// collection. See [`rules`].
+    pub rules: Option<Arc<::rules::live::Registry>>,
     /// The live subscribers the interface reads.
     ///
     /// See [`taps`]: a tap is a real session inside the broker, so
@@ -156,10 +200,11 @@ impl AdminState {
             shared,
             readiness: Arc::new(Readiness::starting()),
             node_id: Arc::from("local"),
-            listeners: Arc::new(Vec::new()),
+            listeners: listener_list(Vec::new()),
             started: Instant::now(),
             token: None,
             allowed_hosts: Arc::from(Vec::new()),
+            rules: None,
             taps: Arc::new(Taps::new()),
         }
     }
@@ -199,11 +244,179 @@ impl AdminState {
         self
     }
 
-    /// Say what was bound.
+    /// Report the listeners in `listeners`, as they are when asked.
+    ///
+    /// The list itself is shared rather than copied, so that a
+    /// listener bound or closed after this call is one this API knows
+    /// about. See [`Listeners`].
     #[must_use]
-    pub fn with_listeners(mut self, listeners: Vec<ListenerView>) -> Self {
-        self.listeners = Arc::new(listeners);
+    pub fn with_listeners(mut self, listeners: Listeners) -> Self {
+        self.listeners = listeners;
         self
+    }
+
+    /// Serve the rules this registry is running. See [`rules`].
+    #[must_use]
+    pub fn with_rules(mut self, registry: Option<Arc<::rules::live::Registry>>) -> Self {
+        self.rules = registry;
+        self
+    }
+}
+
+/// A socket bound for a route set, before anything is served on it.
+///
+/// # The seam, and why it is two steps rather than one
+///
+/// Section 9.2 puts the ingest endpoint on a listener of its own by
+/// default, so that accepting data does not require exposing the
+/// administrative surface. That needs a second address serving a
+/// *different* route set, and this crate is where the serving lives.
+///
+/// Binding and serving are separate because the admin listener has to
+/// know what it bound before it can build its routes: the port may be
+/// zero in the configuration and chosen by the operating system, and
+/// `/api/v1/listeners` reports the port that was actually taken. A
+/// single `serve(address, routes)` could not hand the address to the
+/// thing building the routes.
+///
+/// # What is **not** in here
+///
+/// The host check, the token, the events sampler, the tap reaper and
+/// the interface. All five belong to the admin route set and are
+/// applied by [`router`], not by this. See [`host`] for the decision
+/// about the first of them: the check is a blanket layer over the
+/// admin router because a browser is pointed at that router, and an
+/// ingest listener behind the same layer would mean an operator
+/// listing every webhook sender's hostname, or every delivery refused
+/// in a way that looks like a bug. Every ingest route is guarded by
+/// its own rule's bearer token instead, which is why that listener
+/// needs no rule about the name it is reached under.
+pub struct Bound {
+    /// The bound socket.
+    listener: TcpListener,
+    /// What it actually bound, with the port the operating system
+    /// chose when the configuration asked for zero.
+    address: SocketAddr,
+    /// What this listener is called, for the log lines and for the
+    /// refusal if it cannot be bound.
+    what: &'static str,
+}
+
+impl Bound {
+    /// Bind `address` for the listener called `what`.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminStartError::Bind`] when the socket cannot be bound,
+    /// which is usually something else already on the port. Naming
+    /// `what` in it is the difference between an operator reading
+    /// "cannot bind the ingest listener" and guessing which of the
+    /// two failed.
+    pub async fn at(what: &'static str, address: SocketAddr) -> Result<Self, AdminStartError> {
+        let listener =
+            TcpListener::bind(address)
+                .await
+                .map_err(|source| AdminStartError::Bind {
+                    what,
+                    address,
+                    source,
+                })?;
+        let address = listener
+            .local_addr()
+            .map_err(|source| AdminStartError::Bind {
+                what,
+                address,
+                source,
+            })?;
+        Ok(Self {
+            listener,
+            address,
+            what,
+        })
+    }
+
+    /// The address actually bound.
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Serve `routes` here until the handle is shut down.
+    ///
+    /// `on_stopping` runs **before** hyper begins waiting for open
+    /// connections, not after. Returning from the graceful-shutdown
+    /// future is what starts that wait, and a body that never ends on
+    /// its own — section 11.1's events stream — would make it a wait
+    /// with no end. The admin listener passes the send that tells
+    /// every open stream; a route set with no such body passes
+    /// nothing, which is the honest answer rather than a channel
+    /// nobody reads.
+    pub fn serve(self, routes: Router, on_stopping: impl FnOnce() + Send + 'static) -> Serving {
+        let (stop, stopped) = oneshot::channel();
+        let what = self.what;
+        let address = self.address;
+        let serve = tokio::spawn(async move {
+            let served = axum::serve(self.listener, routes)
+                .with_graceful_shutdown(async move {
+                    // An error is the sender dropped, which is the
+                    // state we are waiting for.
+                    let _ = stopped.await;
+                    on_stopping();
+                })
+                .await;
+            if let Err(error) = served {
+                tracing::error!(%error, listener = what, "a listener stopped with an error");
+            }
+        });
+        tracing::info!(%address, listener = what, "a listener is serving");
+        Serving {
+            address,
+            what,
+            stop: Some(stop),
+            serve,
+        }
+    }
+}
+
+/// A bound listener and the task serving a route set on it.
+pub struct Serving {
+    /// What it bound.
+    address: SocketAddr,
+    /// What it is called.
+    what: &'static str,
+    /// Dropping this is the signal to stop.
+    stop: Option<oneshot::Sender<()>>,
+    /// The task running `axum::serve`.
+    serve: JoinHandle<()>,
+}
+
+impl Serving {
+    /// The address actually bound.
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Stop serving, and wait for the server to finish.
+    ///
+    /// Bounded, as section 11.1 asks. What actually ends a body that
+    /// does not end on its own is the signal it selects on, sent by
+    /// the graceful shutdown future above; the timeout is the backstop
+    /// for a body that does not, so that a broker stops rather than
+    /// hanging on a browser tab. Reaching it is a defect and says so.
+    pub async fn shutdown(mut self) {
+        // Dropping the sender is the signal; sending is the same thing
+        // said explicitly.
+        drop(self.stop.take());
+        if tokio::time::timeout(SHUTDOWN_GRACE, self.serve)
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                listener = self.what,
+                grace = ?SHUTDOWN_GRACE,
+                "a listener did not finish within its grace period; \
+                 something held a connection open past the shutdown signal"
+            );
+        }
     }
 }
 
@@ -225,6 +438,27 @@ impl AdminServer {
         config: &AdminConfig,
         state: AdminState,
     ) -> Result<AdminRunning, AdminStartError> {
+        Self::bind_with(config, state, Router::new()).await
+    }
+
+    /// The same, serving `extra` beside the admin routes.
+    ///
+    /// For section 9.2's ingest endpoint, which an operator may choose
+    /// to serve here rather than on a listener of its own. What is
+    /// merged here **is** behind everything the admin route set is
+    /// behind, the host check included; see [`host`]. That is the right
+    /// way round: an operator who puts a route set on this listener
+    /// takes this listener's rules with it, and the alternative would
+    /// be a hole in a layer that is documented as having no exceptions.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`AdminServer::bind`].
+    pub async fn bind_with(
+        config: &AdminConfig,
+        state: AdminState,
+        extra: Router<AdminState>,
+    ) -> Result<AdminRunning, AdminStartError> {
         config.check()?;
         // The configuration is the authority on the token, not
         // whatever the caller happened to build into the state. The
@@ -235,24 +469,12 @@ impl AdminServer {
         let state = state
             .with_token(config.token.clone())
             .with_allowed_hosts(config.allowed_hosts.clone());
-        let listener =
-            TcpListener::bind(config.address)
-                .await
-                .map_err(|source| AdminStartError::Bind {
-                    address: config.address,
-                    source,
-                })?;
-        let address = listener
-            .local_addr()
-            .map_err(|source| AdminStartError::Bind {
-                address: config.address,
-                source,
-            })?;
+        let bound = Bound::at("admin", config.address).await?;
+        let address = bound.address();
 
         // This listener knows what it bound better than its caller
         // does; see `AdminState::listeners`.
-        let mut listeners = (*state.listeners).clone();
-        listeners.push(ListenerView {
+        state.listeners.write().push(ListenerView {
             name: "admin".to_owned(),
             protocol: ListenerProtocol::Admin,
             address,
@@ -261,41 +483,23 @@ impl AdminServer {
             mountpoint: String::new(),
             max_connections: None,
         });
-        let state = state.with_listeners(listeners);
 
-        let (stop, stopped) = oneshot::channel();
         let events = Arc::clone(&state.events);
         let taps = Arc::clone(&state.taps);
         let shared = Arc::clone(&state.shared);
         let sampler = events::spawn_sampler(state.clone(), state.events_interval);
         let reaper = taps::spawn_reaper(state.clone(), taps::REAP_INTERVAL);
         let signal = state.shutdown.clone();
-        let router = router(state);
-        let serve = tokio::spawn(async move {
-            let served = axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    // An error is the sender dropped, which is the
-                    // state we are waiting for.
-                    let _ = stopped.await;
-                    // **Before returning, not after.** Returning
-                    // from here is what starts hyper waiting for
-                    // every open connection to finish, and an events
-                    // body does not finish on its own. Telling the
-                    // streams first is what makes that wait
-                    // terminate.
-                    let _ = signal.send(true);
-                })
-                .await;
-            if let Err(error) = served {
-                tracing::error!(%error, "the admin listener stopped with an error");
-            }
+        let serving = bound.serve(router(state, extra), move || {
+            // **Before hyper starts waiting, not after.** An events
+            // body does not finish on its own, and telling the streams
+            // first is what makes that wait terminate. See
+            // [`Bound::serve`].
+            let _ = signal.send(true);
         });
 
-        tracing::info!(%address, "the admin listener is serving");
         Ok(AdminRunning {
-            address,
-            stop: Some(stop),
-            serve,
+            serving,
             sampler,
             reaper,
             events,
@@ -317,7 +521,7 @@ impl AdminServer {
 /// The `404` half of that now lives in [`assets`], because the same
 /// fallback has to decide whether the path is a document of the
 /// interface first.
-fn router(state: AdminState) -> Router {
+fn router(state: AdminState, extra: Router<AdminState>) -> Router {
     // **No compression layer, deliberately.** Section 11.1: a
     // compression layer applied across this listener would turn the
     // events stream into batch delivery. The events route is not
@@ -325,8 +529,12 @@ fn router(state: AdminState) -> Router {
     Router::new()
         .merge(health::routes())
         .merge(resources::routes())
+        .merge(rules::routes())
         .merge(events::routes())
         .merge(taps::routes())
+        // Whatever the caller asked to be served here as well, inside
+        // the layer below rather than outside it.
+        .merge(extra)
         // The interface, and the one error shape for everything that
         // is neither a route above nor a document. See [`assets`]:
         // the set of documents is not known until the build script
@@ -350,10 +558,13 @@ fn router(state: AdminState) -> Router {
 }
 
 /// A bound admin listener and the task serving it.
+///
+/// The serving itself is a [`Serving`], which is the seam; what this
+/// adds is everything that belongs to the *admin* route set and to no
+/// other — the events sampler, the tap reaper, and the taps that have
+/// to be closed before the process stops.
 pub struct AdminRunning {
-    address: SocketAddr,
-    stop: Option<oneshot::Sender<()>>,
-    serve: JoinHandle<()>,
+    serving: Serving,
     sampler: JoinHandle<()>,
     reaper: JoinHandle<()>,
     events: Arc<Events>,
@@ -365,7 +576,7 @@ impl AdminRunning {
     /// The address actually bound, with the port the operating system
     /// chose when the configuration asked for zero.
     pub fn address(&self) -> SocketAddr {
-        self.address
+        self.serving.address()
     }
 
     /// The taps this listener is holding.
@@ -386,12 +597,10 @@ impl AdminRunning {
 
     /// Stop serving, and wait for the server to finish.
     ///
-    /// Bounded, as section 11.1 asks. What actually ends an events
-    /// stream is the signal it selects on, sent by the graceful
-    /// shutdown future above; the timeout is the backstop for a
-    /// stream that does not, so that a broker stops rather than
-    /// hanging on a browser tab. Reaching it is a defect and says
-    /// so.
+    /// Bounded by [`Serving::shutdown`], as section 11.1 asks. What is
+    /// here rather than there is what belongs to this route set: the
+    /// taps, which are sessions inside the broker, and the two tasks
+    /// that no other route set has.
     pub async fn shutdown(mut self) {
         // **Before the server stops, not after.** A tap is a session
         // the broker believes is attached, and a session that is
@@ -402,19 +611,7 @@ impl AdminRunning {
         self.reaper.abort();
         let _ = (&mut self.reaper).await;
         self.taps.close_all(&self.shared);
-        // Dropping the sender is the signal; sending is the same thing
-        // said explicitly.
-        drop(self.stop.take());
-        if tokio::time::timeout(SHUTDOWN_GRACE, self.serve)
-            .await
-            .is_err()
-        {
-            tracing::error!(
-                grace = ?SHUTDOWN_GRACE,
-                "the admin listener did not finish within its grace period; \
-                 something held a connection open past the shutdown signal"
-            );
-        }
+        self.serving.shutdown().await;
         self.sampler.abort();
         let _ = self.sampler.await;
     }
@@ -423,6 +620,7 @@ impl AdminRunning {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing;
     use broker_core::broker::BrokerConfig;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -430,6 +628,104 @@ mod tests {
     /// need.
     fn state() -> AdminState {
         AdminState::new(Arc::new(Shared::new(BrokerConfig::default())))
+    }
+
+    /// A route set is served where it is asked for, and nowhere else.
+    ///
+    /// # Every clause here is load bearing
+    ///
+    /// A seam that serves everything everywhere passes any test that
+    /// only asks whether the second listener answers, so the assertions
+    /// go in both directions: a route registered on the second listener
+    /// is **not** on the admin one, and the admin routes are **not** on
+    /// the second. Without the second half, [`router`] merged into
+    /// every route set would pass.
+    ///
+    /// # And the host check is the admin route set's, not the seam's
+    ///
+    /// The last two assertions are the written decision in [`host`],
+    /// said as something that fails. See the module documentation
+    /// there: the check is a blanket layer over the admin router
+    /// because that router is what a browser is pointed at, and an
+    /// ingest listener behind it would mean an operator adding every
+    /// webhook sender's hostname or seeing every delivery refused in a
+    /// way that looks like a bug. Moving the layer into the seam, so
+    /// that it applies to whatever is served, is one of the two
+    /// mutations this test exists to kill.
+    #[tokio::test]
+    async fn a_route_set_is_served_where_it_is_asked_for_and_nowhere_else() {
+        let admin = AdminServer::bind(&config(IpAddr::V4(Ipv4Addr::LOCALHOST), None), state())
+            .await
+            .expect("loopback needs no token");
+
+        // A second listener, serving one route of its own and nothing
+        // of the admin's. Nothing here is the admin's: no state, no
+        // sampler, no interface, no layer.
+        let bound = Bound::at("test", SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("a port on the loopback");
+        let other = bound.serve(
+            Router::new().route(
+                "/only-here",
+                axum::routing::get(|| async { "served on the second listener" }),
+            ),
+            || {},
+        );
+        assert_ne!(
+            other.address(),
+            admin.address(),
+            "two listeners, not one read twice"
+        );
+
+        // Where it was asked for.
+        let answered = testing::get(other.address(), "/only-here").await;
+        assert_eq!(answered.status, 200, "{}", answered.body);
+
+        // And nowhere else.
+        let elsewhere = testing::get(admin.address(), "/only-here").await;
+        assert_eq!(
+            elsewhere.status, 404,
+            "a route registered on one listener answered on the other: {}",
+            elsewhere.body
+        );
+
+        // The admin's own routes are not on the second listener
+        // either. `/api/v1/retained` reads the broker, `/health/live`
+        // is a probe and `/` is the interface: three different route
+        // sources, because the seam merges five of them and a test of
+        // one would pass against a seam that dropped only that one.
+        for path in ["/api/v1/retained", "/health/live", "/metrics", "/"] {
+            let leaked = testing::get(other.address(), path).await;
+            assert_eq!(
+                leaked.status, 404,
+                "{path} is the admin listener's and was served on a listener \
+                 that was never asked for it: {}",
+                leaked.body
+            );
+        }
+
+        // The host check belongs to the admin route set. It refuses a
+        // name on the admin listener...
+        let refused =
+            testing::get_with_host(admin.address(), "/health/live", "attacker.example").await;
+        assert_eq!(
+            refused.status, 400,
+            "the admin listener still checks the name it was reached under: {}",
+            refused.body
+        );
+        // ...and does not reach a route set that never asked for it.
+        let allowed =
+            testing::get_with_host(other.address(), "/only-here", "attacker.example").await;
+        assert_eq!(
+            allowed.status, 200,
+            "the host check was applied to a route set outside the admin router, \
+             which would mean an ingest listener refusing every webhook sender \
+             whose hostname an operator had not listed: {}",
+            allowed.body
+        );
+
+        other.shutdown().await;
+        admin.shutdown().await;
     }
 
     /// A configuration binding `address` with `token`, on a port the

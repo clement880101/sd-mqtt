@@ -579,7 +579,37 @@ Rules are replicated metadata, so a rule created in the UI on any node
 applies everywhere. A message triggers a rule on the node where it enters the
 cluster, exactly once.
 
+**"Exactly once" is a statement about a cluster, and on one node it cannot
+be told apart from at least once.** A message enters at one node, that node
+holds the rule, and the rule fires. Nothing in milestone 4 can make it fire
+twice and nothing in milestone 4 guards against it either, so a test of this
+sentence today would assert the shape of the deployment rather than the
+property. What will make it auditable is the thing that can break it:
+replication, in milestone 5, where a message entering at one node and a rule
+living on every node is exactly the case this sentence rules out. **The guard
+arrives with the replication and is written against it** — a node that did
+not receive the message does not fire its copy of the rule. Written down so
+that the next walk of this section reads a deferral rather than finding an
+untested sentence and re-litigating it.
+
+**Replication is milestone 5, so in milestone 4 a rule is node-local.** It is
+stored durably and survives a restart, and it applies on the node that holds
+it. Nothing about the rule's own shape changes when replication arrives; what
+changes is how many nodes hold it. Saying this now stops a reader taking a
+single-node broker's behaviour for the design.
+
 ### 9.2 Actions
+
+**The durable outbox is its own thing in the store, not a queue wearing a
+session's clothes.** Modelling each rule's outbox as a session would inherit
+the batching writer, the head cursor and the reference counting for free, and
+would cost phantom sessions that every client listing has to remember to
+filter out, an expiry that must be forced to never, and a drop-oldest
+overflow policy that is wrong for an outbox. The record type is extended
+instead, which moves the stored format version. That version is refused
+rather than migrated when it does not match exactly, so a broker built after
+this milestone will not open a store written before it. Nothing is released,
+so the cost is a line in the release notes rather than a migration.
 
 **http_out** posts a JSON envelope to a URL. The envelope carries the topic,
 the payload as a UTF-8 string when valid and base64 otherwise, QoS, the
@@ -587,10 +617,30 @@ retain flag, the publishing client identifier, a timestamp, and v5 user
 properties. Configurable: method, headers, timeout, maximum concurrency,
 retry count and backoff. Each rule owns a durable outbox, so a restart loses
 nothing in flight. After the final attempt an envelope is published to
-`$sd/rules/<id>/dlq` and surfaced in the UI.
+`$sd/rules/<id>/dlq` and kept where an operator who was not watching can
+still find it.
+
+**Which is a retention and not a notification, and the difference is the
+whole requirement.** "Surfaced in the UI" was satisfied equally by a toast,
+and a toast is precisely the wrong answer: an operator learns that a
+connector has stopped working from an alert, from a colleague, or from
+whoever was expecting the data, and opens the page minutes or hours later. A
+notification is gone by then and a page reading a live subscription shows an
+empty list, which is indistinguishable from a rule that has never
+dead-lettered anything.
+
+So the property to hold to, and to test: **the last ten dead letters per
+rule, each truncated to two kibibytes of the document that was published,
+readable per rule from the API without a subscription, kept in memory and
+therefore lost on a restart.** Every one of them is also on the topic, which
+is how an operator keeps them for longer than a process lives.
 
 **http_in** exposes `POST /ingest/<rule-id>`, guarded by a per-rule bearer
-token. Which listener serves it is configuration, and it defaults to a
+token. **The token is not optional and a rule without one is refused**, on
+the same reasoning that refuses an unprotected admin listener: the endpoint
+publishes, so an unguarded one is a hole rather than a degraded mode. That
+also means the ingest listener needs no address rule of its own, because
+every route on it is individually guarded. Which listener serves it is configuration, and it defaults to a
 separate ingest listener rather than the admin listener, so that publishing
 data does not require exposing the administrative surface. Running it on the
 admin listener is permitted but must be chosen explicitly. The body is published to a configured topic at a
@@ -607,15 +657,62 @@ a prefix on either side, and for the outbound direction a template that
 captures wildcard segments from the matched filter and substitutes them by
 position, so `sensors/+/temp` can be published remotely as
 `site-a/temp/{1}`. Inbound messages need no such facility, because a bridge
-publishes them into the local broker where any rule can act on them. Reconnection uses exponential backoff with jitter. A state
-topic reports connectivity, with a will supplying the offline value. Loop
-prevention uses an origin identifier carried in a user property, and messages
-that have already traversed this bridge are not sent back.
+publishes them into the local broker where any rule can act on them.
+Reconnection uses exponential backoff with jitter. Loop prevention uses an
+origin identifier carried in a user property, and messages that have already
+traversed this bridge are not sent back.
+
+**A state topic reports connectivity, on both brokers, and which value comes
+from where is the half the sentence has to say.** The same topic name is used
+at each end and the two ends are not symmetric:
+
+- **On this broker**, the bridge publishes the topic itself: `online` when
+  the connection has been established, `offline` when it ends, retained and
+  at least-once. This end can say both, because it is the end running the
+  bridge.
+- **On the remote**, the bridge registers that topic as its *will*, carrying
+  `offline`, retained and at least-once. A will is the only thing this end
+  can arrange for the remote to publish on its behalf, and it fires exactly
+  when the far side needs it to: when the link is gone and this end is in no
+  position to say anything.
+
+Retained on both, because the point of a liveness topic is that somebody who
+subscribes *after* the bridge died still learns that it did; at least-once,
+because a liveness message a broker may drop leaves a dashboard wrong for
+ever.
+
+The mirror image — publishing to the remote and willing to the local broker —
+would be equally faithful to the shorter sentence and is wrong twice over: a
+local will needs a local session for the bridge, which it has not got, and it
+would announce nothing when the *remote* went away, which is the failure an
+operator is watching this topic for.
+
+**That mechanism does not exist in MQTT 3.1.1**, which has no user
+properties, and a bridge to a 3.1.1 endpoint is exactly the bridge people
+build. So the marker is the second line of defence, not the first.
+
+The first is a configuration-time rule: **a bridge whose inbound and
+outbound filters intersect after rewriting is refused.** That catches a loop
+before a message does, it works on both versions, and it does not depend on
+an intermediary preserving a property it is free to strip. A bridge whose
+own state topic matches its outbound filter is refused for the same reason,
+because a bridge republishing its own liveness is a loop with a heartbeat.
+
+There is a third loop the marker cannot see at all. A bridge publishes
+inbound messages into the local broker so that rules can act on them, so an
+outbound rule feeding a system that posts back through an ingest rule is a
+cycle with no bridge in it. Every publication a connector originates carries
+a hop count, and one over the configured maximum is dropped and counted.
 
 Bridges and pollers are singletons. The owner is the live member with the
 lowest node identifier, recomputed on membership change. This is
 deterministic, needs no election protocol, and at worst duplicates work for
 the moments during which membership views disagree.
+
+In milestone 4 there is one member, so it owns every singleton. The selection
+is still written as a rule over the membership view rather than as an
+assumption that this node is alone, because a rule that is only ever
+exercised in the one-member case is a rule nobody has tested.
 
 ### 9.3 The hook interface
 
@@ -628,6 +725,28 @@ An authorizing hook returns allow, deny or next, where next passes the
 decision along the chain. If every hook returns next, the configured default
 applies. Message hooks may rewrite topic, payload, QoS, retain and
 properties, or drop the message.
+
+**A hook may lower the quality of service and may not raise it past what the
+publisher sent; a raise is clamped to the publisher's level.** The sentence
+above used to stop at "rewrite QoS", which left the one direction with
+protocol consequences both unsaid and unexercised.
+
+The reason is that the promise a level makes was made on the way *in*, to a
+publisher that has already gone. At-most-once is neither acknowledged nor
+made durable, so a hook raising one to at-least-once would have this broker
+queue it durably and redeliver it on a resumed session — a guarantee whose
+foundation, a publisher that will send it again, does not exist, and which a
+restart a moment later breaks. Nor can a raise be reported back: the
+publisher's acknowledgement is decided by the packet it sent rather than by
+the message a hook leaves behind, so it has been told the broker took the
+weaker responsibility, and it is right.
+
+Lowering has none of that. The broker promised the publisher more than it now
+has to do, which it is free to do, and no subscriber is told a guarantee that
+is not being kept.
+
+The clamp is applied once, where the chain runs, rather than at each of the
+three routes that fire it: one of the three is the one somebody would forget.
 
 This is deliberately the shape an external plugin transport would need, so
 v2 can add out-of-process hooks without disturbing the core.
@@ -844,6 +963,24 @@ authentication outcomes; cluster bytes sent, received and dropped; and
 router matches split local and remote. Gauges for connections, sessions,
 subscriptions, retained messages, queue depth and cluster members.
 
+**And, per rule, section 9's connectors.** This list was entirely
+milestone-three vocabulary and named no connector metric at all, so
+everything milestone 4 built was outside the discipline the rest of the
+section imposes — which is how three refusal vocabularies arrived with no
+counter between them. Counters, labelled by rule identifier and by outcome:
+fired, delivered, failed, dead-lettered, attempts made, attempts that were
+retries, bridge connects, bridge disconnects, and messages a bridge took from
+its remote. A gauge per rule for what is waiting in its outbox. And one
+counter, labelled by reason, for publications a connector made that went
+nowhere: refused by a bridge's loop marker, over a hop limit, not a topic,
+reserved, or not made durable.
+
+**The rule identifier is a label where a client identifier deliberately is
+not one.** Rules are created by the person running the broker and are counted
+in tens; clients arrive from outside and are counted in hundreds of
+thousands. A deleted rule keeps its series at the value it stopped at, since
+a counter that disappears is one a dashboard reads as a reset to zero.
+
 Every discard path has both a metric and a hook. A message never disappears
 without being counted.
 
@@ -853,6 +990,33 @@ the sentence above: a fire-and-forget publication too large for its peer
 returned before anything recorded it, so it left no action, no counter and no
 log line. A new drop reason now fails to compile until it has a counter,
 rather than failing a test somebody has to remember to extend.
+
+**And the connectors broke the sentence again, in a way that mechanism could
+not see.** Milestone 4 introduced three refusal vocabularies of its own — a
+bridge's loop marker, the shell's publish refusal, and a per-connection tally
+inside a bridge's session that reset on every reconnection — none of which
+was a drop reason and none of which was counted. A message refused by section
+9.2's second line of defence was a debug line and nothing else, so the
+defence was invisible to an operator in exactly the situation it exists for.
+
+The mechanism is extended rather than duplicated. There is one connector
+refusal vocabulary, it sits in the same compile-checked table as the drop
+reasons, and each connector's own vocabulary converts into it through a match
+with no wildcard. So a variant added anywhere in the chain fails to compile
+until it has a meaning and a counter. What carries it further is that the
+counting happens at the one door every publication without a session goes
+through, so **a connector written next year is counted by calling the
+function it already had to call.**
+
+The hook half is deliberately narrower than the metric half, and the line is
+where the broker can see the message. A refusal at that door fires a hook; so
+does one a connector makes before reaching it, because a connector can reach
+the hook chain through the same shell. What fires nothing is a message a
+bridge's remote sent on a filter no topic rewrite covers — that is a wildcard
+subscription legitimately matching more than the configuration maps, not a
+message this broker ever accepted, and counting it would put a number on the
+remote's traffic rather than on this broker's losses. Recorded as a decision
+rather than left as an omission.
 
 **Router matches are deferred to milestone 5.** This section asks for them
 split local and remote. The remote half needs a cluster, and counting the
@@ -975,7 +1139,8 @@ parameter at fault where one is at fault, and is absent otherwise, so a form
 can mark an input without reading the sentence.
 
 The codes today are `invalid_request`, `not_found`, `method_not_allowed`,
-`not_acceptable`, `unauthorized`, `resource_exhausted` and `internal`.
+`not_acceptable`, `unauthorized`, `resource_exhausted`, `loop_detected` and
+`internal`.
 Adding one is a compatible change and renaming one is not; a client treats an
 unknown code as the class its HTTP status implies. The status is **derived
 from the code** rather than sent beside it, so the two cannot disagree.
@@ -989,6 +1154,14 @@ for a bounded thing that is full — today the live subscriber taps, whose cap
 is fixed. It is deliberately not `invalid_request`: the request was well
 formed and would succeed unchanged a moment later, which is exactly what a
 client needs in order to decide whether to retry.
+
+`loop_detected` arrived with milestone 4 and is a `508`, for a publication
+that has been through more connectors than `broker.max_hops` allows — section
+9.2's third loop, reported by the ingest endpoint, which is the one place in
+such a cycle that a caller can see. It is neither of the two above: the
+request is well formed, so it is not `invalid_request`, and retrying it
+unchanged will not help, so it is not `resource_exhausted`. What has to change
+is a configuration.
 
 The body is nested under `error` so that a client which forgot to look at the
 status code still cannot confuse a failure with a success: no successful

@@ -47,9 +47,10 @@ use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
 use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::family::Family;
-use prometheus_client::metrics::gauge::ConstGauge;
+use prometheus_client::metrics::gauge::{ConstGauge, Gauge};
 use prometheus_client::registry::Registry;
 
+use broker_core::hooks::Refusal;
 use broker_core::session::DropReason;
 
 use crate::shared::Shared;
@@ -509,6 +510,170 @@ reason_table!(RecordDrop, ALL_RECORD_DROPS, record_drop_label, record_drop_index
     WriterStopped => "writer_stopped",
 });
 
+// Why a publication a connector made went nowhere.
+//
+// Section 9's connectors, through the same mechanism as everything
+// above: `Refusal` is declared in `broker_core::hooks` and is
+// matched here without a wildcard, so **a refusal a connector learns
+// to make does not compile until it has a counter**.
+//
+// Milestone four is why this exists. It introduced three refusal
+// vocabularies the `DropReason` table could not see — a bridge's
+// loop marker, the shell's `PublishRefused`, and a per-connection
+// tally inside a bridge's session that reset on every reconnection —
+// and counted none of them. A message refused by a bridge's loop
+// marker was logged at debug and counted nowhere, which is section
+// 11.3's sentence broken by a whole milestone rather than by one
+// path.
+reason_table!(Refusal, ALL_REFUSALS, refusal_label, refusal_index, {
+    Looped => "looped",
+    TooManyHops => "too_many_hops",
+    NotATopic => "not_a_topic",
+    Reserved => "reserved",
+    NotDurable => "not_durable",
+});
+
+/// What a rule did, as a label value.
+///
+/// Section 11.3 does not list per-rule counters, and these are a
+/// deliberate addition rather than a line of it being filled in. The
+/// argument is section 9's: a rule is a connector to somebody else's
+/// system, the way an operator finds out one has stopped working is an
+/// alert, and a total across every rule cannot say which one stopped.
+///
+/// **The cardinality is a number an operator wrote.** A rule
+/// identifier is a label where a client identifier deliberately is not
+/// one, because rules are created by the person running the broker and
+/// counted in tens, while clients arrive from outside and are counted
+/// in hundreds of thousands.
+///
+/// A deleted rule keeps its series, at the value it stopped at. That
+/// is the right way round: a counter that disappears is one a
+/// dashboard reads as a reset to zero.
+/// # Four of these are a series and five are not
+///
+/// The first four are also `rules::stats`' ring, which the Rules page
+/// draws per row. The five below them are exported and not sampled,
+/// and the line between the two is what a 96-pixel cell is for: a
+/// shape over the last minute. "This bridge connected" is not a shape;
+/// it is an event an alert fires on, and a per-second difference of it
+/// is a row of zeros with an occasional one. They are counted where an
+/// alert can read them and left out of where they would say nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleEvent {
+    /// A message matched it, a request arrived for it, or its interval
+    /// came round.
+    Fired,
+    /// Something reached where the rule was sending it.
+    Delivered,
+    /// An attempt failed.
+    Failed,
+    /// An envelope ran out of attempts.
+    DeadLettered,
+    /// A request went out to the rule's endpoint.
+    ///
+    /// Attempts rather than envelopes, so `attempted` over `delivered`
+    /// is what it costs this rule to deliver one thing — which is the
+    /// number that says an endpoint is flaky rather than dead.
+    Attempted,
+    /// One of those attempts was not the first for its envelope.
+    ///
+    /// A subset of [`RuleEvent::Attempted`] and deliberately so: an
+    /// operator sizing a retry policy wants to know how much of the
+    /// traffic to an endpoint is this broker asking again.
+    Retried,
+    /// A bridge established a connection to its remote.
+    ///
+    /// Was a log line and nothing else, which cannot be alerted on. A
+    /// bridge that reconnects every thirty seconds is working
+    /// perfectly by every other number this broker publishes.
+    Connected,
+    /// A bridge's connection to its remote ended.
+    ///
+    /// Counted only for a connection that was established, so that
+    /// this and [`RuleEvent::Connected`] pair: their difference is
+    /// whether the bridge is up now.
+    Disconnected,
+    /// A bridge took a message from its remote and published it here.
+    ///
+    /// This was a field in a per-connection struct whose only consumer
+    /// was one log line and which reset on every reconnection, so the
+    /// question "how much has this bridge brought in" had no answer at
+    /// all.
+    Received,
+}
+
+/// Every rule outcome, in the order the handles are indexed in.
+const RULE_EVENTS: [RuleEvent; 9] = [
+    RuleEvent::Fired,
+    RuleEvent::Delivered,
+    RuleEvent::Failed,
+    RuleEvent::DeadLettered,
+    RuleEvent::Attempted,
+    RuleEvent::Retried,
+    RuleEvent::Connected,
+    RuleEvent::Disconnected,
+    RuleEvent::Received,
+];
+
+/// The label value for a rule outcome.
+fn rule_event_label(event: RuleEvent) -> &'static str {
+    match event {
+        RuleEvent::Fired => "fired",
+        RuleEvent::Delivered => "delivered",
+        RuleEvent::Failed => "failed",
+        RuleEvent::DeadLettered => "dead_lettered",
+        RuleEvent::Attempted => "attempted",
+        RuleEvent::Retried => "retried",
+        RuleEvent::Connected => "connected",
+        RuleEvent::Disconnected => "disconnected",
+        RuleEvent::Received => "received",
+    }
+}
+
+/// Where a rule outcome's handle sits in the flat array.
+fn rule_event_index(event: RuleEvent) -> usize {
+    match event {
+        RuleEvent::Fired => 0,
+        RuleEvent::Delivered => 1,
+        RuleEvent::Failed => 2,
+        RuleEvent::DeadLettered => 3,
+        RuleEvent::Attempted => 4,
+        RuleEvent::Retried => 5,
+        RuleEvent::Connected => 6,
+        RuleEvent::Disconnected => 7,
+        RuleEvent::Received => 8,
+    }
+}
+
+/// One rule's owned handles.
+///
+/// Resolved when the rule is installed and never looked up again,
+/// which is the shape every other family in this module has: nothing
+/// searches a label set while a request or a packet is being served.
+#[derive(Debug)]
+pub struct RuleCounters {
+    events: [Counter; RULE_EVENTS.len()],
+    waiting: Gauge,
+}
+
+impl RuleCounters {
+    /// The counter for one outcome. An index, not a lookup.
+    pub fn event(&self, event: RuleEvent) -> &Counter {
+        &self.events[rule_event_index(event)]
+    }
+
+    /// How many envelopes are waiting in this rule's outbox.
+    ///
+    /// A gauge rather than a counter, and **set rather than added
+    /// to**: it is a depth. The sampler that advances the rule's own
+    /// series sets it, so a scrape reads a number that was already
+    /// there rather than one it went looking for.
+    pub fn waiting(&self) -> &Gauge {
+        &self.waiting
+    }
+}
+
 /// One counter per packet type per version, resolved at startup.
 #[derive(Debug)]
 struct PacketCounters([[Counter; PACKET_KINDS.len()]; VERSIONS.len()]);
@@ -552,6 +717,12 @@ pub struct Metrics {
     /// fallen behind loses events, and none of them may disappear
     /// uncounted. See [`Metrics::admin_events_dropped`].
     admin_events_dropped: Counter,
+    /// Section 9's connectors, by why a publication one of them made
+    /// went nowhere. One family rather than a counter per refusal,
+    /// because an operator wants one number for "a connector lost a
+    /// message" broken down by why. See
+    /// [`Metrics::publication_refused`] and [`Refusal`].
+    publications_refused: Box<[Counter]>,
     sockets_closed: [Counter; SOCKET_OUTCOMES.len()],
     /// Indexed by [`REASON_KINDS`] then by [`ALL_REASONS`].
     reasons_sent: [[Counter; ALL_REASONS.len()]; REASON_KINDS.len()],
@@ -565,6 +736,12 @@ pub struct Metrics {
     dropped_by_queue: Box<[Counter]>,
     dropped_by_shell: Box<[Counter]>,
     records_dropped: Box<[Counter]>,
+    /// Section 9's rules, by identifier and outcome. See
+    /// [`RuleEvent`]. Handles are taken by [`Metrics::rule`] when a
+    /// rule is installed.
+    rule_events: Family<Vec<(String, String)>, Counter>,
+    /// How much each rule has waiting. See [`RuleCounters::waiting`].
+    rule_waiting: Family<Vec<(String, String)>, Gauge>,
     /// Whether [`Metrics::watch`] has already run. A registry with
     /// two collectors over the same numbers would render every one of
     /// them twice, which a scraper reads as a duplicate series.
@@ -633,6 +810,25 @@ impl Metrics {
              each one is answered with a resynchronise rather than a gap",
             admin_events_dropped.clone(),
         );
+        let refused = Family::<[(&'static str, &'static str); 1], Counter>::default();
+        registry.register(
+            "publications_refused",
+            // Unlike the counter above these *are* losses, and two of
+            // them are deliberate ones: a chain of connectors that
+            // feeds itself is stopped by dropping the message that
+            // would extend it, and a bridge refuses a message it has
+            // already carried. A non-zero `looped` or `too_many_hops`
+            // means there is a cycle to find; the other three mean a
+            // connector is handing this broker something it will not
+            // take.
+            "Publications a connector made that went nowhere, by why; looped and \
+             too_many_hops mean a rule is feeding a cycle",
+            refused.clone(),
+        );
+        let publications_refused = ALL_REFUSALS
+            .iter()
+            .map(|reason| refused.get_or_create_owned(&[("reason", refusal_label(*reason))]))
+            .collect();
         let closed = Family::<[(&'static str, &'static str); 1], Counter>::default();
         registry.register(
             "sockets_closed",
@@ -683,6 +879,19 @@ impl Metrics {
             .map(|reason| dropped.get_or_create_owned(&[("reason", shell_label(*reason))]))
             .collect();
 
+        let rule_events = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "rule_events",
+            "What each of section 9's rules has done, by rule and outcome",
+            rule_events.clone(),
+        );
+        let rule_waiting = Family::<Vec<(String, String)>, Gauge>::default();
+        registry.register(
+            "rule_outbox_waiting",
+            "Envelopes waiting in each rule's durable outbox",
+            rule_waiting.clone(),
+        );
+
         let records = Family::<[(&'static str, &'static str); 1], Counter>::default();
         registry.register(
             "records_dropped",
@@ -706,9 +915,12 @@ impl Metrics {
             reasons_sent,
             authentications,
             admin_events_dropped,
+            publications_refused,
             dropped_by_queue,
             dropped_by_shell,
             records_dropped,
+            rule_events,
+            rule_waiting,
             watched: AtomicBool::new(false),
         }
     }
@@ -731,6 +943,30 @@ impl Metrics {
         self.registry
             .lock()
             .register_collector(Box::new(Live(Arc::downgrade(shared))));
+    }
+
+    /// One rule's owned handles.
+    ///
+    /// Called once, when the rule is installed. Calling it twice for
+    /// one identifier gives two handles to the same series, which is
+    /// what makes reinstalling a rule keep its numbers rather than
+    /// start them again.
+    pub fn rule(&self, rule: &str) -> RuleCounters {
+        let events = std::array::from_fn(|at| {
+            self.rule_events.get_or_create_owned(&vec![
+                ("rule".to_owned(), rule.to_owned()),
+                (
+                    "event".to_owned(),
+                    rule_event_label(RULE_EVENTS[at]).to_owned(),
+                ),
+            ])
+        });
+        RuleCounters {
+            events,
+            waiting: self
+                .rule_waiting
+                .get_or_create_owned(&vec![("rule".to_owned(), rule.to_owned())]),
+        }
     }
 
     /// The counter for a packet read from a client.
@@ -773,6 +1009,19 @@ impl Metrics {
     /// how an operator sees that a browser is falling behind.
     pub fn admin_events_dropped(&self) -> &Counter {
         &self.admin_events_dropped
+    }
+
+    /// A publication a connector made that went nowhere, by why.
+    ///
+    /// Section 9.2: "Every publication a connector originates carries
+    /// a hop count, and one over the configured maximum is dropped and
+    /// counted." That is [`Refusal::TooManyHops`], and the other four
+    /// are section 11.3's rule applied to the rest of milestone four:
+    /// a connector chain that quietly swallowed a message would be a
+    /// support case nobody could answer, and until this every one of
+    /// these was a log line at best.
+    pub fn publication_refused(&self, reason: Refusal) -> &Counter {
+        &self.publications_refused[refusal_index(reason)]
     }
 
     /// A socket that has finished, by how it ended.
@@ -1086,8 +1335,11 @@ sdmqtt_packets_received_total{kind=\"unsubscribe\",version=\"5\"} 0
 
         let mut handles = Vec::new();
         for (at, name) in ["one", "two", "three"].iter().enumerate() {
-            let registration =
-                shared.with_broker(|broker| broker.connect("", &connect(name), &mut Vec::new()));
+            let registration = shared.with_broker(|broker| {
+                broker
+                    .connect("", &connect(name), &mut Vec::new())
+                    .expect("the default decision authenticates")
+            });
             // One subscription for the first, two for the second,
             // three for the third: six in total, which no count of
             // sessions can be mistaken for.
@@ -1174,23 +1426,25 @@ sdmqtt_packets_received_total{kind=\"unsubscribe\",version=\"5\"} 0
         shared.metrics().watch(&shared);
 
         let registration = shared.with_broker(|broker| {
-            broker.connect(
-                "",
-                &Connect {
-                    version: Version::V5,
-                    client_id: "waiting".into(),
-                    clean_start: false,
-                    keep_alive: 0,
-                    username: None,
-                    password: None,
-                    will: None,
-                    properties: Properties {
-                        session_expiry_interval: Some(3600),
-                        ..Properties::default()
+            broker
+                .connect(
+                    "",
+                    &Connect {
+                        version: Version::V5,
+                        client_id: "waiting".into(),
+                        clean_start: false,
+                        keep_alive: 0,
+                        username: None,
+                        password: None,
+                        will: None,
+                        properties: Properties {
+                            session_expiry_interval: Some(3600),
+                            ..Properties::default()
+                        },
                     },
-                },
-                &mut Vec::new(),
-            )
+                    &mut Vec::new(),
+                )
+                .expect("the default decision authenticates")
         });
         shared.with_broker(|broker| {
             broker
@@ -1233,20 +1487,22 @@ sdmqtt_packets_received_total{kind=\"unsubscribe\",version=\"5\"} 0
 
         // The session ends, and its queue with it.
         shared.with_broker(|broker| {
-            broker.connect(
-                "",
-                &Connect {
-                    version: Version::V5,
-                    client_id: "waiting".into(),
-                    clean_start: true,
-                    keep_alive: 0,
-                    username: None,
-                    password: None,
-                    will: None,
-                    properties: Properties::default(),
-                },
-                &mut Vec::new(),
-            )
+            broker
+                .connect(
+                    "",
+                    &Connect {
+                        version: Version::V5,
+                        client_id: "waiting".into(),
+                        clean_start: true,
+                        keep_alive: 0,
+                        username: None,
+                        password: None,
+                        will: None,
+                        properties: Properties::default(),
+                    },
+                    &mut Vec::new(),
+                )
+                .expect("the default decision authenticates")
         });
         assert_eq!(
             gauge(&shared.metrics().render(), "sdmqtt_queue_depth"),
@@ -1273,6 +1529,41 @@ sdmqtt_packets_received_total{kind=\"unsubscribe\",version=\"5\"} 0
                 .contains("sdmqtt_packets_received_total{kind=\"pingreq\",version=\"5\"} 7"),
             "an increment through the handle must reach the registry"
         );
+    }
+
+    #[test]
+    fn each_connector_refusal_has_its_own_handle_and_its_own_label() {
+        // The same shape as the test below, for the family milestone
+        // four added. Two refusals mapped onto one slot would be a
+        // counter that says a message was lost and cannot say which
+        // defence lost it -- and the loop marker and the hop limit are
+        // exactly the pair an operator has to tell apart, because one
+        // is a bridge working and the other is a cycle to go and find.
+        let metrics = Metrics::new();
+        for reason in ALL_REFUSALS.iter().copied() {
+            metrics.publication_refused(reason).inc();
+        }
+        for reason in ALL_REFUSALS.iter().copied() {
+            assert_eq!(
+                metrics.publication_refused(reason).get(),
+                1,
+                "{reason:?} shares a handle with another refusal"
+            );
+        }
+        // And the label values are the ones a dashboard is written
+        // against, lower case and written out by hand. See the module
+        // note: a derive would give `TooManyHops`.
+        let exposition = metrics.render();
+        for reason in ALL_REFUSALS.iter().copied() {
+            let line = format!(
+                "sdmqtt_publications_refused_total{{reason=\"{}\"}} 1",
+                refusal_label(reason)
+            );
+            assert!(
+                exposition.contains(&line),
+                "{reason:?} is not on the exposition as {line}:\n{exposition}"
+            );
+        }
     }
 
     #[test]

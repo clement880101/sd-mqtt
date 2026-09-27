@@ -30,8 +30,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, PoisonError};
 
 use crate::record::{
-    BodyRecord, InflightRecord, MessageId, QueueEntry, Record, RetainedRecord, SessionKey,
-    SessionRecord, SubscriptionRecord,
+    BodyRecord, InflightRecord, MessageId, OutboxRecord, QueueEntry, Record, RetainedRecord,
+    RuleRecord, SessionKey, SessionRecord, SubscriptionRecord,
 };
 use crate::restore::{Restored, RestoredSession};
 use crate::{Rejection, Storage, StorageError};
@@ -76,6 +76,32 @@ struct State {
     bodies: BTreeMap<MessageId, HeldBody>,
     /// Retained messages by topic.
     retained: BTreeMap<String, RetainedRecord>,
+    /// Rules by identifier, ordered so that restore is deterministic.
+    rules: BTreeMap<String, RuleRecord>,
+    /// Each rule's outbox, by the same identifier.
+    ///
+    /// Beside the rules rather than inside a rule's own entry, because a
+    /// rule is replaced whole by a [`Record::RulePut`] and an outbox must
+    /// not be: turning a connector off and on again, or editing its URL,
+    /// would otherwise throw away every envelope waiting to go.
+    outboxes: BTreeMap<String, OutboxState>,
+}
+
+/// One rule's outbox and the counters it keeps.
+///
+/// Counters maintained rather than derived, for the reason the module
+/// documentation gives about a queue's: a depth that cannot drift is a
+/// depth no test can prove is maintained, and after an outbox drains
+/// there is nothing left to derive the high-water mark from.
+#[derive(Debug, Clone, Default)]
+struct OutboxState {
+    /// What waits, by sequence number, which is the order the rule
+    /// fired.
+    entries: BTreeMap<u64, OutboxRecord>,
+    /// How many envelopes are held.
+    depth: u64,
+    /// The highest sequence ever appended, held or not.
+    highest_sequence: u64,
 }
 
 /// A body and the count that keeps it alive.
@@ -135,6 +161,18 @@ impl State {
             .ok_or_else(|| Rejection::NoSuchSession {
                 session: session.clone(),
             })
+    }
+
+    /// The outbox of the rule a record names, or a refusal saying the
+    /// rule is not held.
+    ///
+    /// Created on first use rather than by [`Record::RulePut`], so that
+    /// a rule replaced whole keeps the outbox it already had.
+    fn outbox_mut(&mut self, id: &str) -> Result<&mut OutboxState, Rejection> {
+        if !self.rules.contains_key(id) {
+            return Err(Rejection::NoSuchRule { id: id.to_owned() });
+        }
+        Ok(self.outboxes.entry(id.to_owned()).or_default())
     }
 
     /// Apply one record, or refuse it without having changed anything.
@@ -254,6 +292,54 @@ impl State {
             Record::RetainedRemoved { topic } => {
                 self.retained.remove(topic);
             }
+            Record::RulePut { rule } => {
+                self.rules.insert(rule.id.clone(), rule.clone());
+            }
+            Record::RuleRemoved { id } => {
+                // The outbox goes with the rule, as a session's queue
+                // goes with the session. The bodies its envelopes named
+                // are not released; the reference belongs to whoever
+                // took it.
+                self.rules.remove(id);
+                self.outboxes.remove(id);
+            }
+            Record::OutboxAppended { rule, entry } => {
+                let held = self.outbox_mut(rule)?;
+                if entry.sequence <= held.highest_sequence {
+                    return Err(Rejection::OutboxSequenceReused {
+                        id: rule.clone(),
+                        sequence: entry.sequence,
+                        highest: held.highest_sequence,
+                    });
+                }
+                held.entries.insert(entry.sequence, entry.clone());
+                held.depth += 1;
+                held.highest_sequence = entry.sequence;
+            }
+            Record::OutboxAttempted {
+                rule,
+                sequence,
+                attempts,
+                next_attempt_at,
+            } => {
+                // A no-op for an envelope that has left: it was
+                // delivered or dead-lettered, and recording an attempt
+                // on it would resurrect a row nothing would ever remove.
+                if let Some(entry) = self.outbox_mut(rule)?.entries.get_mut(sequence) {
+                    entry.attempts = *attempts;
+                    entry.next_attempt_at = *next_attempt_at;
+                }
+            }
+            Record::OutboxRemoved { rule, sequence } => {
+                let held = self.outbox_mut(rule)?;
+                // Only what was actually there is subtracted, for the
+                // reason a queue pop gives: an outbox reporting empty
+                // while holding envelopes stops draining.
+                if held.entries.remove(sequence).is_some() {
+                    held.depth -= 1;
+                }
+                // The high-water mark is untouched. The number is spent.
+            }
         }
         Ok(())
     }
@@ -312,6 +398,7 @@ impl Storage for MemoryStorage {
                 .iter()
                 .map(|(id, held)| (*id, held.body.clone()))
                 .collect::<HashMap<_, _>>(),
+            rules: state.rules.values().cloned().collect(),
         })
     }
 
@@ -342,6 +429,31 @@ impl Storage for MemoryStorage {
             .sessions
             .get(session)
             .map_or(0, |held| held.highest_sequence))
+    }
+
+    fn outbox_head(&self, rule: &str, cursor: u64) -> Result<Option<OutboxRecord>, StorageError> {
+        Ok(self
+            .state()
+            .outboxes
+            .get(rule)
+            .and_then(|held| held.entries.range(cursor..).next())
+            .map(|(_, entry)| entry.clone()))
+    }
+
+    fn outbox_depth(&self, rule: &str) -> Result<u64, StorageError> {
+        Ok(self.state().outboxes.get(rule).map_or(0, |held| held.depth))
+    }
+
+    fn outbox_highest_sequence(&self, rule: &str) -> Result<u64, StorageError> {
+        Ok(self
+            .state()
+            .outboxes
+            .get(rule)
+            .map_or(0, |held| held.highest_sequence))
+    }
+
+    fn body(&self, id: &MessageId) -> Result<Option<BodyRecord>, StorageError> {
+        Ok(self.state().bodies.get(id).map(|held| held.body.clone()))
     }
 }
 

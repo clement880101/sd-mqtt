@@ -97,6 +97,18 @@ pub enum ErrorCode {
     /// rather than where it is first thrown, because the set is meant
     /// to be readable in one place.
     Unauthorized,
+    /// The request is well formed and disagrees with what is there.
+    ///
+    /// Creating a rule at an identifier something already holds, and
+    /// deleting one whose outbox still has envelopes in it. Neither
+    /// caller has done anything wrong and neither is asking for
+    /// something impossible: the first has to choose another name or
+    /// mean an update, and the second has to wait or disable the rule
+    /// instead. Distinct from [`ErrorCode::InvalidRequest`] for that
+    /// reason — the body is fine — and from
+    /// [`ErrorCode::ResourceExhausted`], which is about a bound this
+    /// broker has rather than about a disagreement with its contents.
+    Conflict,
     /// A bounded thing this broker holds a fixed number of is full.
     ///
     /// Today that is taps: [`crate::taps::MAX_TAPS`] of them exist at
@@ -106,6 +118,22 @@ pub enum ErrorCode {
     /// succeed unchanged a moment later, which is exactly what a
     /// client needs to know to decide whether to retry.
     ResourceExhausted,
+    /// The request would extend a cycle of connectors.
+    ///
+    /// Section 9.2's third loop: a rule feeding a system that
+    /// publishes back through another rule is a circle no single rule
+    /// is in the whole of, so the hop count each publication carries is
+    /// what bounds it and a publication over `broker.max_hops` is
+    /// dropped. This is how the one endpoint in that circle that a
+    /// caller can see says so.
+    ///
+    /// Deliberately not [`ErrorCode::InvalidRequest`], for the reason
+    /// [`ErrorCode::ResourceExhausted`] is not: the request is well
+    /// formed and the caller has done nothing wrong. It is also not
+    /// `resource_exhausted`, because retrying unchanged will not help —
+    /// what has to change is a configuration, and the status says which
+    /// kind of problem it is.
+    LoopDetected,
     /// Something went wrong that is not the caller's fault.
     Internal,
 }
@@ -121,11 +149,16 @@ impl ErrorCode {
             ErrorCode::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             ErrorCode::NotAcceptable => StatusCode::NOT_ACCEPTABLE,
             ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
+            // 409, which is what "Conflict" is for.
+            ErrorCode::Conflict => StatusCode::CONFLICT,
             // 429 rather than 503. The broker is healthy and every
             // other request is being served; what the caller is
             // being told is "not this one, not now", which is the
             // status a client already knows to retry after.
             ErrorCode::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
+            // 508, which is what "Loop Detected" is for and says the
+            // whole thing without a sentence.
+            ErrorCode::LoopDetected => StatusCode::LOOP_DETECTED,
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

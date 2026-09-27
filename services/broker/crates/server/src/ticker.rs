@@ -148,7 +148,9 @@ mod tests {
         let subscriber = shared
             .with_broker(|broker| {
                 let mut out = Vec::new();
-                broker.connect("", &impatient(), &mut out)
+                broker
+                    .connect("", &impatient(), &mut out)
+                    .expect("the default decision authenticates")
             })
             .subscriber;
         let mut inbox = shared.register_outbox(subscriber, 8);

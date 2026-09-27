@@ -58,6 +58,49 @@
 //! nothing to say about a request that cannot have come from one, and
 //! an attacker who can choose the field can choose an allowed value
 //! anyway — this defends the browser, not the socket.
+//!
+//! # The ingest listener is deliberately not behind this
+//!
+//! A decision, written here rather than left as an omission somebody
+//! later reads as an oversight.
+//!
+//! Section 9.2's `http_in` puts `POST /ingest/<rule-id>` on a listener
+//! of its own by default. That listener is **not** behind this layer,
+//! and it is not behind it for a reason rather than because nobody
+//! applied it: the callers are webhook senders, each reaching the
+//! broker under whatever name its own configuration was written with.
+//! Applying this check there would mean an operator either adding every
+//! sender's hostname to a list, or — far likelier — seeing every
+//! delivery refused with a message about DNS rebinding, which reads as
+//! a bug rather than as a policy.
+//!
+//! What makes that safe is that the reasoning above does not transfer.
+//! This check exists because the admin listener's protection is *where
+//! it listens*: against the default configuration — loopback, no token
+//! — a rebound page can publish and read every retained payload. An
+//! ingest listener has no such default. **Every route on it is guarded
+//! by its own rule's bearer token, and section 9.2 refuses a rule
+//! without one**, so a rebound page reaching it has exactly the access
+//! anybody on the network has: none, unless it already holds a token,
+//! and a page that holds the token did not need to be rebound.
+//!
+//! The rest of the attack does not transfer either. An ingest route
+//! publishes and reads nothing back, so there is no response for a
+//! rebound page to steal; the reply is a status and a sentence. What is
+//! left is a page that can make a request it could have made from
+//! anywhere, which is what a token is for.
+//!
+//! Running the ingest routes on the admin listener is permitted and
+//! must be chosen explicitly. A route set served there **is** behind
+//! this layer, because the layer belongs to that router; an operator
+//! who makes that choice takes the admin listener's rules with it, and
+//! that is the right way round.
+//!
+//! The layer is therefore applied by [`crate::router`], which builds
+//! the admin route set, and not by [`crate::Bound::serve`], which
+//! serves whatever it is given.
+//! The test `a_route_set_is_served_where_it_is_asked_for_and_nowhere_else`
+//! in that module is this paragraph written as something that fails.
 
 use std::net::IpAddr;
 

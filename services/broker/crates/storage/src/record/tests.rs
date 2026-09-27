@@ -34,6 +34,24 @@ use super::*;
 ///   that carry one.
 /// - `BodyRecord` and `RetainedRecord`: the two `Bytes` fields hold
 ///   different lengths, and the two `Option`s differ in presence.
+/// - `RuleRecord`: `id` and `name` are different lengths, and `name` and
+///   the trigger's `filter` are the same length and different text, so a
+///   swap of either pair is visible. `enabled` is false, which is the
+///   one byte in the record that is `0x00`, so it cannot be confused
+///   with the two `Option` presence bytes beside it, both `0x01`.
+/// - `HttpOutRecord`: `timeout_ms` and `backoff_ms` are different
+///   two-byte varints; `max_concurrency` and `retries` are different
+///   one-byte ones and adjacent, which is where a transposition would
+///   otherwise hide. `method` is `PUT` rather than the `POST` a default
+///   would produce, so the vector pins what was stored and not what a
+///   default would have supplied.
+///
+/// - `OutboxRecord`: `id` and `body` are both sixteen raw bytes and are
+///   filled with different ones, so a swap is visible; `attempts` is a
+///   one-byte varint and `enqueued_at` and `next_attempt_at` are
+///   five-byte ones that differ in their first byte; and the rule
+///   identifier outside the record is a different length from the
+///   client identifier inside it.
 ///
 /// When adding a record type, check the same property before adding its
 /// vector.
@@ -87,13 +105,15 @@ mod golden {
     #[test]
     fn the_format_marker() {
         // A fixed-size array is its elements with no length prefix, and a
-        // u16 is a varint, so version 2 is one byte. The version moved
+        // u16 is a varint, so version 4 is one byte. The version moved
         // from 1 when the reference count of a body left the body's own
-        // row: a version 1 store's bodies begin with eight bytes this
-        // build would read as payload.
+        // row, from 2 when rules were added, and from 3 when each rule
+        // gained an outbox: a version 3 store has no outbox table at
+        // all and would come up looking healthy with every undelivered
+        // envelope missing.
         let expected: &[u8] = &[
             b's', b'd', b'm', b'q', b't', b't', b's', b't', // magic "sdmqttst"
-            0x02, // version 2
+            0x04, // version 4
         ];
         assert_eq!(FormatMarker::current().encode(), expected);
         assert_eq!(
@@ -392,6 +412,309 @@ mod golden {
         pins(&record, expected);
     }
 
+    /// The rule the vectors below are of.
+    ///
+    /// Written out here once because both of them name it, and because
+    /// what the bytes say it is has to be legible beside the bytes.
+    fn rule() -> RuleRecord {
+        RuleRecord {
+            id: "telemetry".to_owned(),
+            name: "Telemetry out".to_owned(),
+            enabled: false,
+            trigger: TriggerRecord {
+                filter: "sensor/+/temp".to_owned(),
+                min_qos: Some(Qos::ExactlyOnce),
+                client_id: Some("sensor-*".to_owned()),
+            },
+            action: ActionRecord::HttpOut(HttpOutRecord {
+                url: "https://example.invalid/hook".to_owned(),
+                method: "PUT".to_owned(),
+                headers: vec![("x-token".to_owned(), "secret".to_owned())],
+                timeout_ms: 2_500,
+                max_concurrency: 8,
+                retries: 5,
+                backoff_ms: 750,
+            }),
+        }
+    }
+
+    #[test]
+    fn rule_put() {
+        // A tuple is its elements in order with no framing, so a header
+        // is two lengthed strings and a `Vec` of them is a varint count
+        // then that. 2500 = 19 * 128 + 68, so the varint is 68|0x80 then
+        // 19; 750 = 5 * 128 + 110, so it is 110|0x80 then 5.
+        let expected: &[u8] = &[
+            0x0e, // Record::RulePut is variant 14
+            0x09, b't', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y', // id
+            0x0d, b'T', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y', b' ', b'o', b'u',
+            b't', // name "Telemetry out"
+            0x00, // enabled false
+            0x0d, b's', b'e', b'n', b's', b'o', b'r', b'/', b'+', b'/', b't', b'e', b'm',
+            b'p', // trigger filter "sensor/+/temp"
+            0x01, 0x02, // min_qos Some(Qos::ExactlyOnce)
+            0x01, 0x08, b's', b'e', b'n', b's', b'o', b'r', b'-',
+            b'*', // client_id Some("sensor-*")
+            0x00, // ActionRecord::HttpOut is variant 0
+            0x1c, b'h', b't', b't', b'p', b's', b':', b'/', b'/', b'e', b'x', b'a', b'm', b'p',
+            b'l', b'e', b'.', b'i', b'n', b'v', b'a', b'l', b'i', b'd', b'/', b'h', b'o', b'o',
+            b'k', // url, twenty-eight bytes
+            0x03, b'P', b'U', b'T', // method
+            0x01, // one header
+            0x07, b'x', b'-', b't', b'o', b'k', b'e', b'n', // its name
+            0x06, b's', b'e', b'c', b'r', b'e', b't', // its value
+            0xc4, 0x13, // timeout_ms 2500
+            0x08, // max_concurrency 8
+            0x05, // retries 5
+            0xee, 0x05, // backoff_ms 750
+        ];
+        pins(&Record::RulePut { rule: rule() }, expected);
+    }
+
+    /// The ingest rule the vector below is of.
+    ///
+    /// Section 9.2's `http_in`. Its trigger is the empty one an ingest
+    /// rule stores — see [`RuleRecord::trigger`] — so three zero bytes
+    /// sit together in the middle of it. A transposition among them is
+    /// invisible here and is pinned by [`rule_put`] instead, where the
+    /// three fields carry values that differ; what this vector is for
+    /// is the action.
+    fn ingest_rule() -> RuleRecord {
+        RuleRecord {
+            id: "gateway".to_owned(),
+            name: "Gateway in".to_owned(),
+            enabled: true,
+            trigger: TriggerRecord {
+                filter: String::new(),
+                min_qos: None,
+                client_id: None,
+            },
+            action: ActionRecord::HttpIn(HttpInRecord {
+                token: Secret::new("a-secret"),
+                topic: "from/the/web".to_owned(),
+                topic_from: Some(TopicFromRequestRecord {
+                    source: TopicFromRecord::Query("t".to_owned()),
+                    prefix: "ingest/gateway".to_owned(),
+                }),
+                qos: Qos::AtLeastOnce,
+                retain: false,
+            }),
+        }
+    }
+
+    /// The independence property, for this vector: every string in it
+    /// is a different length — 7, 10, 8, 12, 1, 14 — so a transposition
+    /// of any pair changes the bytes; the query parameter's name is one
+    /// character and the variant index beside it is `0x01`, which are
+    /// the same byte, so the name is `t` rather than a character that
+    /// would make the pair look interchangeable; and `qos` and `retain`
+    /// are the two adjacent one-byte fields and differ.
+    #[test]
+    fn rule_put_http_in() {
+        let expected: &[u8] = &[
+            0x0e, // Record::RulePut is variant 14
+            0x07, b'g', b'a', b't', b'e', b'w', b'a', b'y', // id
+            0x0a, b'G', b'a', b't', b'e', b'w', b'a', b'y', b' ', b'i',
+            b'n', // name "Gateway in"
+            0x01, // enabled true
+            0x00, // trigger filter "", the empty trigger of an ingest rule
+            0x00, // min_qos None
+            0x00, // client_id None
+            0x01, // ActionRecord::HttpIn is variant 1
+            // `Secret` is transparent, so the token is the string and
+            // nothing around it.
+            0x08, b'a', b'-', b's', b'e', b'c', b'r', b'e', b't', // token
+            0x0c, b'f', b'r', b'o', b'm', b'/', b't', b'h', b'e', b'/', b'w', b'e',
+            b'b', // topic "from/the/web"
+            0x01, // topic_from Some
+            0x01, // TopicFromRecord::Query is variant 1
+            0x01, b't', // the query parameter's name
+            0x0e, b'i', b'n', b'g', b'e', b's', b't', b'/', b'g', b'a', b't', b'e', b'w', b'a',
+            b'y', // prefix "ingest/gateway"
+            0x01, // qos AtLeastOnce
+            0x00, // retain false
+        ];
+        pins(
+            &Record::RulePut {
+                rule: ingest_rule(),
+            },
+            expected,
+        );
+    }
+
+    /// The polling rule the vector below is of.
+    ///
+    /// Section 9.2's `http_poll`. Like an ingest rule it stores the
+    /// empty trigger — a poller is fired by its own interval, not by a
+    /// published message — so the three zero bytes sit together again
+    /// and are pinned by [`rule_put`] rather than here. What this
+    /// vector is for is the action, and in particular its **three
+    /// adjacent varint fields**: an interval, a timeout and a body
+    /// limit, which is the transposition a round trip cannot see.
+    fn polling_rule() -> RuleRecord {
+        RuleRecord {
+            id: "weather".to_owned(),
+            name: "Weather poll".to_owned(),
+            enabled: true,
+            trigger: TriggerRecord {
+                filter: String::new(),
+                min_qos: None,
+                client_id: None,
+            },
+            action: ActionRecord::HttpPoll(HttpPollRecord {
+                url: "https://example.invalid/now".to_owned(),
+                headers: vec![("accept".to_owned(), "text/plain".to_owned())],
+                interval_ms: 60_000,
+                timeout_ms: 5_000,
+                max_body_bytes: 65_536,
+                topic: "weather/now".to_owned(),
+                qos: Qos::ExactlyOnce,
+                retain: true,
+            }),
+        }
+    }
+
+    /// The independence property, for this vector: every string in it
+    /// is a different length — 7, 12, 27, 6, 10, 11 — so a
+    /// transposition of any pair changes the bytes; the three varints
+    /// encode to three, two and three bytes and share no byte value in
+    /// the same position, so swapping any two of them changes the
+    /// vector; and `qos` and `retain` are the two adjacent one-byte
+    /// fields and differ.
+    #[test]
+    fn rule_put_http_poll() {
+        // 60000 = 3 * 16384 + 84 * 128 + 96, so the varint is 96|0x80,
+        // 84|0x80, 3. 5000 = 39 * 128 + 8, so it is 8|0x80 then 39.
+        // 65536 = 4 * 16384, so it is 0|0x80, 0|0x80, 4 — the one that
+        // shows a varint's trailing groups are not dropped.
+        let expected: &[u8] = &[
+            0x0e, // Record::RulePut is variant 14
+            0x07, b'w', b'e', b'a', b't', b'h', b'e', b'r', // id
+            0x0c, b'W', b'e', b'a', b't', b'h', b'e', b'r', b' ', b'p', b'o', b'l',
+            b'l', // name "Weather poll"
+            0x01, // enabled true
+            0x00, // trigger filter "", the empty trigger of a polling rule
+            0x00, // min_qos None
+            0x00, // client_id None
+            0x02, // ActionRecord::HttpPoll is variant 2
+            0x1b, b'h', b't', b't', b'p', b's', b':', b'/', b'/', b'e', b'x', b'a', b'm', b'p',
+            b'l', b'e', b'.', b'i', b'n', b'v', b'a', b'l', b'i', b'd', b'/', b'n', b'o',
+            b'w', // url, twenty-seven bytes
+            0x01, // one header
+            0x06, b'a', b'c', b'c', b'e', b'p', b't', // its name
+            0x0a, b't', b'e', b'x', b't', b'/', b'p', b'l', b'a', b'i', b'n', // its value
+            0xe0, 0xd4, 0x03, // interval_ms 60000
+            0x88, 0x27, // timeout_ms 5000
+            0x80, 0x80, 0x04, // max_body_bytes 65536
+            0x0b, b'w', b'e', b'a', b't', b'h', b'e', b'r', b'/', b'n', b'o',
+            b'w', // topic "weather/now"
+            0x02, // qos ExactlyOnce
+            0x01, // retain true
+        ];
+        pins(
+            &Record::RulePut {
+                rule: polling_rule(),
+            },
+            expected,
+        );
+    }
+
+    #[test]
+    fn rule_removed() {
+        let expected: &[u8] = &[
+            0x0f, // Record::RuleRemoved is variant 15
+            0x09, b't', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y',
+        ];
+        pins(
+            &Record::RuleRemoved {
+                id: "telemetry".to_owned(),
+            },
+            expected,
+        );
+    }
+
+    /// The envelope the three vectors below are of.
+    ///
+    /// `id` and `body` are sixteen bytes each of `0x11` and `0x22`, so
+    /// that reading one where the other belongs is legible rather than
+    /// hidden behind shared zeroes.
+    fn envelope() -> OutboxRecord {
+        OutboxRecord {
+            sequence: 300,
+            id: MessageId([0x11; 16]),
+            body: MessageId([0x22; 16]),
+            client_id: "sensor".to_owned(),
+            enqueued_at: 1_700_000_000,
+            attempts: 2,
+            next_attempt_at: 1_700_000_017,
+        }
+    }
+
+    #[test]
+    fn outbox_appended() {
+        // A newtype struct is its inner value, and a fixed-size array is
+        // its elements with no length prefix, so a `MessageId` is
+        // sixteen bare bytes. 300 = 2 * 128 + 44, so its varint is
+        // 44|0x80 then 2. 1_700_000_000 and 1_700_000_017 differ only in
+        // their lowest seven bits, which is the first byte of each.
+        let expected: &[u8] = &[
+            0x10, // Record::OutboxAppended is variant 16
+            0x09, b't', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y', // rule
+            0xac, 0x02, // sequence 300
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, // id, sixteen bytes
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+            0x22, 0x22, // body, sixteen bytes
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x06, b's', b'e', b'n', b's', b'o',
+            b'r', // client_id "sensor"
+            0x80, 0xe2, 0xcf, 0xaa, 0x06, // enqueued_at 1_700_000_000
+            0x02, // attempts 2
+            0x91, 0xe2, 0xcf, 0xaa, 0x06, // next_attempt_at 1_700_000_017
+        ];
+        pins(
+            &Record::OutboxAppended {
+                rule: "telemetry".to_owned(),
+                entry: envelope(),
+            },
+            expected,
+        );
+    }
+
+    #[test]
+    fn outbox_attempted() {
+        let expected: &[u8] = &[
+            0x11, // Record::OutboxAttempted is variant 17
+            0x09, b't', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y', // rule
+            0xac, 0x02, // sequence 300
+            0x04, // attempts 4
+            0x91, 0xe2, 0xcf, 0xaa, 0x06, // next_attempt_at 1_700_000_017
+        ];
+        pins(
+            &Record::OutboxAttempted {
+                rule: "telemetry".to_owned(),
+                sequence: 300,
+                attempts: 4,
+                next_attempt_at: 1_700_000_017,
+            },
+            expected,
+        );
+    }
+
+    #[test]
+    fn outbox_removed() {
+        let expected: &[u8] = &[
+            0x12, // Record::OutboxRemoved is variant 18
+            0x09, b't', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y', // rule
+            0xac, 0x02, // sequence 300
+        ];
+        pins(
+            &Record::OutboxRemoved {
+                rule: "telemetry".to_owned(),
+                sequence: 300,
+            },
+            expected,
+        );
+    }
+
     #[test]
     fn retained_removed() {
         let expected: &[u8] = &[
@@ -513,7 +836,7 @@ mod version {
 
     #[test]
     fn an_unknown_discriminant_does_not_decode() {
-        // The highest variant is 13. A record written by a build that has
+        // The highest variant is 18. A record written by a build that has
         // more of them must be refused rather than read as something else.
         let err = Record::decode(&[0x63]).expect_err("variant 99 is not ours");
         assert!(matches!(err, FormatError::Undecodable(_)), "said: {err:?}");
@@ -886,6 +1209,147 @@ mod roundtrip {
             )
     }
 
+    fn trigger() -> impl Strategy<Value = TriggerRecord> {
+        (
+            text(),
+            proptest::option::of(qos()),
+            proptest::option::of(text()),
+        )
+            .prop_map(|(filter, min_qos, client_id)| TriggerRecord {
+                filter,
+                min_qos,
+                client_id,
+            })
+    }
+
+    /// **Every variant, not the first one.** Convention 5: a generator
+    /// that cannot produce a case leaves that case untested however
+    /// many thousand cases are run, and this strategy produced nothing
+    /// but an `HttpOut` while two other variants existed. The round
+    /// trip below is what says a record survives the encoding, so a
+    /// variant it never builds is a variant nothing says that about.
+    fn action() -> impl Strategy<Value = ActionRecord> {
+        prop_oneof![
+            (
+                text(),
+                text(),
+                proptest::collection::vec((text(), text()), 0..4),
+                any::<u32>(),
+                any::<u16>(),
+                any::<u8>(),
+                any::<u32>(),
+            )
+                .prop_map(
+                    |(url, method, headers, timeout_ms, max_concurrency, retries, backoff_ms)| {
+                        ActionRecord::HttpOut(HttpOutRecord {
+                            url,
+                            method,
+                            headers,
+                            timeout_ms,
+                            max_concurrency,
+                            retries,
+                            backoff_ms,
+                        })
+                    },
+                ),
+            (
+                text(),
+                text(),
+                proptest::option::of((topic_from(), text())),
+                qos(),
+                any::<bool>(),
+            )
+                .prop_map(|(token, topic, topic_from, qos, retain)| {
+                    ActionRecord::HttpIn(HttpInRecord {
+                        token: Secret::new(token),
+                        topic,
+                        topic_from: topic_from
+                            .map(|(source, prefix)| TopicFromRequestRecord { source, prefix }),
+                        qos,
+                        retain,
+                    })
+                }),
+            (
+                text(),
+                proptest::collection::vec((text(), text()), 0..4),
+                any::<u32>(),
+                any::<u32>(),
+                any::<u32>(),
+                text(),
+                qos(),
+                any::<bool>(),
+            )
+                .prop_map(
+                    |(
+                        url,
+                        headers,
+                        interval_ms,
+                        timeout_ms,
+                        max_body_bytes,
+                        topic,
+                        qos,
+                        retain,
+                    )| {
+                        ActionRecord::HttpPoll(HttpPollRecord {
+                            url,
+                            headers,
+                            interval_ms,
+                            timeout_ms,
+                            max_body_bytes,
+                            topic,
+                            qos,
+                            retain,
+                        })
+                    },
+                ),
+        ]
+    }
+
+    /// Where an ingest rule reads a topic from, either spelling.
+    fn topic_from() -> impl Strategy<Value = TopicFromRecord> {
+        prop_oneof![
+            text().prop_map(TopicFromRecord::Header),
+            text().prop_map(TopicFromRecord::Query),
+        ]
+    }
+
+    fn outbox_entry() -> impl Strategy<Value = OutboxRecord> {
+        (
+            any::<u64>(),
+            message_id(),
+            message_id(),
+            text(),
+            any::<u32>(),
+            any::<u32>(),
+            any::<u32>(),
+        )
+            .prop_map(
+                |(sequence, id, body, client_id, enqueued_at, attempts, next_attempt_at)| {
+                    OutboxRecord {
+                        sequence,
+                        id,
+                        body,
+                        client_id,
+                        enqueued_at,
+                        attempts,
+                        next_attempt_at,
+                    }
+                },
+            )
+    }
+
+    fn rule() -> impl Strategy<Value = RuleRecord> {
+        (text(), text(), any::<bool>(), trigger(), action()).prop_map(
+            |(id, name, enabled, trigger, action)| RuleRecord {
+                id,
+                name,
+                enabled,
+                trigger,
+                action,
+            },
+        )
+    }
+
     fn retained() -> impl Strategy<Value = RetainedRecord> {
         (bytes(), qos(), any::<Option<u32>>(), bytes()).prop_map(
             |(payload, qos, expires_at, properties)| RetainedRecord {
@@ -928,6 +1392,20 @@ mod roundtrip {
             (text(), retained())
                 .prop_map(|(topic, message)| Record::RetainedPut { topic, message }),
             text().prop_map(|topic| Record::RetainedRemoved { topic }),
+            rule().prop_map(|rule| Record::RulePut { rule }),
+            text().prop_map(|id| Record::RuleRemoved { id }),
+            (text(), outbox_entry())
+                .prop_map(|(rule, entry)| Record::OutboxAppended { rule, entry }),
+            (text(), any::<u64>(), any::<u32>(), any::<u32>()).prop_map(
+                |(rule, sequence, attempts, next_attempt_at)| Record::OutboxAttempted {
+                    rule,
+                    sequence,
+                    attempts,
+                    next_attempt_at,
+                }
+            ),
+            (text(), any::<u64>())
+                .prop_map(|(rule, sequence)| Record::OutboxRemoved { rule, sequence }),
         ]
     }
 

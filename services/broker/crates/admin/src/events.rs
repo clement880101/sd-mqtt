@@ -1350,7 +1350,9 @@ mod tests {
         };
         state.shared.with_broker(|broker| {
             let mut out = Vec::new();
-            broker.connect("", &connect, &mut out);
+            broker
+                .connect("", &connect, &mut out)
+                .expect("the default decision authenticates");
         });
         // What a real connection moves as it arrives, and what the
         // counters event is drawn from.

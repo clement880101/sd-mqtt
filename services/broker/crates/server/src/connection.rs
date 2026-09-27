@@ -423,7 +423,15 @@ where
         };
 
         let mut out = Vec::new();
-        let registration = broker.connect(&config.mountpoint, &connect, &mut out);
+        let registration = match broker.connect(&config.mountpoint, &connect, &mut out) {
+            Ok(registration) => registration,
+            // Section 9.3's authenticate chain refused it. Nothing
+            // was registered and no incumbent was displaced, so
+            // nothing is owed but the answer: the client is told the
+            // reason and the connection closed [MQTT-3.1.4-6],
+            // rather than dropped in silence.
+            Err(reason) => return Some(Err(reason)),
+        };
         let configured = usize::from(broker.config().max_inflight);
         if let Some(session) = broker.session_mut(registration.subscriber) {
             // Section 4.9: what the client can receive bounds what we
@@ -448,10 +456,10 @@ where
                 .inbound
                 .set_receive_maximum(usize::from(config.receive_maximum));
         }
-        Some((registration, out, assigned))
+        Some(Ok((registration, out, assigned)))
     });
 
-    let Some((registration, actions, assigned)) = registered else {
+    let Some(outcome) = registered else {
         // Every candidate identifier was taken. Nothing was registered,
         // so nothing is owed; the client is told rather than dropped.
         refuse(
@@ -464,6 +472,14 @@ where
         return Err(ConnectionError::Protocol(
             ReasonCode::ClientIdentifierNotValid,
         ));
+    };
+
+    let (registration, actions, assigned) = match outcome {
+        Ok(accepted) => accepted,
+        Err(reason) => {
+            refuse(&mut write_half, version, reason, &metrics).await?;
+            return Err(ConnectionError::Protocol(reason));
+        }
     };
 
     let attached = Attached {
@@ -1848,7 +1864,9 @@ mod tests {
         let shared = Shared::new(BrokerConfig::default());
         shared.with_broker(|broker| {
             let mut out = Vec::new();
-            broker.connect("", &connect("taken", 0), &mut out);
+            broker
+                .connect("", &connect("taken", 0), &mut out)
+                .expect("the default decision authenticates");
         });
 
         let mut offered = ["taken", "free"].into_iter();
@@ -1865,7 +1883,9 @@ mod tests {
         let shared = Shared::new(BrokerConfig::default());
         shared.with_broker(|broker| {
             let mut out = Vec::new();
-            broker.connect("", &connect("taken", 0), &mut out);
+            broker
+                .connect("", &connect("taken", 0), &mut out)
+                .expect("the default decision authenticates");
         });
 
         let mut attempts = 0;
@@ -1888,7 +1908,9 @@ mod tests {
         let shared = Shared::new(BrokerConfig::default());
         shared.with_broker(|broker| {
             let mut out = Vec::new();
-            broker.connect("tenant-a", &connect("taken", 0), &mut out);
+            broker
+                .connect("tenant-a", &connect("taken", 0), &mut out)
+                .expect("the default decision authenticates");
         });
 
         let assigned =
@@ -2025,7 +2047,9 @@ mod tests {
         let shared = Arc::new(Shared::new(BrokerConfig::default()));
         shared.with_broker(|broker| {
             let mut out = Vec::new();
-            broker.connect("", &connect("taken", 0), &mut out);
+            broker
+                .connect("", &connect("taken", 0), &mut out)
+                .expect("the default decision authenticates");
         });
 
         let mut client = serve_one_with_candidates(Arc::clone(&shared), || "taken".into());
@@ -2067,7 +2091,9 @@ mod tests {
         let shared = Arc::new(Shared::new(BrokerConfig::default()));
         shared.with_broker(|broker| {
             let mut out = Vec::new();
-            broker.connect("", &connect("taken", 0), &mut out);
+            broker
+                .connect("", &connect("taken", 0), &mut out)
+                .expect("the default decision authenticates");
         });
 
         let mut offered = ["taken", "free"].into_iter();
@@ -2344,7 +2370,9 @@ mod tests {
         let shared = Arc::new(Shared::new(BrokerConfig::default()));
         let registration = shared.with_broker(|broker| {
             let mut out = Vec::new();
-            let registration = broker.connect("", &connect("c", 0), &mut out);
+            let registration = broker
+                .connect("", &connect("c", 0), &mut out)
+                .expect("the default decision authenticates");
             let session = broker.session_mut(registration.subscriber).unwrap();
             session.outbound.set_online(true);
             registration

@@ -2,9 +2,9 @@
 
 Preact 10 with signals, routed by preact-iso, bundled by Vite 8, styled
 with hand-written CSS over Open Props tokens. Section 11.2 of the
-design says what it is for. Three of its six pages are built —
-Overview, Clients and Topics — over the shell and the pipeline that
-carries them.
+design says what it is for. Four of its six pages are built —
+Overview, Clients, Topics and Rules — over the shell and the pipeline
+that carries them.
 
 ## Running it
 
@@ -210,6 +210,81 @@ messages: a fire-and-forget delivery to an attached session writes
 nothing. A tab that closes without deleting its tap leaves it until
 the idle timeout, which is what the timeout is for; the page tries
 on both unmount and `pagehide` anyway.
+
+## The sparklines, which are drawn here rather than charted
+
+The Rules page draws a series per row, which is the first per-row
+series this project has: section 11.2 promised them in table rows
+and milestone three deferred them to milestone four because until
+per-rule statistics existed there was nothing to draw.
+
+**One SVG path per row, not one chart per row.** That is what
+`docs/research/component-selection.md` chose and the reason it gave:
+a chart library instance per table row does not scale, and a table of
+two hundred rules is two hundred of whatever is picked. uPlot stays on
+the Overview page, where there are two plots and both want axes, a
+legend and a cursor.
+
+The two cases worth knowing, because both happen constantly and
+**neither is a line**:
+
+- **An empty series draws no geometry at all** — no `<svg>` and no
+  `<path>`. The cell says `no samples` in words. A flat line means
+  "this rule was quiet", which is a fact about the broker; an empty
+  series is a fact about this page, and a sparkline that draws a
+  convincing flat line when it has nothing is the failure mode of the
+  whole idea.
+- **One sample draws a dot**, at the right-hand edge, where the newest
+  sample sits at every other length. It lasts about a second, on the
+  way from nothing to a line.
+
+Zero is the floor of the scale rather than the series' minimum, so a
+rule that has done nothing for a minute is a flat line along the
+bottom rather than one through the middle. The peak is each row's own
+and is in the label, because the numbers are in the columns beside it
+and a scale shared across the table would flatten every rule against
+the busiest one.
+
+`drawing()` in `src/sparkline.tsx` is exported and pure for the reason
+`onCounters` is: there is no test runner here, and
+`await import('/src/sparkline.tsx')` in a browser console reaches all
+three branches with a series typed by hand, so the path data can be
+read as text rather than judged by eye.
+
+## What the Rules page polls, and why it is not a stream
+
+`/api/v1/rule-stats` once a second — one request for the whole table,
+not one per row. Section 11.1 allows this application one events
+stream, the Overview page spends it, and the stream carries nothing
+about a rule, so there is no third option; it is the cadence the
+Topics page's tap reader already uses.
+
+The poll skips while the tab is hidden, and **the first read happens
+anyway**. That is not a detail: a page loaded in a tab that is not in
+front would otherwise never make its first request, and every row
+would say `no samples` — a sentence about the broker — for as long as
+it stayed there. It was written the other way round first and found
+by loading the page in a hidden tab against a broker with a full
+minute of samples.
+
+The rules themselves are not polled. They change when an operator
+edits one, so the list is fetched on load, on a resynchronise, and
+after this page changes something.
+
+## What the editor has to know about secrets
+
+An ingest rule's token, a bridge's password and every outbound header
+**value** are redacted on the way out, because the read resources need
+no token. So the editor is filled with a rule that has an empty token,
+no password, and header names with empty values.
+
+An update that leaves a secret out keeps the stored one, which is
+`crates/admin/src/rules.rs`'s rule. The form therefore sends nothing
+for a blank secret and sends a header back with its empty value, and
+says on screen that blank means unchanged. Dropping an empty-valued
+header instead — the obvious tidy-up — deletes it from the rule:
+checked by doing exactly that, after which the endpoint received no
+credential at all and the save still looked like it had worked.
 
 ## Attribution
 

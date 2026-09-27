@@ -46,6 +46,22 @@ pub struct FrameReader<R> {
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
+    /// A reader over `inner` whose bytes are not counted anywhere.
+    ///
+    /// For a stream that is not a client connection and so is not part
+    /// of the listener totals [`crate::metrics`] keeps: section 9.2's
+    /// bridge, which is a connection this broker *makes*. Counting it
+    /// into the received-bytes counter would make a metric named after
+    /// what clients sent include what this broker fetched, which is a
+    /// worse answer than not counting it.
+    ///
+    /// A counter of its own, per bridge, is the right answer and is
+    /// deferred rather than forgotten: it belongs with the rest of the
+    /// bridge's metrics, and nothing yet reports any of them.
+    pub fn unmetered(inner: R, limits: Limits) -> Self {
+        Self::new(inner, limits, Counter::default())
+    }
+
     /// A reader over `inner`, counting what it reads into `bytes`.
     pub fn new(inner: R, limits: Limits, bytes: Counter) -> Self {
         Self {
