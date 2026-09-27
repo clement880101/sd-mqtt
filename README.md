@@ -78,10 +78,16 @@ validator, so the refusals below are the same refusals either way and
 name the same key.
 
 A rule read back over the API carries **no** `http_in.token`, **no**
-`mqtt_bridge.password`, and its `headers` with their names and empty
-values: those are secrets and the read resources need no token to
-read. An update that leaves one out keeps the stored one, which is
-what makes "read a rule, change one field, write it back" safe.
+`mqtt_bridge.password`, its `headers` with their names and empty
+values, and a `url` reduced to its scheme and host with the rest
+elided: those are secrets and the read resources need no token to
+read. A URL is one as often as not — a chat platform's webhook is an
+unguessable path and nothing else, and a key in a query string is the
+same thing in another shape — and the host is what a form needs to
+show you where your rule posts. An update that leaves a secret out, or
+that sends a URL back exactly as it was read, keeps the stored one,
+which is what makes "read a rule, change one field, write it back"
+safe.
 
 #### Post a message out: `[rules.http_out]`
 

@@ -237,6 +237,16 @@ impl RuleSpec {
     /// are skipped on the way to the wire anyway; they are cleared
     /// here as well so that a caller holding one of these in memory
     /// is not holding a secret either.
+    ///
+    /// **The URL is one of them**, and is the one with no type saying
+    /// so. A `http_out` or `http_poll` URL comes back as its scheme
+    /// and host with everything else elided, because for the
+    /// commonest outbound target — a chat platform's webhook — the
+    /// path *is* the credential, and a key in a query string or a
+    /// password in the authority is the same hole in two other
+    /// shapes. `crate::http_out::redacted_url` has the whole
+    /// argument, including why that is still enough for a form to
+    /// show an operator what their rule posts to.
     pub fn of(rule: &Rule) -> Self {
         let trigger = rule.trigger.as_ref();
         Self {
@@ -250,7 +260,7 @@ impl RuleSpec {
                 .map(|pattern| pattern.as_str().to_owned()),
             http_out: match &rule.action {
                 Action::HttpOut(action) => Some(HttpOutSpec {
-                    url: action.url.clone(),
+                    url: crate::http_out::redacted_url(&action.url),
                     method: action.method.clone(),
                     headers: redacted(&action.headers),
                     timeout_ms: action.timeout_ms,
@@ -286,7 +296,7 @@ impl RuleSpec {
             },
             http_poll: match &rule.action {
                 Action::HttpPoll(action) => Some(HttpPollSpec {
-                    url: action.url.clone(),
+                    url: crate::http_out::redacted_url(&action.url),
                     headers: redacted(&action.headers),
                     interval_ms: action.interval_ms,
                     timeout_ms: action.timeout_ms,
@@ -1048,7 +1058,7 @@ mod tests {
                 min_qos: Some(1),
                 client_id: Some("gateway-*".to_owned()),
                 http_out: Some(HttpOutSpec {
-                    url: "https://example.invalid/hook".to_owned(),
+                    url: "https://example.invalid/services/T0/B0/an-unguessable-webhook".to_owned(),
                     method: "POST".to_owned(),
                     headers: [("x-token".to_owned(), "the-bearer-token".to_owned())]
                         .into_iter()
@@ -1074,7 +1084,7 @@ mod tests {
             },
             RuleSpec {
                 http_poll: Some(HttpPollSpec {
-                    url: "https://example.invalid/now".to_owned(),
+                    url: "https://example.invalid/now?key=a-secret".to_owned(),
                     headers: BTreeMap::new(),
                     interval_ms: 30_000,
                     timeout_ms: 5_000,
@@ -1149,6 +1159,12 @@ mod tests {
     fn put_the_secrets_back(spec: &mut RuleSpec, from: &RuleSpec) {
         if let (Some(into), Some(had)) = (&mut spec.http_in, &from.http_in) {
             into.token = had.token.clone();
+        }
+        if let (Some(into), Some(had)) = (&mut spec.http_out, &from.http_out) {
+            into.url.clone_from(&had.url);
+        }
+        if let (Some(into), Some(had)) = (&mut spec.http_poll, &from.http_poll) {
+            into.url.clone_from(&had.url);
         }
         if let (Some(into), Some(had)) = (&mut spec.mqtt_bridge, &from.mqtt_bridge) {
             into.password.clone_from(&had.password);
@@ -1226,8 +1242,32 @@ mod tests {
             // caller holds and the bytes a reader of an
             // unauthenticated resource sees are two different
             // questions.
+            // The URL is the fourth secret, and the one with no type
+            // saying so: a chat platform's webhook URL is a long
+            // unguessable path and nothing else. What comes back is
+            // the scheme and the host, which is what a form needs to
+            // show an operator where their rule posts.
+            for url in [
+                out.http_out.as_ref().map(|action| &action.url),
+                out.http_poll.as_ref().map(|action| &action.url),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert_eq!(
+                    url.as_str(),
+                    "https://example.invalid/\u{2026}",
+                    "{} gave out the path or query of its URL",
+                    spec.id
+                );
+            }
             let json = serde_json::to_string(&out).expect("a spec serialises");
-            for secret in ["a-secret", "the-bearer-token"] {
+            for secret in [
+                "a-secret",
+                "the-bearer-token",
+                "an-unguessable-webhook",
+                "key=",
+            ] {
                 assert!(
                     !json.contains(secret),
                     "{} serialised a secret: {json}",

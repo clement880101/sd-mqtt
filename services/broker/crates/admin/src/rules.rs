@@ -72,6 +72,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use ::rules::http_out::redacted_url;
 use ::rules::live::{InstallError, Registry};
 use ::rules::rule::{Rule, RuleId};
 use ::rules::spec::{RuleSpec, SpecError};
@@ -174,12 +175,32 @@ fn identifier(id: &str) -> Result<RuleId, ApiError> {
 /// because this API does not give them out, not because the caller
 /// means to remove them.
 ///
-/// **Three of them**, not two. A header value is the third and is the
-/// one with no type saying so: a rule's headers are where its bearer
-/// token goes, they are written back out with their names and empty
-/// values, and an empty value here therefore means "the one you
-/// already have" rather than "send nothing".
+/// **Four of them**, not two. A header value is the third and is one
+/// with no type saying so: a rule's headers are where its bearer token
+/// goes, they are written back out with their names and empty values,
+/// and an empty value here therefore means "the one you already have"
+/// rather than "send nothing".
+///
+/// The fourth is the **URL**, which for a chat platform's webhook is
+/// the whole of the credential. It is written back out as its scheme
+/// and host with the rest elided, so a caller sending back exactly
+/// what it was given means "the one you already have" too; anything
+/// else is a caller repointing the rule, which is a change they are
+/// entitled to make. Compared against the redaction of the stored URL
+/// rather than against the marker alone, so that pasting one rule's
+/// redacted URL into another rule cannot pick up that other rule's
+/// secret.
 fn keep_secrets(spec: &mut RuleSpec, stored: &Rule) {
+    if let (Some(written), Action::HttpOut(held)) = (&mut spec.http_out, &stored.action) {
+        if written.url == redacted_url(&held.url) {
+            written.url.clone_from(&held.url);
+        }
+    }
+    if let (Some(written), Action::HttpPoll(held)) = (&mut spec.http_poll, &stored.action) {
+        if written.url == redacted_url(&held.url) {
+            written.url.clone_from(&held.url);
+        }
+    }
     match (&mut spec.http_in, &stored.action) {
         (Some(written), Action::HttpIn(held)) if written.token.is_empty() => {
             written.token = held.token.clone();
@@ -1104,6 +1125,68 @@ mod tests {
                 action.token.expose(),
                 "a-secret-nobody-may-read",
                 "the update replaced the token with nothing"
+            ),
+            other => panic!("the action changed: {other:?}"),
+        }
+        node.stop().await;
+    }
+
+    /// The URL is a secret too, and the read resources need no token.
+    ///
+    /// For the commonest outbound target the URL *is* the credential:
+    /// a chat platform's webhook is a long unguessable path and
+    /// nothing else. What comes back is the scheme and the host, which
+    /// is what a form needs to show an operator where their rule
+    /// posts, and the rest is elided.
+    ///
+    /// The second half is what stops the first being a redaction
+    /// nobody could live with: a caller that reads a rule, renames it
+    /// and writes it back keeps the URL it was never given. Without
+    /// that, the obvious edit silently repoints the rule at a path
+    /// that is three dots.
+    #[tokio::test]
+    async fn a_rules_url_does_not_come_back_but_its_host_does() {
+        let node = Node::start(None).await;
+        node.post(
+            "/api/v1/rules",
+            r#"{"id":"telemetry","name":"Telemetry out","filter":"sensor/+/temp",
+                "http_out":{"url":"https://hooks.example.invalid/services/T0/an-unguessable-webhook"}}"#,
+        )
+        .await;
+
+        for path in ["/api/v1/rules/telemetry", "/api/v1/rules"] {
+            let read = node.get(path).await;
+            assert!(
+                !read.body.contains("an-unguessable-webhook"),
+                "{path} gave out the path of a webhook URL: {}",
+                read.body
+            );
+            assert!(
+                read.body.contains("hooks.example.invalid"),
+                "{path} did not say where the rule posts at all: {}",
+                read.body
+            );
+        }
+
+        // Read, renamed, written back: the URL the caller was never
+        // given is the URL the rule keeps.
+        let read = node.get("/api/v1/rules/telemetry").await;
+        let written = read.body.replace("Telemetry out", "Telemetry, renamed");
+        let updated = node.put("/api/v1/rules/telemetry", &written).await;
+        assert_eq!(
+            updated.status, 200,
+            "writing back what was read was refused: {}",
+            updated.body
+        );
+        let held = node
+            .registry
+            .get(&RuleId::new("telemetry").expect("an identifier"))
+            .expect("the rule is still there");
+        assert_eq!(held.name, "Telemetry, renamed");
+        match &held.action {
+            Action::HttpOut(action) => assert_eq!(
+                action.url, "https://hooks.example.invalid/services/T0/an-unguessable-webhook",
+                "an update that sent back the redacted URL repointed the rule"
             ),
             other => panic!("the action changed: {other:?}"),
         }

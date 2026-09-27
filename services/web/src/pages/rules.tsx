@@ -87,10 +87,21 @@
  * a rule read back has an empty token, no password, and its header
  * names with empty values.
  *
- * **An update that sends an empty secret keeps the stored one**, which
- * is the admin crate's rule and not this page's. This form therefore
- * sends nothing for a secret left blank, and says on screen that
- * blank means unchanged. A form that sent the empty string it was
+ * **A URL is a secret too**, and is the fourth. For the commonest
+ * outbound target it *is* the credential: a chat platform's webhook is
+ * a long unguessable path and nothing else, and a key in a query
+ * string is the same hole in another shape. A URL read back is its
+ * scheme and host with the rest elided, which is what this form needs
+ * to show an operator where their rule posts and is all of it that is
+ * safe to show.
+ *
+ * **An update that sends a secret back unchanged keeps the stored
+ * one**, which is the admin crate's rule and not this page's: an empty
+ * token, password or header value means "the one you already have",
+ * and so does a URL sent back exactly as it was read. This form
+ * therefore sends nothing for a secret left blank, sends the URL it
+ * was given untouched unless somebody edits it, and says on screen
+ * what each of those means. A form that sent the empty string it was
  * showing would blank an endpoint's credentials on every save, and
  * the save would look like it worked.
  */
@@ -1095,7 +1106,7 @@ function Editor({
           <Field label="Client pattern" problems={held} hint="Optional. * stands for any run of characters and is the whole of the syntax.">
             <Text draft={draft} field="client_id" problems={held} placeholder="sensor-*" />
           </Field>
-          <Field label="URL" field="http_out.url" problems={held} hint="https, or http to a loopback address.">
+          <Field label="URL" field="http_out.url" problems={held} hint="https, or http to a loopback address. A URL is a credential as often as not, so this API never reads one back whole: the scheme and host come back and the rest is elided. Left as it was read, the stored URL is kept.">
             <Text draft={draft} field="url" name="http_out.url" problems={held} placeholder="https://example.com/hook" />
           </Field>
           <Field label="Method" field="http_out.method" problems={held}>
@@ -1178,7 +1189,7 @@ function Editor({
 
       {kind === 'http_poll' ? (
         <div class="fields">
-          <Field label="URL" field="http_poll.url" problems={held} hint="https, or http to a loopback address.">
+          <Field label="URL" field="http_poll.url" problems={held} hint="https, or http to a loopback address. A URL is a credential as often as not, so this API never reads one back whole: the scheme and host come back and the rest is elided. Left as it was read, the stored URL is kept.">
             <Text draft={draft} field="url" name="http_poll.url" problems={held} placeholder="https://example.com/state.json" />
           </Field>
           <Field label="Interval (ms)" field="http_poll.interval_ms" problems={held} hint="One fetch is ever in flight; a fetch slower than this loses the intervals it covered.">

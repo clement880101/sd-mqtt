@@ -110,6 +110,83 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 /// again while anything is waiting.
 const IDLE_POLL: Duration = Duration::from_secs(1);
 
+/// What stands in for whatever [`redacted_url`] took out.
+///
+/// One character, so that a URL an operator reads on a page or in a
+/// log is obviously shortened rather than obviously wrong.
+pub const ELIDED: &str = "\u{2026}";
+
+/// What is left of a URL once everything that could be a credential is
+/// taken out of it.
+///
+/// # The URL is a secret, and this is how much of one
+///
+/// A rule's bearer token, a bridge's password and an outbound header
+/// value are all [`storage::record::Secret`]s or redacted maps, and the
+/// URL was not. For the commonest outbound target it **is** the
+/// credential: a chat platform's webhook URL is a long unguessable path
+/// and nothing else, and a URL carrying a key in its query, or a user
+/// name and password in its authority, is the same hole in two other
+/// shapes. Anybody holding one can post as the rule.
+///
+/// So what comes out of here is the scheme and the host, and that is
+/// all: no user information, no path, no query, no fragment. The port
+/// is kept, because a port is a deployment fact rather than a secret.
+///
+/// # What a page needs and what a log needs are not the same
+///
+/// A log line already names the rule, so the URL in it answers *where*
+/// — which host has stopped answering — and the host is the whole of
+/// that. A form has the harder job: it has to show an operator what
+/// their own rule posts to, and "nothing" would leave the rules page
+/// unable to tell them anything about it.
+///
+/// The host answers that too, and [`ELIDED`] is what says the rest
+/// exists. Two rules posting to two paths on one host look alike here
+/// and are told apart by their name and identifier, which is what
+/// those are for. The alternative — showing a prefix of the path — is
+/// showing a prefix of the secret, and a webhook URL has no prefix
+/// that is safe to show.
+///
+/// # Read back and written back unchanged
+///
+/// Convention 1 from the other side. [`crate::spec::RuleSpec::of`]
+/// writes this and `to_rule` reads it, so a caller that reads a rule,
+/// changes one field and writes it back must not silently repoint the
+/// rule at `https://host/…`. `sdmqtt_admin::rules` carries the stored
+/// URL over when the caller sends back exactly what it was given,
+/// which is the rule a redacted header value already follows.
+///
+/// # A string that will not parse
+///
+/// Taken apart textually rather than by a URL parser, because one of
+/// the callers is the refusal for a URL that **did not parse** and a
+/// parser has nothing to say about that one. The rule is the same
+/// either way: everything from the first `/`, `?` or `#` after the
+/// authority is gone, and so is anything before an `@` inside it.
+pub fn redacted_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        // No scheme, so nothing in it can be trusted to be an
+        // authority and nothing is shown.
+        return ELIDED.to_owned();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Everything before the last `@` is user information, which is
+    // where a URL keeps a user name and a password.
+    let (userinfo, host) = match authority.rsplit_once('@') {
+        Some((_, host)) => (ELIDED, host),
+        None => ("", authority),
+    };
+    let separator = if userinfo.is_empty() { "" } else { "@" };
+    if host.is_empty() {
+        return format!("{scheme}://{userinfo}{separator}{ELIDED}");
+    }
+    if rest.len() > authority.len() {
+        return format!("{scheme}://{userinfo}{separator}{host}/{ELIDED}");
+    }
+    format!("{scheme}://{userinfo}{separator}{host}")
+}
+
 /// What can go wrong before a single request is made.
 ///
 /// Every one of these is a rule an operator configured wrongly, found
@@ -119,23 +196,23 @@ const IDLE_POLL: Duration = Duration::from_secs(1);
 #[derive(Debug, thiserror::Error)]
 pub enum HttpOutError {
     /// The URL did not parse.
-    #[error("{url:?} is not a URL")]
+    #[error("{url} is not a URL")]
     NotAUrl {
-        /// What was configured.
+        /// What was configured, [`redacted_url`].
         url: String,
     },
     /// The URL is plain text to somewhere that is not this machine.
     #[error(
-        "{url:?} would post in the clear: an http:// URL is permitted only to a loopback address"
+        "{url} would post in the clear: an http:// URL is permitted only to a loopback address"
     )]
     NotEncrypted {
-        /// What was configured.
+        /// What was configured, [`redacted_url`].
         url: String,
     },
     /// The URL has no host to connect to.
-    #[error("{url:?} names no host")]
+    #[error("{url} names no host")]
     NoHost {
-        /// What was configured.
+        /// What was configured, [`redacted_url`].
         url: String,
     },
     /// The method is not one HTTP has.
@@ -432,7 +509,7 @@ pub fn endpoint(
     content_type: Option<&'static str>,
 ) -> Result<Endpoint, HttpOutError> {
     let uri: Uri = url.parse().map_err(|_| HttpOutError::NotAUrl {
-        url: url.to_owned(),
+        url: redacted_url(url),
     })?;
     check_scheme(&uri, url)?;
 
@@ -496,14 +573,14 @@ fn parts(action: &HttpOut) -> Result<Endpoint, HttpOutError> {
 fn check_scheme(uri: &Uri, configured: &str) -> Result<(), HttpOutError> {
     let Some(host) = uri.host() else {
         return Err(HttpOutError::NoHost {
-            url: configured.to_owned(),
+            url: redacted_url(configured),
         });
     };
     match uri.scheme_str() {
         Some("https") => Ok(()),
         Some("http") if is_loopback(host) => Ok(()),
         _ => Err(HttpOutError::NotEncrypted {
-            url: configured.to_owned(),
+            url: redacted_url(configured),
         }),
     }
 }
@@ -1016,5 +1093,101 @@ mod tests {
         );
         assert_eq!(retry_after(&headers), None);
         assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
+
+    /// What a redacted URL keeps and what it takes out, case by case.
+    ///
+    /// The cases are the four shapes a URL hides a credential in — a
+    /// path, a query, a fragment and the authority's user information
+    /// — beside the two that hide nothing, so that an assertion which
+    /// passed by elising everything could not pass here: a URL with
+    /// nothing but a host comes back whole.
+    #[test]
+    fn a_redacted_url_keeps_the_host_and_nothing_that_could_be_a_secret() {
+        for (configured, expected) in [
+            // The commonest outbound target: the path is the whole of
+            // the credential.
+            (
+                "https://hooks.example.invalid/services/T0/B0/XXXXXXXX",
+                "https://hooks.example.invalid/\u{2026}",
+            ),
+            // A key in the query.
+            (
+                "https://api.example.invalid/publish?token=sssh",
+                "https://api.example.invalid/\u{2026}",
+            ),
+            // A fragment, which is not sent to a server and is still
+            // somebody's to keep.
+            (
+                "https://api.example.invalid/x#anchor",
+                "https://api.example.invalid/\u{2026}",
+            ),
+            // User information, which is a user name and a password.
+            (
+                "https://someone:sssh@example.invalid/hook",
+                "https://\u{2026}@example.invalid/\u{2026}",
+            ),
+            // A port is a deployment fact rather than a secret.
+            (
+                "http://127.0.0.1:8080/hook",
+                "http://127.0.0.1:8080/\u{2026}",
+            ),
+            // Nothing to hide, and nothing hidden: this is the case
+            // that stops the assertions above passing for a function
+            // that elides everything.
+            ("https://example.invalid", "https://example.invalid"),
+            (
+                "https://example.invalid:8443",
+                "https://example.invalid:8443",
+            ),
+            // A trailing slash is a path, and is elided like one:
+            // there is no reading of it worth showing a credential
+            // for.
+            (
+                "https://example.invalid/",
+                "https://example.invalid/\u{2026}",
+            ),
+            // Not a URL at all, which is the one case a parser has
+            // nothing to say about and is a case the refusal for a
+            // URL that did not parse reaches.
+            ("not a url", "\u{2026}"),
+            ("https://", "https://\u{2026}"),
+        ] {
+            assert_eq!(
+                redacted_url(configured),
+                expected,
+                "{configured:?} was redacted wrongly"
+            );
+        }
+    }
+
+    /// And the refusals carry the redaction rather than the URL.
+    ///
+    /// These reach standard error when a broker refuses to start, and
+    /// standard error is read by more people than the configuration
+    /// file is.
+    #[test]
+    fn a_refusal_about_a_url_does_not_print_the_url() {
+        let refused = endpoint(
+            "http://elsewhere.invalid/services/T0/B0/XXXXXXXX",
+            "POST",
+            &[],
+            1_000,
+            None,
+        )
+        .expect_err("plain text off this host is refused");
+        assert!(
+            matches!(refused, HttpOutError::NotEncrypted { .. }),
+            "{refused:?}"
+        );
+        let said = refused.to_string();
+        assert!(
+            !said.contains("XXXXXXXX"),
+            "the refusal printed the path: {said}"
+        );
+        assert!(
+            said.contains("elsewhere.invalid"),
+            "the refusal did not say which host it was about: {said}"
+        );
     }
 }

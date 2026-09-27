@@ -565,7 +565,11 @@ impl Poller {
                 // carried into the line.
                 Polled::Skipped(why) => tracing::warn!(
                     rule = self.rule.as_str(),
-                    url = %self.fetcher.uri(),
+                    // Scheme and host, and nothing else. This line is
+                    // written on every failed poll, and for the
+                    // commonest target the rest of the URL is the
+                    // credential; see `http_out::redacted_url`.
+                    url = http_out::redacted_url(&self.fetcher.uri().to_string()),
                     ?why,
                     "a fetch produced nothing, so this interval is skipped; \
                      the next one happens as usual"
