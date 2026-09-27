@@ -201,6 +201,12 @@ jobs:
       - name: Build the interface
         working-directory: services/web
         run: npm ci && npm run build
+      # The budget script's own rule, turned on itself: a check that
+      # quietly passes when it cannot measure is worse than no check.
+      # Run before the budgets, because if the script cannot fail
+      # there is no point reading what it says.
+      - name: The budget script fails when it cannot measure
+        run: scripts/test_budgets.sh
       - name: Budgets
         run: scripts/budgets.sh
 
