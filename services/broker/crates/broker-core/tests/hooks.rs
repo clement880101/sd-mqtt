@@ -102,6 +102,16 @@ fn published(out: &[(SubscriberId, Action)]) -> Vec<(SubscriberId, String)> {
         .collect()
 }
 
+/// The level of every publish in `out`.
+fn published_levels(out: &[(SubscriberId, Action)]) -> Vec<QoS> {
+    out.iter()
+        .filter_map(|(_, action)| match action {
+            Action::Send(Packet::Publish(publish)) => Some(publish.qos),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Every acknowledgement reason in `out`.
 fn ack_reasons(out: &[(SubscriberId, Action)]) -> Vec<ReasonCode> {
     out.iter()
@@ -276,6 +286,22 @@ impl Hook for Mover {
         if &*message.topic == self.from {
             message.topic = Arc::from(self.to);
         }
+        Disposition::Deliver
+    }
+}
+
+/// Sets every message to one level, whatever the publisher sent.
+struct Leveller {
+    to: QoS,
+}
+
+impl Hook for Leveller {
+    fn name(&self) -> &str {
+        "leveller"
+    }
+
+    fn message_received(&self, _client: &ClientInfo<'_>, message: &mut Message) -> Disposition {
+        message.qos = self.to;
         Disposition::Deliver
     }
 }
@@ -1280,5 +1306,102 @@ fn a_hook_may_drop_a_will() {
     assert!(
         published(&out).is_empty(),
         "nobody receives a will a hook took: {out:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Section 9.3's quality of service, in the direction the spec did not say
+// ---------------------------------------------------------------------
+
+/// A hook may lower the level.
+///
+/// The half that works, asserted first so that the clamped half below
+/// cannot pass by the rewrite doing nothing at all. Without this, a
+/// `message.qos = published` that ignored the hook entirely would
+/// satisfy every assertion in the next test.
+#[test]
+fn a_message_hook_may_lower_the_level() {
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(Arc::new(Leveller {
+        to: QoS::AtMostOnce,
+    }));
+
+    let subscriber = join(&mut broker, "s");
+    let publisher = join(&mut broker, "p");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::ExactlyOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    out.clear();
+    broker
+        .handle(
+            publisher,
+            &publish_packet("a/b", QoS::ExactlyOnce, Some(1)),
+            &mut out,
+        )
+        .expect("a well formed publish");
+
+    assert_eq!(
+        published_levels(&out),
+        vec![QoS::AtMostOnce],
+        "a hook lowered the level and the subscriber got the publisher's"
+    );
+}
+
+/// And may not raise it past what the publisher sent.
+///
+/// Section 9.3 permits a message hook to rewrite quality of service
+/// and stopped there, which left the one direction with protocol
+/// consequences unsaid and unexercised. What the design now says, and
+/// what this asserts, is that a raise is clamped.
+///
+/// The reason is the promise. At-most-once is not acknowledged and is
+/// not made durable, so a hook that raised one to exactly-once would
+/// have the broker queue it durably and redeliver it on a resumed
+/// session — a guarantee whose foundation, a publisher that will send
+/// it again, does not exist. The subscriber would be told a message
+/// cannot be lost by a message that a restart a moment later loses.
+///
+/// Convention 5's question: this fails if the clamp is removed, and
+/// the input makes it fail because the subscriber holds the filter at
+/// exactly-once, so nothing *else* between the hook and the wire would
+/// bring the level back down. A subscriber at at-most-once would have
+/// passed this test with no clamp at all, which is the shape of test
+/// that guards nothing.
+#[test]
+fn a_message_hook_may_not_raise_the_level_past_what_the_publisher_sent() {
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(Arc::new(Leveller {
+        to: QoS::ExactlyOnce,
+    }));
+
+    let subscriber = join(&mut broker, "s");
+    let publisher = join(&mut broker, "p");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("a/b", QoS::ExactlyOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+    out.clear();
+    broker
+        .handle(
+            publisher,
+            &publish_packet("a/b", QoS::AtMostOnce, None),
+            &mut out,
+        )
+        .expect("a well formed publish");
+
+    assert_eq!(
+        published_levels(&out),
+        vec![QoS::AtMostOnce],
+        "a hook raised a fire-and-forget message to a level this broker \
+         never took responsibility for"
     );
 }

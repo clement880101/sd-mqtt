@@ -483,11 +483,44 @@ impl Hooks {
     /// chain of rewrites composes. A hook that drops it ends the walk:
     /// the hooks after it are not asked about a message that is not
     /// going anywhere.
+    ///
+    /// # A hook may lower the level and may not raise it
+    ///
+    /// Section 9.3 permits a message hook to rewrite the quality of
+    /// service, and left it there. Lowering is unproblematic: the
+    /// broker promised the publisher more than it now has to do.
+    /// Raising is not, and the reason is that the promise a level
+    /// makes was made on the way **in**, to a publisher that has
+    /// already gone:
+    ///
+    /// - At-most-once is not acknowledged and is not made durable. A
+    ///   hook that raised one to at-least-once would have this broker
+    ///   queue it durably and retransmit it on a resumed session — a
+    ///   guarantee whose foundation, a publisher that will send it
+    ///   again, does not exist. The message is lost by a restart a
+    ///   moment later and the subscriber was told it would not be.
+    /// - The publisher's acknowledgement is decided by the packet it
+    ///   sent and not by the message this leaves behind, so a raise
+    ///   cannot be reported back to it either. It has been told the
+    ///   broker took the weaker responsibility, and it is right.
+    ///
+    /// So a raise is clamped to what the publisher sent, silently:
+    /// this crate holds no logger, and a hook is in-process code
+    /// compiled into this binary rather than somebody's configuration.
+    /// The rule is in section 9.3 and in [`Hook::message_received`],
+    /// which is where a person writing one reads.
+    ///
+    /// **Clamped here rather than at the three call sites**, because
+    /// one of the three would have been the one somebody forgot.
     pub fn message_received(&self, client: &ClientInfo<'_>, message: &mut Message) -> Disposition {
+        let published = message.qos;
         for hook in &self.installed {
             if hook.message_received(client, message) == Disposition::Drop {
                 return Disposition::Drop;
             }
+        }
+        if message.qos > published {
+            message.qos = published;
         }
         Disposition::Deliver
     }

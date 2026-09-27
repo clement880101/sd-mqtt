@@ -672,6 +672,28 @@ decision along the chain. If every hook returns next, the configured default
 applies. Message hooks may rewrite topic, payload, QoS, retain and
 properties, or drop the message.
 
+**A hook may lower the quality of service and may not raise it past what the
+publisher sent; a raise is clamped to the publisher's level.** The sentence
+above used to stop at "rewrite QoS", which left the one direction with
+protocol consequences both unsaid and unexercised.
+
+The reason is that the promise a level makes was made on the way *in*, to a
+publisher that has already gone. At-most-once is neither acknowledged nor
+made durable, so a hook raising one to at-least-once would have this broker
+queue it durably and redeliver it on a resumed session — a guarantee whose
+foundation, a publisher that will send it again, does not exist, and which a
+restart a moment later breaks. Nor can a raise be reported back: the
+publisher's acknowledgement is decided by the packet it sent rather than by
+the message a hook leaves behind, so it has been told the broker took the
+weaker responsibility, and it is right.
+
+Lowering has none of that. The broker promised the publisher more than it now
+has to do, which it is free to do, and no subscriber is told a guarantee that
+is not being kept.
+
+The clamp is applied once, where the chain runs, rather than at each of the
+three routes that fire it: one of the three is the one somebody would forget.
+
 This is deliberately the shape an external plugin transport would need, so
 v2 can add out-of-process hooks without disturbing the core.
 
