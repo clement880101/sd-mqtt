@@ -41,6 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use broker_core::broker::{Broker, BrokerConfig};
+use broker_core::hooks::Refusal;
 use bytes::{Bytes, BytesMut};
 use mqtt_codec::packet::{Ack, ConnAck, Disconnect};
 use mqtt_codec::{decode, encode, Limits, Packet, Properties, QoS, ReasonCode, Version};
@@ -51,6 +52,7 @@ use rules::bridge::Flow;
 use rules::rule::{Action, BridgeTopic, Direction, MqttBridge, Rule, RuleId};
 use rules::stats::{RuleStats, Totals};
 use rules::Outbox;
+use sdmqtt_server::metrics::RuleEvent;
 use sdmqtt_server::shared::Shared;
 use storage::record::{BodyRecord, MessageId, Qos, Record};
 use storage::{MemoryStorage, Storage, Writer, WriterConfig};
@@ -214,6 +216,23 @@ struct Fixture {
 impl Fixture {
     /// `payloads` become one envelope each, in order, body `n + 1`.
     fn new(payloads: &[&[u8]]) -> Self {
+        Self::with_bodies(
+            payloads
+                .iter()
+                .enumerate()
+                .map(|(index, payload)| {
+                    body(
+                        u8::try_from(index + 1).expect("few enough envelopes"),
+                        payload,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// The same, for a test that needs a body carrying something in
+    /// particular rather than only a payload.
+    fn with_bodies(bodies: Vec<BodyRecord>) -> Self {
         let action = action();
         let store = Arc::new(MemoryStorage::new());
         let rule = Rule {
@@ -235,19 +254,28 @@ impl Fixture {
         );
         let outbox =
             Arc::new(Outbox::open(rule.id.clone(), store.as_ref()).expect("the outbox opens"));
-        for (index, payload) in payloads.iter().enumerate() {
+        for (index, body) in bodies.into_iter().enumerate() {
             let n = u8::try_from(index + 1).expect("few enough envelopes");
             let (_, records) = outbox.append(
                 id(100 + n),
                 id(n),
-                body(n, payload),
+                body,
                 "sensor",
                 1_700_000_000 + u32::from(n),
             );
             store.apply(&records).expect("the envelope is storable");
         }
 
-        let stats = Arc::new(RuleStats::new());
+        let shared = Arc::new(Shared::with_store(
+            Broker::new(BrokerConfig::default()),
+            Arc::clone(&writer),
+        ));
+        // **Exporting, rather than the bare `RuleStats::new` every
+        // other test of a connector builds.** Five of this rule's nine
+        // outcomes are exported and not sampled, so a `RuleStats` with
+        // no broker behind it cannot see them at all — and a test that
+        // cannot see a counter is a test a deleted increment passes.
+        let stats = Arc::new(RuleStats::exporting(Some(shared.metrics().rule(RULE))));
         let bridge = Bridge {
             rule: rule.id.clone(),
             action: action.clone(),
@@ -256,10 +284,7 @@ impl Fixture {
             outbox: Arc::clone(&outbox),
             store: Arc::clone(&store) as Arc<dyn Storage>,
             writer: Arc::clone(&writer),
-            shared: Arc::new(Shared::with_store(
-                Broker::new(BrokerConfig::default()),
-                Arc::clone(&writer),
-            )),
+            shared: Arc::clone(&shared),
             wake: Arc::new(Notify::new()),
             stats: Arc::clone(&stats),
         };
@@ -316,6 +341,16 @@ impl Fixture {
         self.stats.totals(self.outbox.waiting())
     }
 
+    /// What one of this rule's exported counters reads.
+    ///
+    /// Taken from the registry by label rather than from the handle
+    /// the fixture holds, so that a counter which moved the wrong
+    /// series cannot pass: `Metrics::rule` answers a handle on the
+    /// same series, and a different series would read zero.
+    fn exported(&self, event: RuleEvent) -> u64 {
+        self.bridge.shared.metrics().rule(RULE).event(event).get()
+    }
+
     fn holds_body(&self, n: u8) -> bool {
         self.store.body(&id(n)).expect("the read answers").is_some()
     }
@@ -361,6 +396,18 @@ fn body(n: u8, payload: &[u8]) -> BodyRecord {
         retain: false,
         expires_at: None,
         properties: Bytes::new(),
+    }
+}
+
+/// The same, carrying the user properties a message that had already
+/// been through this bridge would carry.
+fn marked_body(n: u8, payload: &[u8], user_properties: Vec<(String, String)>) -> BodyRecord {
+    BodyRecord {
+        properties: broker_core::journal::stored_properties(&Properties {
+            user_properties,
+            ..Properties::default()
+        }),
+        ..body(n, payload)
     }
 }
 
@@ -429,11 +476,103 @@ async fn a_message_the_remote_refuses_is_counted_as_a_failure_and_not_a_delivery
         },
         "the connection's own summary disagrees with the rule's numbers"
     );
+    // One connection, counted once at each end of it. Both were a log
+    // line and nothing else, and a log line cannot be alerted on: a
+    // bridge that reconnects every thirty seconds looks perfect by
+    // every other number this broker publishes. They are asserted here
+    // rather than in a test of their own because this test is a whole
+    // connection from CONNECT to DISCONNECT, which is the only thing
+    // either of them counts.
+    assert_eq!(fixture.exported(RuleEvent::Connected), 1);
+    assert_eq!(fixture.exported(RuleEvent::Disconnected), 1);
     // Both are finished with, in the store as well as in the counters:
     // a refusal must not be retried, and a delivery must not be either.
     assert_eq!(fixture.depth(), 0, "an answered envelope is still waiting");
     assert!(!fixture.holds_body(1), "a delivered payload was leaked");
     assert!(!fixture.holds_body(2), "a refused payload was leaked");
+}
+
+/// Section 9.2's second line of defence, counted.
+///
+/// A message that came in through this bridge and was queued to go
+/// back out through it is refused by the marker. That much was already
+/// true and already tested in `rules::bridge::marker`. What was not
+/// true is section 11.3's sentence about it: the refusal was a
+/// `tracing::debug!` and a field in a per-connection struct, so an
+/// operator had **no number at all** for the defence that catches the
+/// loop a configuration check cannot see — and a mutation that deleted
+/// the check would have moved nothing an alert could read.
+///
+/// Convention 5's question: this fails if the counter is not moved,
+/// and the input can make it fail because the envelope really does
+/// carry this bridge's own origin. It is asserted through
+/// `session::run` over a real socket rather than against
+/// `marker::carry`, because a unit test of the helper is not a test of
+/// the caller that was supposed to use it.
+///
+/// Two envelopes, one marked and one not, so that a counter which
+/// moved on every entry cannot pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_this_bridge_already_carried_is_refused_and_counted() {
+    let marked = marked_body(
+        1,
+        b"21.5",
+        vec![(rules::bridge::marker::ORIGIN.to_owned(), RULE.to_owned())],
+    );
+    let fixture = Fixture::with_bodies(vec![marked, body(2, b"22.5")]);
+    let mut flow = Flow::new(fixture.bridge.action.receive_maximum);
+    let metrics = Arc::clone(&fixture.bridge.shared);
+
+    assert_eq!(
+        metrics.metrics().publication_refused(Refusal::Looped).get(),
+        0,
+        "the counter had already moved before anything happened"
+    );
+
+    let (carried, _, remote) = fixture
+        .connect(&mut flow, |mut remote| async move {
+            remote.accept().await;
+            remote.answer(&[ReasonCode::Success]).await;
+            remote
+        })
+        .await;
+
+    assert_eq!(
+        remote
+            .published
+            .iter()
+            .map(|(topic, _)| topic.as_str())
+            .collect::<Vec<_>>(),
+        vec!["from-here/sensor/2/temp"],
+        "the message this bridge had already carried went back out"
+    );
+    assert_eq!(
+        carried,
+        Carried {
+            sent: 1,
+            received: 0,
+            refused: 1,
+        },
+        "the connection's own summary disagrees with what went out"
+    );
+    assert_eq!(
+        metrics.metrics().publication_refused(Refusal::Looped).get(),
+        1,
+        "the loop was stopped and nothing counted it"
+    );
+    // And it landed on its own series rather than on a neighbour's.
+    for other in [
+        Refusal::TooManyHops,
+        Refusal::NotATopic,
+        Refusal::Reserved,
+        Refusal::NotDurable,
+    ] {
+        assert_eq!(
+            metrics.metrics().publication_refused(other).get(),
+            0,
+            "a loop refusal moved the {other:?} counter as well"
+        );
+    }
 }
 
 /// An envelope whose payload has gone leaves the outbox, once.

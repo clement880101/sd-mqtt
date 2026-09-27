@@ -57,6 +57,7 @@
 
 use std::sync::Arc;
 
+use broker_core::hooks::{ClientInfo, Refusal};
 use broker_core::session::message::Message;
 use bytes::Bytes;
 use mqtt_codec::{Properties, QoS};
@@ -167,6 +168,68 @@ pub enum PublishRefused {
     TooManyHops(#[from] broker_core::broker::Looped),
 }
 
+impl PublishRefused {
+    /// What this refusal is, in the vocabulary the metric and the hook
+    /// share.
+    ///
+    /// **A match with no wildcard, and that is the whole mechanism.**
+    /// Section 11.3 says every discard path has a metric and a hook,
+    /// and milestone three made that true of the queue by having a new
+    /// [`DropReason`] fail to compile until it had a counter. This is
+    /// the same trick one layer out: a variant added to
+    /// [`PublishRefused`] does not compile until it is given a
+    /// [`Refusal`], and a variant added to [`Refusal`] does not
+    /// compile until `crate::metrics` gives it a counter.
+    ///
+    /// And because [`publish`] is the one door every publication
+    /// without a session goes through — section 9.2's ingest endpoint,
+    /// a poller, the inbound half of a bridge, the admin API's publish
+    /// — a connector written after this one is counted by calling the
+    /// function it already had to call.
+    ///
+    /// [`DropReason`]: broker_core::session::DropReason
+    pub fn refusal(&self) -> Refusal {
+        match self {
+            Self::NotATopic(_) => Refusal::NotATopic,
+            Self::Reserved => Refusal::Reserved,
+            Self::NotDurable => Refusal::NotDurable,
+            Self::TooManyHops(_) => Refusal::TooManyHops,
+        }
+    }
+}
+
+/// Count a publication that went nowhere, and tell the hooks.
+///
+/// Section 11.3's two halves in one call, so that a caller cannot do
+/// one and forget the other. [`publish`] calls it for every refusal of
+/// its own; a connector that refuses a message *before* it reaches
+/// that door — a bridge's loop marker is the one milestone four has —
+/// calls it with the [`Refusal`] its own vocabulary maps to.
+///
+/// `origin` is the connector's rule identifier, never a session: there
+/// is no session here, which is what this whole module is about, and
+/// [`ClientInfo::subscriber`] is `None` for the reason it documents.
+///
+/// **The hook runs under the broker's lock**, as every hook does, and
+/// the obligations in `broker_core::hooks` apply unchanged. Taking the
+/// lock for a message that has already been lost is not a cost worth
+/// designing around; taking it on the packet path would be.
+pub fn refuse(shared: &Shared, origin: &str, topic: &str, qos: QoS, reason: Refusal) {
+    shared.metrics().publication_refused(reason).inc();
+    shared.with_broker(|broker| {
+        broker.hooks().message_refused(
+            &ClientInfo {
+                subscriber: None,
+                mountpoint: "",
+                client_id: origin,
+            },
+            topic,
+            qos,
+            reason,
+        );
+    });
+}
+
 /// Publish `publication` through the path a connection publishes by.
 ///
 /// # Errors
@@ -239,15 +302,23 @@ pub async fn publish(
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(refused) => {
+            // Section 9.2: dropped **and counted** — and, since this
+            // milestone, hooked, because section 11.3 asks for both
+            // and the hop limit returned before any action existed for
+            // one to be attached to. Counted here rather than in the
+            // broker, which holds no metrics.
+            //
+            // **Every refusal, not only the hop limit.** A topic the
+            // broker will not take and a batch the store would not
+            // hold are messages that disappeared just as completely,
+            // and until this they were an error string handed back to
+            // a caller and nothing else.
+            refuse(shared, &origin, &topic, qos, refused.refusal());
             if let PublishRefused::TooManyHops(looped) = &refused {
-                // Section 9.2: dropped **and counted**. Counted here
-                // rather than in the broker, which holds no metrics,
-                // and warned about here because a cycle is a
-                // configuration mistake an operator has to be told
-                // about: nothing else in the system can see it, by
-                // construction, since no single rule is in the whole of
-                // it.
-                shared.metrics().publications_over_hop_limit().inc();
+                // Warned about because a cycle is a configuration
+                // mistake an operator has to be told about: nothing
+                // else in the system can see it, by construction,
+                // since no single rule is in the whole of it.
                 tracing::warn!(
                     %origin,
                     topic,
@@ -276,6 +347,18 @@ pub async fn publish(
              the caller is told so rather than answered"
         );
         shared.deliver(actions);
+        // Counted and hooked like every other refusal, and here rather
+        // than only in the caller: this one is a publication that was
+        // *made* and then could not be promised, which is the case a
+        // caller is least able to describe and the one an operator
+        // most wants a number for.
+        refuse(
+            shared,
+            &origin,
+            &topic,
+            qos,
+            PublishRefused::NotDurable.refusal(),
+        );
         return Err(PublishRefused::NotDurable);
     }
     shared.deliver(actions);
@@ -300,11 +383,19 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         seen: Mutex<Vec<String>>,
+        refused: Mutex<Vec<(String, String, Refusal)>>,
     }
 
     impl Recorder {
         fn seen(&self) -> Vec<String> {
             self.seen.lock().expect("no test panics holding it").clone()
+        }
+
+        fn refusals(&self) -> Vec<(String, String, Refusal)> {
+            self.refused
+                .lock()
+                .expect("no test panics holding it")
+                .clone()
         }
     }
 
@@ -319,6 +410,19 @@ mod tests {
                 .expect("no test panics holding it")
                 .push(format!("{} {}", client.client_id, message.topic));
             Disposition::Deliver
+        }
+
+        fn message_refused(
+            &self,
+            origin: &ClientInfo<'_>,
+            topic: &str,
+            _qos: QoS,
+            reason: Refusal,
+        ) {
+            self.refused
+                .lock()
+                .expect("no test panics holding it")
+                .push((origin.client_id.to_owned(), topic.to_owned(), reason));
         }
     }
 
@@ -386,7 +490,10 @@ mod tests {
             recorder.seen()
         );
         assert_eq!(
-            shared.metrics().publications_over_hop_limit().get(),
+            shared
+                .metrics()
+                .publication_refused(Refusal::TooManyHops)
+                .get(),
             1,
             "section 9.2 says dropped *and counted*"
         );
@@ -405,7 +512,13 @@ mod tests {
                 .await
                 .expect_err("two hops is over a maximum of one");
         }
-        assert_eq!(shared.metrics().publications_over_hop_limit().get(), 3);
+        assert_eq!(
+            shared
+                .metrics()
+                .publication_refused(Refusal::TooManyHops)
+                .get(),
+            3
+        );
     }
 
     /// A publication under the limit moves nothing, so an operator
@@ -419,6 +532,121 @@ mod tests {
         publish(&shared, publication("a/b", hops(2)))
             .await
             .expect("two hops is the maximum, not over it");
-        assert_eq!(shared.metrics().publications_over_hop_limit().get(), 0);
+        assert_eq!(
+            shared
+                .metrics()
+                .publication_refused(Refusal::TooManyHops)
+                .get(),
+            0
+        );
+    }
+
+    /// Every refusal moves its own counter, and no other.
+    ///
+    /// Section 11.3's rule applied to milestone four: a message never
+    /// disappears without being counted. Four refusals, four series,
+    /// and every one of the other three asserted to have stayed still
+    /// — because a family whose reasons shared a slot would say a
+    /// connector lost a message without saying which door it was lost
+    /// at, and "the topic was reserved" and "the store would not take
+    /// it" are different support cases.
+    ///
+    /// `NotDurable` is not here: it needs a store that fails, which is
+    /// the gated backend `crates/rules/tests/delivery.rs` uses. It is
+    /// on the same one call as the other three, which is the point of
+    /// there being one call.
+    #[tokio::test]
+    async fn each_refusal_moves_its_own_counter() {
+        // A publication, the refusal it should produce, and nothing
+        // else.
+        let cases: [(&str, Refusal); 3] = [
+            // A wildcard is not a topic name.
+            ("a/+/b", Refusal::NotATopic),
+            // Section 12.3's reserved namespace.
+            ("$sys/made-up", Refusal::Reserved),
+            // Over the limit set below.
+            ("a/b", Refusal::TooManyHops),
+        ];
+
+        for (topic, expected) in cases {
+            let shared = Shared::new(BrokerConfig {
+                max_hops: 1,
+                ..BrokerConfig::default()
+            });
+            let hops = if expected == Refusal::TooManyHops {
+                hops(2)
+            } else {
+                Vec::new()
+            };
+            publish(&shared, publication(topic, hops))
+                .await
+                .expect_err("every case here is a refusal");
+
+            for reason in [
+                Refusal::Looped,
+                Refusal::TooManyHops,
+                Refusal::NotATopic,
+                Refusal::Reserved,
+                Refusal::NotDurable,
+            ] {
+                let moved = u64::from(reason == expected);
+                assert_eq!(
+                    shared.metrics().publication_refused(reason).get(),
+                    moved,
+                    "publishing to {topic} should have moved {expected:?} and \
+                     {reason:?} reads otherwise"
+                );
+            }
+        }
+    }
+
+    /// And every refusal reaches a hook.
+    ///
+    /// Section 11.3 asks for a metric **and a hook** on every discard
+    /// path. The hop limit had the metric and not the hook, because it
+    /// returns before any action exists for one to be attached to —
+    /// and the other three had neither. The hook is fired from here
+    /// rather than from inside the broker for the same reason the
+    /// counter is: this is the one door, and a hook fired at three
+    /// call sites is a hook missing from the fourth.
+    #[tokio::test]
+    async fn a_refused_publication_reaches_a_hook_that_can_say_which_and_why() {
+        let shared = Shared::new(BrokerConfig {
+            max_hops: 1,
+            ..BrokerConfig::default()
+        });
+        let recorder = Arc::new(Recorder::default());
+        shared.with_broker(|broker| {
+            broker.hooks_mut().install(recorder.clone());
+        });
+
+        publish(&shared, publication("$sys/made-up", Vec::new()))
+            .await
+            .expect_err("the reserved namespace is not publishable");
+        publish(&shared, publication("over/the/limit", hops(2)))
+            .await
+            .expect_err("two hops is over a maximum of one");
+
+        assert_eq!(
+            recorder.refusals(),
+            vec![
+                (
+                    "a-connector".to_owned(),
+                    "$sys/made-up".to_owned(),
+                    Refusal::Reserved
+                ),
+                (
+                    "a-connector".to_owned(),
+                    "over/the/limit".to_owned(),
+                    Refusal::TooManyHops
+                ),
+            ],
+            "the hook was not told which connector, which topic, or why"
+        );
+        assert!(
+            recorder.seen().is_empty(),
+            "a refused publication fired a rule: {:?}",
+            recorder.seen()
+        );
     }
 }

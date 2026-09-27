@@ -784,6 +784,18 @@ impl Delivery {
         };
 
         let envelope = Envelope::build(&entry, &body);
+        // Counted before the request rather than after it, so a post
+        // that never comes back is still an attempt this rule made:
+        // `attempted` minus `delivered` minus `failed` is what is in
+        // flight, and a count taken on the way out is the only one
+        // that can say so.
+        self.stats.attempted();
+        if entry.attempts > 0 {
+            // A subset of the above, deliberately: what an operator
+            // sizing a retry policy wants to know is how much of the
+            // traffic to an endpoint is this broker asking again.
+            self.stats.retried();
+        }
         let attempt = self.poster.post(&envelope).await;
         if attempt.delivered() {
             tracing::debug!(

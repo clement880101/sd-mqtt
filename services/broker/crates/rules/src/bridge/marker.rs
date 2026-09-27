@@ -43,6 +43,7 @@
 //! the origin is derived from the rule identifier, which is unique per
 //! bridge by [`crate::rule::RuleId`]'s own rules.
 
+use broker_core::hooks::Refusal;
 use mqtt_codec::Version;
 
 use crate::rule::RuleId;
@@ -139,6 +140,30 @@ pub enum Refused {
         /// What the rule allows.
         maximum: u32,
     },
+}
+
+impl Refused {
+    /// What this refusal is, in the vocabulary the metric and the hook
+    /// share.
+    ///
+    /// **A match with no wildcard**, which is the point of it: a
+    /// bridge that learns a new reason not to carry something does not
+    /// compile until that reason has been given a meaning in
+    /// [`Refusal`], and a [`Refusal`] does not compile until
+    /// `sdmqtt_server::metrics` gives it a counter. Section 11.3 says
+    /// a message never disappears without being counted; this is that
+    /// sentence made into a compile error rather than a habit.
+    ///
+    /// Both of these were logged at debug and counted nowhere until
+    /// this, which for `Looped` meant that section 9.2's second line of
+    /// defence — the one that catches the loop a configuration check
+    /// cannot see — was invisible to an operator while it worked.
+    pub fn refusal(&self) -> Refusal {
+        match self {
+            Self::Looped => Refusal::Looped,
+            Self::TooManyHops { .. } => Refusal::TooManyHops,
+        }
+    }
 }
 
 /// Whether this bridge carries a message, and the properties it

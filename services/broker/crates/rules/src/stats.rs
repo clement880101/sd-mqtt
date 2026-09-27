@@ -235,6 +235,39 @@ impl RuleStats {
         self.export(RuleEvent::DeadLettered);
     }
 
+    /// A request went out to this rule's endpoint.
+    ///
+    /// **Exported and not sampled**, which is the line between this
+    /// and the four above: the ring behind them is what a 96-pixel
+    /// cell draws, and a shape is what a cell is for. `attempted` over
+    /// `delivered` is a ratio an alert reads, not a shape; putting it
+    /// in the ring would add a column to the page for a line nobody
+    /// would look at. See [`RuleEvent`] for the same argument written
+    /// once.
+    pub fn attempted(&self) {
+        self.export(RuleEvent::Attempted);
+    }
+
+    /// One of those attempts was not the first for its envelope.
+    pub fn retried(&self) {
+        self.export(RuleEvent::Retried);
+    }
+
+    /// A bridge established a connection to its remote.
+    pub fn connected(&self) {
+        self.export(RuleEvent::Connected);
+    }
+
+    /// A bridge's established connection ended.
+    pub fn disconnected(&self) {
+        self.export(RuleEvent::Disconnected);
+    }
+
+    /// A bridge took a message from its remote and published it here.
+    pub fn received(&self) {
+        self.export(RuleEvent::Received);
+    }
+
     /// What this rule has done since the process started.
     ///
     /// `waiting` is the caller's, because the depth belongs to the
@@ -314,6 +347,172 @@ fn difference(now: u64, before: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use sdmqtt_server::metrics::Metrics;
+
+    /// The value of one series on a rendered exposition.
+    ///
+    /// Read out of the text rather than asserted as a substring so
+    /// that a failure says what the number *was*. A series that is
+    /// absent and a series that is zero are the two different
+    /// failures this whole section is about, and a `contains` cannot
+    /// tell them apart.
+    fn series(exposition: &str, name: &str, labels: &str) -> Option<u64> {
+        let prefix = format!("{name}{{{labels}}} ");
+        exposition
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .and_then(|line| line[prefix.len()..].trim().parse().ok())
+    }
+
+    /// What a rule's four counters read on the exposition.
+    fn exported(metrics: &Metrics, rule: &str) -> Vec<(&'static str, Option<u64>)> {
+        let exposition = metrics.render();
+        ["fired", "delivered", "failed", "dead_lettered"]
+            .into_iter()
+            .map(|event| {
+                (
+                    event,
+                    series(
+                        &exposition,
+                        "sdmqtt_rule_events_total",
+                        &format!(r#"rule="{rule}",event="{event}""#),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// **The mirror, not the atomics.** Every other test in this
+    /// module builds a [`RuleStats`] with no exporter, which is what
+    /// `RuleStats::new` gives and what a connector's own test gets —
+    /// so every one of them exercises the atomics and none of them
+    /// touches the half an operator's alert reads. The per-rule
+    /// counters reached Prometheus and nothing asserted a non-zero
+    /// value for one, which means `export` could have been a no-op for
+    /// three of the four outcomes and the whole suite would have
+    /// stayed green.
+    ///
+    /// Convention 5's question: this fails if the increment on the
+    /// exported handle is missing, if two outcomes share a handle, or
+    /// if a label value is written with a capital letter — and the
+    /// inputs make all three reachable, because each outcome is moved
+    /// a different number of times and every series is read back.
+    #[test]
+    fn every_outcome_reaches_the_exposition_with_its_own_value() {
+        let metrics = Metrics::new();
+        let stats = RuleStats::exporting(Some(metrics.rule("gateway")));
+
+        // Different counts, so that a handle shared between two
+        // outcomes cannot pass by coincidence.
+        stats.fired();
+        stats.fired();
+        stats.fired();
+        stats.delivered();
+        stats.delivered();
+        stats.failed();
+        stats.failed();
+        stats.failed();
+        stats.failed();
+        stats.dead_lettered();
+
+        assert_eq!(
+            exported(&metrics, "gateway"),
+            vec![
+                ("fired", Some(3)),
+                ("delivered", Some(2)),
+                ("failed", Some(4)),
+                ("dead_lettered", Some(1)),
+            ],
+            "the exposition is:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// And a rule that has done nothing renders zeros rather than
+    /// nothing at all.
+    ///
+    /// The other half of the test above, and the reason the handles
+    /// are taken when a rule is installed rather than when it first
+    /// does something: a series that appears on its first event makes
+    /// a dashboard read "no data" for a rule that is running and
+    /// quiet, which is the same confusion the sparkline's empty case
+    /// exists to avoid one layer up.
+    #[test]
+    fn an_installed_rule_that_has_done_nothing_renders_zeros() {
+        let metrics = Metrics::new();
+        let _stats = RuleStats::exporting(Some(metrics.rule("quiet")));
+        assert_eq!(
+            exported(&metrics, "quiet"),
+            vec![
+                ("fired", Some(0)),
+                ("delivered", Some(0)),
+                ("failed", Some(0)),
+                ("dead_lettered", Some(0)),
+            ],
+            "the exposition is:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// The five milestone-four connector outcomes, on the same
+    /// exposition.
+    ///
+    /// Section 11.3's counter list named no connector metric at all,
+    /// and these five were the ones its discipline implies: outbound
+    /// attempts, outbound retries, bridge connects, bridge disconnects
+    /// and bridge messages in. Two of those were a log line and one
+    /// was a field in a struct that reset on every reconnection.
+    #[test]
+    fn the_connector_outcomes_reach_the_exposition_too() {
+        let metrics = Metrics::new();
+        let stats = RuleStats::exporting(Some(metrics.rule("hub")));
+
+        stats.attempted();
+        stats.attempted();
+        stats.retried();
+        stats.connected();
+        stats.disconnected();
+        stats.received();
+        stats.received();
+        stats.received();
+
+        let exposition = metrics.render();
+        let read = |event: &str| {
+            series(
+                &exposition,
+                "sdmqtt_rule_events_total",
+                &format!(r#"rule="hub",event="{event}""#),
+            )
+        };
+        assert_eq!(read("attempted"), Some(2));
+        assert_eq!(read("retried"), Some(1));
+        assert_eq!(read("connected"), Some(1));
+        assert_eq!(read("disconnected"), Some(1));
+        assert_eq!(
+            read("received"),
+            Some(3),
+            "the exposition is:\n{exposition}"
+        );
+    }
+
+    /// The depth is a gauge, set by the sampler, and it is exported.
+    #[test]
+    fn the_outbox_depth_reaches_the_exposition_as_a_gauge() {
+        let metrics = Metrics::new();
+        let stats = RuleStats::exporting(Some(metrics.rule("backed-up")));
+        stats.sample(7);
+        assert_eq!(
+            series(
+                &metrics.render(),
+                "sdmqtt_rule_outbox_waiting",
+                r#"rule="backed-up""#
+            ),
+            Some(7),
+            "the exposition is:\n{}",
+            metrics.render()
+        );
+    }
 
     #[test]
     fn a_sample_is_the_difference_and_not_the_total() {

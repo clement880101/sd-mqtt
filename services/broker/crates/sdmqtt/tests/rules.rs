@@ -1596,7 +1596,7 @@ fn a_cycle_of_connectors_is_driven_into_the_hop_limit() {
     // whole of what an operator has to find a cycle with.
     let exposition = http(admin, "GET", "/metrics", ADMIN_TOKEN, None).body;
     assert!(
-        exposition.contains("sdmqtt_publications_over_hop_limit_total 1"),
+        exposition.contains(r#"sdmqtt_publications_refused_total{reason="too_many_hops"} 1"#),
         "the drop is counted: {exposition}"
     );
 

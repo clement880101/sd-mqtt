@@ -887,6 +887,24 @@ authentication outcomes; cluster bytes sent, received and dropped; and
 router matches split local and remote. Gauges for connections, sessions,
 subscriptions, retained messages, queue depth and cluster members.
 
+**And, per rule, section 9's connectors.** This list was entirely
+milestone-three vocabulary and named no connector metric at all, so
+everything milestone 4 built was outside the discipline the rest of the
+section imposes — which is how three refusal vocabularies arrived with no
+counter between them. Counters, labelled by rule identifier and by outcome:
+fired, delivered, failed, dead-lettered, attempts made, attempts that were
+retries, bridge connects, bridge disconnects, and messages a bridge took from
+its remote. A gauge per rule for what is waiting in its outbox. And one
+counter, labelled by reason, for publications a connector made that went
+nowhere: refused by a bridge's loop marker, over a hop limit, not a topic,
+reserved, or not made durable.
+
+**The rule identifier is a label where a client identifier deliberately is
+not one.** Rules are created by the person running the broker and are counted
+in tens; clients arrive from outside and are counted in hundreds of
+thousands. A deleted rule keeps its series at the value it stopped at, since
+a counter that disappears is one a dashboard reads as a reset to zero.
+
 Every discard path has both a metric and a hook. A message never disappears
 without being counted.
 
@@ -896,6 +914,34 @@ the sentence above: a fire-and-forget publication too large for its peer
 returned before anything recorded it, so it left no action, no counter and no
 log line. A new drop reason now fails to compile until it has a counter,
 rather than failing a test somebody has to remember to extend.
+
+**And the connectors broke the sentence again, in a way that mechanism could
+not see.** Milestone 4 introduced three refusal vocabularies of its own — a
+bridge's loop marker, the shell's publish refusal, and a per-connection tally
+inside a bridge's session that reset on every reconnection — none of which
+was a drop reason and none of which was counted. A message refused by section
+9.2's second line of defence was a debug line and nothing else, so the
+defence was invisible to an operator in exactly the situation it exists for.
+
+The mechanism is extended rather than duplicated. There is one connector
+refusal vocabulary, it sits in the same compile-checked table as the drop
+reasons, and each connector's own vocabulary converts into it through a match
+with no wildcard. So a variant added anywhere in the chain fails to compile
+until it has a meaning and a counter. What carries it further is that the
+counting happens at the one door every publication without a session goes
+through, so **a connector written next year is counted by calling the
+function it already had to call.**
+
+The hook half is deliberately narrower than the metric half, and the line is
+where the broker can see the message. A refusal at that door fires a hook; so
+does one a connector makes before reaching it, because a connector can reach
+the hook chain through the same shell. What fires nothing is a message a
+bridge's remote sent on a filter no topic rewrite covers — that is a wildcard
+subscription legitimately matching more than the configuration maps, not a
+message this broker ever accepted, and counting it would put a number on the
+remote's traffic rather than on this broker's losses. Recorded as a decision
+rather than left as an omission.
+
 
 **Router matches are deferred to milestone 5.** This section asks for them
 split local and remote. The remote half needs a cluster, and counting the

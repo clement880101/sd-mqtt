@@ -133,6 +133,64 @@ pub enum Decision {
     Next,
 }
 
+/// Why a publication a connector made went nowhere.
+///
+/// **The connector half of [`DropReason`], and a separate enum for the
+/// reason that one is separate from [`crate::session::queue`]'s
+/// vocabulary: the events are not the same event.** A [`DropReason`]
+/// is a message that reached the broker, was matched, was queued for a
+/// particular subscriber and was then discarded on the way to that one
+/// session. A [`Refusal`] is a message that never became anybody's:
+/// there is no subscriber to name, no queue it sat in, and in three of
+/// the five cases no [`Message`] was ever built.
+///
+/// Milestone four introduced three parallel refusal vocabularies —
+/// `marker::Refused` in a bridge, `PublishRefused` in the shell, and a
+/// per-connection tally in a bridge's session — and counted none of
+/// them. This is the one they map onto, and the mapping is what makes
+/// the next one fail to compile:
+///
+/// - Every variant here must appear in `sdmqtt_server::metrics`'
+///   reason table, which is a match with no wildcard, so **a variant
+///   added here does not compile until it has a counter**. That is the
+///   mechanism milestone three built for [`DropReason`], reused rather
+///   than reinvented.
+/// - Each connector vocabulary converts into this one through a match
+///   with no wildcard of its own, so a variant added *there* does not
+///   compile until it has been given a meaning here.
+/// - And the conversion is applied at the one door every publication
+///   without a session goes through, so a connector written next year
+///   is counted by calling the function it already has to call.
+///
+/// [`DropReason`]: crate::session::queue::DropReason
+/// [`Message`]: crate::session::message::Message
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Refusal {
+    /// A bridge would not carry it, because it had already been
+    /// through that bridge.
+    ///
+    /// Section 9.2's second line of defence, which is the one that
+    /// catches a loop no configuration check can see: a message that
+    /// went out through this bridge, was republished by the remote on
+    /// some other topic, and came back on a filter that overlaps
+    /// nothing.
+    Looped,
+    /// It had been through more connectors than a limit allows.
+    ///
+    /// Section 9.2's third loop, the one with no bridge in it. Both
+    /// limits land here — a bridge rule's `max_hops` and the node's
+    /// `broker.max_hops` — because what an operator wants from this
+    /// number is "there is a cycle", and which of the two limits
+    /// happened to be the lower is in the log line beside it.
+    TooManyHops,
+    /// The topic it would have been published to is not a topic.
+    NotATopic,
+    /// That topic is in the namespace the broker reserves for itself.
+    Reserved,
+    /// The batch could not be made durable, so nothing was promised.
+    NotDurable,
+}
+
 /// What a message hook says should happen to the message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disposition {
@@ -290,6 +348,31 @@ pub trait Hook: Send + Sync {
     /// metric and a hook.
     fn message_dropped(&self, _to: &ClientInfo<'_>, _topic: &str, _qos: QoS, _reason: DropReason) {}
 
+    /// A publication a connector made was not published at all, and
+    /// why.
+    ///
+    /// **Not [`Hook::message_dropped`], because there is nobody to
+    /// name.** That one says "this session did not get it" and takes a
+    /// [`ClientInfo`] for the session that did not. This one says "it
+    /// never became anybody's": the topic was refused, the store
+    /// would not take it, or it was over a hop limit and routing it
+    /// would have extended a cycle. The `origin` is the connector that
+    /// made it — a rule identifier, never a session — and
+    /// `ClientInfo::subscriber` is `None` for the same reason it is
+    /// `None` in [`Hook::message_received`] on this route.
+    ///
+    /// Section 11.3: every discard path has both a metric and a hook.
+    /// Milestone four added three refusal vocabularies that had
+    /// neither; [`Refusal`] is the metric's half and this is the
+    /// hook's.
+    ///
+    /// Fired at the door every publication without a session goes
+    /// through, and by a connector that refused one before it reached
+    /// that door. Like every hook it runs under the broker's lock, so
+    /// the obligations in the module documentation apply unchanged.
+    fn message_refused(&self, _origin: &ClientInfo<'_>, _topic: &str, _qos: QoS, _reason: Refusal) {
+    }
+
     /// A connection has been accepted and its session registered.
     fn client_connected(&self, _client: &ClientInfo<'_>) {}
 
@@ -420,6 +503,13 @@ impl Hooks {
     pub fn message_dropped(&self, to: &ClientInfo<'_>, topic: &str, qos: QoS, reason: DropReason) {
         for hook in &self.installed {
             hook.message_dropped(to, topic, qos, reason);
+        }
+    }
+
+    /// Tell every hook a publication a connector made went nowhere.
+    pub fn message_refused(&self, origin: &ClientInfo<'_>, topic: &str, qos: QoS, reason: Refusal) {
+        for hook in &self.installed {
+            hook.message_refused(origin, topic, qos, reason);
         }
     }
 

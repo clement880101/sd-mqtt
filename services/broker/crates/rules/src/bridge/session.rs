@@ -40,7 +40,7 @@ use bytes::BytesMut;
 use mqtt_codec::packet::{Disconnect, Publish};
 use mqtt_codec::{Limits, Packet, Properties, QoS, ReasonCode, Version};
 use sdmqtt_server::framing::FrameReader;
-use sdmqtt_server::publish::{Publication, PublishRefused};
+use sdmqtt_server::publish::{self, Publication, PublishRefused};
 use sdmqtt_server::shared::Shared;
 use storage::record::{OutboxRecord, Record};
 use storage::Storage;
@@ -163,6 +163,31 @@ pub struct Bridge {
 }
 
 impl Bridge {
+    /// Count a message this bridge would not carry, and tell the
+    /// hooks.
+    ///
+    /// Section 11.3 asks for both on every discard path and this one
+    /// had neither: a message refused by the loop marker was a debug
+    /// line and nothing else, which means section 9.2's second line of
+    /// defence was invisible to an operator in exactly the situation
+    /// it exists for.
+    ///
+    /// Delegated to [`publish::refuse`] rather than reaching for the
+    /// metric here, so that a refusal a connector makes before the
+    /// publish door and one the door itself makes land on the same
+    /// series through the same call. The `qos` is the level the
+    /// message would have gone at; the topic is the one it would have
+    /// gone to.
+    fn refused(&self, refusal: &Refused, topic: &str, qos: QoS) {
+        publish::refuse(
+            &self.shared,
+            self.rule.as_str(),
+            topic,
+            qos,
+            refusal.refusal(),
+        );
+    }
+
     /// The filters this bridge subscribes to on the remote, with the
     /// level each is wanted at.
     pub fn inbound_filters(&self) -> Vec<(String, QoS)> {
@@ -212,6 +237,15 @@ enum Declined {
 }
 
 /// What one connection produced, for the supervisor's log line.
+///
+/// **This connection's, and that is the whole of what it is for.** It
+/// resets on every reconnection, so it cannot answer "how much has
+/// this bridge brought in" and must not be read as though it could.
+/// The lifetime numbers are the rule's counters —
+/// `RuleEvent::Received` and the `publications_refused` family — which
+/// this struct is now counted beside rather than instead of. It was
+/// the only record of either, which is why section 11.3's sentence was
+/// false for the whole of this milestone's inbound path.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Carried {
     /// Messages handed to the remote and acknowledged by it.
@@ -336,6 +370,19 @@ where
         outbound_alias_maximum = negotiated.outbound_alias_maximum,
         "the bridge is connected, and these are the limits the remote declared"
     );
+    // **Beside the state topic, because they are the same fact said to
+    // two audiences.** The topic is for a subscriber watching this
+    // bridge; the counter is for an alert. It was a log line and
+    // nothing else, which cannot be alerted on: a bridge that
+    // reconnects every thirty seconds is working perfectly by every
+    // other number this broker publishes.
+    //
+    // Here rather than in the supervisor, for the reason the state
+    // topic is here: "connected" is only true from this point until
+    // this function returns, and the supervisor sees only the
+    // aftermath. It is also the difference between a fact a test can
+    // reach over a pipe and one that needs a listener.
+    bridge.stats.connected();
     state(bridge, ONLINE).await;
 
     // **The window belongs to the supervisor, not to this
@@ -372,6 +419,11 @@ where
         )
         .await;
     }
+    // Counted only on the path that counted a connect, so the two
+    // pair: their difference is whether this bridge is up now. A
+    // remote that accepts a socket and then refuses the CONNECT
+    // returns above, having done neither.
+    bridge.stats.disconnected();
     state(bridge, OFFLINE).await;
     (Some(negotiated), session.carried, ended)
 }
@@ -660,6 +712,29 @@ impl Session<'_> {
     }
 
     /// Publish one inbound message into the local broker.
+    ///
+    /// # Two counters here are not guarded, and that is a deferral
+    ///
+    /// Convention 8: said out loud rather than left to be found.
+    /// Deleting either `self.bridge.stats.received()` or the
+    /// `self.bridge.refused(..)` beside the marker check below leaves
+    /// the whole suite green — both mutations were run and both
+    /// survived.
+    ///
+    /// The reason is the same for both: the in-process fixture in
+    /// `rules/tests/bridge.rs` drives an **outbound-only** bridge over
+    /// a pipe, which is where a test can read this rule's metric
+    /// handles; and `sdmqtt/tests/bridge.rs`, which does move messages
+    /// inbound between two real brokers, reaches neither broker's
+    /// `/metrics` — it is given no admin port. The outbound halves of
+    /// both counters are guarded, and the *logic* the inbound marker
+    /// check performs is guarded by
+    /// `a_message_this_bridge_sent_is_not_taken_back`. What is
+    /// unguarded is the counting, on the inbound side only.
+    ///
+    /// Closing it means either an inbound fixture over a pipe or an
+    /// admin port in the two-process test, and either is worth doing
+    /// before a connector is added to this path.
     async fn deliver(&mut self, publish: &Publish, topic: &str) {
         let Some((rewrite, local)) = self.bridge.rewrites.iter().find_map(|rewrite| match rewrite
             .inbound(topic)
@@ -700,6 +775,8 @@ impl Session<'_> {
                 // **The marker, read on the way back in.** Without
                 // this half the mark is a property nobody looks at.
                 self.carried.refused += 1;
+                self.bridge
+                    .refused(&refused, topic, rewrite.qos().min(publish.qos));
                 match refused {
                     Refused::Looped => tracing::debug!(
                         rule = self.bridge.rule.as_str(),
@@ -735,7 +812,14 @@ impl Session<'_> {
         )
         .await
         {
-            Ok(_) => self.carried.received += 1,
+            Ok(_) => {
+                self.carried.received += 1;
+                // The lifetime count, beside the per-connection one.
+                // See [`Carried`]: that field resets on every
+                // reconnection and answers a log line, and "how much
+                // has this bridge brought in" had no answer at all.
+                self.bridge.stats.received();
+            }
             Err(refused @ (PublishRefused::NotATopic(_) | PublishRefused::Reserved)) => {
                 self.carried.refused += 1;
                 tracing::warn!(
@@ -927,6 +1011,8 @@ impl Session<'_> {
                 // message that came in through this same bridge,
                 // refused here. Either half alone leaves the loop open.
                 self.carried.refused += 1;
+                self.bridge
+                    .refused(&refused, &body.topic, live_qos(body.qos));
                 match refused {
                     Refused::Looped => tracing::debug!(
                         rule = self.bridge.rule.as_str(),

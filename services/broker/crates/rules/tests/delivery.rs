@@ -35,6 +35,7 @@ use bytes::Bytes;
 use rules::http_out::{client, DeadLetters, Delivery, Poster, Turn};
 use rules::rule::{HttpOut, RuleId};
 use rules::Outbox;
+use sdmqtt_server::metrics::RuleEvent;
 use storage::record::{
     ActionRecord, BodyRecord, HttpOutRecord, MessageId, Qos, Record, RuleRecord, TriggerRecord,
 };
@@ -902,6 +903,70 @@ async fn each_counter_moves_for_its_own_outcome_and_no_other() {
             ..rules::stats::Totals::default()
         },
         "the dead letter and the attempt that caused it were counted as one thing"
+    );
+}
+
+/// Attempts and retries, on the exposition.
+///
+/// Section 11.3's counter list named no connector metric at all, which
+/// is how a rule could be posting four times to deliver once with
+/// nothing anywhere saying so. Two of the five this milestone adds are
+/// here: how many requests this rule made, and how many of those were
+/// this broker asking again.
+///
+/// **A retry is a subset of an attempt and the two must not be equal
+/// or independent.** Three attempts against a refusing endpoint is two
+/// retries, and a counter that moved on every attempt or on none of
+/// them would read three or zero. Both wrong answers are reachable
+/// from this input, which is what makes the assertion worth writing.
+///
+/// Exported and not sampled, so this reads the registry rather than
+/// `Totals`: a `RuleStats` with no broker behind it — which is what
+/// every other test in this file builds — cannot see either of them.
+#[tokio::test]
+async fn attempts_and_retries_are_counted_where_an_alert_can_read_them() {
+    let endpoint = Endpoint::start(Behaviour::AlwaysRefuse {
+        status: 500,
+        retry_after: None,
+    })
+    .await;
+    let mut action = action_for(endpoint.url());
+    action.retries = 2;
+    let fixture = Fixture::new(action, &[("sensor-1", b"21.5" as &[u8])]);
+
+    let metrics = sdmqtt_server::metrics::Metrics::new();
+    let stats = Arc::new(rules::stats::RuleStats::exporting(Some(
+        metrics.rule("sensor-1"),
+    )));
+    let delivery = fixture.delivery().with_stats(Arc::clone(&stats));
+    let read = |event| metrics.rule("sensor-1").event(event).get();
+
+    assert_eq!(read(RuleEvent::Attempted), 0, "nothing has been posted yet");
+
+    assert!(matches!(delivery.turn().await, Turn::BackedOff(_)));
+    assert_eq!(read(RuleEvent::Attempted), 1);
+    assert_eq!(
+        read(RuleEvent::Retried),
+        0,
+        "the first attempt at an envelope is not a retry"
+    );
+
+    assert!(matches!(delivery.turn().await, Turn::BackedOff(_)));
+    assert!(matches!(delivery.turn().await, Turn::DeadLettered(_)));
+    assert_eq!(
+        endpoint.count(),
+        3,
+        "the endpoint saw a different number of requests from the one counted"
+    );
+    assert_eq!(
+        read(RuleEvent::Attempted),
+        3,
+        "attempts and requests have drifted apart"
+    );
+    assert_eq!(
+        read(RuleEvent::Retried),
+        2,
+        "two retries is three attempts, of which the first is not one"
     );
 }
 
