@@ -5,6 +5,9 @@ integrations. One binary, no external dependencies.
 
 Status: in development. See `docs/superpowers/specs/` for the design and
 `docs/superpowers/plans/` for the implementation plans.
+`CHANGELOG.md` is what to read before upgrading: while nothing is
+released the stored format is allowed to move, and a store written by an
+earlier build is refused rather than migrated.
 
 ## Build
 
@@ -47,6 +50,24 @@ to a publisher before its message is on the disk.
 The directory is created if it is not there, and the store is the file
 `sdmqtt.redb` inside it. One broker per directory: a second is refused
 with the path it could not take.
+
+**A store written by an earlier build is refused rather than migrated.**
+The stored format carries a version and the check on it is exact, so a
+broker that meets a store it does not know refuses to start and names
+both versions:
+
+```
+store format version 3 is not readable by this build, which reads version 4.
+The store is not damaged; it was written by a different build. Nothing is
+released yet, so there is no migration: see CHANGELOG.md for what moved and
+what starting with a fresh store directory throws away.
+```
+
+The file is not damaged; it is being read by the wrong build, and
+guessing at an unknown layout would restore nonsense from healthy bytes.
+Nothing is released yet, so there is no migration: move or delete the
+store directory and start again. `CHANGELOG.md` says, per milestone,
+whether the version moved and what starting again throws away.
 
 ### Rules, and the four things one can do
 

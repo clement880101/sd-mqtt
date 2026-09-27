@@ -106,7 +106,19 @@ pub enum StorageError {
     /// Not a corruption. The file is intact and is being read by the wrong
     /// build, which is the case that would otherwise be silent: guessing
     /// at an unknown layout restores nonsense from healthy bytes.
-    #[error("store format version {found} is not readable by this build, which reads version {expected}")]
+    ///
+    /// **The message names the release notes**, because "refuses to
+    /// start" is only actionable to an operator who knows there is no
+    /// migration and what starting again costs. Section 9.2 promised
+    /// exactly that: "Nothing is released, so the cost is a line in
+    /// the release notes rather than a migration." A line nobody is
+    /// pointed at is a line nobody reads.
+    #[error(
+        "store format version {found} is not readable by this build, which reads version \
+         {expected}. The store is not damaged; it was written by a different build. \
+         Nothing is released yet, so there is no migration: see CHANGELOG.md for what \
+         moved and what starting with a fresh store directory throws away."
+    )]
     UnsupportedVersion {
         /// The version the store carries.
         found: u16,

@@ -579,6 +579,19 @@ Rules are replicated metadata, so a rule created in the UI on any node
 applies everywhere. A message triggers a rule on the node where it enters the
 cluster, exactly once.
 
+**"Exactly once" is a statement about a cluster, and on one node it cannot
+be told apart from at least once.** A message enters at one node, that node
+holds the rule, and the rule fires. Nothing in milestone 4 can make it fire
+twice and nothing in milestone 4 guards against it either, so a test of this
+sentence today would assert the shape of the deployment rather than the
+property. What will make it auditable is the thing that can break it:
+replication, in milestone 5, where a message entering at one node and a rule
+living on every node is exactly the case this sentence rules out. **The guard
+arrives with the replication and is written against it** — a node that did
+not receive the message does not fire its copy of the rule. Written down so
+that the next walk of this section reads a deferral rather than finding an
+untested sentence and re-litigating it.
+
 **Replication is milestone 5, so in milestone 4 a rule is node-local.** It is
 stored durably and survives a restart, and it applies on the node that holds
 it. Nothing about the rule's own shape changes when replication arrives; what
@@ -604,7 +617,23 @@ retain flag, the publishing client identifier, a timestamp, and v5 user
 properties. Configurable: method, headers, timeout, maximum concurrency,
 retry count and backoff. Each rule owns a durable outbox, so a restart loses
 nothing in flight. After the final attempt an envelope is published to
-`$sd/rules/<id>/dlq` and surfaced in the UI.
+`$sd/rules/<id>/dlq` and kept where an operator who was not watching can
+still find it.
+
+**Which is a retention and not a notification, and the difference is the
+whole requirement.** "Surfaced in the UI" was satisfied equally by a toast,
+and a toast is precisely the wrong answer: an operator learns that a
+connector has stopped working from an alert, from a colleague, or from
+whoever was expecting the data, and opens the page minutes or hours later. A
+notification is gone by then and a page reading a live subscription shows an
+empty list, which is indistinguishable from a rule that has never
+dead-lettered anything.
+
+So the property to hold to, and to test: **the last ten dead letters per
+rule, each truncated to two kibibytes of the document that was published,
+readable per rule from the API without a subscription, kept in memory and
+therefore lost on a restart.** Every one of them is also on the topic, which
+is how an operator keeps them for longer than a process lives.
 
 **http_in** exposes `POST /ingest/<rule-id>`, guarded by a per-rule bearer
 token. **The token is not optional and a rule without one is refused**, on
@@ -628,10 +657,35 @@ a prefix on either side, and for the outbound direction a template that
 captures wildcard segments from the matched filter and substitutes them by
 position, so `sensors/+/temp` can be published remotely as
 `site-a/temp/{1}`. Inbound messages need no such facility, because a bridge
-publishes them into the local broker where any rule can act on them. Reconnection uses exponential backoff with jitter. A state
-topic reports connectivity, with a will supplying the offline value. Loop
-prevention uses an origin identifier carried in a user property, and messages
-that have already traversed this bridge are not sent back.
+publishes them into the local broker where any rule can act on them.
+Reconnection uses exponential backoff with jitter. Loop prevention uses an
+origin identifier carried in a user property, and messages that have already
+traversed this bridge are not sent back.
+
+**A state topic reports connectivity, on both brokers, and which value comes
+from where is the half the sentence has to say.** The same topic name is used
+at each end and the two ends are not symmetric:
+
+- **On this broker**, the bridge publishes the topic itself: `online` when
+  the connection has been established, `offline` when it ends, retained and
+  at least-once. This end can say both, because it is the end running the
+  bridge.
+- **On the remote**, the bridge registers that topic as its *will*, carrying
+  `offline`, retained and at least-once. A will is the only thing this end
+  can arrange for the remote to publish on its behalf, and it fires exactly
+  when the far side needs it to: when the link is gone and this end is in no
+  position to say anything.
+
+Retained on both, because the point of a liveness topic is that somebody who
+subscribes *after* the bridge died still learns that it did; at least-once,
+because a liveness message a broker may drop leaves a dashboard wrong for
+ever.
+
+The mirror image — publishing to the remote and willing to the local broker —
+would be equally faithful to the shorter sentence and is wrong twice over: a
+local will needs a local session for the bridge, which it has not got, and it
+would announce nothing when the *remote* went away, which is the failure an
+operator is watching this topic for.
 
 **That mechanism does not exist in MQTT 3.1.1**, which has no user
 properties, and a bridge to a 3.1.1 endpoint is exactly the bridge people
@@ -963,7 +1017,6 @@ subscription legitimately matching more than the configuration maps, not a
 message this broker ever accepted, and counting it would put a number on the
 remote's traffic rather than on this broker's losses. Recorded as a decision
 rather than left as an omission.
-
 
 **Router matches are deferred to milestone 5.** This section asks for them
 split local and remote. The remote half needs a cluster, and counting the
