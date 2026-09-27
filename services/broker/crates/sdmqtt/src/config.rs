@@ -870,6 +870,27 @@ impl Config {
             }
         }
 
+        // **The one limit a rule is checked against that is not its
+        // own.** `http_in` derives its body limit from
+        // `broker.max_packet_size` and says why; a poller takes one
+        // from an operator, and one set above what this broker can
+        // carry is a rule that fetches every interval and publishes
+        // nothing. Here rather than in `to_rule` because the number
+        // belongs to the node.
+        for section in &self.rules {
+            let Ok(rule) = section.to_rule() else {
+                continue;
+            };
+            if let rules::Action::HttpPoll(action) = &rule.action {
+                rules::http_poll::check_body_limit(action, self.broker.max_packet_size).map_err(
+                    |error| ConfigError::Rule {
+                        id: section.id.clone(),
+                        why: error.to_string(),
+                    },
+                )?;
+            }
+        }
+
         // **The loop no single rule is wrong in.** `to_rule` above has
         // already refused a bridge whose own entries feed each other;
         // this is the pair that feeds each other through one remote,
@@ -1428,6 +1449,55 @@ mod tests {
             .expect("every key is known")
             .validate()
             .expect("a rule that lets a caller choose, bounded, is usable");
+    }
+
+    /// A poller whose body limit is larger than this broker can
+    /// publish does not start it.
+    ///
+    /// `http_in` derives its limit from `broker.max_packet_size` and
+    /// says why. A poller takes one from an operator, and one set
+    /// above what the broker carries is a rule that fetches a document
+    /// every interval and publishes none of them. The refusal is here
+    /// rather than in the rule, because the number it is measured
+    /// against belongs to the node: the same rule under the default
+    /// packet size is accepted, which is the second half below and is
+    /// what stops this being a refusal of every poller.
+    #[test]
+    fn a_poller_that_could_not_publish_what_it_fetches_does_not_start() {
+        const BIG_POLLER: &str = r#"
+        [broker]
+        max_packet_size = 32768
+
+        [[rules]]
+        id = "weather"
+        name = "The weather"
+
+        [rules.http_poll]
+        url = "https://example.invalid/now"
+        topic = "weather/now"
+        max_body_bytes = 262144
+        "#;
+
+        let refused = Config::from_toml(&with_rule(BIG_POLLER))
+            .expect("every key is known")
+            .validate()
+            .expect_err("a poller that could publish nothing must not start a broker");
+        let ConfigError::Rule { id, why } = &refused else {
+            panic!("the wrong refusal: {refused}");
+        };
+        assert_eq!(id, "weather");
+        assert!(
+            why.contains("max_body_bytes") && why.contains("max_packet_size"),
+            "the refusal should name both settings: {why}"
+        );
+
+        // The same rule under a packet size that carries it.
+        Config::from_toml(&with_rule(
+            &BIG_POLLER.replace("max_packet_size = 32768", "max_packet_size = 2000000"),
+        ))
+        .expect("every key is known")
+        .validate()
+        .expect("a body limit the broker can carry is not refused");
     }
 
     /// Section 12.3, on the way in: the configuration is logged at

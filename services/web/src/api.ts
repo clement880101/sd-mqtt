@@ -30,6 +30,7 @@ export type ErrorCode =
   | 'method_not_allowed'
   | 'not_acceptable'
   | 'unauthorized'
+  | 'conflict'
   | 'resource_exhausted'
   | 'loop_detected'
   | 'internal';

@@ -232,6 +232,22 @@ pub enum InstallError {
         /// witness on each side.
         why: String,
     },
+    /// The rule cannot work on **this** node, for a reason that is
+    /// about the node rather than about the rule.
+    ///
+    /// A poller whose body limit is larger than this broker's maximum
+    /// packet size is the one case: the same rule on a node with a
+    /// larger limit is fine, so it is not something `crate::spec` can
+    /// refuse when the rule is read.
+    #[error("{why}")]
+    Unusable {
+        /// Which rule.
+        id: String,
+        /// Which of its fields, for a form to mark.
+        field: &'static str,
+        /// The whole of the refusal.
+        why: String,
+    },
     /// The socket its route would be served on is not there.
     ///
     /// An ingest rule with no listener in front of it is a rule that
@@ -679,6 +695,7 @@ impl Registry {
         // the same reason: a pair of bridges that would loop is a
         // refusal with this node exactly as it was.
         self.check_for_a_loop(&rule)?;
+        self.check_it_fits(&rule)?;
         // **Before anything changes.** An address something else is
         // already on is then a refusal with the node exactly as it
         // was, rather than a stored rule nothing can reach.
@@ -806,6 +823,29 @@ impl Registry {
             })?;
         }
         Ok(())
+    }
+
+    /// Refuse a poller whose body limit is larger than this broker
+    /// could publish.
+    ///
+    /// Checked here rather than in `crate::spec`, because the number
+    /// it is checked against is the **node's**: the same rule on a
+    /// node with a larger `broker.max_packet_size` is fine, and a rule
+    /// is read in places that have no broker at all.
+    fn check_it_fits(&self, rule: &Rule) -> Result<(), InstallError> {
+        let Action::HttpPoll(action) = &rule.action else {
+            return Ok(());
+        };
+        let max_packet_size = self
+            .shared
+            .with_broker(|broker| broker.config().limits.max_packet_size);
+        crate::http_poll::check_body_limit(action, max_packet_size).map_err(|error| {
+            InstallError::Unusable {
+                id: rule.id.as_str().to_owned(),
+                field: error.field(),
+                why: error.to_string(),
+            }
+        })
     }
 
     /// Turn a rule on or off without deleting it.

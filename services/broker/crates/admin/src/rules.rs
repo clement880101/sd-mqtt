@@ -146,6 +146,11 @@ fn install_refusal(error: &InstallError) -> ApiError {
         // what that code is for. Not `invalid_request`: this body is
         // well formed and would be accepted on a node that did not
         // hold the other rule.
+        // The body is fine and names a field; a node with a larger
+        // maximum packet size would accept it unchanged.
+        InstallError::Unusable { field, .. } => {
+            ApiError::in_field(ErrorCode::InvalidRequest, field, error.to_string())
+        }
         InstallError::Loops { .. } => ApiError::in_field(
             ErrorCode::LoopDetected,
             "mqtt_bridge.topics",

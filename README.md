@@ -246,6 +246,13 @@ back-to-back requests. A body past `max_body_bytes` is a **failed
 fetch and not a truncated publication**: half a document on a topic is
 worse than nothing on it, and a subscriber cannot tell the two apart.
 
+`max_body_bytes` must be one this broker could publish: a body larger
+than `broker.max_packet_size` leaves room for is refused at startup
+and by the API, naming both numbers. The ingest endpoint derives its
+own limit from that setting for the same reason, and a poller that
+could fetch a document and never publish it is a rule that fails once
+an interval for ever.
+
 `retain = true` is usually what an operator wants from a poller — the
 current value, there for a subscriber that has just connected — and is
 off by default all the same, because a retained message outlives the

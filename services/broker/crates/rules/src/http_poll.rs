@@ -160,6 +160,34 @@ pub enum HttpPollError {
         /// What was configured.
         topic: String,
     },
+    /// The body limit is larger than a publication of it could be.
+    ///
+    /// `http_in` derives its limit from `broker.max_packet_size` and
+    /// says why: a body the broker cannot carry is a post that is
+    /// refused rather than published. A poller takes its limit from an
+    /// operator instead, and one set above what the broker carries is
+    /// a rule that fetches a document every interval and publishes
+    /// none of them — loudly, once per interval, for ever.
+    ///
+    /// Refused rather than clamped. Clamping would truncate a body,
+    /// and half a JSON document published to a topic is worse than
+    /// nothing published at all: a subscriber has no way to tell.
+    #[error(
+        "http_poll.max_body_bytes is {max_body_bytes} and the largest body that can be \
+         published to {topic:?} is {largest}, because broker.max_packet_size is \
+         {max_packet_size}. A poller that fetched a larger body could not publish it, so \
+         lower the limit or raise broker.max_packet_size."
+    )]
+    BodyOverPacketSize {
+        /// What was configured.
+        max_body_bytes: u32,
+        /// Where it publishes, whose length is part of the packet.
+        topic: String,
+        /// The largest body a publication to that topic can carry.
+        largest: usize,
+        /// The node-wide limit it is derived from.
+        max_packet_size: u32,
+    },
 }
 
 impl HttpPollError {
@@ -175,8 +203,40 @@ impl HttpPollError {
             Self::NoInterval => "http_poll.interval_ms",
             Self::NoBody => "http_poll.max_body_bytes",
             Self::NotATopic { .. } | Self::Reserved { .. } => "http_poll.topic",
+            Self::BodyOverPacketSize { .. } => "http_poll.max_body_bytes",
         }
     }
+}
+
+/// Refuse a body limit larger than a publication of it could be.
+///
+/// **Separate from [`check`] because the number is not the rule's.**
+/// `broker.max_packet_size` belongs to the node, so this is asked by
+/// whoever holds both: the configuration, which has the file, and the
+/// registry, which has the running broker. Everything [`check`] refuses
+/// is wrong about the rule wherever it is read; this one is wrong about
+/// the rule *on this node*, and the same rule on a node with a larger
+/// packet size is fine.
+///
+/// The same arithmetic `http_in` uses, through the same function, so
+/// the two connectors cannot disagree about how large a publication of
+/// a given body is.
+///
+/// # Errors
+///
+/// [`HttpPollError::BodyOverPacketSize`], naming both numbers and the
+/// topic whose length is part of the difference.
+pub fn check_body_limit(action: &HttpPoll, max_packet_size: u32) -> Result<(), HttpPollError> {
+    let largest = crate::http_in::largest_body(max_packet_size, &action.topic);
+    if action.max_body_bytes as usize > largest {
+        return Err(HttpPollError::BodyOverPacketSize {
+            max_body_bytes: action.max_body_bytes,
+            topic: action.topic.clone(),
+            largest,
+            max_packet_size,
+        });
+    }
+    Ok(())
 }
 
 /// Check a rule's configuration without building anything to fetch
@@ -812,5 +872,40 @@ mod tests {
         let mut both = action("http://example.invalid/now");
         both.topic = "weather/#".to_owned();
         assert!(matches!(check(&both), Err(HttpPollError::NotATopic { .. })));
+    }
+
+    /// A body limit larger than a publication of it could be is
+    /// refused, and one that fits is not.
+    ///
+    /// The number is the node's rather than the rule's, so both
+    /// directions are asserted against one action: a poller that is
+    /// wrong on a small broker is right on a large one, and a check
+    /// that refused every poller would satisfy the first assertion on
+    /// its own.
+    #[test]
+    fn a_body_limit_the_broker_could_not_publish_is_refused() {
+        let mut poller = action("https://example.invalid/now");
+        poller.max_body_bytes = 65_536;
+
+        check_body_limit(&poller, 2_000_000).expect("a body well inside the packet size");
+
+        let refused = check_body_limit(&poller, 32_768)
+            .expect_err("a body limit larger than the broker carries must be refused");
+        assert_eq!(refused.field(), "http_poll.max_body_bytes");
+        let said = refused.to_string();
+        assert!(
+            said.contains("32768") && said.contains("65536"),
+            "the refusal should name both numbers: {said}"
+        );
+
+        // The boundary is the packet size less the overhead of a
+        // publication of that topic, which is the same arithmetic the
+        // ingest endpoint refuses a post with. A limit of exactly the
+        // largest body fits; one byte more does not.
+        let largest = crate::http_in::largest_body(32_768, &poller.topic);
+        poller.max_body_bytes = u32::try_from(largest).expect("it is small");
+        check_body_limit(&poller, 32_768).expect("the largest body that fits, fits");
+        poller.max_body_bytes += 1;
+        check_body_limit(&poller, 32_768).expect_err("one byte over the largest body is over");
     }
 }
