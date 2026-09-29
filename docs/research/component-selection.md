@@ -326,6 +326,51 @@ ISC alone. The full licence text still ships; what is wrong is the summary
 line and the Apache-2.0 obligation that line is what triggers. Fixed before
 the dependency landed, not after.
 
+## Verified again before milestone 5
+
+Three questions, answered by building rather than by reading.
+
+**The clock is ours, and this document already said so.** The entry reading
+"own HLC, roughly eighty lines" was right; the implementation is about a
+hundred and forty with its documentation. The one mature candidate, `uhlc`,
+passes the licence gate on its Apache branch, which was checked by running
+our own policy against it rather than assuming. It costs **seven crates**,
+including a complete cryptographic random stack so that it can generate a
+node identifier, in a project that already has version 7 identifiers for
+identity. It also brings a second logging facade beside the one this project
+standardised on, which is the reason the HTTP framework's default features
+are off, and a second major version of a random crate, which the ban policy
+warns about. Two of the ten candidates surveyed carry no node identity at
+all, which makes them unusable for a tie-break; one depends on a crate
+version with an unfixed advisory.
+
+**The cryptographic library is already linked and costs one line.** It
+arrives transitively through the TLS stack, and naming it in a manifest to
+call its keyed hash resolved with a **byte-identical lock file**: no new
+crates, no new licence obligations, one more direct dependency of the
+thirty-five allowed. The modules needed are ungated by any feature the TLS
+stack does not already enable, confirmed by building a probe with exactly
+that feature set.
+
+**A partition is created by a gate, not a firewall.** Operating-system
+packet filtering needs root on both platforms, the vendor of one of them
+documents its filter as not an interface to build products on, and the
+dropped-packet path takes minutes to time out rather than milliseconds. The
+standard proxy daemon is a separate service every developer and every build
+must install and supervise, and its timeout behaviour closes the connection
+on healing, which makes the one case a heartbeat exists for untestable.
+Containers cannot produce a one-way partition at all without extra
+privileges, and are unavailable on one of the two platforms.
+
+What works is about a hundred and fifteen lines in this repository: one
+listener per ordered pair of nodes, two independent flags deciding whether
+bytes move in each direction, no dependency and no privilege. It produces
+the case that finds bugs, where one node can hear another but not the
+reverse, and it heals **on the same connection**, which is the case a closed
+socket cannot reach. It was built and tested on the developer platform,
+including against a peer in a separate process. The bulk of the matrix still
+runs over an in-memory link, which section 14 already committed to.
+
 ## Rejected outright
 
 | Component | Reason |
