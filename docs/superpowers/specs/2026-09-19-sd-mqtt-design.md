@@ -456,6 +456,14 @@ take.
 Replicated metadata comprises subscriptions, retained messages, rules, users,
 access control rules, API keys and session ownership.
 
+**Three of those do not exist until milestone 7.** Users, access control
+rules and API keys arrive with authentication, so milestone 5 replicates
+subscriptions, retained messages, rules and session ownership. The register
+type and the anti-entropy exchange are written to carry a kind they do not
+yet know, so that adding the other three is a new variant rather than a new
+mechanism. Rules stop being node-local here, which is what milestone 4 said
+would happen.
+
 Each record is a last-writer-wins register stamped with a hybrid logical
 clock reading and the writing node's identity, which breaks ties
 deterministically. Writes broadcast immediately to all peers. Every few
