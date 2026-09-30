@@ -58,6 +58,14 @@ identity, and the node reading it would found itself a second time.
   register. Nothing dials a peer yet, so there is nothing for an
   operator to configure until there is; the refusal is already the
   only way to build a usable configuration.
+- The framing those links carry: a 32-bit little-endian length
+  **covering the version byte and the body**, bounded by a configured
+  maximum that is refused from the declared length alone, before
+  anything is reserved for a frame that will never arrive. Writes are
+  gathered and flushed on a size or a time threshold, and the queue to
+  one peer is bounded: past the bound, messages to that peer are
+  dropped and counted rather than blocking whoever sent them, and the
+  link carries on.
 
 ### Changed
 

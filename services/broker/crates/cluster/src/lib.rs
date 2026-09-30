@@ -30,11 +30,24 @@
 //! [`config::ClusterConfig`] cannot be built without a secret, so "a
 //! node with no secret refuses to cluster" is the absence of a way to
 //! say otherwise rather than a check in a startup path.
+//!
+//! # And then it is bounded, in both directions
+//!
+//! [`frame`] is what a message looks like once a link is open: a
+//! 32-bit length covering a version byte and a postcard body, refused
+//! from that length alone when it is larger than the link carries.
+//! [`link`] is the loop around it — reading incrementally, writing in
+//! batches, and **dropping and counting** rather than letting a wedged
+//! peer block whoever had something to say to it.
 
 pub mod config;
+pub mod frame;
 pub mod handshake;
 pub mod identity;
+pub mod link;
 
 pub use config::{ClusterConfig, ClusterSettings, ConfigError};
+pub use frame::{FrameError, FrameLimits, FRAME_VERSION};
 pub use handshake::{accept, dial, HandshakeError, Peer, Role};
 pub use identity::{IdentityError, NodeId, NodeIdentity, Reconciled};
+pub use link::{outgoing, pump, FrameReader, LinkConfig, LinkError, Outgoing, Sent};

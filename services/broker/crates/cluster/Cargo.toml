@@ -28,10 +28,21 @@ uuid = { version = "1", default-features = false, features = ["v7", "std"] }
 # `tokio-rustls` and `hyper-rustls` already ask for; `hmac` and `rand`
 # are ungated by anything beyond it.
 aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
-# The streams a handshake runs over. A trait rather than a socket:
-# `AsyncRead` and `AsyncWrite` are what let every test here run over an
-# in-memory pair, which is what section 14 committed to.
-tokio = { version = "1", default-features = false, features = ["io-util"] }
+# The streams a handshake and a link run over. A trait rather than a
+# socket: `AsyncRead` and `AsyncWrite` are what let every test here run
+# over an in-memory pair, which is what section 14 committed to.
+# `sync` is the bounded queue to one peer and `time` is the link's flush
+# deadline; neither is a runtime, which is the binary's to choose.
+tokio = { version = "1", default-features = false, features = ["io-util", "sync", "time"] }
+# What a frame's body is, the same encoder the store uses. One format in
+# the binary rather than two, and the one already pinned by golden
+# vectors derived from postcard's rules.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+# The buffer a frame is read into. The same type `crates/server` reads
+# packets into, so "consumes nothing when the frame is incomplete" means
+# the same thing in both places.
+bytes.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
