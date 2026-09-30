@@ -16,6 +16,22 @@ storage = { path = "../storage", version = "0.1.0", default-features = false }
 # names, and the same crate: a second version 7 generator in one binary
 # would be two answers to what a fresh identifier looks like.
 uuid = { version = "1", default-features = false, features = ["v7", "std"] }
+# Section 8.1's keyed hash, and the random source its nonces come from.
+#
+# **Already linked, transitively, through the TLS stack**, so naming it
+# here costs one more direct dependency of the thirty-five allowed and
+# no new crates at all: `docs/research/component-selection.md` measured
+# a byte-identical lock file and this build reproduced it, which is the
+# check worth doing rather than the claim worth repeating.
+#
+# Default features off with `aws-lc-sys` named, which is the feature set
+# `tokio-rustls` and `hyper-rustls` already ask for; `hmac` and `rand`
+# are ungated by anything beyond it.
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
+# The streams a handshake runs over. A trait rather than a socket:
+# `AsyncRead` and `AsyncWrite` are what let every test here run over an
+# in-memory pair, which is what section 14 committed to.
+tokio = { version = "1", default-features = false, features = ["io-util"] }
 thiserror.workspace = true
 
 [dev-dependencies]
@@ -26,6 +42,10 @@ thiserror.workspace = true
 storage = { path = "../storage", version = "0.1.0", features = ["redb"] }
 # The directory those stores live in, thrown away with them.
 tempfile.workspace = true
+# `rt` and `macros` for `#[tokio::test]`; `io-util` for `duplex`, which
+# is the pair of ends every handshake test runs over; `time` for the
+# bounds that make a stalled handshake fail rather than hang.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "io-util", "time"] }
 
 [lints]
 workspace = true

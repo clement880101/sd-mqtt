@@ -18,7 +18,23 @@
 //! rather than by one of its own, for the reason that module's
 //! documentation gives: two answers to "which node" in one binary is a
 //! defect waiting for the first cluster.
+//!
+//! # A link is authenticated before it is anything else
+//!
+//! [`handshake`] is section 8.1's mutual challenge: two nonces, a role
+//! byte, and a keyed hash over a length-prefixed transcript. Nothing
+//! above it has to ask whether a peer proved itself, because a
+//! [`handshake::Peer`] is the only thing either end of it returns.
+//!
+//! [`config`] is what a cluster will not start without. A
+//! [`config::ClusterConfig`] cannot be built without a secret, so "a
+//! node with no secret refuses to cluster" is the absence of a way to
+//! say otherwise rather than a check in a startup path.
 
+pub mod config;
+pub mod handshake;
 pub mod identity;
 
+pub use config::{ClusterConfig, ClusterSettings, ConfigError};
+pub use handshake::{accept, dial, HandshakeError, Peer, Role};
 pub use identity::{IdentityError, NodeId, NodeIdentity, Reconciled};

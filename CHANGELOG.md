@@ -49,6 +49,15 @@ identity, and the node reading it would found itself a second time.
   start and read back unchanged afterwards. Renaming a node moves the
   name and not the UUID. See `[node]` in `README.md` and
   `SDMQTT_NODE_NAME`.
+- Section 8.1's authenticated link: a mutual challenge over a
+  length-prefixed transcript, keyed with a shared cluster secret that
+  is never sent. **A node with no secret will refuse to cluster, and
+  an empty secret is refused for being empty rather than read as
+  absent** — there is no loopback exemption, because a link grants
+  session takeover and unauthenticated writes to every replicated
+  register. Nothing dials a peer yet, so there is nothing for an
+  operator to configure until there is; the refusal is already the
+  only way to build a usable configuration.
 
 ### Changed
 
