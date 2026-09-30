@@ -463,39 +463,73 @@ pub(crate) fn page<'a, T, R>(
 // ---------------------------------------------------------------
 
 /// A node in this cluster.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct NodeView {
-    /// What this node is called.
+    /// Section 8.1's identity: the UUID, in its canonical text.
     pub id: String,
+    /// What an operator calls it. Never compared.
+    pub name: String,
+    /// The address it says peers should dial.
+    ///
+    /// Empty on a node that does not cluster. **Not a bind address**,
+    /// and not the address a link arrived from: see `cluster::mesh`.
+    pub address: String,
     /// Whether it is the one answering.
     pub this_node: bool,
-    /// `up`. Membership is milestone 5; until then the only node is
-    /// the one answering, and it is up by virtue of answering.
+    /// `up`, `suspect` or `down`.
+    ///
+    /// For this node it is `up` by virtue of answering. For a peer it
+    /// is what section 8.1's failure detection says: suspect after
+    /// three missed beats, dead after the window.
     pub state: &'static str,
     /// The build serving this API.
-    pub version: &'static str,
-    /// How long it has been serving.
-    pub uptime_seconds: u64,
+    ///
+    /// **`null` for a peer.** Membership carries an identity, a name
+    /// and an address, and nothing about the build at the other end;
+    /// reporting this node's version beside a peer's row would be a
+    /// number that is wrong exactly when it matters, during an
+    /// upgrade.
+    pub version: Option<&'static str>,
+    /// How long it has been serving, `null` for a peer and for the
+    /// same reason.
+    pub uptime_seconds: Option<u64>,
 }
 
 async fn nodes(State(state): State<AdminState>, paging: Paging) -> Json<Page<NodeView>> {
     // Not read under the broker lock, because none of it is the
     // broker's. Paginated anyway so that all six resources have one
-    // envelope; a cluster of one is one row.
-    let uptime = state.started.elapsed().as_secs();
-    let id = state.node_id.to_string();
+    // envelope; a cluster of one is still one row.
+    let mut rows = vec![NodeView {
+        id: state.node_id.to_string(),
+        name: state.node_name.to_string(),
+        address: state.node_address.to_string(),
+        this_node: true,
+        state: "up",
+        version: Some(env!("CARGO_PKG_VERSION")),
+        uptime_seconds: Some(state.started.elapsed().as_secs()),
+    }];
+    if let Some(cluster) = &state.cluster {
+        rows.extend(cluster.peers().into_iter().map(|peer| NodeView {
+            id: peer.id,
+            name: peer.name,
+            address: peer.address,
+            this_node: false,
+            state: peer.state,
+            version: None,
+            uptime_seconds: None,
+        }));
+    }
+    // By identity, which is the order section 8.1 says everything
+    // orders by, so two nodes asked the same question list the cluster
+    // the same way round.
+    rows.sort_by(|one, other| one.id.cmp(&other.id));
+
     let selection = select(
-        std::iter::once(([id.as_str(), "", ""], ())),
+        rows.iter().map(|row| ([row.id.as_str(), "", ""], row)),
         paging.after.as_ref(),
         paging.limit,
     );
-    Json(page(selection, |key, ()| NodeView {
-        id: key[0].to_owned(),
-        this_node: true,
-        state: "up",
-        version: env!("CARGO_PKG_VERSION"),
-        uptime_seconds: uptime,
-    }))
+    Json(page(selection, |_key, row| row.clone()))
 }
 
 // ---------------------------------------------------------------
@@ -515,6 +549,14 @@ pub enum ListenerProtocol {
     /// Absent when the ingest routes are served on the admin listener,
     /// because then there is no second socket to report.
     Ingest,
+    /// Section 8.1's cluster link, on a node that clusters.
+    ///
+    /// Its row carries the **advertised** address in the mountpoint
+    /// field as well as the bind address, because a node bound to
+    /// every interface has a bind address no peer can use and that is
+    /// exactly the row an operator is looking at when they ask why a
+    /// peer cannot reach them.
+    Cluster,
 }
 
 /// A listener this node has bound.
@@ -1620,6 +1662,42 @@ mod tests {
     // Nodes and listeners.
     // -----------------------------------------------------------
 
+    /// A cluster this node has met, for the listing to report.
+    #[derive(Debug)]
+    struct Peers(Vec<crate::ClusterPeer>);
+
+    impl crate::Cluster for Peers {
+        fn peers(&self) -> Vec<crate::ClusterPeer> {
+            self.0.clone()
+        }
+    }
+
+    fn peer(id: &str, name: &str, state: &'static str) -> crate::ClusterPeer {
+        crate::ClusterPeer {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            address: format!("10.0.0.1:7700/{name}"),
+            state,
+        }
+    }
+
+    async fn admin_over_a_cluster(peers: Vec<crate::ClusterPeer>) -> AdminRunning {
+        let config = AdminConfig {
+            address: "127.0.0.1:0".parse().expect("a valid address"),
+            ..AdminConfig::default()
+        };
+        AdminServer::bind(
+            &config,
+            AdminState::new(Arc::new(Shared::new(BrokerConfig::default())))
+                .with_node_id("bbbbbbbb-0000-7000-8000-000000000000")
+                .with_node_name("edge-b")
+                .with_node_address("10.0.0.1:7700/edge-b")
+                .with_cluster(Some(Arc::new(Peers(peers)) as Arc<dyn crate::Cluster>)),
+        )
+        .await
+        .expect("loopback needs no token")
+    }
+
     #[tokio::test]
     async fn nodes_reports_this_node() {
         let both = Both::start().await;
@@ -1637,6 +1715,69 @@ mod tests {
         );
         assert!(response.body.contains("\"total\":1"), "{}", response.body);
         both.stop().await;
+    }
+
+    /// The listing reports the peers as well, in identity order, and
+    /// says which row is this node.
+    ///
+    /// The identifier used to be the word `local`, hardcoded, on a
+    /// node that had a real one. This is what says it is not any more.
+    #[tokio::test]
+    async fn nodes_reports_the_cluster_in_identity_order() {
+        let admin = admin_over_a_cluster(vec![
+            peer("cccccccc-0000-7000-8000-000000000000", "edge-c", "up"),
+            peer("aaaaaaaa-0000-7000-8000-000000000000", "edge-a", "down"),
+        ])
+        .await;
+        let response = testing::get(admin.address(), "/api/v1/nodes").await;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("\"total\":3"), "{}", response.body);
+
+        let order: Vec<&str> = ["edge-a", "edge-b", "edge-c"]
+            .into_iter()
+            .filter(|name| response.body.contains(&format!("\"name\":\"{name}\"")))
+            .collect();
+        assert_eq!(order, ["edge-a", "edge-b", "edge-c"], "{}", response.body);
+        let positions: Vec<usize> = ["edge-a", "edge-b", "edge-c"]
+            .into_iter()
+            .map(|name| {
+                response
+                    .body
+                    .find(&format!("\"name\":\"{name}\""))
+                    .expect("every node is listed")
+            })
+            .collect();
+        assert!(
+            positions[0] < positions[1] && positions[1] < positions[2],
+            "the rows must be in identity order: {}",
+            response.body
+        );
+
+        // The peer that is down says so, and this node says which it
+        // is. A version is reported for this node and for no peer.
+        assert!(
+            response.body.contains("\"state\":\"down\""),
+            "{}",
+            response.body
+        );
+        assert_eq!(
+            response.body.matches("\"this_node\":true").count(),
+            1,
+            "{}",
+            response.body
+        );
+        assert_eq!(
+            response.body.matches("\"version\":null").count(),
+            2,
+            "a peer's build is not something membership carries: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("10.0.0.1:7700/edge-a"),
+            "the address a peer advertised is what an operator dials: {}",
+            response.body
+        );
+        admin.shutdown().await;
     }
 
     #[tokio::test]

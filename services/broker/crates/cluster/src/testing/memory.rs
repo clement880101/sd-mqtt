@@ -78,6 +78,18 @@ impl Switch {
         }
     }
 
+    /// Stop answering to `name`.
+    ///
+    /// What lets a test stop a node and start it again under the same
+    /// name, which is how a rejoin is written. Anything still holding
+    /// the old transport simply stops being dialled.
+    pub fn forget(&self, name: &str) {
+        self.listeners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
+    }
+
     /// The valve on what `from` says to `to`, made if it is new.
     ///
     /// On demand and by name, so that a test can sever a pair before

@@ -188,6 +188,7 @@ pub enum Sent {
 pub struct Outgoing {
     queue: mpsc::Sender<Vec<u8>>,
     dropped: Arc<AtomicU64>,
+    dropped_bytes: Arc<AtomicU64>,
     limits: FrameLimits,
 }
 
@@ -208,6 +209,7 @@ pub fn outgoing(config: &LinkConfig) -> (Outgoing, Outbox) {
         Outgoing {
             queue: sender,
             dropped: Arc::new(AtomicU64::new(0)),
+            dropped_bytes: Arc::new(AtomicU64::new(0)),
             limits: config.frames,
         },
         Outbox { queue: receiver },
@@ -232,6 +234,9 @@ impl Outgoing {
     /// peer's doing.
     pub fn send<M: Serialize>(&self, message: &M) -> Result<Sent, FrameError> {
         let frame = encode(message, &self.limits)?;
+        // Weighed before it is handed over, because a frame that was
+        // taken is a frame this no longer owns.
+        let weight = frame.len() as u64;
         match self.queue.try_send(frame) {
             Ok(()) => Ok(Sent::Queued),
             Err(_) => {
@@ -240,6 +245,11 @@ impl Outgoing {
                 // count is read by an operator and by the metrics, and
                 // nothing branches on it.
                 self.dropped.fetch_add(1, Ordering::Relaxed);
+                // And the bytes beside the count, because section 11.3
+                // asks for cluster bytes dropped and a count of
+                // messages is not that: a heartbeat and a replicated
+                // record are two very different losses.
+                self.dropped_bytes.fetch_add(weight, Ordering::Relaxed);
                 Ok(Sent::Dropped)
             }
         }
@@ -253,6 +263,17 @@ impl Outgoing {
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// How many bytes to this peer have been dropped.
+    ///
+    /// Section 11.3's cluster bytes dropped, which is what the metrics
+    /// report. Counted as the frame would have weighed on the wire,
+    /// which is what a byte counter beside bytes sent and received has
+    /// to mean for the three to be comparable.
+    #[must_use]
+    pub fn dropped_bytes(&self) -> u64 {
+        self.dropped_bytes.load(Ordering::Relaxed)
     }
 }
 

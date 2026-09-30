@@ -746,6 +746,33 @@ pub struct Metrics {
     /// two collectors over the same numbers would render every one of
     /// them twice, which a scraper reads as a duplicate series.
     watched: AtomicBool,
+    /// The same, for [`Metrics::watch_cluster`].
+    watching_cluster: AtomicBool,
+}
+
+/// What a running cluster can be asked for, once there is one.
+///
+/// Section 11.3's cluster numbers: **the members gauge, and bytes
+/// sent, received and dropped on the links.** All four were deferred
+/// to milestone 5 and recorded as deferred — a counter that can only
+/// ever read zero says something false rather than something empty,
+/// and a membership of zero is wrong rather than empty because this
+/// node is a member of its own cluster of one.
+///
+/// A trait rather than the mesh itself, for the reason
+/// `sdmqtt_admin::Cluster` is one: what this needs of section 8 is
+/// four numbers, and taking the mesh's type would make this crate
+/// unbuildable without a transport, a handshake and a failure
+/// detector.
+pub trait ClusterMetrics: std::fmt::Debug + Send + Sync + 'static {
+    /// How many nodes this one can see, **itself included**.
+    fn members(&self) -> u64;
+    /// Bytes written to peers.
+    fn bytes_sent(&self) -> u64;
+    /// Bytes read from peers.
+    fn bytes_received(&self) -> u64;
+    /// Bytes never written, because a peer's queue was full.
+    fn bytes_dropped(&self) -> u64;
 }
 
 impl Default for Metrics {
@@ -922,6 +949,7 @@ impl Metrics {
             rule_events,
             rule_waiting,
             watched: AtomicBool::new(false),
+            watching_cluster: AtomicBool::new(false),
         }
     }
 
@@ -943,6 +971,28 @@ impl Metrics {
         self.registry
             .lock()
             .register_collector(Box::new(Live(Arc::downgrade(shared))));
+    }
+
+    /// Register section 11.3's cluster numbers, read from the mesh
+    /// that holds them.
+    ///
+    /// Called only on a node that clusters, which is what keeps the
+    /// four series absent rather than zero on a node that does not:
+    /// "the links are quiet" and "there are no links" are different
+    /// statements, and a scraper cannot tell them apart from a zero.
+    ///
+    /// A strong reference, unlike [`Metrics::watch`]: the mesh does
+    /// not own this registry, so there is no cycle, and a mesh that
+    /// has been shut down still holds the totals its links reached.
+    ///
+    /// Idempotent, for the reason [`Metrics::watch`] is.
+    pub fn watch_cluster(&self, cluster: Arc<dyn ClusterMetrics>) {
+        if self.watching_cluster.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.registry
+            .lock()
+            .register_collector(Box::new(ClusterLive(cluster)));
     }
 
     /// One rule's owned handles.
@@ -1125,22 +1175,15 @@ impl Collector for Live {
         // Each is guarded against drifting from what it counts by a
         // property that walks.
         //
-        // **Cluster members are milestone 5 and are deliberately not
-        // registered at all.** An authentication outcome that will
-        // always be zero until milestone 7 is still a true statement
-        // about this broker; a membership of zero is not, because
-        // this node is a member of its own cluster of one and
-        // reporting none would be wrong rather than empty.
-        //
-        // The same goes for section 11.3's cluster bytes sent,
-        // received and dropped, which are also milestone 5 and are
-        // also absent. There is no inter-node link to count bytes on
-        // until section 8 exists, so the three counters could only
-        // read zero, and zero here would read as "the links are
-        // quiet" rather than "there are no links". Said out loud
-        // because the other two cluster deferrals were recorded and
-        // these three were not, which is the difference between a
-        // decision and an omission.
+        // Section 11.3's cluster members gauge and its three byte
+        // counters used to be listed here as deferred to milestone 5,
+        // with the reason: a membership of zero would be wrong rather
+        // than empty, and three counters that could only read zero
+        // would say "the links are quiet" rather than "there are no
+        // links". They are not deferred any more. They live in
+        // [`ClusterLive`], registered by [`Metrics::watch_cluster`]
+        // **only on a node that clusters**, which is what keeps them
+        // absent rather than zero on a node that does not.
         let connections = shared.outbox_count();
         let (sessions, subscriptions, retained, queued) = shared.with_broker(|broker| {
             (
@@ -1184,6 +1227,52 @@ impl Collector for Live {
             reading.encode(descriptor)?;
         }
 
+        Ok(())
+    }
+}
+
+/// Section 11.3's cluster numbers, read from the mesh at the moment
+/// of the scrape.
+///
+/// Registered only on a node that clusters; see
+/// [`Metrics::watch_cluster`].
+#[derive(Debug)]
+struct ClusterLive(Arc<dyn ClusterMetrics>);
+
+impl Collector for ClusterLive {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        // Itself included, which is what the trait promises: a node
+        // that has lost every peer is a cluster of one, not of none.
+        let members = ConstGauge::new(i64::try_from(self.0.members()).unwrap_or(i64::MAX));
+        let descriptor = encoder.encode_descriptor(
+            "cluster_members",
+            "Nodes in this cluster that this node can see, itself included",
+            None,
+            members.metric_type(),
+        )?;
+        members.encode(descriptor)?;
+
+        for (name, help, value) in [
+            (
+                "cluster_bytes_sent",
+                "Bytes written to cluster peers",
+                self.0.bytes_sent(),
+            ),
+            (
+                "cluster_bytes_received",
+                "Bytes read from cluster peers",
+                self.0.bytes_received(),
+            ),
+            (
+                "cluster_bytes_dropped",
+                "Bytes never written to a cluster peer, because its queue was full",
+                self.0.bytes_dropped(),
+            ),
+        ] {
+            let counter = ConstCounter::new(value);
+            let descriptor = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
+            counter.encode(descriptor)?;
+        }
         Ok(())
     }
 }

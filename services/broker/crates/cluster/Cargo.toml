@@ -48,6 +48,10 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 # the same thing in both places.
 bytes.workspace = true
 thiserror.workspace = true
+# What a mesh says when a peer goes, when a secret is refused and when
+# a link comes up. The same subscriber the binary installs; this crate
+# emits and never configures.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # The redb backend, for the identity tests alone. "Minted once and read

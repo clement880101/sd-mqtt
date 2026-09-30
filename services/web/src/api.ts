@@ -87,13 +87,19 @@ export interface SubscriptionView {
   subscription_id: number | null;
 }
 
-/** A node in this cluster; today there is one. */
+/** A node in this cluster. */
 export interface NodeView {
   id: string;
+  name: string;
+  /** What peers dial to reach it; empty on a node that does not cluster. */
+  address: string;
   this_node: boolean;
+  /** `up`, `suspect` or `down`. */
   state: string;
-  version: string;
-  uptime_seconds: number;
+  /** Null for a peer: membership carries no build. */
+  version: string | null;
+  /** Null for a peer, for the same reason. */
+  uptime_seconds: number | null;
 }
 
 /** What the publish endpoint answers when it accepted a message. */

@@ -19,14 +19,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use broker_core::broker::Broker;
 use clap::{Args, Parser, Subcommand};
-use cluster::NodeIdentity;
+use cluster::membership::MemberState;
+use cluster::mesh::Mesh;
+use cluster::{NodeIdentity, TcpTransport};
 use config::{Config, ConfigError, IngestListener, LogLevel, Overrides};
 use ingest::IngestSocket;
 use rules::live::IngestListening;
 use rules::Ingest;
 use sdmqtt_admin::{
-    listener_list, AdminRunning, AdminServer, AdminStartError, AdminState, ListenerProtocol,
-    ListenerView, Listeners, Readiness, Router,
+    listener_list, AdminRunning, AdminServer, AdminStartError, AdminState, ClusterPeer,
+    ListenerProtocol, ListenerView, Listeners, Readiness, Router,
 };
 use sdmqtt_server::listener::{Running, Server};
 use sdmqtt_server::shared::Shared;
@@ -199,6 +201,144 @@ pub enum StartupError {
     /// next restart — and would be, without saying so.
     #[error("{0}")]
     Identity(#[from] cluster::IdentityError),
+    /// The cluster's own configuration will not do.
+    ///
+    /// Carried verbatim: `cluster::ConfigError` names which of the
+    /// three things is wrong and what to do about it.
+    #[error("{0}")]
+    Cluster(#[from] cluster::ConfigError),
+    /// The cluster listener could not be bound.
+    ///
+    /// Fatal, and for the reason the other listeners' failures are: a
+    /// node whose peers cannot reach it is a node that has joined
+    /// nothing, and discovering that from a membership of zero an hour
+    /// later is worse than not starting.
+    #[error("cannot bind the cluster listener on {address}: {source}")]
+    ClusterListener {
+        /// Where it was asked to bind.
+        address: std::net::SocketAddr,
+        /// Why it could not.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// The mesh, as the two things that read it want it.
+///
+/// One adapter for both, because the two traits are two views of one
+/// set of numbers and a second adapter would be a second place for
+/// them to disagree.
+#[derive(Debug)]
+struct MeshView(Arc<Mesh>);
+
+impl sdmqtt_admin::Cluster for MeshView {
+    fn peers(&self) -> Vec<ClusterPeer> {
+        self.0
+            .members()
+            .into_iter()
+            .map(|member| ClusterPeer {
+                id: member.identity.id().to_string(),
+                name: member.identity.name().to_owned(),
+                address: member.advertised,
+                state: member.state.label(),
+            })
+            .collect()
+    }
+}
+
+impl sdmqtt_server::metrics::ClusterMetrics for MeshView {
+    fn members(&self) -> u64 {
+        // **Itself included.** A node that has lost every peer is a
+        // cluster of one, and reporting none would be wrong rather
+        // than empty.
+        self.0
+            .members()
+            .iter()
+            .filter(|member| member.state == MemberState::Alive)
+            .count() as u64
+            + 1
+    }
+
+    fn bytes_sent(&self) -> u64 {
+        self.0.stats().bytes_sent
+    }
+
+    fn bytes_received(&self) -> u64 {
+        self.0.stats().bytes_received
+    }
+
+    fn bytes_dropped(&self) -> u64 {
+        self.0.stats().bytes_dropped
+    }
+}
+
+/// Who this node is, as the admin API has to report it.
+///
+/// One parameter rather than two, because they are one fact: a node
+/// with no store has neither, a node with a store has an identity, and
+/// only a node that clusters has a mesh.
+struct Node<'a> {
+    /// Section 8.1's identity, on a node that has somewhere to keep
+    /// one.
+    identity: Option<&'a NodeIdentity>,
+    /// Its mesh, on a node that clusters.
+    mesh: Option<&'a Arc<Mesh>>,
+}
+
+/// Start section 8.1's mesh, when this node clusters.
+///
+/// `Ok(None)` is a node with no `cluster.address`, which is the
+/// default and a supported way to run this broker.
+///
+/// **After the store has been read**, because the identity a peer is
+/// told is the one the store holds; `Config::validate` has already
+/// refused clustering without a store, so the identity is always
+/// there by the time this is reached.
+async fn start_cluster(
+    config: &Config,
+    rebuilt: Option<&Rebuilt>,
+) -> Result<Option<Arc<Mesh>>, StartupError> {
+    let Some(address) = config.cluster.address else {
+        if config.cluster.secret.is_some() {
+            // Said out loud. An operator who put the secret in the
+            // environment of every node and forgot the address on one
+            // of them has a node that looks configured and clusters
+            // with nobody.
+            tracing::warn!(
+                "cluster.secret is configured and cluster.address is not, so this node \
+                 does not cluster at all"
+            );
+        }
+        return Ok(None);
+    };
+    let Some(rebuilt) = rebuilt else {
+        // `Config::validate` refuses this, so reaching it means
+        // something went round the file. Refusing again is cheaper
+        // than a node whose identity lasts until its next restart.
+        return Err(StartupError::Cluster(cluster::ConfigError::NoSecret));
+    };
+
+    let settings = config.cluster.settings().check()?;
+    let transport = Arc::new(
+        TcpTransport::bind(&address.to_string())
+            .await
+            .map_err(|source| StartupError::ClusterListener { address, source })?,
+    );
+    let mesh = Mesh::start(
+        rebuilt.identity.clone(),
+        settings,
+        config.cluster.mesh(),
+        transport,
+    );
+    tracing::info!(
+        node = %rebuilt.identity,
+        address = %mesh.address(),
+        advertise = mesh.advertise(),
+        seeds = config.cluster.seeds.len(),
+        cluster = config.cluster.name,
+        "this node is clustering"
+    );
+    Ok(Some(mesh))
 }
 
 /// Wait for whichever stop signal comes first, and name it.
@@ -467,6 +607,7 @@ async fn start_admin(
     listeners: Listeners,
     ingest: &Arc<Ingest>,
     registry: Option<&Arc<rules::live::Registry>>,
+    node: Node<'_>,
 ) -> Result<Option<AdminRunning>, StartupError> {
     if !config.admin.enabled {
         tracing::warn!(
@@ -489,13 +630,29 @@ async fn start_admin(
         }
         return Ok(None);
     }
-    let state = AdminState::new(Arc::clone(running.shared()))
+    let mut state = AdminState::new(Arc::clone(running.shared()))
         .with_readiness(readiness)
         .with_listeners(listeners)
         // Section 11.1 serves rules, and section 9.1 makes one
         // durable metadata, so a node with no store has none to
         // serve. See `sdmqtt_admin::rules`.
         .with_rules(registry.map(Arc::clone));
+    // **Section 8.1's identity, not the word `local`.** A node with no
+    // store has none — its identity is a thing that is written down —
+    // so it keeps the old answer, which is honest: it is the only node
+    // there will ever be in its cluster, and it cannot be in one.
+    if let Some(identity) = node.identity {
+        state = state
+            .with_node_id(identity.id().to_string())
+            .with_node_name(identity.name());
+    }
+    if let Some(mesh) = node.mesh {
+        state = state
+            .with_node_address(mesh.advertise())
+            .with_cluster(Some(
+                Arc::new(MeshView(Arc::clone(mesh))) as Arc<dyn sdmqtt_admin::Cluster>
+            ));
+    }
 
     // Section 9.2: serving the ingest routes here is permitted and
     // must be chosen explicitly. `Router::new()` is the ordinary case.
@@ -649,19 +806,51 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         "sdmqtt is serving MQTT over TCP"
     );
 
+    // Section 8.1's mesh, after the store has been read and after the
+    // listener clients use is up. A peer that connects before the MQTT
+    // listener is bound is no trouble — nothing is forwarded over a
+    // link in this milestone — and binding this one last means a
+    // cluster port already in use is not discovered after the broker
+    // has started answering clients.
+    let mesh = start_cluster(&config, rebuilt.as_ref()).await?;
+    if let Some(mesh) = &mesh {
+        let metrics: Arc<dyn sdmqtt_server::metrics::ClusterMetrics> =
+            Arc::new(MeshView(Arc::clone(mesh)));
+        // Section 11.3's four cluster numbers, registered **only
+        // here**: a node that does not cluster leaves them absent
+        // rather than reporting zero, which is a different statement.
+        running.shared().metrics().watch_cluster(metrics);
+    }
+
     // What this process bound, which nothing can discover: a socket
     // does not know what it is for and the broker does not know a
     // listener exists. The other two listeners add their own rows,
     // the admin one once it knows its port and the ingest one
     // whenever it is bound — which is not only at startup; see
     // `ingest`.
-    let listeners = listener_list(vec![ListenerView {
+    let mut bound = vec![ListenerView {
         name: "mqtt".to_owned(),
         protocol: ListenerProtocol::Mqtt,
         address: running.address(),
         mountpoint: config.listener.mountpoint.clone(),
         max_connections: Some(config.listener.max_connections),
-    }]);
+    }];
+    if let (Some(mesh), Some(address)) = (&mesh, config.cluster.address) {
+        bound.push(ListenerView {
+            name: "cluster".to_owned(),
+            protocol: ListenerProtocol::Cluster,
+            // What was actually bound, port and all, which is not what
+            // was asked for when the port was zero.
+            address: mesh.address().parse().unwrap_or(address),
+            // The advertised address, which is what a peer dials and
+            // is not the bind address. It has nowhere better to go in
+            // this row, and a row that showed only a wildcard bind
+            // would be the one thing an operator cannot use.
+            mountpoint: mesh.advertise().to_owned(),
+            max_connections: None,
+        });
+    }
+    let listeners = listener_list(bound);
 
     // **After the MQTT listener, not before.** An ingest post is a
     // publication, and a publication that reaches subscribers before
@@ -676,6 +865,10 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         Arc::clone(&listeners),
         connectors.ingest(),
         connectors.registry(),
+        Node {
+            identity: rebuilt.as_ref().map(|rebuilt| &rebuilt.identity),
+            mesh: mesh.as_ref(),
+        },
     )
     .await?;
     // All of them, and only once all are bound. A node that said
@@ -703,6 +896,14 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     if let Some(admin) = admin {
         admin.shutdown().await;
         tracing::info!("the admin listener has stopped");
+    }
+    // And the cluster links, before the MQTT listener: a peer that is
+    // told this node has gone can move on, and leaving the links up
+    // while sessions are being torn down would have peers heartbeating
+    // at a broker that is closing.
+    if let Some(mesh) = &mesh {
+        mesh.shutdown();
+        tracing::info!("the cluster links have closed");
     }
     // And the ingest listener beside it, for the same reason: it
     // publishes, so nothing may enter a broker that is being torn

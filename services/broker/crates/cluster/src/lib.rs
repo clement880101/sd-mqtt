@@ -64,12 +64,16 @@ pub mod frame;
 pub mod handshake;
 pub mod identity;
 pub mod link;
+pub mod membership;
+pub mod mesh;
 pub mod testing;
 pub mod transport;
 
-pub use config::{ClusterConfig, ClusterSettings, ConfigError};
+pub use config::{ClusterConfig, ClusterSettings, ConfigError, DEFAULT_CLUSTER_NAME};
 pub use frame::{FrameError, FrameLimits, FRAME_VERSION};
 pub use handshake::{accept, dial, HandshakeError, Peer, Role};
 pub use identity::{IdentityError, NodeId, NodeIdentity, Reconciled};
 pub use link::{outgoing, pump, FrameReader, LinkConfig, LinkError, Outgoing, Sent};
+pub use membership::{Member, MemberState, Membership};
+pub use mesh::{keeper, Mesh, MeshSettings, MeshStats};
 pub use transport::{BoxStream, TcpTransport, Transport};

@@ -67,8 +67,56 @@ identity, and the node reading it would found itself a second time.
   dropped and counted rather than blocking whoever sent them, and the
   link carries on.
 
+- Section 8.1's mesh. A node given `cluster.address` listens for peers,
+  dials its seeds, and forms a full mesh: every link authenticates
+  before it carries anything, a heartbeat every second covers a
+  connection that is open and silent, and reconnection backs off with
+  jitter — harder after a peer refuses the secret, which is a
+  configuration error that will not fix itself.
+- **A node advertises the address peers should dial**, which is not its
+  bind address. `cluster.advertise`, defaulting to the bind address and
+  **required** when that address is a wildcard: a node bound to every
+  interface has no address a peer can use, and nothing can guess which
+  one was meant. It is what lets a node redial a peer it met but was
+  never seeded with.
+- **Two nodes dialling each other at once settle on one link.** The one
+  that survives is the one dialled by the **lower identity**, which
+  both ends work out from the two identities without another message.
+  A link with no rival is never dropped for its role.
+- Section 11.3's four cluster metrics, which were deferred to this
+  milestone and are deferred no longer: `cluster_members`, and
+  `cluster_bytes_sent`, `_received` and `_dropped`. They are registered
+  **only on a node that clusters**, so a node that does not leaves them
+  absent rather than reporting a zero that reads as "the links are
+  quiet".
+- Configuration: a whole `[cluster]` section, and
+  `SDMQTT_CLUSTER_NAME`, `_SECRET`, `_ADDRESS`, `_ADVERTISE` and
+  `_SEEDS` beside it. An empty `SDMQTT_CLUSTER_SECRET` is refused for
+  being empty, as `SDMQTT_ADMIN_TOKEN` is.
+
 ### Changed
 
+- **The admin API reports this node's real identity.** `/api/v1/nodes`
+  answered with the word `local`, hardcoded, on a binary that has had
+  a UUID since the first task of this milestone. It now reports that
+  UUID, the node's name and the address it advertises, and lists every
+  peer beside it in identity order. Two fields changed shape: `version`
+  and `uptime_seconds` are now `null` for a peer, because membership
+  carries an identity and not a build, and reporting this node's
+  version beside a peer's row would be wrong exactly during an upgrade.
+  `/health/cluster` answers what this node can actually see, and says
+  `incomplete` when a peer is missing or merely suspect. A node that
+  does not cluster still answers a cluster of one.
+- **Clustering requires a store, and is refused without one.** A
+  node's identity is minted once and written down; a node with no
+  `storage.directory` would be a new node to its peers after every
+  restart, would own a singleton it had already given up, and would
+  break the uniqueness conflict resolution depends on. Running with no
+  store at all is still a supported mode — asking that node to cluster
+  is not.
+- The cluster greeting moved to version 2 and its transcript to `v2`,
+  because the greeting now carries the advertised address and the
+  transcript covers it. Nothing has shipped that speaks version 1.
 - **Singleton ownership now orders nodes by that UUID.** It ordered
   them by a string whose meaning was this milestone's to decide, and
   the decision is the UUID: the name is for operators and is never

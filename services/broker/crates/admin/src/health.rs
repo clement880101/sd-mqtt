@@ -169,17 +169,40 @@ async fn ready(State(state): State<AdminState>) -> (StatusCode, Json<ReadinessVi
 
 /// Whether this node's view of cluster membership is complete.
 ///
-/// **Membership is milestone 5.** The endpoint is served now, saying
-/// this node is a cluster of one, rather than being left absent: an
-/// operator who points a probe at it today must not have to change
-/// that configuration when clustering lands. A node on its own has a
-/// complete view of its membership by definition, so `complete` here
-/// is the truth and not a placeholder.
-async fn cluster() -> Json<ClusterView> {
+/// `expected` counts this node and every peer it has met; `members`
+/// counts the ones answering. They are equal when nothing is missing,
+/// and the status says `complete` exactly then.
+///
+/// **A node that does not cluster answers a cluster of one**, and that
+/// is the truth rather than a placeholder: it is the only node, and
+/// its view of that is complete. An operator who pointed a probe at
+/// this before clustering existed does not have to change anything
+/// now that it does.
+///
+/// A peer that is suspect counts as missing. That is the point of
+/// having the endpoint separate from readiness: an operator chooses
+/// which one gates traffic, and the stricter reading is the useful one
+/// for the choice that says "do not send me work until I can see
+/// everybody".
+async fn cluster(State(state): State<AdminState>) -> Json<ClusterView> {
+    let Some(cluster) = &state.cluster else {
+        return Json(ClusterView {
+            status: "complete",
+            members: 1,
+            expected: 1,
+        });
+    };
+    let peers = cluster.peers();
+    let expected = peers.len() + 1;
+    let members = peers.iter().filter(|peer| peer.state == "up").count() + 1;
     Json(ClusterView {
-        status: "complete",
-        members: 1,
-        expected: 1,
+        status: if members == expected {
+            "complete"
+        } else {
+            "incomplete"
+        },
+        members,
+        expected,
     })
 }
 
@@ -306,6 +329,85 @@ mod tests {
             200
         );
         running.shutdown().await;
+    }
+
+    /// A node that clusters reports what it can see, and says
+    /// incomplete when it cannot see all of it.
+    ///
+    /// The endpoint answered a cluster of one whatever was true, which
+    /// was correct while membership did not exist and is a placeholder
+    /// now that it does.
+    #[tokio::test]
+    async fn the_cluster_endpoint_reports_what_this_node_can_see() {
+        #[derive(Debug)]
+        struct Peers(Vec<crate::ClusterPeer>);
+        impl crate::Cluster for Peers {
+            fn peers(&self) -> Vec<crate::ClusterPeer> {
+                self.0.clone()
+            }
+        }
+        fn peer(state: &'static str) -> crate::ClusterPeer {
+            crate::ClusterPeer {
+                id: format!("peer-{state}"),
+                name: "edge".to_owned(),
+                address: "10.0.0.2:7700".to_owned(),
+                state,
+            }
+        }
+        async fn serve_with(peers: Vec<crate::ClusterPeer>) -> crate::AdminRunning {
+            let config = AdminConfig {
+                address: "127.0.0.1:0"
+                    .parse::<SocketAddr>()
+                    .expect("a valid address"),
+                ..AdminConfig::default()
+            };
+            let state = AdminState::new(Arc::new(Shared::new(BrokerConfig::default())))
+                .with_cluster(Some(Arc::new(Peers(peers)) as Arc<dyn crate::Cluster>));
+            AdminServer::bind(&config, state)
+                .await
+                .expect("loopback needs no token")
+        }
+
+        let whole = serve_with(vec![peer("up"), peer("up")]).await;
+        let response = testing::get(whole.address(), "/health/cluster").await;
+        assert!(response.body.contains("\"members\":3"), "{}", response.body);
+        assert!(
+            response.body.contains("\"expected\":3"),
+            "{}",
+            response.body
+        );
+        assert!(
+            response.body.contains("\"status\":\"complete\""),
+            "{}",
+            response.body
+        );
+        whole.shutdown().await;
+
+        let broken = serve_with(vec![peer("up"), peer("down")]).await;
+        let response = testing::get(broken.address(), "/health/cluster").await;
+        assert!(response.body.contains("\"members\":2"), "{}", response.body);
+        assert!(
+            response.body.contains("\"expected\":3"),
+            "{}",
+            response.body
+        );
+        assert!(
+            response.body.contains("\"status\":\"incomplete\""),
+            "a node that cannot see a peer does not have a complete view: {}",
+            response.body
+        );
+        broken.shutdown().await;
+
+        // And a peer that is merely suspect counts as missing, which
+        // is the stricter reading this endpoint exists to offer.
+        let unsure = serve_with(vec![peer("suspect")]).await;
+        let response = testing::get(unsure.address(), "/health/cluster").await;
+        assert!(
+            response.body.contains("\"status\":\"incomplete\""),
+            "{}",
+            response.body
+        );
+        unsure.shutdown().await;
     }
 
     /// A broker configured with no store is ready, not forever

@@ -68,7 +68,7 @@ use crate::identity::{NodeId, NodeIdentity};
 /// proof for any other use of the same secret. Versioned, because the
 /// day the transcript's layout changes, the two layouts must not be
 /// able to produce one proof.
-const DOMAIN: &[u8] = b"sd-mqtt cluster handshake v1";
+const DOMAIN: &[u8] = b"sd-mqtt cluster handshake v2";
 
 /// What a greeting starts with, so that something which is not one is
 /// refused as such rather than as a bad proof.
@@ -80,7 +80,15 @@ const GREETING_MAGIC: [u8; 8] = *b"sdmqttcl";
 /// cannot even be greeted must say so before either side has spent
 /// anything, and the frame version is about messages that only flow
 /// once this has succeeded.
-const GREETING_VERSION: u8 = 1;
+///
+/// **Two, because the greeting grew an advertised address.** This is
+/// what that version is for: a build that speaks version one would
+/// read the address's length byte as the first byte of a proof, and
+/// saying so before either side has spent anything is better than
+/// either of them working out what went wrong from a failed
+/// verification. [`DOMAIN`] moved with it, so the two layouts cannot
+/// produce one proof either.
+const GREETING_VERSION: u8 = 2;
 
 /// How many bytes of nonce each side sends.
 ///
@@ -100,7 +108,18 @@ pub const PROOF_BYTES: usize = 32;
 /// this bounds, before anything is trusted.
 const MAX_NAME_BYTES: usize = 255;
 
+/// The longest address a node may advertise.
+///
+/// A byte, as the name is and for the same reason: it is a length a
+/// peer controls, and a greeting is read into a buffer this bounds
+/// before anything in it is trusted.
+const MAX_ADDRESS_BYTES: usize = 255;
+
 /// Magic, version, identity, nonce and the name's length.
+///
+/// The advertised address follows the name and carries its own
+/// length, so it is not in the fixed head: the name's length is not
+/// known until the head has been read.
 const GREETING_HEAD: usize = GREETING_MAGIC.len() + 1 + 16 + NONCE_BYTES + 1;
 
 /// Which end of the link a proof was made by.
@@ -144,6 +163,23 @@ pub struct Greeting {
     pub name: String,
     /// The challenge this end contributes, fresh per connection.
     pub nonce: [u8; NONCE_BYTES],
+    /// The address this node says peers should dial to reach it.
+    ///
+    /// **Not the address this connection came from**, which is a
+    /// source port nothing can dial, and not the bind address either.
+    /// Section 8.1: a node bound to all interfaces, behind a port
+    /// mapping, or behind a test's fault-injection gate has a bind
+    /// address no peer can use, and seeds alone are not enough for a
+    /// full mesh because a node learnt through a seed must publish
+    /// somewhere to reach it.
+    ///
+    /// In the transcript, so it cannot be altered in flight: a middle
+    /// that could rewrite it would redirect every future dial this
+    /// node makes to that peer.
+    ///
+    /// May be empty, which is a node that will not be dialled — it can
+    /// open links and cannot be given one back.
+    pub advertised: String,
 }
 
 impl Greeting {
@@ -155,10 +191,15 @@ impl Greeting {
     /// fails, and [`HandshakeError::NameTooLong`] if this node's own
     /// name will not fit in a greeting. Both are refusals to open a
     /// link rather than a link opened with a nonce that is not one.
-    pub fn mint(identity: &NodeIdentity) -> Result<Self, HandshakeError> {
+    pub fn mint(identity: &NodeIdentity, advertised: &str) -> Result<Self, HandshakeError> {
         if identity.name().len() > MAX_NAME_BYTES {
             return Err(HandshakeError::NameTooLong {
                 length: identity.name().len(),
+            });
+        }
+        if advertised.len() > MAX_ADDRESS_BYTES {
+            return Err(HandshakeError::AddressTooLong {
+                length: advertised.len(),
             });
         }
         let mut nonce = [0_u8; NONCE_BYTES];
@@ -169,21 +210,25 @@ impl Greeting {
             id: identity.id(),
             name: identity.name().to_owned(),
             nonce,
+            advertised: advertised.to_owned(),
         })
     }
 
     /// The greeting, as it goes on the wire.
     fn encode(&self) -> Vec<u8> {
         let name = self.name.as_bytes();
-        let mut out = Vec::with_capacity(GREETING_HEAD + name.len());
+        let advertised = self.advertised.as_bytes();
+        let mut out = Vec::with_capacity(GREETING_HEAD + name.len() + 1 + advertised.len());
         out.extend_from_slice(&GREETING_MAGIC);
         out.push(GREETING_VERSION);
         out.extend_from_slice(&self.id.to_bytes());
         out.extend_from_slice(&self.nonce);
-        // Fits: `mint` refused a longer one, and this is the only way
-        // one is made.
+        // Both fit: `mint` refused anything longer, and this is the
+        // only way one is made.
         out.push(u8::try_from(name.len()).unwrap_or(u8::MAX));
         out.extend_from_slice(name);
+        out.push(u8::try_from(advertised.len()).unwrap_or(u8::MAX));
+        out.extend_from_slice(advertised);
         out
     }
 }
@@ -218,10 +263,19 @@ async fn read_greeting<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Greeting,
     stream.read_exact(&mut name).await?;
     let name = String::from_utf8(name).map_err(|_| HandshakeError::NameNotText)?;
 
+    // A third read, and bounded the same way: one byte of length,
+    // then at most the 255 bytes it can ask for.
+    let mut length = [0_u8; 1];
+    stream.read_exact(&mut length).await?;
+    let mut advertised = vec![0_u8; usize::from(length[0])];
+    stream.read_exact(&mut advertised).await?;
+    let advertised = String::from_utf8(advertised).map_err(|_| HandshakeError::AddressNotText)?;
+
     Ok(Greeting {
         id: NodeId::from_bytes(id),
         name,
         nonce,
+        advertised,
     })
 }
 
@@ -255,6 +309,10 @@ fn transcript(role: Role, cluster: &str, dialler: &Greeting, listener: &Greeting
     out.extend_from_slice(&listener.id.to_bytes());
     prefixed(&mut out, dialler.name.as_bytes());
     prefixed(&mut out, listener.name.as_bytes());
+    // Both advertised addresses, so that a middle cannot rewrite where
+    // either end will be dialled next.
+    prefixed(&mut out, dialler.advertised.as_bytes());
+    prefixed(&mut out, listener.advertised.as_bytes());
     out.extend_from_slice(&dialler.nonce);
     out.extend_from_slice(&listener.nonce);
     out
@@ -314,6 +372,11 @@ pub struct Peer {
     /// The nonce this end contributed, kept so that a caller can tie a
     /// link to the handshake that opened it.
     pub nonce: [u8; NONCE_BYTES],
+    /// The address the peer says it should be dialled at.
+    ///
+    /// Covered by the proof, so it is the address that peer wrote down
+    /// rather than one anybody in the middle preferred.
+    pub advertised: String,
 }
 
 /// Open a link as the end that dialled.
@@ -333,8 +396,9 @@ pub async fn dial<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     config: &ClusterConfig,
     me: &NodeIdentity,
+    advertise: &str,
 ) -> Result<Peer, HandshakeError> {
-    let mine = Greeting::mint(me)?;
+    let mine = Greeting::mint(me, advertise)?;
     stream.write_all(&mine.encode()).await?;
     stream.flush().await?;
 
@@ -358,6 +422,7 @@ pub async fn dial<S: AsyncRead + AsyncWrite + Unpin>(
 
     Ok(Peer {
         identity: NodeIdentity::new(theirs.id, theirs.name),
+        advertised: theirs.advertised,
         nonce: mine.nonce,
     })
 }
@@ -376,11 +441,12 @@ pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     config: &ClusterConfig,
     me: &NodeIdentity,
+    advertise: &str,
 ) -> Result<Peer, HandshakeError> {
     let theirs = read_greeting(stream).await?;
     refuse_ourselves(me, &theirs)?;
 
-    let mine = Greeting::mint(me)?;
+    let mine = Greeting::mint(me, advertise)?;
     stream.write_all(&mine.encode()).await?;
     stream.flush().await?;
 
@@ -401,6 +467,7 @@ pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
 
     Ok(Peer {
         identity: NodeIdentity::new(theirs.id, theirs.name),
+        advertised: theirs.advertised,
         nonce: mine.nonce,
     })
 }
@@ -442,9 +509,18 @@ pub enum HandshakeError {
     /// The peer's advertised name is not text.
     #[error("the peer's name is not valid UTF-8")]
     NameNotText,
+    /// The peer's advertised address is not text.
+    #[error("the peer's advertised address is not valid UTF-8")]
+    AddressNotText,
     /// This node's own name will not fit in a greeting.
     #[error("this node's name is {length} bytes, and a greeting carries at most 255")]
     NameTooLong {
+        /// How long it is.
+        length: usize,
+    },
+    /// The address this node advertises will not fit in a greeting.
+    #[error("this node advertises {length} bytes of address, and a greeting carries at most 255")]
+    AddressTooLong {
         /// How long it is.
         length: usize,
     },
@@ -490,6 +566,9 @@ mod tests {
     use crate::config::ClusterSettings;
     use tokio::io::{duplex, DuplexStream};
 
+    /// What a node in these tests tells a peer to dial.
+    const ADVERTISED: &str = "10.0.0.1:7700";
+
     fn config(secret: &str) -> ClusterConfig {
         ClusterSettings {
             name: "production".to_owned(),
@@ -509,6 +588,7 @@ mod tests {
             id: NodeId::mint(),
             name: name.to_owned(),
             nonce: [nonce; NONCE_BYTES],
+            advertised: ADVERTISED.to_owned(),
         }
     }
 
@@ -538,9 +618,11 @@ mod tests {
         let dialled = {
             let config = config.clone();
             let dialler = dialler.clone();
-            tokio::spawn(async move { dial(&mut dialling_side, &config, &dialler).await })
+            tokio::spawn(
+                async move { dial(&mut dialling_side, &config, &dialler, ADVERTISED).await },
+            )
         };
-        let accepted = accept(&mut accepting_side, &config, &listener)
+        let accepted = accept(&mut accepting_side, &config, &listener, ADVERTISED)
             .await
             .expect("the listener authenticates the dialler");
         let dialled = dialled
@@ -578,7 +660,7 @@ mod tests {
         let accepting = {
             let config = config("the-real-secret");
             let listener = listener.clone();
-            tokio::spawn(async move { accept(&mut honest, &config, &listener).await })
+            tokio::spawn(async move { accept(&mut honest, &config, &listener, ADVERTISED).await })
         };
         let mine = greeting("impostor", 0x11);
         write_all(&mut impostor, &mine.encode()).await;
@@ -608,7 +690,7 @@ mod tests {
         let dialling = {
             let config = config("the-real-secret");
             let dialler = dialler.clone();
-            tokio::spawn(async move { dial(&mut honest, &config, &dialler).await })
+            tokio::spawn(async move { dial(&mut honest, &config, &dialler, ADVERTISED).await })
         };
         let theirs = read_greeting(&mut impostor).await.expect("a greeting");
         let mine = greeting("impostor", 0x22);
@@ -643,7 +725,7 @@ mod tests {
         let accepting = {
             let config = config("a-shared-secret");
             let listener = listener.clone();
-            tokio::spawn(async move { accept(&mut ours, &config, &listener).await })
+            tokio::spawn(async move { accept(&mut ours, &config, &listener, ADVERTISED).await })
         };
 
         let staging = ClusterSettings {
@@ -653,7 +735,7 @@ mod tests {
         .check()
         .expect("usable");
         let dialler = identity("edge-1");
-        let refused = dial(&mut theirs, &staging, &dialler)
+        let refused = dial(&mut theirs, &staging, &dialler, ADVERTISED)
             .await
             .expect_err("a staging node must not join production");
         // The listener refuses and closes, so the dialler sees the
@@ -702,9 +784,11 @@ mod tests {
         let accepting = {
             let config = config.clone();
             let listener = listener.clone();
-            tokio::spawn(async move { accept(&mut accepting_side, &config, &listener).await })
+            tokio::spawn(async move {
+                accept(&mut accepting_side, &config, &listener, ADVERTISED).await
+            })
         };
-        let mine = Greeting::mint(&dialler).expect("a greeting");
+        let mine = Greeting::mint(&dialler, ADVERTISED).expect("a greeting");
         captured.extend_from_slice(&mine.encode());
         write_all(&mut wire, &mine.encode()).await;
         let theirs = read_greeting(&mut wire).await.expect("a greeting");
@@ -722,7 +806,9 @@ mod tests {
         let accepting = {
             let config = config.clone();
             let listener = listener.clone();
-            tokio::spawn(async move { accept(&mut accepting_side, &config, &listener).await })
+            tokio::spawn(async move {
+                accept(&mut accepting_side, &config, &listener, ADVERTISED).await
+            })
         };
         write_all(&mut replay, &captured).await;
         let refused = accepting
@@ -766,7 +852,7 @@ mod tests {
         let dialling = {
             let config = config.clone();
             let honest = honest.clone();
-            tokio::spawn(async move { dial(&mut honest_side, &config, &honest).await })
+            tokio::spawn(async move { dial(&mut honest_side, &config, &honest, ADVERTISED).await })
         };
         let theirs = read_greeting(&mut attacker)
             .await
@@ -818,7 +904,9 @@ mod tests {
         let accepting = {
             let config = config.clone();
             let honest = honest.clone();
-            tokio::spawn(async move { accept(&mut honest_side, &config, &honest).await })
+            tokio::spawn(
+                async move { accept(&mut honest_side, &config, &honest, ADVERTISED).await },
+            )
         };
         write_all(&mut attacker, &mine.encode()).await;
         let _fresh = read_greeting(&mut attacker).await.expect("a greeting");
@@ -854,7 +942,7 @@ mod tests {
         let accepting = {
             let config = config("the-real-secret");
             let listener = listener.clone();
-            tokio::spawn(async move { accept(&mut honest, &config, &listener).await })
+            tokio::spawn(async move { accept(&mut honest, &config, &listener, ADVERTISED).await })
         };
 
         let mine = greeting("impostor", 0x33);
@@ -902,9 +990,9 @@ mod tests {
         let accepting = {
             let config = config.clone();
             let me = me.clone();
-            tokio::spawn(async move { accept(&mut ours, &config, &me).await })
+            tokio::spawn(async move { accept(&mut ours, &config, &me, ADVERTISED).await })
         };
-        let refused_by_dialler = dial(&mut theirs, &config, &twin)
+        let refused_by_dialler = dial(&mut theirs, &config, &twin, ADVERTISED)
             .await
             .expect_err("refused");
         let refused_by_listener = accepting.await.expect("no panic").expect_err("refused");
@@ -932,38 +1020,50 @@ mod tests {
     #[test]
     fn sliding_a_field_boundary_changes_the_transcript() {
         let id = |byte: u8| NodeId::from_bytes([byte; 16]);
-        let make = |cluster: &str, dialler_name: &str, listener_name: &str| {
+        let make = |cluster: &str, names: (&str, &str), addresses: (&str, &str)| {
             transcript(
                 Role::Dialler,
                 cluster,
                 &Greeting {
                     id: id(1),
-                    name: dialler_name.to_owned(),
+                    name: names.0.to_owned(),
                     nonce: [0x01; NONCE_BYTES],
+                    advertised: addresses.0.to_owned(),
                 },
                 &Greeting {
                     id: id(2),
-                    name: listener_name.to_owned(),
+                    name: names.1.to_owned(),
                     nonce: [0x02; NONCE_BYTES],
+                    advertised: addresses.1.to_owned(),
                 },
             )
         };
 
-        // The two names are adjacent in the transcript, which is where
-        // a boundary can actually slide.
+        // Four variable-length fields run consecutively through the
+        // transcript — the cluster name, the two node names and the
+        // two advertised addresses — and every boundary between them
+        // is one a peer can choose where to put.
         let mut seen = std::collections::BTreeSet::new();
-        for (cluster, dialler, listener) in [
-            ("prod", "ab", "c"),
-            ("prod", "a", "bc"),
-            ("prod", "abc", ""),
-            ("prod", "", "abc"),
-            ("pro", "dab", "c"),
-            ("p", "rodab", "c"),
+        for (cluster, names, addresses) in [
+            ("prod", ("ab", "c"), ("xy", "z")),
+            ("prod", ("a", "bc"), ("xy", "z")),
+            ("prod", ("abc", ""), ("xy", "z")),
+            ("prod", ("", "abc"), ("xy", "z")),
+            ("pro", ("dab", "c"), ("xy", "z")),
+            ("p", ("rodab", "c"), ("xy", "z")),
+            // And the same again over the pair the address boundary
+            // sits in, which is the field this version added.
+            ("prod", ("ab", "c"), ("x", "yz")),
+            ("prod", ("ab", "c"), ("xyz", "")),
+            ("prod", ("ab", "c"), ("", "xyz")),
+            // The name and the address next to it, which are adjacent
+            // across the two greetings' halves of the transcript.
+            ("prod", ("ab", "cx"), ("y", "z")),
         ] {
             assert!(
-                seen.insert(make(cluster, dialler, listener)),
+                seen.insert(make(cluster, names, addresses)),
                 "two distinct handshakes produced one transcript: \
-                 cluster {cluster:?}, names {dialler:?} and {listener:?}"
+                 cluster {cluster:?}, names {names:?}, addresses {addresses:?}"
             );
         }
     }
@@ -1023,8 +1123,8 @@ mod tests {
     #[tokio::test]
     async fn a_greeting_round_trips_and_its_nonce_is_fresh() {
         let me = identity("edge-1");
-        let first = Greeting::mint(&me).expect("a greeting");
-        let second = Greeting::mint(&me).expect("another");
+        let first = Greeting::mint(&me, ADVERTISED).expect("a greeting");
+        let second = Greeting::mint(&me, ADVERTISED).expect("another");
         assert_ne!(
             first.nonce, second.nonce,
             "a nonce reused across connections is a captured transcript that works"
@@ -1047,7 +1147,7 @@ mod tests {
             HandshakeError::NotAGreeting
         ));
 
-        let mut wrong_version = Greeting::mint(&identity("edge-1"))
+        let mut wrong_version = Greeting::mint(&identity("edge-1"), ADVERTISED)
             .expect("a greeting")
             .encode();
         wrong_version[GREETING_MAGIC.len()] = GREETING_VERSION + 7;
@@ -1071,10 +1171,10 @@ mod tests {
     fn a_name_too_long_for_a_greeting_is_refused() {
         let long = NodeIdentity::new(NodeId::mint(), "n".repeat(MAX_NAME_BYTES + 1));
         assert!(matches!(
-            Greeting::mint(&long).expect_err("it will not fit"),
+            Greeting::mint(&long, ADVERTISED).expect_err("it will not fit"),
             HandshakeError::NameTooLong { .. }
         ));
         let longest = NodeIdentity::new(NodeId::mint(), "n".repeat(MAX_NAME_BYTES));
-        Greeting::mint(&longest).expect("the longest name that fits, fits");
+        Greeting::mint(&longest, ADVERTISED).expect("the longest name that fits, fits");
     }
 }

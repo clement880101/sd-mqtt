@@ -406,6 +406,65 @@ conflict resolution cannot survive. Start a second node with a store
 directory of its own; a node that receives a greeting carrying its own
 identity refuses the link and says so.
 
+### Joining a cluster
+
+```toml
+[cluster]
+secret = "the-same-on-every-node"   # or SDMQTT_CLUSTER_SECRET
+address = "0.0.0.0:7700"            # where peers connect; unset means no cluster
+advertise = "10.0.0.4:7700"         # what peers should dial
+seeds = ["10.0.0.5:7700", "10.0.0.6:7700"]
+```
+
+**`cluster.address` is the switch.** Without it a node does not
+cluster, which is the default and a perfectly good way to run this
+broker. With it, `cluster.secret` is compulsory: there is no
+unauthenticated mode and no loopback exemption, because a link grants
+session takeover and unauthenticated writes to every replicated
+register. An empty secret is refused for being empty rather than read
+as absent, as an empty `admin.token` is.
+
+**`advertise` is what peers dial, and it is not the bind address.** A
+node bound to every interface, behind a port mapping, or behind a NAT
+has a bind address no peer can use. Left out, the bind address is
+advertised, which is right when you bind one reachable address;
+binding `0.0.0.0` with nothing advertised is refused, because nothing
+here can guess which interface you meant. The address a node
+advertises is also how its peers find it again after a link is lost,
+including peers that were never given it as a seed.
+
+**Clustering needs a store.** A node's identity is minted once and
+written down, so a node with no `storage.directory` would be a new
+node to its peers after every restart. That configuration is refused
+rather than started.
+
+Seeds are where to look, not who is there. A seed list naming this
+node is harmless — the handshake recognises it and the node stops
+dialling itself — so the same file can go on every node. Two nodes
+that dial each other at the same moment settle on **one** link: the
+one dialled by the lower identity, which both ends work out from the
+two identities alone.
+
+Failure detection uses the link. A closed socket is immediate. A
+connection that is open and silent is covered by a heartbeat every
+`heartbeat_ms` (1000): a peer is suspect after `suspect_after` (3)
+missed beats and dead after `dead_after_ms` (10000). A peer declared
+dead over a connection that is still there comes back alive on that
+same connection the moment it speaks again; nothing reconnects.
+`reconnect_min_ms`, `reconnect_max_ms` and `refused_backoff_ms` are
+the backoff, and the last of those is much longer on purpose: a peer
+that refuses the secret is a configuration error that will not fix
+itself.
+
+`SDMQTT_CLUSTER_NAME`, `SDMQTT_CLUSTER_SECRET`,
+`SDMQTT_CLUSTER_ADDRESS`, `SDMQTT_CLUSTER_ADVERTISE` and
+`SDMQTT_CLUSTER_SEEDS` (comma separated) set the same values.
+`cluster.name` is bound into every handshake, so a staging node
+configured with a production secret still cannot join production.
+
+`GET /api/v1/nodes` lists what this node can see, and
+`GET /health/cluster` says whether that view is complete.
+
 ### The admin listener answers to an address, not to a name
 
 ```toml
