@@ -32,8 +32,12 @@ aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"]
 # socket: `AsyncRead` and `AsyncWrite` are what let every test here run
 # over an in-memory pair, which is what section 14 committed to.
 # `sync` is the bounded queue to one peer and `time` is the link's flush
-# deadline; neither is a runtime, which is the binary's to choose.
-tokio = { version = "1", default-features = false, features = ["io-util", "sync", "time"] }
+# deadline. `net` and `rt` arrive with the mesh and its harnesses: a node
+# binds a socket and spawns a task per link, and the gate of
+# `testing::gate` is a listener of its own in front of a real one. The
+# runtime itself is still the binary's to choose; `rt` is the handle a
+# spawn needs, not a reactor this crate starts.
+tokio = { version = "1", default-features = false, features = ["io-util", "sync", "time", "net", "rt"] }
 # What a frame's body is, the same encoder the store uses. One format in
 # the binary rather than two, and the one already pinned by golden
 # vectors derived from postcard's rules.
