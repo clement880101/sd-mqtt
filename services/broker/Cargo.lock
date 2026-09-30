@@ -308,6 +308,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
+name = "cluster"
+version = "0.1.0"
+dependencies = [
+ "storage",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1037,6 +1047,7 @@ dependencies = [
  "base64",
  "broker-core",
  "bytes",
+ "cluster",
  "http-body-util",
  "hyper",
  "hyper-rustls",
@@ -1149,6 +1160,7 @@ dependencies = [
  "brotli",
  "bytes",
  "clap",
+ "cluster",
  "mqtt-codec",
  "rules",
  "sdmqtt-admin",

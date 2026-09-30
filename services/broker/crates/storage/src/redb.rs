@@ -44,16 +44,23 @@ use ::redb::{
 use serde::Serialize;
 
 use crate::record::{
-    decode_exact, BodyRecord, FormatError, FormatMarker, MessageId, OutboxRecord, QueueEntry,
-    Record, SessionKey, SessionRecord,
+    decode_exact, BodyRecord, FormatError, FormatMarker, MessageId, NodeIdentityRecord,
+    OutboxRecord, QueueEntry, Record, SessionKey, SessionRecord,
 };
 use crate::restore::{Restored, RestoredSession};
 use crate::{Rejection, Storage, StorageError, SyncMode};
 
-/// Anything global to the database, of which there is currently one thing.
+/// Anything global to the database, of which there are two things.
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// Where the format marker lives in [`META`].
 const FORMAT_KEY: &str = "format";
+/// Where [`crate::record::NodeIdentityRecord`] lives in [`META`].
+///
+/// A row rather than a table, because there is exactly one of them and
+/// a table keyed by nothing is a table with a key nobody can choose.
+/// Global to the database for the same reason the format marker is: it
+/// is a fact about the store rather than about anything in it.
+const NODE_KEY: &str = "node";
 /// Session key to [`SessionRecord`].
 const SESSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sessions");
 /// Session key and filter, to [`SubscriptionRecord`].
@@ -161,8 +168,17 @@ impl RedbStorage {
         // was found.
         let transaction = database.begin_write().map_err(StorageError::from)?;
         {
-            let mut meta = transaction.open_table(META).map_err(StorageError::from)?;
-            let held = meta
+            // Every table is created here rather than on first use, so
+            // that a read transaction never meets a table that does not
+            // exist and no read path has to pretend a missing table is an
+            // empty one. `meta` comes through the same struct rather than
+            // being opened beside it: redb refuses a second handle on a
+            // table already open in the transaction, so two ways of
+            // reaching one table is a runtime failure waiting for the
+            // first record that uses both.
+            let mut tables = Tables::open(&transaction)?;
+            let held = tables
+                .meta
                 .get(FORMAT_KEY)
                 .map_err(StorageError::from)?
                 .map(|marker| marker.value().to_vec());
@@ -171,15 +187,12 @@ impl RedbStorage {
                     FormatMarker::read(&marker)?;
                 }
                 None => {
-                    meta.insert(FORMAT_KEY, FormatMarker::current().encode().as_slice())
+                    tables
+                        .meta
+                        .insert(FORMAT_KEY, FormatMarker::current().encode().as_slice())
                         .map_err(StorageError::from)?;
                 }
             }
-            // Every table is created here rather than on first use, so
-            // that a read transaction never meets a table that does not
-            // exist and no read path has to pretend a missing table is an
-            // empty one.
-            Tables::open(&transaction)?;
         }
         // Immediate: a store whose marker was not written is a store the
         // next open cannot tell from a foreign file.
@@ -270,6 +283,7 @@ impl Storage for RedbStorage {
             .open_table(RETAINED)
             .map_err(StorageError::from)?;
         let rules = transaction.open_table(RULES).map_err(StorageError::from)?;
+        let meta = transaction.open_table(META).map_err(StorageError::from)?;
 
         let mut restored = Restored::default();
         for entry in sessions.iter().map_err(StorageError::from)? {
@@ -323,6 +337,10 @@ impl Storage for RedbStorage {
             let (_, value) = entry.map_err(StorageError::from)?;
             restored.rules.push(decode(value.value())?);
         }
+        restored.node = match meta.get(NODE_KEY).map_err(StorageError::from)? {
+            Some(held) => Some(decode::<NodeIdentityRecord>(held.value())?),
+            None => None,
+        };
         Ok(restored)
     }
 
@@ -420,6 +438,7 @@ type ByteTable<'txn> = Table<'txn, &'static [u8], &'static [u8]>;
 /// them and the borrow checker is then the thing keeping the transaction
 /// alive, rather than a rule someone has to remember.
 struct Tables<'txn> {
+    meta: Table<'txn, &'static str, &'static [u8]>,
     sessions: ByteTable<'txn>,
     subscriptions: ByteTable<'txn>,
     inbound: Table<'txn, &'static [u8], ()>,
@@ -438,6 +457,7 @@ impl<'txn> Tables<'txn> {
     /// Open them all, creating any that a new database does not have.
     fn open(transaction: &'txn WriteTransaction) -> Result<Self, StorageError> {
         Ok(Self {
+            meta: transaction.open_table(META).map_err(StorageError::from)?,
             sessions: transaction
                 .open_table(SESSIONS)
                 .map_err(StorageError::from)?,
@@ -696,6 +716,14 @@ impl<'txn> Tables<'txn> {
                     .remove(prefix.as_slice())
                     .map_err(StorageError::from)?;
                 remove_prefixed(&mut self.outboxes, &prefix)?;
+            }
+            Record::NodeIdentityPut { identity } => {
+                // Replaced whole, as a rule is by a `RulePut`. One row
+                // in `META`, beside the format marker, because a store
+                // belongs to one node.
+                self.meta
+                    .insert(NODE_KEY, encode(identity).as_slice())
+                    .map_err(StorageError::from)?;
             }
             Record::OutboxAppended { rule, entry } => {
                 let prefix = self.rule_prefix_of(rule)?;

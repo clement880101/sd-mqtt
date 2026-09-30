@@ -658,7 +658,7 @@ mod tests {
                 Arc::clone(&shared),
                 Arc::clone(&store),
                 writer,
-                Arc::new(Membership::alone(NodeId::new("local"))),
+                Arc::new(Membership::alone(NodeId::mint())),
             );
             // The same wiring the binary does, and the reason a rule
             // created below actually fires: without it there is no

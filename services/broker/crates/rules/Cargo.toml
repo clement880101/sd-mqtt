@@ -19,6 +19,13 @@ mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
 # For the reference matcher. Rules sit above the broker rather than
 # beside it, so this direction is the layering and not a cycle.
 broker-core = { path = "../broker-core", version = "0.1.0" }
+# Section 8.1's node identity, which `singleton` orders singleton
+# ownership by. Taken from there rather than declared here: the two
+# places that must agree about which node is lowest are this crate and
+# the cluster's own tie-break, and two types would be two answers.
+# Nothing else of `cluster` is used, and the direction is the layering:
+# `cluster` knows nothing about a rule.
+cluster = { path = "../cluster", version = "0.1.0" }
 # The record vocabulary, with no backend, for the same reason
 # `broker-core` takes it that way: nothing here touches a disk.
 storage = { path = "../storage", version = "0.1.0", default-features = false }

@@ -1551,7 +1551,7 @@ mod tests {
             shared,
             Arc::clone(&store) as Arc<dyn Storage>,
             writer,
-            Arc::new(Membership::alone(NodeId::new("local"))),
+            Arc::new(Membership::alone(NodeId::mint())),
         );
         (registry, store)
     }

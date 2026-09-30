@@ -381,6 +381,31 @@ broker told somebody it had accepted. Turning a connector off while an
 endpoint is down is `enabled = false`, or the disable button, which
 keeps the outbox.
 
+### What this node is called, and what identifies it
+
+```toml
+[node]
+name = "edge-1"        # the default is "local"
+```
+
+**The name is not the identity.** Section 8.1 gives a node a UUID
+minted the first time it starts and stored in its store directory, and
+that UUID is what singleton ownership and every conflict tie-break
+order by. The name is what an operator reads beside it, and nothing
+compares one — two copied configurations share a name, and an ordering
+that is not antisymmetric leaves both sides believing they won.
+
+So changing `node.name` renames the node and does not re-found it: the
+stored UUID does not move. `SDMQTT_NODE_NAME` sets the same value. An
+empty name is refused rather than read as absent, for the reason an
+empty `admin.token` is.
+
+**A node is its store directory.** Copying one, image and all, copies
+the UUID with it, and two nodes with one identity is the thing
+conflict resolution cannot survive. Start a second node with a store
+directory of its own; a node that receives a greeting carrying its own
+identity refuses the link and says so.
+
 ### The admin listener answers to an address, not to a name
 
 ```toml

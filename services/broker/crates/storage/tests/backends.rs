@@ -32,9 +32,9 @@ use std::collections::BTreeSet;
 
 use storage::{
     ActionRecord, BodyRecord, DeliveryRecord, HttpOutRecord, InflightRecord, InflightState,
-    MessageId, OutboxRecord, ProtocolVersion, Qos, QueueEntry, Record, Rejection, Restored,
-    RestoredSession, RetainHandling, RetainedRecord, RuleRecord, SessionKey, SessionRecord,
-    Storage, StorageError, SubscriptionRecord, TriggerRecord,
+    MessageId, NodeIdentityRecord, OutboxRecord, ProtocolVersion, Qos, QueueEntry, Record,
+    Rejection, Restored, RestoredSession, RetainHandling, RetainedRecord, RuleRecord, SessionKey,
+    SessionRecord, Storage, StorageError, SubscriptionRecord, TriggerRecord,
 };
 
 /// The contract, as functions over any backend.
@@ -1645,6 +1645,59 @@ mod contract {
         );
     }
 
+    // ---- this node's own identity ----------------------------------------
+
+    /// Section 8.1's node identity: absent until something says, then
+    /// held, and a rename moves the name and nothing else.
+    ///
+    /// The last part is the one worth having. An operator renaming a
+    /// node must not re-found it, and a store that replaced the row
+    /// with whatever the put carried would be fine here — which is
+    /// why the put below carries the *same* UUID and a different name,
+    /// and the assertion is on both fields rather than on the name.
+    /// What stops a caller minting a second UUID is `cluster`, and its
+    /// own tests say so.
+    pub fn the_node_identity_is_held_and_renamed_without_re_founding<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = new();
+        assert_eq!(
+            restore(&store).node,
+            None,
+            "a store that has never been told who it is says so, rather than \
+             guessing"
+        );
+
+        let minted = NodeIdentityRecord {
+            uuid: [
+                0x01, 0x93, 0x4e, 0x3a, 0x7c, 0x10, 0x70, 0x00, 0x80, 0x00, 0x0a, 0x0b, 0x0c, 0x0d,
+                0x0e, 0x0f,
+            ],
+            name: "edge-1".to_owned(),
+        };
+        apply(
+            &store,
+            &[Record::NodeIdentityPut {
+                identity: minted.clone(),
+            }],
+        );
+        assert_eq!(restore(&store).node, Some(minted.clone()));
+
+        let renamed = NodeIdentityRecord {
+            name: "edge-one".to_owned(),
+            ..minted.clone()
+        };
+        apply(
+            &store,
+            &[Record::NodeIdentityPut {
+                identity: renamed.clone(),
+            }],
+        );
+        let held = restore(&store).node.expect("the store still knows");
+        assert_eq!(held.name, "edge-one", "the operator's rename took");
+        assert_eq!(held.uuid, minted.uuid, "and it did not re-found the node");
+    }
+
     // ---- rules -----------------------------------------------------------
 
     /// Rules are held, replaced whole, and removed. Section 9.1.
@@ -2288,6 +2341,7 @@ macro_rules! every_contract_test {
             an_outbox_survives_an_edit_and_goes_with_a_delete,
             removing_an_envelope_does_not_release_the_body_it_named,
             a_body_can_be_read_back_on_its_own,
+            the_node_identity_is_held_and_renamed_without_re_founding,
             a_flush_keeps_everything_and_leaves_the_store_usable,
         }
     };

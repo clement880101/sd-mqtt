@@ -9,6 +9,11 @@ description = "A distributed MQTT broker"
 
 [dependencies]
 sdmqtt-server = { path = "../server", version = "0.1.0" }
+# Section 8.1's node identity, minted or read back at startup. Already
+# in the binary through `rules`, which orders singleton ownership by
+# it; named here because this crate is the one that decides when it is
+# minted and writes it down.
+cluster = { path = "../cluster", version = "0.1.0" }
 sdmqtt-admin = { path = "../admin", version = "0.1.0" }
 broker-core = { path = "../broker-core", version = "0.1.0" }
 # The rules and the outbound connector. This is where the HTTP client

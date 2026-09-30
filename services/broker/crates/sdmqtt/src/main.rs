@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use broker_core::broker::Broker;
 use clap::{Args, Parser, Subcommand};
+use cluster::NodeIdentity;
 use config::{Config, ConfigError, IngestListener, LogLevel, Overrides};
 use ingest::IngestSocket;
 use rules::live::IngestListening;
@@ -190,6 +191,14 @@ pub enum StartupError {
     /// this milestone exists to make trustworthy.
     #[error("cannot start a rule: {0}")]
     Connector(String),
+    /// This node's identity could not be established.
+    ///
+    /// Fatal. Section 8.1 makes the identity the thing singleton
+    /// ownership and every conflict tie-break order by, so a node that
+    /// cannot write down who it is would be a different node after the
+    /// next restart — and would be, without saying so.
+    #[error("{0}")]
+    Identity(#[from] cluster::IdentityError),
 }
 
 /// Wait for whichever stop signal comes first, and name it.
@@ -280,6 +289,12 @@ struct Rebuilt {
     store: Arc<dyn Storage>,
     /// What a rule's hook and pump write through.
     writer: Arc<Writer>,
+    /// Who this node is, section 8.1.
+    ///
+    /// Read out of the same restore as everything else and minted here
+    /// if the store has never held one, which is what makes a store
+    /// directory and a node the same thing.
+    identity: NodeIdentity,
 }
 
 /// The same, against a store somebody else opened.
@@ -299,6 +314,22 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, Sta
     // surviving.
     let now = now_seconds();
     let restored = store.restore().map_err(StartupError::Restore)?;
+
+    // Section 8.1, and before anything else is decided: who this node
+    // is. Out of the restore that has just been read rather than out of
+    // a second one, and written back only when there is something to
+    // say — a founding, or an operator's rename.
+    let reconciled =
+        NodeIdentity::adopt(store.as_ref(), restored.node.as_ref(), &config.node.name)?;
+    if reconciled.founded {
+        tracing::info!(
+            node = %reconciled.identity,
+            "this store had no identity, so one was minted; it is this node's \
+             for the life of the store directory"
+        );
+    } else {
+        tracing::info!(node = %reconciled.identity, "this node");
+    }
 
     let mut broker = Broker::new(config.server().broker);
     let report = broker_core::restore::restore(&mut broker, &restored, now);
@@ -416,6 +447,7 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, Sta
         shared: Arc::new(Shared::with_store(broker, Arc::clone(&writer))),
         store,
         writer,
+        identity: reconciled.identity,
     })
 }
 
@@ -594,7 +626,14 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     // rule here always has somewhere durable to put an envelope.
     let connectors = match &rebuilt {
         Some(rebuilt) => {
-            connectors::start(&config, &shared, &rebuilt.store, &rebuilt.writer).await?
+            connectors::start(
+                &config,
+                &shared,
+                &rebuilt.store,
+                &rebuilt.writer,
+                rebuilt.identity.id(),
+            )
+            .await?
         }
         None => connectors::start_without_rules(),
     };

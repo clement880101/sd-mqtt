@@ -30,8 +30,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, PoisonError};
 
 use crate::record::{
-    BodyRecord, InflightRecord, MessageId, OutboxRecord, QueueEntry, Record, RetainedRecord,
-    RuleRecord, SessionKey, SessionRecord, SubscriptionRecord,
+    BodyRecord, InflightRecord, MessageId, NodeIdentityRecord, OutboxRecord, QueueEntry, Record,
+    RetainedRecord, RuleRecord, SessionKey, SessionRecord, SubscriptionRecord,
 };
 use crate::restore::{Restored, RestoredSession};
 use crate::{Rejection, Storage, StorageError};
@@ -78,6 +78,10 @@ struct State {
     retained: BTreeMap<String, RetainedRecord>,
     /// Rules by identifier, ordered so that restore is deterministic.
     rules: BTreeMap<String, RuleRecord>,
+    /// Who this node is, once something has said. Section 8.1.
+    ///
+    /// One row rather than a table: a store belongs to one node.
+    node: Option<NodeIdentityRecord>,
     /// Each rule's outbox, by the same identifier.
     ///
     /// Beside the rules rather than inside a rule's own entry, because a
@@ -330,6 +334,15 @@ impl State {
                     entry.next_attempt_at = *next_attempt_at;
                 }
             }
+            Record::NodeIdentityPut { identity } => {
+                // Replaced whole, as a rule is by a `RulePut`: the
+                // identity is whatever the last put said it was. What
+                // must not happen — a fresh UUID minted over one that
+                // already exists — is the caller's to prevent, and
+                // `Record::NodeIdentityPut` says why it is not the
+                // store's.
+                self.node = Some(identity.clone());
+            }
             Record::OutboxRemoved { rule, sequence } => {
                 let held = self.outbox_mut(rule)?;
                 // Only what was actually there is subtracted, for the
@@ -399,6 +412,7 @@ impl Storage for MemoryStorage {
                 .map(|(id, held)| (*id, held.body.clone()))
                 .collect::<HashMap<_, _>>(),
             rules: state.rules.values().cloned().collect(),
+            node: state.node.clone(),
         })
     }
 

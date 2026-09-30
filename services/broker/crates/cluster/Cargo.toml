@@ -1,0 +1,31 @@
+[package]
+name = "cluster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Node identity, the authenticated link and the membership view for sd-mqtt"
+
+[dependencies]
+# The record vocabulary and nothing that touches a disk, for the reason
+# `broker-core` takes it that way: which engine a node's identity is
+# written to is the binary's choice and nothing this crate can see.
+storage = { path = "../storage", version = "0.1.0", default-features = false }
+# Section 8.1's identity is a UUID v7. The same features `broker-core`
+# names, and the same crate: a second version 7 generator in one binary
+# would be two answers to what a fresh identifier looks like.
+uuid = { version = "1", default-features = false, features = ["v7", "std"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+# The redb backend, for the identity tests alone. "Minted once and read
+# back unchanged across a restart" is a claim about a file, and the
+# in-memory backend answers it with a store that cannot be reopened.
+# Dev only: nothing this crate ships gains redb.
+storage = { path = "../storage", version = "0.1.0", features = ["redb"] }
+# The directory those stores live in, thrown away with them.
+tempfile.workspace = true
+
+[lints]
+workspace = true

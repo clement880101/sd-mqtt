@@ -105,15 +105,17 @@ mod golden {
     #[test]
     fn the_format_marker() {
         // A fixed-size array is its elements with no length prefix, and a
-        // u16 is a varint, so version 4 is one byte. The version moved
+        // u16 is a varint, so version 5 is one byte. The version moved
         // from 1 when the reference count of a body left the body's own
-        // row, from 2 when rules were added, and from 3 when each rule
-        // gained an outbox: a version 3 store has no outbox table at
+        // row, from 2 when rules were added, from 3 when each rule
+        // gained an outbox — a version 3 store has no outbox table at
         // all and would come up looking healthy with every undelivered
-        // envelope missing.
+        // envelope missing — and from 4 when the node's own identity
+        // was stored, because a store from before it holds none and the
+        // node reading it would mint a second UUID for itself.
         let expected: &[u8] = &[
             b's', b'd', b'm', b'q', b't', b't', b's', b't', // magic "sdmqttst"
-            0x04, // version 4
+            0x05, // version 5
         ];
         assert_eq!(FormatMarker::current().encode(), expected);
         assert_eq!(
@@ -710,6 +712,36 @@ mod golden {
             &Record::OutboxRemoved {
                 rule: "telemetry".to_owned(),
                 sequence: 300,
+            },
+            expected,
+        );
+    }
+
+    /// Section 8.1's identity.
+    ///
+    /// The UUID is a fixed-size array, so postcard writes its sixteen
+    /// bytes with no length prefix; the name is a varint length and
+    /// then the bytes. The two are distinguishable in this vector —
+    /// sixteen bytes that are not ASCII, then a length that is — so a
+    /// transposition of the fields would not decode at all, let alone
+    /// decode to something else.
+    #[test]
+    fn node_identity_put() {
+        let expected: &[u8] = &[
+            0x13, // Record::NodeIdentityPut is variant 19
+            0x01, 0x93, 0x4e, 0x3a, 0x7c, 0x10, 0x70, 0x00, // uuid, sixteen bytes
+            0x80, 0x00, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, //
+            0x06, b'e', b'd', b'g', b'e', b'-', b'1', // name "edge-1"
+        ];
+        pins(
+            &Record::NodeIdentityPut {
+                identity: NodeIdentityRecord {
+                    uuid: [
+                        0x01, 0x93, 0x4e, 0x3a, 0x7c, 0x10, 0x70, 0x00, 0x80, 0x00, 0x0a, 0x0b,
+                        0x0c, 0x0d, 0x0e, 0x0f,
+                    ],
+                    name: "edge-1".to_owned(),
+                },
             },
             expected,
         );

@@ -602,10 +602,44 @@ pub struct Log {
     pub level: LogLevel,
 }
 
+/// The node section, section 8.1.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Node {
+    /// What an operator calls this node.
+    ///
+    /// **Not what identifies it.** Section 8.1 gives a node a UUID
+    /// minted on first start and persisted, and that is what singleton
+    /// ownership and every conflict tie-break order by; this is the
+    /// name printed beside it. Two nodes may share a name — two copied
+    /// configurations do — and nothing compares one.
+    ///
+    /// Changing it renames the node and does not re-found it: the
+    /// stored UUID does not move. See `cluster::NodeIdentity`.
+    pub name: String,
+}
+
+/// The default node name.
+///
+/// The same word the admin API has always reported as the only row in
+/// its node listing, so a configuration that says nothing reads the
+/// same as it did before there was anything to say.
+const DEFAULT_NODE_NAME: &str = "local";
+
+impl Default for Node {
+    fn default() -> Self {
+        Self {
+            name: DEFAULT_NODE_NAME.to_owned(),
+        }
+    }
+}
+
 /// What the three sources add up to.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
+    /// The node section.
+    pub node: Node,
     /// The listener section.
     pub listener: Listener,
     /// The broker section.
@@ -727,6 +761,19 @@ impl Config {
         // documents zero as "no ceiling", and either meaning is arguable
         // here, which is the argument for making the operator say which
         // they meant instead of guessing.
+        // A name an operator can read is the whole point of having a
+        // name beside the identifier, and an empty one is a log line
+        // that says a node is called nothing. Refused rather than
+        // filled in, for the reason the empty admin token is: one
+        // value, one reading, whichever source it came from.
+        if self.node.name.is_empty() {
+            return Err(ConfigError::Unusable {
+                key: "node.name",
+                value: String::new(),
+                why: "a node's name is what an operator reads beside its identifier; \
+                      leave the key out to take the default",
+            });
+        }
         if self.broker.max_inflight == 0 {
             return Err(ConfigError::Unusable {
                 key: "broker.max_inflight",
@@ -1007,6 +1054,12 @@ impl Config {
         }
         if let Some(value) = lookup("SDMQTT_LOG") {
             self.log.level = parse("SDMQTT_LOG", &value, "log level")?;
+        }
+        if let Some(value) = lookup("SDMQTT_NODE_NAME") {
+            // Kept whatever it says, empty included, so that
+            // `validate` is the one place that refuses it — the rule
+            // `SDMQTT_ADMIN_TOKEN` above is written out at length for.
+            self.node.name = value;
         }
         Ok(())
     }
@@ -3065,6 +3118,45 @@ mod tests {
             "and refused with the same sentence, so an operator reading one \
              log line learns the same thing either way"
         );
+    }
+
+    /// Section 8.1's node name: a default, an override, and a refusal.
+    ///
+    /// The name is not the identity — the stored UUID is — so this is
+    /// about what an operator reads, and the one thing that can go
+    /// wrong with it is an environment variable that expanded to
+    /// nothing. Refused rather than read as absent, which is the rule
+    /// `an_empty_token_is_refused_wherever_it_came_from` records.
+    #[test]
+    fn the_node_name_defaults_can_be_set_and_may_not_be_empty() {
+        assert_eq!(
+            Config::from_toml("")
+                .expect("an empty file is a valid one")
+                .node
+                .name,
+            "local",
+            "a configuration that says nothing reads as it always did"
+        );
+
+        let named = Config::from_toml("[node]\nname = \"edge-1\"\n").expect("it parses");
+        named.validate().expect("a name is usable");
+        assert_eq!(named.node.name, "edge-1");
+
+        let mut from_the_environment = Config::default();
+        from_the_environment
+            .apply_env(|variable| (variable == "SDMQTT_NODE_NAME").then(|| "edge-2".to_owned()))
+            .expect("it is read");
+        assert_eq!(from_the_environment.node.name, "edge-2");
+
+        let mut emptied = Config::default();
+        emptied
+            .apply_env(|variable| (variable == "SDMQTT_NODE_NAME").then(String::new))
+            .expect("reading it is not the error; what it says is");
+        let said = emptied
+            .validate()
+            .expect_err("a node called nothing is not a node")
+            .to_string();
+        assert!(said.contains("node.name"), "{said}");
     }
 
     /// `--no-admin` absent must not turn a disabled listener back on.

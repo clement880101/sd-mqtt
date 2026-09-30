@@ -7,6 +7,59 @@ milestones, which is what this project actually ships in.
 **The one thing to read before upgrading is "Before you upgrade" under
 the milestone you are moving to.** Everything else is description.
 
+## Unreleased — milestone 5: the cluster mesh
+
+### Before you upgrade: a store written before this milestone is refused
+
+**A broker built from this milestone will not open a store written by
+milestone 4. It refuses to start, and says so:**
+
+```
+store format version 4 is not readable by this build, which reads version 5.
+The store is not damaged; it was written by a different build. Nothing is
+released yet, so there is no migration: see CHANGELOG.md for what moved and
+what starting with a fresh store directory throws away.
+```
+
+The file is not damaged and the check is **exact rather than a
+range**, for the reason the milestone 4 section below gives at length:
+reading healthy bytes with the wrong layout restores nonsense.
+
+**What to do.** Stop the broker, move or delete the store directory
+(`storage.directory`, holding `sdmqtt.redb`), and start the new build,
+which creates a fresh store. What that throws away is what the store
+held, and the list is the one in the milestone 4 section — durable
+sessions, queued messages, retained messages, wills, rules and
+outboxes — **with one addition: this node's identity.** A fresh store
+mints a fresh UUID, so as far as the rest of a cluster is concerned
+the node that comes back is a new one. Nothing else in a cluster
+depends on that yet, because nothing joins one yet; it will.
+
+**Why the version moved.** Section 8.1 gives each node a stable
+identity — a UUID v7 minted on first start and a name beside it — and
+it is stored, because a node that minted a new one on every restart
+would stop being the node its peers know without ever saying so. That
+added one record variant, a record to go in it, and one global row in
+each backend. A version 4 store opened by this build holds no
+identity, and the node reading it would found itself a second time.
+
+### Added
+
+- Section 8.1's node identity: a UUID v7 and a name, minted on first
+  start and read back unchanged afterwards. Renaming a node moves the
+  name and not the UUID. See `[node]` in `README.md` and
+  `SDMQTT_NODE_NAME`.
+
+### Changed
+
+- **Singleton ownership now orders nodes by that UUID.** It ordered
+  them by a string whose meaning was this milestone's to decide, and
+  the decision is the UUID: the name is for operators and is never
+  compared, because two copied configurations share one. The type that
+  orders now carries no name at all, so the comparison section 8.1
+  forbids is one that does not compile. Nothing an operator can see
+  changes while there is one node.
+
 ## Unreleased — milestone 4: the hook interface and four connectors
 
 ### Before you upgrade: a store written before this milestone is refused

@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 
 use crate::record::{
-    BodyRecord, InflightRecord, MessageId, QueueEntry, RetainedRecord, RuleRecord, SessionRecord,
-    SubscriptionRecord,
+    BodyRecord, InflightRecord, MessageId, NodeIdentityRecord, QueueEntry, RetainedRecord,
+    RuleRecord, SessionRecord, SubscriptionRecord,
 };
 
 /// Everything needed to rebuild the broker, read once at startup.
@@ -88,6 +88,17 @@ pub struct Restored {
     /// hand back the same value and the restart property can compare them
     /// as one equality.
     pub rules: Vec<RuleRecord>,
+    /// Who this node is, if the store has ever been told.
+    ///
+    /// `None` for a store that has never held an identity, which is a
+    /// store starting for the first time. Section 8.1 mints one then;
+    /// **the store does not mint it**, because minting is a decision
+    /// about a cluster and this crate knows nothing about one.
+    ///
+    /// Read back here rather than through a call of its own so that
+    /// startup reads the store once. It is one row, and it is wanted at
+    /// exactly the moment everything else is.
+    pub node: Option<NodeIdentityRecord>,
 }
 
 /// One session and everything that belongs to it.

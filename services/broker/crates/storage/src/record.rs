@@ -73,7 +73,17 @@ use serde::{Deserialize, Serialize};
 /// opened by this build would come up with every rule's outbox empty,
 /// which is not an empty outbox but an undelivered message nobody will
 /// ever look for again.
-pub const FORMAT_VERSION: u16 = 4;
+///
+/// Version 5 added the node's own identity, section 8.1: one variant at
+/// the end of [`Record`], a [`NodeIdentityRecord`] to go in it, and one
+/// global row in each backend. The same argument again, and the sharpest
+/// instance of it yet — **a version 4 store opened by this build holds
+/// no identity, so this node would mint a new UUID and stop being the
+/// node its peers already know.** Section 8.1 makes that identity the
+/// thing singleton ownership and every conflict tie-break order by, so a
+/// silent re-founding is not a node that lost a name; it is two answers
+/// to "which node" separated by a restart.
+pub const FORMAT_VERSION: u16 = 5;
 
 /// What every sd-mqtt store begins with, so a file that is not one is
 /// refused as such rather than as a corrupt store.
@@ -781,6 +791,38 @@ pub struct OutboxRecord {
     pub next_attempt_at: u32,
 }
 
+/// Who this node is, section 8.1.
+///
+/// Minted on first start and read back unchanged for the life of the
+/// store. There is one of these per store, not one per anything else:
+/// it names the process's whole identity in the cluster.
+///
+/// # The UUID is stored as its bytes, and the name beside it
+///
+/// **[`Self::uuid`] is the identity everything orders by** and
+/// [`Self::name`] is for operators and is never compared. Section 8.1
+/// gives the reason in one sentence: two copied configurations share a
+/// name, and a comparison that is not antisymmetric leaves both sides
+/// believing they won.
+///
+/// The sixteen bytes rather than the canonical text, because the text
+/// is a rendering of them and storing a rendering invites a reader that
+/// parses it differently. The bytes are in the order the specification
+/// lays a UUID out, which is what `Uuid::as_bytes` gives and what
+/// `Uuid::from_bytes` takes back, so the ordering the cluster relies on
+/// is the ordering of these bytes.
+///
+/// An operator may rename a node; the UUID does not move when they do.
+/// That is the whole reason the two are separate fields rather than one
+/// string: a rename must not re-found the node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeIdentityRecord {
+    /// The UUID v7 that names this node, as its sixteen bytes.
+    pub uuid: [u8; 16],
+    /// What an operator calls it. Never compared.
+    pub name: String,
+}
+
 /// A message held for future subscribers to a topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedRecord {
@@ -963,6 +1005,22 @@ pub enum Record {
         /// Which envelope.
         sequence: u64,
     },
+    /// Who this node is, section 8.1.
+    ///
+    /// One record for minting and for renaming, as [`Record::RulePut`]
+    /// is one record for creating and for editing: the identity is
+    /// whatever the last put said it was.
+    ///
+    /// **The store does not decide when one of these is written.** It
+    /// holds what it is given, and the caller is the one place that
+    /// knows an identity already exists and must not be replaced with a
+    /// fresh one; see `cluster::NodeIdentity`. A store that refused a
+    /// put whose UUID differed would be a second opinion about the same
+    /// rule, in the layer that cannot see why the caller is asking.
+    NodeIdentityPut {
+        /// Who this node is.
+        identity: NodeIdentityRecord,
+    },
 }
 
 impl Record {
@@ -1089,6 +1147,10 @@ impl Record {
             // carries it and is weighed on its own.
             Self::OutboxAppended { rule, entry } => rule.len() + entry.client_id.len(),
             Self::OutboxAttempted { rule, .. } | Self::OutboxRemoved { rule, .. } => rule.len(),
+            // An operator's string, and the only variable thing here:
+            // the UUID is sixteen bytes counted by the record's own
+            // footprint.
+            Self::NodeIdentityPut { identity } => identity.name.len(),
         };
         std::mem::size_of::<Self>() + variable
     }

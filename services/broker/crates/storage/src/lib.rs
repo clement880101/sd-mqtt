@@ -31,10 +31,10 @@ pub use memory::MemoryStorage;
 
 pub use record::{
     ActionRecord, BodyRecord, DeliveryRecord, FormatError, FormatMarker, HttpInRecord,
-    HttpOutRecord, InflightRecord, InflightState, MessageId, OutboxRecord, ProtocolVersion, Qos,
-    QueueEntry, Record, RetainHandling, RetainedRecord, RuleRecord, Secret, SessionKey,
-    SessionRecord, SubscriptionRecord, TopicFromRecord, TopicFromRequestRecord, TriggerRecord,
-    WillRecord, FORMAT_MAGIC, FORMAT_VERSION,
+    HttpOutRecord, InflightRecord, InflightState, MessageId, NodeIdentityRecord, OutboxRecord,
+    ProtocolVersion, Qos, QueueEntry, Record, RetainHandling, RetainedRecord, RuleRecord, Secret,
+    SessionKey, SessionRecord, SubscriptionRecord, TopicFromRecord, TopicFromRequestRecord,
+    TriggerRecord, WillRecord, FORMAT_MAGIC, FORMAT_VERSION,
 };
 pub use restore::{Restored, RestoredSession};
 pub use writer::{Applied, Durable, NotDurable, Writer, WriterConfig, WriterStopped};
