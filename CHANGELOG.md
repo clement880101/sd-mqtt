@@ -84,6 +84,17 @@ already holds the winner.
     holds, not from zero.** The reading rides in the same batch as the
     write it stamps, so a stamp that survived a crash has its mark
     beside it and a stamp that did not was shown to nobody.
+- Section 8.2's last-writer-wins register, which is how two nodes
+  resolve a conflict without talking about it: a value, a stamp, and
+  whether the value is there at all. The order is the reading's
+  milliseconds, then its counter, then the writing node's UUID bytes,
+  and all three are load-bearing — milliseconds alone leave two nodes
+  that wrote in the same millisecond each keeping their own, the
+  counter is what stops a node being ambiguous with itself, and the
+  identity is what breaks the tie that is left. **A deletion is a
+  tombstone competing by that same comparison and not a special case**:
+  "a delete always wins" diverges, because two nodes that saw a delete
+  and a later write in different orders keep different things.
 - Section 8.1's node identity: a UUID v7 and a name, minted on first
   start and read back unchanged afterwards. Renaming a node moves the
   name and not the UUID. See `[node]` in `README.md` and

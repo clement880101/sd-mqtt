@@ -52,6 +52,16 @@
 //! same reason: convergence is conditional on no two writes ever sharing
 //! a stamp.
 //!
+//! # One merge function, and a tombstone is not a special case
+//!
+//! [`register`] is section 8.2's last-writer-wins register: a value, a
+//! [`Stamp`], and whether the value is there at all. An absent value is
+//! a tombstone and competes by the same comparison as any other, because
+//! "a delete always wins" diverges — two nodes that saw a delete and a
+//! later write in different orders keep different things. So there is one
+//! merge function and no path through it that asks whether either side
+//! is a tombstone.
+//!
 //! # And it is opened over something, which is not always a socket
 //!
 //! [`transport`] is the seam. Section 14 committed to three nodes in
@@ -79,6 +89,7 @@ pub mod identity;
 pub mod link;
 pub mod membership;
 pub mod mesh;
+pub mod register;
 pub mod testing;
 pub mod transport;
 
@@ -90,4 +101,5 @@ pub use identity::{IdentityError, NodeId, NodeIdentity, Reconciled};
 pub use link::{outgoing, pump, FrameReader, LinkConfig, LinkError, Outgoing, Sent};
 pub use membership::{Member, MemberState, Membership};
 pub use mesh::{keeper, Mesh, MeshSettings, MeshStats};
+pub use register::{Register, Stamp};
 pub use transport::{BoxStream, TcpTransport, Transport};
