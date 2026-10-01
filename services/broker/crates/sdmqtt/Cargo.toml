@@ -42,6 +42,11 @@ tempfile.workspace = true
 # `tests/restart.rs` speaks MQTT to the binary over a real socket, and
 # the codec reads and writes through `BytesMut`.
 bytes.workspace = true
+# `tests/cluster.rs` reads the admin API's node listing, which is a
+# document with an envelope around it: a substring search would pass
+# against a page that named the right node in the wrong field. Already
+# in the binary through the admin crate, so this costs no new crate.
+serde_json = { version = "1", default-features = false, features = ["std"] }
 # `tests/interface.rs` asks the binary for the interface as brotli and
 # has to prove the bytes really are brotli. A decoder says so; a
 # content-encoding header does not. Dev only, so nothing of it ships.
