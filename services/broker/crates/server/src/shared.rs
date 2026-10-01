@@ -7,11 +7,12 @@ use std::sync::Arc;
 
 use broker_core::broker::{Addressed, Broker, BrokerConfig};
 use broker_core::session::Action;
-use broker_core::subscriptions::SubscriberId;
+use broker_core::subscriptions::{FilterEvent, SubscriberId};
+use cluster::Replicated;
 use foldhash::fast::RandomState;
 use mqtt_codec::Packet;
 use parking_lot::{Mutex, RwLock};
-use storage::{Applied, Durable, NotDurable, Writer};
+use storage::{Applied, Durable, NotDurable, Record, Writer};
 use tokio::sync::mpsc;
 
 use crate::metrics::{Metrics, RecordDrop, ShellDrop};
@@ -187,6 +188,22 @@ pub struct Shared {
     /// the journal is left to grow: it is still drained, and then
     /// dropped.
     writer: Option<Arc<Writer>>,
+    /// What stamps a replicated write, and `None` on a node that has no
+    /// store and therefore no identity and no clock.
+    ///
+    /// Section 8.2: the broker says which filters gained or lost a
+    /// subscriber on this node, and this turns the ones that left or
+    /// reached zero into registers. It is held here because **the
+    /// register has to go in the same batch as the subscription that
+    /// caused it** — one batch is all or nothing, so a node cannot end
+    /// up with a subscription the cluster was never told about, or a
+    /// register for a subscription it did not keep.
+    ///
+    /// `None` is milestone one's mode, which is still supported: a node
+    /// with no store cannot cluster, so there is nothing to stamp and
+    /// the events are drained and dropped. Drained, not ignored, for the
+    /// reason [`Self::writer`] gives about the journal.
+    replicated: Option<Arc<Replicated>>,
     outboxes: RwLock<HashMap<SubscriberId, mpsc::Sender<Action>, RandomState>>,
     /// How often a caller was told the writer is behind. See
     /// [`Shared::report_pacing`].
@@ -211,7 +228,7 @@ pub struct Shared {
 impl Shared {
     /// A server with no connections and no store.
     pub fn new(config: BrokerConfig) -> Self {
-        Self::from_parts(Broker::new(config), None)
+        Self::from_parts(Broker::new(config), None, None)
     }
 
     /// A server whose broker is already built, writing to `writer`.
@@ -223,13 +240,32 @@ impl Shared {
     /// before the broker does, so a half-restored broker is not a
     /// state anything can be pointed at.
     pub fn with_store(broker: Broker, writer: Arc<Writer>) -> Self {
-        Self::from_parts(broker, Some(writer))
+        Self::from_parts(broker, Some(writer), None)
     }
 
-    fn from_parts(broker: Broker, writer: Option<Arc<Writer>>) -> Self {
+    /// The same, with section 8.2's replicated state beside it.
+    ///
+    /// What the binary builds. The `Replicated` comes out of the same
+    /// restore as the broker, because the clock inside it resumes from
+    /// the highest reading this node has written and the registers are
+    /// the ones it held; see `Replicated::open`.
+    pub fn with_replication(
+        broker: Broker,
+        writer: Arc<Writer>,
+        replicated: Arc<Replicated>,
+    ) -> Self {
+        Self::from_parts(broker, Some(writer), Some(replicated))
+    }
+
+    fn from_parts(
+        broker: Broker,
+        writer: Option<Arc<Writer>>,
+        replicated: Option<Arc<Replicated>>,
+    ) -> Self {
         Self {
             broker: Mutex::new(broker),
             writer,
+            replicated,
             outboxes: RwLock::new(HashMap::with_hasher(RandomState::default())),
             paced: AtomicU64::new(0),
             pacing_reported: AtomicU64::new(0),
@@ -241,6 +277,55 @@ impl Shared {
     /// What this process counts.
     pub fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
+    }
+
+    /// What this node replicates, for whatever broadcasts it.
+    ///
+    /// `None` on a node with no store, which is a node that cannot
+    /// cluster.
+    pub fn replicated(&self) -> Option<&Arc<Replicated>> {
+        self.replicated.as_ref()
+    }
+
+    /// Turn the filters that gained or lost a subscriber into registers.
+    ///
+    /// Section 8.2, and **appended to the same batch as the journal**:
+    /// one batch is all or nothing, so a subscription cannot be stored
+    /// without the register that tells the cluster about it, nor the
+    /// register without the subscription. Drained under the same lock
+    /// that filled it, so the order a filter was gained and lost in is
+    /// the order the registers are written in.
+    ///
+    /// A node with no store drains and drops them, for the reason
+    /// [`Self::writer`] gives about the journal: a buffer nobody reads
+    /// is a buffer that grows for the life of the process.
+    ///
+    /// Most events produce nothing. A register is written only when the
+    /// count leaves or reaches zero, which is what makes this a write
+    /// per filter rather than per client subscription; see
+    /// `cluster::metadata`.
+    ///
+    /// Several writes in one batch each carry the clock's mark, so the
+    /// batch can hold the same row several times over. Harmless — the
+    /// last one is the highest and the store simply replaces the row —
+    /// and the alternative is a caller that holds a register without
+    /// the mark that covers its stamp, which is what
+    /// `Replicated::records` exists to make impossible.
+    fn take_filter_events(&self, broker: &mut Broker, records: &mut Vec<Record>) {
+        let mut events = Vec::new();
+        broker.take_filter_events(&mut events);
+        let Some(replicated) = &self.replicated else {
+            return;
+        };
+        for event in events {
+            let write = match &event {
+                FilterEvent::Arrived(filter) => replicated.subscriber_arrived(filter),
+                FilterEvent::Departed(filter) => replicated.subscriber_departed(filter),
+            };
+            if let Some(write) = write {
+                records.extend(replicated.records(&write));
+            }
+        }
     }
 
     /// Do something with the broker, holding the lock for exactly that,
@@ -350,6 +435,7 @@ impl Shared {
     fn hand_over(&self, broker: &mut Broker, promised: bool) -> Committed {
         let mut records = Vec::new();
         broker.take_journal(&mut records);
+        self.take_filter_events(broker, &mut records);
 
         let Some(writer) = &self.writer else {
             // No store: nothing is written down and nothing can be

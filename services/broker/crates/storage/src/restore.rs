@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 
 use crate::record::{
-    BodyRecord, ClockRecord, InflightRecord, MessageId, NodeIdentityRecord, QueueEntry,
-    RetainedRecord, RuleRecord, SessionRecord, SubscriptionRecord,
+    BodyRecord, ClockRecord, InflightRecord, MessageId, MetadataRecord, NodeIdentityRecord,
+    QueueEntry, RetainedRecord, RuleRecord, SessionRecord, SubscriptionRecord,
 };
 
 /// Everything needed to rebuild the broker, read once at startup.
@@ -82,9 +82,12 @@ pub struct Restored {
     pub bodies: HashMap<MessageId, BodyRecord>,
     /// Every rule the node holds, in identifier order.
     ///
-    /// Section 9.1: a rule is durable node-local metadata in milestone 4,
-    /// so it comes back with everything else rather than being read on
-    /// demand. Ordered, so that two backends restoring the same store
+    /// Section 9.1: a rule is durable metadata, so it comes back with
+    /// everything else rather than being read on demand. It was
+    /// node-local in milestone 4 and is replicated from milestone 5, and
+    /// what changed is how many nodes hold one rather than its shape;
+    /// the register that carries it between them is
+    /// [`Self::metadata`]. Ordered, so that two backends restoring the same store
     /// hand back the same value and the restart property can compare them
     /// as one equality.
     pub rules: Vec<RuleRecord>,
@@ -113,6 +116,19 @@ pub struct Restored {
     /// reason [`Self::node`] gives: it is one row, and it is wanted at
     /// exactly the moment everything else is.
     pub clock: Option<ClockRecord>,
+    /// Every replicated register the node holds, in key order.
+    ///
+    /// Section 8.2's records: that a node has a subscriber for a filter,
+    /// retained messages, rules and session ownership, each a
+    /// last-writer-wins register with the stamp that orders it.
+    /// **Tombstones are here too**, because a deletion is a register
+    /// with no value and a node that dropped one would be handed an
+    /// older copy by the next peer it spoke to.
+    ///
+    /// Ordered, so that two backends restoring the same store hand back
+    /// the same value and the restart property can compare them as one
+    /// equality — the same reason [`Self::rules`] is ordered.
+    pub metadata: Vec<MetadataRecord>,
 }
 
 /// One session and everything that belongs to it.

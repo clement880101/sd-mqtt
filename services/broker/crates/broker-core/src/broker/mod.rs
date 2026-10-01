@@ -21,7 +21,7 @@ use crate::session::message::Message;
 use crate::session::queue::{Delivery, DropReason, QueueLimits};
 use crate::session::state::{will_message, Session, StoredWill};
 use crate::session::Action;
-use crate::subscriptions::{SharedSubscriptions, SubscriberId, SubscriptionTrie};
+use crate::subscriptions::{FilterEvent, SharedSubscriptions, SubscriberId, SubscriptionTrie};
 
 /// The inflight window a session has when nothing narrows it, from
 /// section 6 of the design.
@@ -186,6 +186,23 @@ pub struct Broker {
     /// the same lock that filled it, so a record and the actions it
     /// belongs with are always taken together and in order.
     journal: Vec<Record>,
+    /// Which filters gained or lost a subscriber on this node, and has
+    /// not been handed over.
+    ///
+    /// Section 8.2 replicates that a node has at least one subscriber
+    /// for a filter, so the shell has to know when that changed. This
+    /// is beside [`Self::journal`] and not in it, and the reason is the
+    /// stamp: a replicated write is ordered by a hybrid logical clock
+    /// reading and this node's identity, and neither is something this
+    /// crate has or should gain — it reads no clock, and the identity
+    /// belongs to `cluster`, which rests on nothing of ours.
+    ///
+    /// So this says what happened and the shell decides what is
+    /// written, which is exactly the division [`Self::journal`]'s
+    /// comment describes. See [`crate::subscriptions::events`] for why
+    /// it is one event per session and filter rather than one per
+    /// packet, and for the three paths that must emit a departure.
+    filter_events: Vec<FilterEvent>,
 }
 
 impl Broker {
@@ -209,6 +226,7 @@ impl Broker {
             config,
             hooks: Hooks::new(),
             journal: Vec::new(),
+            filter_events: Vec::new(),
         }
     }
 
@@ -270,6 +288,35 @@ impl Broker {
         out.append(&mut self.journal);
     }
 
+    /// Move every filter that gained or lost a subscriber onto `out`.
+    ///
+    /// Section 8.2, and [`Self::filter_events`] for why these are not
+    /// records. Drained by the shell under the same lock that filled
+    /// it, so that the order a filter was gained and lost in is the
+    /// order the registers are written in — reversed, the node would
+    /// end up advertising a filter it had just given up.
+    pub fn take_filter_events(&mut self, out: &mut Vec<FilterEvent>) {
+        out.append(&mut self.filter_events);
+    }
+
+    /// How many of this node's sessions are subscribed to `filter`.
+    ///
+    /// Walks the trie, so it is for a test and for an operator and not
+    /// for a routing path. The count the replication layer keeps is its
+    /// own, fed by [`Self::take_filter_events`]; this is what says the
+    /// two agree.
+    #[must_use]
+    pub fn local_subscribers(&self, filter: &str) -> usize {
+        let mut matched = 0;
+        for (_, session) in self.registry.iter() {
+            matched += session
+                .filters()
+                .filter(|held| crate::subscriptions::inner_filter(held) == filter)
+                .count();
+        }
+        matched
+    }
+
     /// Throw away everything said so far, everywhere it is held.
     ///
     /// For [`crate::restore`] and nothing else. Restore rebuilds a
@@ -283,6 +330,26 @@ impl Broker {
     /// discarded by clearing this one: it would simply be handed over
     /// by whichever call next drained that session, long after the
     /// restore that produced it.
+    ///
+    /// # It does not discard the filter events, and that is the point
+    ///
+    /// [`Self::filter_events`] survives this, although the reasoning
+    /// above would seem to apply to it just as well. It does not,
+    /// because the thing those events feed is **not in the store at
+    /// all**: section 8.2's replication keeps a reference count per
+    /// filter, deliberately unreplicated and deliberately unstored, and
+    /// a restore replaying this node's subscriptions is the only thing
+    /// that rebuilds it. Discarding them would leave the count at zero
+    /// with the trie full, so the first genuine last-unsubscribe would
+    /// find nothing to decrement and would tell the cluster nothing —
+    /// and the node would stay advertised for a filter it no longer
+    /// serves until somebody noticed.
+    ///
+    /// The cost is that a node re-announces its filters as it comes
+    /// back, one register per filter rather than per subscription. That
+    /// is a cost worth paying twice over: a peer may have tombstoned
+    /// this node while it was down, or may never have heard from it at
+    /// all, and a node that came back silently would be routed nothing.
     pub fn discard_journal(&mut self) {
         for (_, session) in self.registry.iter_mut() {
             session.take_journal(&mut self.journal);
@@ -559,6 +626,16 @@ impl Broker {
         }
 
         let displaced = self.displace_incumbent(&identity, connect.clean_start, now, out);
+        // What the handle was subscribed to before any of this, read
+        // while the session that held it still exists. Section 8.2
+        // needs a departure per filter and the registry is about to
+        // replace the session wholesale; see `subscribe::remove_held`.
+        let held: Vec<String> = self
+            .registry
+            .subscriber_of(&identity)
+            .and_then(|subscriber| self.registry.get(subscriber))
+            .map(|session| session.filters().map(str::to_string).collect())
+            .unwrap_or_default();
         if connect.clean_start {
             // The registry is about to replace this session wholesale,
             // taking its queue and its window with it. What it was
@@ -596,7 +673,13 @@ impl Broker {
             // in the trie keyed by that same handle, so only this layer
             // can discard them. A no-op for a handle never seen before.
             if let Some(session) = self.registry.get_mut(registration.subscriber) {
-                subscribe::remove_all(&self.subscriptions, &self.shared, session);
+                subscribe::remove_held(
+                    &self.subscriptions,
+                    &self.shared,
+                    session,
+                    &held,
+                    &mut self.filter_events,
+                );
             }
         }
 
@@ -909,6 +992,7 @@ impl Broker {
                     now,
                     &mut |filter: &str, qos| hooks.authorize_subscribe(&client, filter, qos),
                     &mut actions,
+                    &mut self.filter_events,
                 );
                 actions.push(Action::Send(Packet::SubAck(mqtt_codec::packet::SubAck {
                     packet_id: request.packet_id,
@@ -928,6 +1012,7 @@ impl Broker {
                     &self.shared,
                     session,
                     &request.filters,
+                    &mut self.filter_events,
                 );
                 out.push((
                     subscriber,
@@ -1490,7 +1575,12 @@ impl Broker {
                     mountpoint: &identity.mountpoint,
                     client_id: &identity.client_id,
                 };
-                subscribe::remove_all(&self.subscriptions, &self.shared, &mut session);
+                subscribe::remove_all(
+                    &self.subscriptions,
+                    &self.shared,
+                    &mut session,
+                    &mut self.filter_events,
+                );
                 // Not through `emit`: the session is already out of
                 // the registry, so there is nothing left there to
                 // look its identity up by. The drops it owes its
@@ -2254,6 +2344,332 @@ mod tests {
             }],
             properties: Properties::default(),
         })
+    }
+
+    // ---- what is replicated, at node granularity: section 8.2 --------
+
+    /// Unsubscribe from one filter.
+    fn unsubscribe_from(filter: &str) -> Packet {
+        Packet::Unsubscribe(mqtt_codec::packet::Unsubscribe {
+            packet_id: 2,
+            filters: vec![filter.to_string()],
+            properties: Properties::default(),
+        })
+    }
+
+    /// Everything the broker has said about filters, drained.
+    fn filter_events(broker: &mut Broker) -> Vec<FilterEvent> {
+        let mut events = Vec::new();
+        broker.take_filter_events(&mut events);
+        events
+    }
+
+    /// Connect a client that keeps its session for an hour.
+    fn durable(broker: &mut Broker, client: &str, out: &mut Vec<Addressed>) -> SubscriberId {
+        let mut connect = connect_v5(client);
+        connect.properties.session_expiry_interval = Some(3_600);
+        broker
+            .connect("", &connect, out)
+            .expect("the default decision authenticates")
+            .subscriber
+    }
+
+    /// **A filter gaining a second local subscriber says nothing new.**
+    ///
+    /// Section 8.2's first easy-to-miss edge, walked through the broker
+    /// rather than through the counting type: convention 5's last entry
+    /// is a guard that built its type by hand and so never reached the
+    /// caller that was supposed to use it. Two clients subscribe to one
+    /// filter through SUBSCRIBE packets, and the second must produce
+    /// exactly one arrival of its own — which the replication layer
+    /// counts to two and broadcasts nothing for.
+    ///
+    /// The count the broker can see is asserted beside it, because an
+    /// event emitted and a subscription inserted are two different
+    /// claims and a test of one is not a test of the other.
+    #[test]
+    fn a_second_subscriber_to_a_filter_is_one_more_arrival_and_nothing_else() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let first = durable(&mut broker, "first", &mut out);
+        let second = durable(&mut broker, "second", &mut out);
+        assert_eq!(
+            filter_events(&mut broker),
+            Vec::new(),
+            "a connect subscribes to nothing"
+        );
+
+        broker
+            .handle(first, &subscribe_to("sensor/+/temp"), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Arrived("sensor/+/temp".to_owned())]
+        );
+
+        broker
+            .handle(second, &subscribe_to("sensor/+/temp"), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Arrived("sensor/+/temp".to_owned())],
+            "the second subscriber to a filter must be one arrival, no more and no less"
+        );
+        assert_eq!(broker.local_subscribers("sensor/+/temp"), 2);
+    }
+
+    /// A session re-subscribing to a filter it holds says nothing.
+    ///
+    /// The protocol's rule is that a second subscribe to the same filter
+    /// changes the options rather than adding a subscription, and the
+    /// count has to agree: an arrival per packet would be incremented
+    /// twice by this client and would never come back down, so the
+    /// filter would stay advertised after its only subscriber left.
+    #[test]
+    fn re_subscribing_to_a_held_filter_is_not_another_arrival() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let only = durable(&mut broker, "only", &mut out);
+
+        broker
+            .handle(only, &subscribe_to("a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Arrived("a/b".to_owned())]
+        );
+
+        // The same filter at a different quality of service, which is
+        // the options changing and not a new subscription.
+        broker
+            .handle(only, &subscribe_at("a/b", QoS::ExactlyOnce), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            Vec::new(),
+            "changing a held filter's options was reported as a new subscriber"
+        );
+        assert_eq!(broker.local_subscribers("a/b"), 1);
+
+        // And the one departure still arrives, which is what the count
+        // above would have lost.
+        broker
+            .handle(only, &unsubscribe_from("a/b"), &mut out)
+            .expect("the unsubscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Departed("a/b".to_owned())]
+        );
+    }
+
+    /// **A filter losing its last local subscriber departs.**
+    ///
+    /// Section 8.2's second edge. The departure is what the replication
+    /// layer turns into a tombstone; without it every peer goes on
+    /// routing to this node for a filter it has no subscriber for.
+    #[test]
+    fn the_last_unsubscribe_from_a_filter_is_the_departure_that_tombstones_it() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let first = durable(&mut broker, "first", &mut out);
+        let second = durable(&mut broker, "second", &mut out);
+        broker
+            .handle(first, &subscribe_to("a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        broker
+            .handle(second, &subscribe_to("a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        drop(filter_events(&mut broker));
+
+        broker
+            .handle(first, &unsubscribe_from("a/b"), &mut out)
+            .expect("the unsubscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Departed("a/b".to_owned())]
+        );
+        assert_eq!(broker.local_subscribers("a/b"), 1);
+
+        broker
+            .handle(second, &unsubscribe_from("a/b"), &mut out)
+            .expect("the unsubscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Departed("a/b".to_owned())],
+            "the last unsubscribe from a filter must depart"
+        );
+        assert_eq!(broker.local_subscribers("a/b"), 0);
+    }
+
+    /// Unsubscribing from a filter nothing held says nothing.
+    ///
+    /// The protocol answers "no subscription existed" and the count must
+    /// agree: a departure here would take the count below zero, and a
+    /// count that cannot reach zero again never tombstones the filter.
+    #[test]
+    fn unsubscribing_from_a_filter_nothing_held_is_not_a_departure() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let only = durable(&mut broker, "only", &mut out);
+        broker
+            .handle(only, &unsubscribe_from("a/b"), &mut out)
+            .expect("the unsubscribe is accepted");
+        assert_eq!(filter_events(&mut broker), Vec::new());
+    }
+
+    /// A session expiring departs from every filter it held.
+    ///
+    /// One of the two teardown paths nobody thinks of. The session is
+    /// never unsubscribed from anything; it simply stops existing, and
+    /// the trie entries go with it. A departure missed here leaves the
+    /// node advertised for the filter until it restarts — and a restart
+    /// would not fix it either, because the subscription is gone from
+    /// the store too.
+    #[test]
+    fn a_session_expiring_departs_from_every_filter_it_held() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let mut connect = connect_v5("brief");
+        connect.properties.session_expiry_interval = Some(1);
+        let only = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates")
+            .subscriber;
+        broker
+            .handle(only, &subscribe_to("a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        broker
+            .handle(only, &subscribe_to("c/d"), &mut out)
+            .expect("the subscribe is accepted");
+        drop(filter_events(&mut broker));
+
+        broker.disconnect(only, &mut out);
+        run_to(&mut broker, 60, &mut out);
+        assert_eq!(broker.session_count(), 0, "the session must have expired");
+
+        let mut departed: Vec<String> = filter_events(&mut broker)
+            .into_iter()
+            .map(|event| match event {
+                FilterEvent::Departed(filter) => filter,
+                FilterEvent::Arrived(filter) => {
+                    panic!("an expiring session reported an arrival for {filter}")
+                }
+            })
+            .collect();
+        departed.sort();
+        assert_eq!(departed, vec!["a/b".to_owned(), "c/d".to_owned()]);
+        assert_eq!(broker.local_subscribers("a/b"), 0);
+    }
+
+    /// A clean-start connect departs from everything the old session held.
+    ///
+    /// The other teardown path, and the one that hides: a clean-start
+    /// takeover replaces the session wholesale and keeps the handle, so
+    /// only this layer can clear the trie — which is exactly why only
+    /// this layer can report the departures.
+    #[test]
+    fn a_clean_start_connect_departs_from_what_the_old_session_held() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let first = durable(&mut broker, "same", &mut out);
+        broker
+            .handle(first, &subscribe_to("a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        drop(filter_events(&mut broker));
+
+        let mut again = connect_v5("same");
+        again.clean_start = true;
+        broker
+            .connect("", &again, &mut out)
+            .expect("the default decision authenticates");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Departed("a/b".to_owned())],
+            "a clean start kept the trie entry or kept it quiet"
+        );
+        assert_eq!(broker.local_subscribers("a/b"), 0);
+    }
+
+    /// A shared subscription is an arrival on the filter topics match.
+    ///
+    /// Section 8.3 routes by matching a published topic, and `$share/g/`
+    /// is how this node shares a delivery among its own clients: a peer
+    /// has nothing to do with the group. So two groups on one filter are
+    /// two subscribers to that filter, and the last of them to go is what
+    /// departs.
+    #[test]
+    fn a_shared_subscription_arrives_and_departs_on_its_inner_filter() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let only = durable(&mut broker, "worker", &mut out);
+
+        broker
+            .handle(only, &subscribe_to("$share/one/a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Arrived("a/b".to_owned())],
+            "a shared subscription was reported under its group"
+        );
+        broker
+            .handle(only, &subscribe_to("$share/two/a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Arrived("a/b".to_owned())]
+        );
+        assert_eq!(broker.local_subscribers("a/b"), 2);
+
+        broker
+            .handle(only, &unsubscribe_from("$share/one/a/b"), &mut out)
+            .expect("the unsubscribe is accepted");
+        broker
+            .handle(only, &unsubscribe_from("$share/two/a/b"), &mut out)
+            .expect("the unsubscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![
+                FilterEvent::Departed("a/b".to_owned()),
+                FilterEvent::Departed("a/b".to_owned())
+            ]
+        );
+        assert_eq!(broker.local_subscribers("a/b"), 0);
+    }
+
+    /// A refused subscribe is not an arrival.
+    ///
+    /// Nothing went into the trie, so nothing may be advertised. A node
+    /// that announced a filter its authorizing chain had refused would
+    /// be asked for traffic it would then throw away.
+    #[test]
+    fn a_refused_subscribe_is_not_an_arrival() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let only = durable(&mut broker, "only", &mut out);
+        broker.hooks_mut().set_defaults(crate::hooks::Defaults {
+            subscribe: false,
+            ..crate::hooks::Defaults::default()
+        });
+        broker
+            .handle(only, &subscribe_to("a/b"), &mut out)
+            .expect("the subscribe is answered, per filter");
+        assert_eq!(
+            filter_events(&mut broker),
+            Vec::new(),
+            "a filter the chain refused was advertised to the cluster"
+        );
+    }
+
+    /// An invalid filter is not an arrival either.
+    #[test]
+    fn an_invalid_filter_is_not_an_arrival() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let only = durable(&mut broker, "only", &mut out);
+        broker
+            .handle(only, &subscribe_to("a/#/b"), &mut out)
+            .expect("the subscribe is answered, per filter");
+        assert_eq!(filter_events(&mut broker), Vec::new());
     }
 
     /// A subscribe to one filter at the given quality of service.

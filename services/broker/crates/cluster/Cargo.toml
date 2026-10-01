@@ -67,6 +67,22 @@ tempfile.workspace = true
 # enumerate, and the second one *found* the condition convergence
 # depends on rather than having it explained.
 proptest.workspace = true
+# Section 8.2 replicates **that a node has a subscriber for a filter**,
+# and the two edges of that rule — a second subscriber broadcasting
+# nothing, the last unsubscribe broadcasting a tombstone — are claims
+# about the broker's subscribe path and this crate's count together.
+# `tests/metadata.rs` drives one into the other, because convention 5's
+# last entry is a guard that built its type by hand and so never reached
+# the caller that was supposed to use it.
+#
+# **Dev only, and the direction stays the one it is.** `broker-core`
+# depends on nothing of ours but `storage`, and its `Cargo.toml` asserts
+# that with a `cargo tree -e normal` check; a normal dependency either
+# way would put `tokio`, `aws-lc-rs` and `postcard` into the crate
+# documented as doing no I/O, or this crate's clock into the one that
+# reads no clock. A dev-dependency is neither: nothing shipped links it.
+broker-core = { path = "../broker-core", version = "0.1.0" }
+mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
 # `rt` and `macros` for `#[tokio::test]`; `io-util` for `duplex`, which
 # is the pair of ends every handshake test runs over; `time` for the
 # bounds that make a stalled handshake fail rather than hang.

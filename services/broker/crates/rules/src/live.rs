@@ -157,6 +157,13 @@ use crate::singleton::Membership;
 use crate::stats::{RuleStats, Sample, Totals, SAMPLE_INTERVAL};
 use crate::{Ingest, Outbox};
 
+/// Section 8.2's replicated metadata, re-exported for the same reason
+/// [`crate::singleton::NodeId`] is: a caller building a [`Registry`] has
+/// to name the type, and a second path to it invites a second one in the
+/// process. `HybridClock` and the drift bound come with it, because
+/// opening a `Replicated` means resuming a clock.
+pub use cluster::{HybridClock, Replicated, DEFAULT_MAX_DRIFT_MILLIS};
+
 /// The HTTP client every rule on this node shares.
 ///
 /// One, because the connection pool is the thing worth sharing: two
@@ -461,6 +468,17 @@ pub struct Registry {
     /// change again. Nothing changes it in milestone 4, and something
     /// will in milestone 5.
     membership: Arc<Membership>,
+    /// This node's replicated metadata, section 8.2.
+    ///
+    /// Held because **a rule stops being node-local here**, which is
+    /// what section 9.1 and milestone 4 said would happen. A rule is one
+    /// of the four kinds this milestone replicates, so installing,
+    /// editing or removing one writes a last-writer-wins register
+    /// beside the node's own `RulePut` or `RuleRemoved`: the first is
+    /// this node's copy, the second is what travels. The two go in one
+    /// batch, so a rule that survived a crash has the register that
+    /// carries it beside it.
+    replicated: Arc<Replicated>,
     /// The one HTTP client.
     client: HttpClient,
     /// The ingest routes, which this installs into and withdraws from.
@@ -516,12 +534,14 @@ impl Registry {
         store: Arc<dyn Storage>,
         writer: Arc<Writer>,
         membership: Arc<Membership>,
+        replicated: Arc<Replicated>,
     ) -> Arc<Self> {
         let registry = Arc::new(Self {
             shared,
             store,
             writer,
             membership,
+            replicated,
             client: client(),
             ingest: Arc::new(Ingest::new()),
             ingest_socket: OnceLock::new(),
@@ -531,6 +551,16 @@ impl Registry {
         });
         *registry.sampler.lock() = Some(tokio::spawn(sample_forever(Arc::downgrade(&registry))));
         registry
+    }
+
+    /// This node's replicated metadata, section 8.2.
+    ///
+    /// Handed out so that whatever broadcasts and gossips the registers
+    /// is given the same one this writes into. A second would be a
+    /// second clock and a second set of registers in one process, which
+    /// is two answers to which write is later.
+    pub fn replicated(&self) -> &Arc<Replicated> {
+        &self.replicated
     }
 
     /// The ingest routes this node serves.
@@ -721,10 +751,24 @@ impl Registry {
         // **Durable before anything hangs off it**, and before the old
         // one is taken away: a store that refuses the record leaves
         // the node exactly as it was.
+        //
+        // Three records in one batch, section 8.2: this node's own copy,
+        // the register that carries it to every peer, and the clock mark
+        // that covers the register's stamp. **One batch, because a batch
+        // is all or nothing** — a rule stored without its register would
+        // be a rule this node runs and nobody else has, and a register
+        // stored without the mark would be a stamp the store has no
+        // record of, which is a clock resuming behind a reading it has
+        // already shown somebody.
+        let mut records = vec![Record::RulePut {
+            rule: rule.to_record(),
+        }];
+        records.extend(
+            self.replicated
+                .records(&self.replicated.rule(rule.to_record())),
+        );
         self.writer
-            .apply_durable(vec![Record::RulePut {
-                rule: rule.to_record(),
-            }])
+            .apply_durable(records)
             .map_err(|error| InstallError::storage(&rule.id, error))?
             .await
             .map_err(|error| InstallError::storage(&rule.id, error))?;
@@ -921,10 +965,22 @@ impl Registry {
             });
         }
 
+        // **A tombstone, not the absence of a register.** Section 8.2: a
+        // deletion is a value competing by the same comparison as any
+        // other, so a removal that merely dropped the row would be
+        // handed the rule back by the next peer this node spoke to and
+        // the rule an operator deleted would reinstall itself. Written
+        // after the refusals above, so a removal this node will not
+        // perform is not one it tells the cluster about.
+        let mut records = vec![Record::RuleRemoved {
+            id: id.as_str().to_owned(),
+        }];
+        records.extend(
+            self.replicated
+                .records(&self.replicated.rule_removed(id.as_str())),
+        );
         self.writer
-            .apply_durable(vec![Record::RuleRemoved {
-                id: id.as_str().to_owned(),
-            }])
+            .apply_durable(records)
             .map_err(|error| InstallError::storage(id, error))?
             .await
             .map_err(|error| InstallError::storage(id, error))?;
@@ -1533,6 +1589,226 @@ mod tests {
         );
     }
 
+    // ---- a rule stops being node-local: section 8.2 ------------------
+
+    /// Every replicated register the store holds for a rule.
+    fn rule_registers(store: &MemoryStorage) -> Vec<storage::MetadataRecord> {
+        store
+            .restore()
+            .expect("a restore")
+            .metadata
+            .into_iter()
+            .filter(|entry| matches!(entry.key, storage::MetadataKeyRecord::Rule { .. }))
+            .collect()
+    }
+
+    /// **Installing a rule writes the register that carries it.**
+    ///
+    /// Section 8.2 lists rules among what is replicated, and section 9.1
+    /// said in milestone 4 that they would stop being node-local here.
+    /// This is what that means in the store: beside the node's own
+    /// `RulePut` there is now a last-writer-wins register holding the
+    /// whole rule, stamped with this node's clock and identity, so that
+    /// a peer receiving it has something to install rather than an
+    /// identifier it has never seen.
+    ///
+    /// Asserted through the store rather than through the registry's
+    /// map, because the register is the thing that travels and the map
+    /// is the thing that does not: a test of the map would pass on a
+    /// node that replicated nothing.
+    #[tokio::test]
+    async fn installing_a_rule_writes_the_register_that_replicates_it() {
+        let (registry, store) = registry();
+        registry
+            .install(a_rule())
+            .await
+            .expect("the install succeeds");
+
+        let held = rule_registers(&store);
+        assert_eq!(
+            held.len(),
+            1,
+            "a rule was installed and no register went with it, so it is still node-local"
+        );
+        assert_eq!(
+            held[0].key,
+            storage::MetadataKeyRecord::Rule {
+                id: "held".to_owned()
+            }
+        );
+        assert_eq!(
+            held[0].value,
+            Some(storage::MetadataValueRecord::Rule(Box::new(
+                a_rule().to_record()
+            ))),
+            "the register carries something other than the whole rule"
+        );
+        assert_eq!(
+            held[0].stamp.node,
+            registry.replicated().me().to_bytes(),
+            "the register was attributed to another node"
+        );
+
+        // And the node's own copy is still there: the register is what
+        // travels, not a replacement for what this node reads back at
+        // startup.
+        assert_eq!(
+            store.restore().expect("a restore").rules,
+            vec![a_rule().to_record()]
+        );
+    }
+
+    /// The clock mark rides in the same batch as the register.
+    ///
+    /// Section 8.2's resume depends on it: a batch is all or nothing, so
+    /// a stamp that survived a crash has the mark that covers it beside
+    /// it. A mark written separately could be lost while the register
+    /// survived, which is a clock resuming behind a stamp it has already
+    /// shown somebody.
+    #[tokio::test]
+    async fn the_clock_mark_is_stored_with_the_rules_register() {
+        let (registry, store) = registry();
+        registry
+            .install(a_rule())
+            .await
+            .expect("the install succeeds");
+
+        let restored = store.restore().expect("a restore");
+        let mark = restored.clock.expect("the mark must be stored beside it");
+        let stamp = rule_registers(&store)[0].stamp;
+        assert!(
+            (mark.millis, mark.counter) >= (stamp.millis, stamp.counter),
+            "the stored mark {mark:?} does not cover the stamp {stamp:?} written beside it"
+        );
+    }
+
+    /// Editing a rule writes a later register.
+    ///
+    /// Disabling one is an edit and goes through the same install, so the
+    /// register has to move with it: a peer holding the enabled copy and
+    /// never hearing about the change would go on firing a rule an
+    /// operator switched off.
+    #[tokio::test]
+    async fn disabling_a_rule_writes_a_later_register() {
+        let (registry, store) = registry();
+        registry
+            .install(a_rule())
+            .await
+            .expect("the install succeeds");
+        let first = rule_registers(&store)[0].stamp;
+
+        let id = RuleId::new("held").expect("a valid identifier");
+        registry
+            .set_enabled(&id, false)
+            .await
+            .expect("the rule can be switched off");
+
+        let held = rule_registers(&store);
+        assert_eq!(
+            held.len(),
+            1,
+            "the edit added a register instead of replacing one"
+        );
+        let Some(storage::MetadataValueRecord::Rule(stored)) = &held[0].value else {
+            panic!("the register stopped carrying a rule: {held:?}")
+        };
+        assert!(
+            !stored.enabled,
+            "the register still says the rule is enabled"
+        );
+        assert!(
+            (held[0].stamp.millis, held[0].stamp.counter) > (first.millis, first.counter),
+            "the edited register does not beat the copy it has to overwrite"
+        );
+    }
+
+    /// **Removing a rule writes a tombstone, not nothing.**
+    ///
+    /// Section 8.2: a deletion is a value competing by the same
+    /// comparison. A removal that simply dropped the register would be
+    /// handed the rule back by the next peer this node spoke to, and the
+    /// rule an operator deleted would reinstall itself.
+    #[tokio::test]
+    async fn removing_a_rule_writes_a_tombstone_that_beats_it() {
+        let (registry, store) = registry();
+        registry
+            .install(a_rule())
+            .await
+            .expect("the install succeeds");
+        let written = rule_registers(&store)[0].stamp;
+
+        let id = RuleId::new("held").expect("a valid identifier");
+        registry.remove(&id).await.expect("the rule can be removed");
+
+        let held = rule_registers(&store);
+        assert_eq!(
+            held.len(),
+            1,
+            "the register was dropped rather than tombstoned, so the rule comes back \
+             from the first peer this node speaks to"
+        );
+        assert_eq!(held[0].value, None, "the deletion carries a value");
+        assert!(
+            (held[0].stamp.millis, held[0].stamp.counter) > (written.millis, written.counter),
+            "the tombstone does not beat the write it has to supersede"
+        );
+
+        // The node's own copy went, which is what milestone 4 already
+        // did and what a peer's copy must not undo.
+        assert_eq!(store.restore().expect("a restore").rules, Vec::new());
+    }
+
+    /// A removal that is refused writes no register.
+    ///
+    /// An outbox with envelopes in it refuses the removal, and the node
+    /// is left exactly as it was. A tombstone written anyway would
+    /// delete the rule everywhere else while this node went on running
+    /// it.
+    #[tokio::test]
+    async fn a_refused_removal_writes_no_register() {
+        let (registry, store) = registry();
+        registry
+            .install(a_rule())
+            .await
+            .expect("the install succeeds");
+        let written = rule_registers(&store)[0].stamp;
+
+        let id = RuleId::new("held").expect("a valid identifier");
+        let outbox =
+            crate::outbox::Outbox::open(id.clone(), store.as_ref()).expect("the outbox opens");
+        let (_, records) = outbox.append(
+            storage::MessageId([1; 16]),
+            storage::MessageId([2; 16]),
+            storage::BodyRecord {
+                topic: "sensor/1".to_owned(),
+                payload: bytes::Bytes::from_static(b"{}"),
+                qos: storage::Qos::AtLeastOnce,
+                retain: false,
+                expires_at: None,
+                properties: bytes::Bytes::new(),
+            },
+            "gauge",
+            0,
+        );
+        store.apply(&records).expect("an envelope can be queued");
+        registry
+            .remove(&id)
+            .await
+            .expect_err("a rule with a waiting envelope is not removable");
+
+        let held = rule_registers(&store);
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            (held[0].stamp.millis, held[0].stamp.counter),
+            (written.millis, written.counter),
+            "a refused removal moved the register"
+        );
+        assert!(
+            held[0].value.is_some(),
+            "a refused removal tombstoned the rule"
+        );
+    }
+
     /// A registry over a memory store, with nothing installed.
     fn registry() -> (Arc<Registry>, Arc<MemoryStorage>) {
         let store = Arc::new(MemoryStorage::new());
@@ -1547,11 +1823,16 @@ mod tests {
             Broker::new(BrokerConfig::default()),
             Arc::clone(&writer),
         ));
+        let me = NodeId::mint();
         let registry = Registry::new(
             shared,
             Arc::clone(&store) as Arc<dyn Storage>,
             writer,
-            Arc::new(Membership::alone(NodeId::mint())),
+            Arc::new(Membership::alone(me)),
+            Arc::new(
+                Replicated::open(me, HybridClock::resume(None, DEFAULT_MAX_DRIFT_MILLIS), &[])
+                    .expect("an empty store holds nothing to refuse"),
+            ),
         );
         (registry, store)
     }

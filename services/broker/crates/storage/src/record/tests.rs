@@ -105,7 +105,7 @@ mod golden {
     #[test]
     fn the_format_marker() {
         // A fixed-size array is its elements with no length prefix, and a
-        // u16 is a varint, so version 6 is one byte. The version moved
+        // u16 is a varint, so version 7 is one byte. The version moved
         // from 1 when the reference count of a body left the body's own
         // row, from 2 when rules were added, from 3 when each rule
         // gained an outbox — a version 3 store has no outbox table at
@@ -116,10 +116,13 @@ mod golden {
         // 5 when the clock's high-water mark was stored, because a
         // store from before it holds none and the node reading it would
         // resume its clock from zero and re-issue stamps it has already
-        // used.
+        // used, and from 6 when the replicated registers themselves were
+        // stored, because a store from before it holds none and the node
+        // reading it would come up routing to nobody and then resurrect
+        // everything it had ever deleted under fresh stamps.
         let expected: &[u8] = &[
             b's', b'd', b'm', b'q', b't', b't', b's', b't', // magic "sdmqttst"
-            0x06, // version 6
+            0x07, // version 7
         ];
         assert_eq!(FormatMarker::current().encode(), expected);
         assert_eq!(
@@ -775,6 +778,126 @@ mod golden {
         );
     }
 
+    /// Section 8.2's replicated register, with a value.
+    ///
+    /// Two sixteen-byte arrays in one record — the node in the key and
+    /// the node in the stamp — so they carry **different** bytes here: a
+    /// transposition of the two would otherwise round trip perfectly and
+    /// attribute every write to the wrong node. The filter is three
+    /// bytes between them, which is what makes the transposition
+    /// visible at all.
+    ///
+    /// The value is a unit variant, which is one byte after the
+    /// `Option`'s presence byte. That is the whole of a node
+    /// subscription: section 8.2 replicates that a node has a
+    /// subscriber, and nothing about which of its clients it is.
+    #[test]
+    fn metadata_put_with_a_value() {
+        let expected: &[u8] = &[
+            0x15, // Record::MetadataPut is variant 21
+            0x00, // MetadataKeyRecord::NodeSubscription is variant 0
+            0x01, 0x93, 0x4e, 0x3a, 0x7c, 0x10, 0x70, 0x00, // the key's node
+            0x80, 0x00, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, //
+            0x03, b'a', b'/', b'b', // filter "a/b"
+            0xfb, 0xd0, 0x95, 0xff, 0xbc, 0x31, // stamp millis 1_700_000_000_123
+            0xac, 0x02, // stamp counter 300
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // the stamp's node
+            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, //
+            0x01, // the value is present
+            0x00, // MetadataValueRecord::NodeSubscription is variant 0
+        ];
+        pins(
+            &Record::MetadataPut {
+                entry: MetadataRecord {
+                    key: MetadataKeyRecord::NodeSubscription {
+                        node: [
+                            0x01, 0x93, 0x4e, 0x3a, 0x7c, 0x10, 0x70, 0x00, 0x80, 0x00, 0x0a, 0x0b,
+                            0x0c, 0x0d, 0x0e, 0x0f,
+                        ],
+                        filter: "a/b".to_owned(),
+                    },
+                    stamp: StampRecord {
+                        millis: 1_700_000_000_123,
+                        counter: 300,
+                        node: [
+                            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+                            0x1d, 0x1e, 0x1f, 0x20,
+                        ],
+                    },
+                    value: Some(MetadataValueRecord::NodeSubscription),
+                },
+            },
+            expected,
+        );
+    }
+
+    /// The same record carrying a tombstone.
+    ///
+    /// **The only thing that distinguishes a deletion is one byte**, the
+    /// `Option`'s absence byte, and that is the design rather than an
+    /// economy: section 8.2 makes a tombstone a value competing by the
+    /// same comparison, so there is no removal record and no flag. A
+    /// vector for it because a single byte is exactly the kind of
+    /// difference an encoding change loses silently, and losing it turns
+    /// every delete in the cluster back into a write.
+    #[test]
+    fn metadata_put_carrying_a_tombstone() {
+        let expected: &[u8] = &[
+            0x15, // Record::MetadataPut is variant 21
+            0x02, // MetadataKeyRecord::Rule is variant 2
+            0x09, b't', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y', // id
+            0x05, // stamp millis 5
+            0x00, // stamp counter 0
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, // the stamp's node
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, //
+            0x00, // the value is absent, which is what a tombstone is
+        ];
+        pins(
+            &Record::MetadataPut {
+                entry: MetadataRecord {
+                    key: MetadataKeyRecord::Rule {
+                        id: "telemetry".to_owned(),
+                    },
+                    stamp: StampRecord {
+                        millis: 5,
+                        counter: 0,
+                        node: [0x22; 16],
+                    },
+                    value: None,
+                },
+            },
+            expected,
+        );
+    }
+
+    /// Boxing the rule inside a register costs no bytes.
+    ///
+    /// [`MetadataValueRecord::Rule`] holds a `Box<RuleRecord>` so that
+    /// the variant is not three hundred bytes while the smallest is
+    /// sixteen, and the whole of that decision rests on serde writing a
+    /// `Box<T>` exactly as it writes a `T`. **That is a claim about
+    /// somebody else's derive**, and the two vectors above do not pin it,
+    /// because neither of them carries a rule: a release that
+    /// length-prefixed a box would move every stored register and the
+    /// round trip would not notice, because it would read back whatever
+    /// it had written.
+    ///
+    /// So the bytes are compared against the variant index followed by
+    /// the rule's own encoding, which is what the unboxed variant would
+    /// have produced.
+    #[test]
+    fn boxing_the_rule_in_a_register_costs_no_bytes() {
+        let held = rule();
+        let mut expected = vec![0x02]; // MetadataValueRecord::Rule is variant 2
+        expected.extend(postcard::to_allocvec(&held).expect("a rule encodes"));
+        assert_eq!(
+            postcard::to_allocvec(&MetadataValueRecord::Rule(Box::new(held)))
+                .expect("a register's value encodes"),
+            expected,
+            "a boxed rule is not written as the rule it boxes"
+        );
+    }
+
     #[test]
     fn retained_removed() {
         let expected: &[u8] = &[
@@ -1410,6 +1533,53 @@ mod roundtrip {
         )
     }
 
+    /// Every [`MetadataKeyRecord`] variant.
+    fn metadata_key() -> impl Strategy<Value = MetadataKeyRecord> {
+        prop_oneof![
+            (any::<[u8; 16]>(), text())
+                .prop_map(|(node, filter)| MetadataKeyRecord::NodeSubscription { node, filter }),
+            text().prop_map(|topic| MetadataKeyRecord::Retained { topic }),
+            text().prop_map(|id| MetadataKeyRecord::Rule { id }),
+            session_key().prop_map(|session| MetadataKeyRecord::SessionOwner { session }),
+        ]
+    }
+
+    /// Every [`MetadataValueRecord`] variant.
+    fn metadata_value() -> impl Strategy<Value = MetadataValueRecord> {
+        prop_oneof![
+            Just(MetadataValueRecord::NodeSubscription),
+            retained().prop_map(MetadataValueRecord::Retained),
+            rule().prop_map(|held| MetadataValueRecord::Rule(Box::new(held))),
+            any::<[u8; 16]>().prop_map(|node| MetadataValueRecord::SessionOwner { node }),
+        ]
+    }
+
+    /// A register, with a tombstone as often as a value.
+    ///
+    /// `proptest::option::of` produces `None` rarely by default, and a
+    /// tombstone is not a rare case here — it is half of what section
+    /// 8.2's deletion vocabulary is. Weighted so that the absence byte
+    /// is exercised rather than stumbled on.
+    fn metadata_entry() -> impl Strategy<Value = MetadataRecord> {
+        (
+            metadata_key(),
+            (any::<u64>(), any::<u32>(), any::<[u8; 16]>()),
+            prop_oneof![
+                1 => Just(None),
+                1 => metadata_value().prop_map(Some),
+            ],
+        )
+            .prop_map(|(key, (millis, counter, node), value)| MetadataRecord {
+                key,
+                stamp: StampRecord {
+                    millis,
+                    counter,
+                    node,
+                },
+                value,
+            })
+    }
+
     fn retained() -> impl Strategy<Value = RetainedRecord> {
         (bytes(), qos(), any::<Option<u32>>(), bytes()).prop_map(
             |(payload, qos, expires_at, properties)| RetainedRecord {
@@ -1481,6 +1651,7 @@ mod roundtrip {
                     reading: ClockRecord { millis, counter },
                 }
             }),
+            metadata_entry().prop_map(|entry| Record::MetadataPut { entry }),
         ]
     }
 

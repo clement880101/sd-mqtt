@@ -44,7 +44,7 @@ use ::redb::{
 use serde::Serialize;
 
 use crate::record::{
-    decode_exact, BodyRecord, ClockRecord, FormatError, FormatMarker, MessageId,
+    decode_exact, BodyRecord, ClockRecord, FormatError, FormatMarker, MessageId, MetadataKeyRecord,
     NodeIdentityRecord, OutboxRecord, QueueEntry, Record, SessionKey, SessionRecord,
 };
 use crate::restore::{Restored, RestoredSession};
@@ -117,6 +117,21 @@ const RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("rules");
 const OUTBOXES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("outboxes");
 /// Rule identifier to its outbox's depth and high-water mark.
 const OUTBOX_STATE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("outbox_state");
+/// An encoded [`MetadataKeyRecord`] to the whole
+/// [`crate::record::MetadataRecord`] filed under it.
+///
+/// Keyed by [`metadata_key`] rather than by the key's postcard
+/// encoding, because **the order has to be the order the in-memory
+/// backend's `BTreeMap` produces** and postcard writes a string as a
+/// length and then its bytes, which sorts by length before content:
+/// `"a"`, `"b"`, `"ab"` rather than `"a"`, `"ab"`, `"b"`. Two backends
+/// restoring one store would then hand back the same registers in
+/// different orders, and the restart property compares them as one
+/// equality.
+///
+/// The value carries its own key, so a restore reads the rows in order
+/// and never has to decode one of these back.
+const METADATA: TableDefinition<&[u8], &[u8]> = TableDefinition::new("metadata");
 
 /// A [`Storage`] backed by a redb database on a path.
 #[derive(Debug)]
@@ -289,6 +304,7 @@ impl Storage for RedbStorage {
             .open_table(RETAINED)
             .map_err(StorageError::from)?;
         let rules = transaction.open_table(RULES).map_err(StorageError::from)?;
+        let metadata = open_read(&transaction, METADATA)?;
         let meta = transaction.open_table(META).map_err(StorageError::from)?;
 
         let mut restored = Restored::default();
@@ -351,6 +367,12 @@ impl Storage for RedbStorage {
             Some(held) => Some(decode::<ClockRecord>(held.value())?),
             None => None,
         };
+        // In key order, which `metadata_key` makes the order the
+        // in-memory backend's `BTreeMap` produces.
+        for entry in metadata.iter().map_err(StorageError::from)? {
+            let (_, value) = entry.map_err(StorageError::from)?;
+            restored.metadata.push(decode(value.value())?);
+        }
         Ok(restored)
     }
 
@@ -461,6 +483,7 @@ struct Tables<'txn> {
     rules: Table<'txn, &'static str, &'static [u8]>,
     outboxes: ByteTable<'txn>,
     outbox_state: ByteTable<'txn>,
+    metadata: ByteTable<'txn>,
 }
 
 impl<'txn> Tables<'txn> {
@@ -497,6 +520,9 @@ impl<'txn> Tables<'txn> {
                 .map_err(StorageError::from)?,
             outbox_state: transaction
                 .open_table(OUTBOX_STATE)
+                .map_err(StorageError::from)?,
+            metadata: transaction
+                .open_table(METADATA)
                 .map_err(StorageError::from)?,
         })
     }
@@ -742,6 +768,18 @@ impl<'txn> Tables<'txn> {
                 // reading moved forwards is not this layer's question.
                 self.meta
                     .insert(CLOCK_KEY, encode(reading).as_slice())
+                    .map_err(StorageError::from)?;
+            }
+            Record::MetadataPut { entry } => {
+                // Replaced whole, and not merged: which of two copies
+                // wins is the caller's one comparison. The row holds the
+                // whole record, key included, so a restore walks the
+                // table in order and decodes no keys.
+                self.metadata
+                    .insert(
+                        metadata_key(&entry.key).as_slice(),
+                        encode(entry).as_slice(),
+                    )
                     .map_err(StorageError::from)?;
             }
             Record::OutboxAppended { rule, entry } => {
@@ -1021,6 +1059,47 @@ fn rule_prefix(id: &str) -> Vec<u8> {
     let mut prefix = Vec::with_capacity(id.len() + 2);
     push_component(&mut prefix, id);
     prefix
+}
+
+/// A replicated register's key, in an order-preserving encoding.
+///
+/// The leading byte is the [`MetadataKeyRecord`] variant's index, so the
+/// variants sort in declaration order — which is the order the derived
+/// `Ord` the in-memory backend keys by produces. **The two must stay in
+/// step**, and [`FORMAT_VERSION`] is what covers them: reordering the
+/// variants changes both this encoding and that `Ord`, and a store
+/// written before the change would come back in an order the new build
+/// does not produce.
+///
+/// Each string is escaped and terminated by [`push_component`] rather
+/// than length-prefixed, for the reason the module documentation gives:
+/// a length prefix sorts by length before content. The node's sixteen
+/// bytes are written raw, which is prefix-free because it is a fixed
+/// width.
+///
+/// [`FORMAT_VERSION`]: crate::record::FORMAT_VERSION
+fn metadata_key(key: &MetadataKeyRecord) -> Vec<u8> {
+    let mut out = Vec::new();
+    match key {
+        MetadataKeyRecord::NodeSubscription { node, filter } => {
+            out.push(0);
+            out.extend_from_slice(node);
+            push_component(&mut out, filter);
+        }
+        MetadataKeyRecord::Retained { topic } => {
+            out.push(1);
+            push_component(&mut out, topic);
+        }
+        MetadataKeyRecord::Rule { id } => {
+            out.push(2);
+            push_component(&mut out, id);
+        }
+        MetadataKeyRecord::SessionOwner { session } => {
+            out.push(3);
+            out.extend_from_slice(&session_prefix(session));
+        }
+    }
+    out
 }
 
 /// A session's prefix followed by something that identifies a row within

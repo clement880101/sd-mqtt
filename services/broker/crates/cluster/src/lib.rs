@@ -62,6 +62,27 @@
 //! merge function and no path through it that asks whether either side
 //! is a tombstone.
 //!
+//! # And what those registers are about, and at what granularity
+//!
+//! [`metadata`] is section 8.2's vocabulary: the four kinds this
+//! milestone replicates — that a node has at least one subscriber for a
+//! filter, retained messages, rules and which node owns a session — and
+//! [`Replicated`], which holds this node's registers, its clock, and the
+//! one thing that is deliberately *not* replicated.
+//!
+//! That one thing is a reference count of this node's own subscribers per
+//! filter, because **subscriptions replicate at node granularity.** A
+//! register per client subscription would be fifty nodes holding a
+//! hundred thousand registers each at the design ceiling, against a
+//! thirty megabyte idle budget. So a second subscriber to a filter writes
+//! nothing and the last unsubscribe writes a **tombstone**, and what the
+//! cluster is told is that a node has a subscriber and never which of its
+//! clients it is.
+//!
+//! Rules stop being node-local here too, which is what section 9.1 said
+//! in milestone 4 would happen: `rules::live::Registry` writes the
+//! register that carries a rule in the same batch as the node's own copy.
+//!
 //! # And it is opened over something, which is not always a socket
 //!
 //! [`transport`] is the seam. Section 14 committed to three nodes in
@@ -89,6 +110,7 @@ pub mod identity;
 pub mod link;
 pub mod membership;
 pub mod mesh;
+pub mod metadata;
 pub mod register;
 pub mod testing;
 pub mod transport;
@@ -101,5 +123,6 @@ pub use identity::{IdentityError, NodeId, NodeIdentity, Reconciled};
 pub use link::{outgoing, pump, FrameReader, LinkConfig, LinkError, Outgoing, Sent};
 pub use membership::{Member, MemberState, Membership};
 pub use mesh::{keeper, Mesh, MeshSettings, MeshStats};
+pub use metadata::{MetadataError, MetadataKey, MetadataValue, MetadataWrite, Replicated};
 pub use register::{Register, Stamp};
 pub use transport::{BoxStream, TcpTransport, Transport};

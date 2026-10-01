@@ -21,7 +21,9 @@ use broker_core::broker::Broker;
 use clap::{Args, Parser, Subcommand};
 use cluster::membership::MemberState;
 use cluster::mesh::Mesh;
-use cluster::{NodeIdentity, TcpTransport};
+use cluster::{
+    HybridClock, MetadataError, NodeIdentity, Replicated, TcpTransport, DEFAULT_MAX_DRIFT_MILLIS,
+};
 use config::{Config, ConfigError, IngestListener, LogLevel, Overrides};
 use ingest::IngestSocket;
 use rules::live::IngestListening;
@@ -201,6 +203,16 @@ pub enum StartupError {
     /// next restart — and would be, without saying so.
     #[error("{0}")]
     Identity(#[from] cluster::IdentityError),
+    /// A stored replicated register could not be read back.
+    ///
+    /// Fatal, and for the reason [`Self::Restore`] is. Section 8.2's
+    /// registers are what routes to a peer, what serves a replicated
+    /// rule and what claims a session; coming up holding half of one
+    /// this build does not understand is a node that looks perfectly
+    /// healthy and routes nothing. A store written by this build cannot
+    /// contain one, so this is a store written by something else.
+    #[error("cannot read a replicated register from the store: {0}")]
+    Metadata(#[from] MetadataError),
     /// The cluster's own configuration will not do.
     ///
     /// Carried verbatim: `cluster::ConfigError` names which of the
@@ -435,6 +447,14 @@ struct Rebuilt {
     /// if the store has never held one, which is what makes a store
     /// directory and a node the same thing.
     identity: NodeIdentity,
+    /// This node's replicated metadata, section 8.2.
+    ///
+    /// Opened out of the same restore as everything else, which is
+    /// what it has to be: the clock inside it resumes from the highest
+    /// reading this node has ever written and the registers are the
+    /// ones it held, and a second restore would be a second answer to
+    /// both.
+    replicated: Arc<Replicated>,
 }
 
 /// The same, against a store somebody else opened.
@@ -476,6 +496,23 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, Sta
 
     let writer = Arc::new(
         Writer::spawn(Arc::clone(&store), config.storage.writer()).map_err(StartupError::Writer)?,
+    );
+
+    // Section 8.2, out of the same restore. **The clock resumes from
+    // the stored reading rather than from zero**: a clock that
+    // restarted behind itself would re-issue a stamp it had already
+    // used, and two values under one key carrying one stamp is the
+    // single divergence no later exchange repairs. The registers come
+    // back with it, tombstones included, because a node that dropped a
+    // tombstone would be handed its own older copy by the next peer it
+    // spoke to and would resurrect what it had deleted.
+    let replicated = Arc::new(
+        Replicated::open(
+            reconciled.identity.id(),
+            HybridClock::resume(restored.clock, DEFAULT_MAX_DRIFT_MILLIS),
+            &restored.metadata,
+        )
+        .map_err(StartupError::Metadata)?,
     );
 
     // A session the restore skipped is still in the store, and nothing
@@ -584,10 +621,15 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, Sta
     }
 
     Ok(Rebuilt {
-        shared: Arc::new(Shared::with_store(broker, Arc::clone(&writer))),
+        shared: Arc::new(Shared::with_replication(
+            broker,
+            Arc::clone(&writer),
+            Arc::clone(&replicated),
+        )),
         store,
         writer,
         identity: reconciled.identity,
+        replicated,
     })
 }
 
@@ -789,6 +831,7 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
                 &rebuilt.store,
                 &rebuilt.writer,
                 rebuilt.identity.id(),
+                &rebuilt.replicated,
             )
             .await?
         }

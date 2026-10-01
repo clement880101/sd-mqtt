@@ -312,7 +312,9 @@ name = "cluster"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "broker-core",
  "bytes",
+ "mqtt-codec",
  "postcard",
  "proptest",
  "serde",
@@ -1211,6 +1213,7 @@ version = "0.1.0"
 dependencies = [
  "broker-core",
  "bytes",
+ "cluster",
  "foldhash",
  "mqtt-codec",
  "parking_lot",

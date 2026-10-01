@@ -10,6 +10,7 @@ use crate::session::message::Message;
 use crate::session::queue::Delivery;
 use crate::session::state::Session;
 use crate::session::Action;
+use crate::subscriptions::events::{inner_filter, FilterEvent};
 use crate::subscriptions::{SharedSubscriptions, Subscription, SubscriptionTrie};
 
 /// Apply a subscribe request, returning one reason code per filter.
@@ -33,6 +34,7 @@ pub fn subscribe(
     now: u32,
     authorize: &mut dyn FnMut(&str, QoS) -> bool,
     out: &mut Vec<Action>,
+    events: &mut Vec<FilterEvent>,
 ) -> Vec<ReasonCode> {
     let subscription_id = packet.properties.subscription_identifiers.first().copied();
     let mut reasons = Vec::with_capacity(packet.filters.len());
@@ -71,6 +73,24 @@ pub fn subscribe(
             Some((name, inner)) => shared.insert(name, inner, subscription),
             None => trie.insert(&options.filter, subscription),
         };
+        // Section 8.2: the cluster is told that this node has a
+        // subscriber for the filter, and the filter is the one a
+        // published topic is matched against — the inner filter for a
+        // shared subscription, because the group is how this node
+        // shares a delivery among its own clients and is nothing a peer
+        // can route by.
+        //
+        // **Only when the trie actually gained an entry.** A second
+        // subscribe to a filter this session already holds changes the
+        // options rather than adding a subscription, and an arrival for
+        // it would be a count incremented twice that never comes back
+        // down: the filter would stay advertised to the cluster after
+        // its last subscriber left.
+        if !existed {
+            events.push(FilterEvent::Arrived(
+                inner_filter(&options.filter).to_owned(),
+            ));
+        }
         // Everything the filter was taken under, not just its name. The
         // identifier above all: [MQTT-3.8.4-3] has it echoed on every
         // delivery the subscription causes, and a restart that dropped
@@ -166,6 +186,7 @@ pub fn unsubscribe(
     shared: &SharedSubscriptions,
     session: &mut Session,
     filters: &[String],
+    events: &mut Vec<FilterEvent>,
 ) -> Vec<ReasonCode> {
     filters
         .iter()
@@ -176,6 +197,12 @@ pub fn unsubscribe(
             };
             session.remove_filter(filter);
             if removed {
+                // Only what actually went, for the reason the arrival
+                // above is only what actually came: a departure from a
+                // filter nothing held would take the count below zero,
+                // and a count that cannot reach zero again never
+                // tombstones the filter.
+                events.push(FilterEvent::Departed(inner_filter(filter).to_owned()));
                 ReasonCode::Success
             } else {
                 ReasonCode::NoSubscriptionExisted
@@ -185,12 +212,54 @@ pub fn unsubscribe(
 }
 
 /// Remove every subscription a session holds, for teardown.
-pub fn remove_all(trie: &SubscriptionTrie, shared: &SharedSubscriptions, session: &mut Session) {
+pub fn remove_all(
+    trie: &SubscriptionTrie,
+    shared: &SharedSubscriptions,
+    session: &mut Session,
+    events: &mut Vec<FilterEvent>,
+) {
+    let held: Vec<String> = session.filters().map(str::to_string).collect();
+    remove_held(trie, shared, session, &held, events);
+}
+
+/// The same, told what the handle's subscriptions were.
+///
+/// # Two of section 8.2's three departure paths come through here
+///
+/// A clean-start connect and a session expiring in a tick, neither of
+/// which is an UNSUBSCRIBE and neither of which any client asked for.
+/// The departures are emitted **here rather than by those two callers**,
+/// because a third teardown path added later gets them for free, and a
+/// departure missed leaves this node advertised to the cluster for a
+/// filter nobody is subscribed to, for ever — a restart does not repair
+/// it, because the subscription is gone from the store too.
+///
+/// # Why `held` is a parameter and not read from `session`
+///
+/// A clean-start connect **replaces the session before the trie is
+/// cleared**: the registry hands back a fresh one under the same handle,
+/// so by the time this runs the session's own list is empty while the
+/// trie still holds its entries. Reading the list here would report
+/// nothing on exactly the path nobody thinks of, and would do it
+/// silently, because the trie is cleared by handle and comes out right
+/// either way. So the caller that knows which session it is taking away
+/// says what it held.
+pub fn remove_held(
+    trie: &SubscriptionTrie,
+    shared: &SharedSubscriptions,
+    session: &mut Session,
+    held: &[String],
+    events: &mut Vec<FilterEvent>,
+) {
     trie.remove_subscriber(session.subscriber());
     shared.remove_subscriber(session.subscriber());
-    let held: Vec<String> = session.filters().map(str::to_string).collect();
     for filter in held {
-        session.remove_filter(&filter);
+        // The return is not consulted, for the reason above: on the
+        // clean-start path the session being told is the replacement and
+        // holds none of these. One departure per filter the handle held
+        // is the claim, and `held` is one entry per filter.
+        session.remove_filter(filter);
+        events.push(FilterEvent::Departed(inner_filter(filter).to_owned()));
     }
 }
 
@@ -295,6 +364,7 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
         assert_eq!(reasons, vec![ReasonCode::GrantedQos1]);
         assert_eq!(f.trie.len(), 1);
@@ -314,6 +384,7 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
         assert_eq!(sent_topics(&out), vec!["a/b".to_string()]);
 
@@ -342,6 +413,7 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
         let flags: Vec<bool> = out
             .iter()
@@ -369,6 +441,7 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
         assert_eq!(sent_topics(&out).len(), 1);
 
@@ -383,6 +456,7 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
         assert!(sent_topics(&out).is_empty(), "the subscription existed");
     }
@@ -405,6 +479,7 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
         assert_eq!(sent_topics(&out).len(), 1);
 
@@ -419,6 +494,7 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
         assert_eq!(sent_topics(&out).len(), 1, "sent again, [MQTT-3.3.1-9]");
     }
@@ -437,6 +513,7 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
         assert!(sent_topics(&out).is_empty());
     }
@@ -455,6 +532,7 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
         assert_eq!(f.shared.group_count(), 1);
         assert_eq!(f.trie.len(), 0, "not in the ordinary trie");
@@ -475,6 +553,7 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
         assert!(sent_topics(&out).is_empty());
     }
@@ -513,6 +592,7 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
         assert_eq!(reasons.len(), 2);
         assert!(!reasons[0].is_failure());
@@ -548,6 +628,7 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
         assert_eq!(f.session.filters().count(), 0);
     }
@@ -568,6 +649,7 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
         let ids: Vec<Vec<u32>> = out
             .iter()
@@ -605,6 +687,7 @@ mod tests {
             9,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
         assert_eq!(sent_topics(&out), vec!["a/b".to_string()]);
     }
@@ -623,6 +706,7 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
 
         let reasons = unsubscribe(
@@ -630,6 +714,7 @@ mod tests {
             &f.shared,
             &mut f.session,
             &["x/y".into(), "z".into()],
+            &mut Vec::new(),
         );
         assert_eq!(reasons[0], ReasonCode::Success);
         assert_eq!(reasons[1], ReasonCode::NoSubscriptionExisted);
@@ -650,9 +735,16 @@ mod tests {
             0,
             &mut allow_everything,
             &mut out,
+            &mut Vec::new(),
         );
 
-        let reasons = unsubscribe(&f.trie, &f.shared, &mut f.session, &["$share/g/x/y".into()]);
+        let reasons = unsubscribe(
+            &f.trie,
+            &f.shared,
+            &mut f.session,
+            &["$share/g/x/y".into()],
+            &mut Vec::new(),
+        );
         assert_eq!(reasons[0], ReasonCode::Success);
         assert_eq!(f.shared.group_count(), 0);
         assert_eq!(f.session.filters().count(), 0);
@@ -673,11 +765,12 @@ mod tests {
                 0,
                 &mut allow_everything,
                 &mut out,
+                &mut Vec::new(),
             );
         }
         assert_eq!(f.trie.len() + f.shared.group_count(), 3);
 
-        remove_all(&f.trie, &f.shared, &mut f.session);
+        remove_all(&f.trie, &f.shared, &mut f.session, &mut Vec::new());
         assert_eq!(f.trie.len(), 0);
         assert_eq!(f.shared.group_count(), 0);
         assert_eq!(f.session.filters().count(), 0);

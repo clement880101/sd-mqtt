@@ -46,6 +46,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use cluster::Replicated;
 use rules::live::Registry;
 use rules::rule::Rule;
 use rules::singleton::{Membership, NodeId};
@@ -121,6 +122,7 @@ pub async fn start(
     store: &Arc<dyn Storage>,
     writer: &Arc<Writer>,
     this_node: NodeId,
+    replicated: &Arc<Replicated>,
 ) -> Result<Connectors, StartupError> {
     // One member, so it owns every singleton. Written as a view
     // because a rule only ever exercised in the one-member case is a
@@ -138,6 +140,7 @@ pub async fn start(
         Arc::clone(store),
         Arc::clone(writer),
         membership,
+        Arc::clone(replicated),
     );
 
     let mut configured = BTreeSet::new();

@@ -18,6 +18,13 @@ testing = []
 
 [dependencies]
 broker-core = { path = "../broker-core", version = "0.1.0" }
+# Section 8.2's replicated registers. The shell is where the broker's
+# journal is written down, and a filter gaining or losing its last local
+# subscriber is a replicated write that has to go in the same batch as
+# the subscription that caused it — so the thing that stamps it is held
+# here. The direction is the layering, as it is for `rules`: `cluster`
+# knows nothing about a connection.
+cluster = { path = "../cluster", version = "0.1.0" }
 mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
 # Default features off, and not for `broker-core`'s reason. This crate is
 # allowed a disk; it simply has no use for one. It needs the record

@@ -30,8 +30,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, PoisonError};
 
 use crate::record::{
-    BodyRecord, ClockRecord, InflightRecord, MessageId, NodeIdentityRecord, OutboxRecord,
-    QueueEntry, Record, RetainedRecord, RuleRecord, SessionKey, SessionRecord, SubscriptionRecord,
+    BodyRecord, ClockRecord, InflightRecord, MessageId, MetadataKeyRecord, MetadataRecord,
+    NodeIdentityRecord, OutboxRecord, QueueEntry, Record, RetainedRecord, RuleRecord, SessionKey,
+    SessionRecord, SubscriptionRecord,
 };
 use crate::restore::{Restored, RestoredSession};
 use crate::{Rejection, Storage, StorageError};
@@ -87,6 +88,13 @@ struct State {
     /// One row, beside the identity and for the same reason: a store
     /// belongs to one node, and this is that node's clock.
     clock: Option<ClockRecord>,
+    /// Every replicated register, by what it is about. Section 8.2.
+    ///
+    /// Ordered by the key, which is what makes a restore from this
+    /// backend comparable with one from redb: redb's key encoding puts
+    /// the variant index in a leading byte and escapes each string
+    /// component so that its byte order is this `BTreeMap`'s order.
+    metadata: BTreeMap<MetadataKeyRecord, MetadataRecord>,
     /// Each rule's outbox, by the same identifier.
     ///
     /// Beside the rules rather than inside a rule's own entry, because a
@@ -355,6 +363,14 @@ impl State {
                 // store's.
                 self.clock = Some(*reading);
             }
+            Record::MetadataPut { entry } => {
+                // Replaced whole, and not compared with what is held:
+                // which of two copies wins is the caller's one
+                // comparison, and `Record::MetadataPut` says why it is
+                // not the store's. A deletion arrives here as an entry
+                // whose value is absent, and is stored like any other.
+                self.metadata.insert(entry.key.clone(), entry.clone());
+            }
             Record::OutboxRemoved { rule, sequence } => {
                 let held = self.outbox_mut(rule)?;
                 // Only what was actually there is subtracted, for the
@@ -426,6 +442,7 @@ impl Storage for MemoryStorage {
             rules: state.rules.values().cloned().collect(),
             node: state.node.clone(),
             clock: state.clock,
+            metadata: state.metadata.values().cloned().collect(),
         })
     }
 

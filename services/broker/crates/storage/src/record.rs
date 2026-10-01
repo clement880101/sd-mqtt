@@ -94,7 +94,19 @@ use serde::{Deserialize, Serialize};
 /// writes ever sharing a stamp, so a clock that restarts behind itself
 /// is not a node that lost some counter; it is two values under one key
 /// that no later exchange can ever separate.
-pub const FORMAT_VERSION: u16 = 6;
+///
+/// Version 7 added the replicated registers themselves, section 8.2:
+/// one variant at the end of [`Record`], a [`MetadataRecord`] to go in
+/// it with the key, stamp and value types it is made of, and one table
+/// in each backend. The same argument as every version above, and the
+/// failure a version 6 store would produce is the quietest of the lot
+/// — **a node would come up holding no registers at all and looking
+/// perfectly healthy**, routing nothing to any peer, serving no
+/// replicated rule, and claiming no session it owned. Worse, it would
+/// then re-create what it had locally under fresh stamps, which beat
+/// the tombstones every other node still holds: a restart that
+/// resurrects everything this node ever deleted.
+pub const FORMAT_VERSION: u16 = 7;
 
 /// What every sd-mqtt store begins with, so a file that is not one is
 /// refused as such rather than as a corrupt store.
@@ -873,6 +885,134 @@ pub struct ClockRecord {
     pub counter: u32,
 }
 
+/// What orders one replicated write against another, section 8.2.
+///
+/// A clock reading and the node that wrote it. **The comparison is the
+/// milliseconds, then the counter, then the sixteen UUID bytes**, and it
+/// lives in `cluster::register` rather than here: this crate holds the
+/// bytes and does not resolve conflicts. The field order below is that
+/// order all the same, so a hex dump reads in the order a comparison
+/// does.
+///
+/// The node is its sixteen bytes rather than its canonical text, for the
+/// reason [`NodeIdentityRecord::uuid`] gives: the text is a rendering of
+/// the bytes, and storing a rendering invites a reader that parses it
+/// differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StampRecord {
+    /// The reading's physical half.
+    pub millis: u64,
+    /// The reading's logical half.
+    pub counter: u32,
+    /// Who wrote it.
+    pub node: [u8; 16],
+}
+
+/// What a replicated register is about, section 8.2.
+///
+/// # An open vocabulary, deliberately
+///
+/// Section 8.2 lists seven kinds of replicated metadata and three of
+/// them — users, access control rules, API keys — do not exist until
+/// milestone 7 brings authentication. They are a variant here and a
+/// variant of [`MetadataValueRecord`], and nothing else: no table, no
+/// exchange, no merge rule. That is what "written to carry a kind they
+/// do not yet know" means in practice.
+///
+/// **Variant order is the format**, as it is for [`Record`]: a new kind
+/// goes at the end or [`FORMAT_VERSION`] moves. It is also the order a
+/// restore hands these back in, and the redb backend's key encoding
+/// puts the variant index in the leading byte precisely so that the two
+/// backends agree on it.
+///
+/// # A subscription names a node and a filter, and not a client
+///
+/// Section 8.2: **subscriptions are replicated at node granularity.** A
+/// register per client subscription would be fifty nodes holding a
+/// hundred thousand each at the design ceiling, against a thirty
+/// megabyte idle budget. What is replicated is that a node has at least
+/// one subscriber for a filter, which is what routing needs; which of
+/// its clients that is never leaves the node, so there is nothing here
+/// to hold it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum MetadataKeyRecord {
+    /// That a node has at least one subscriber for a filter.
+    NodeSubscription {
+        /// Whose subscriber. Its sixteen UUID bytes.
+        node: [u8; 16],
+        /// Which filter.
+        filter: String,
+    },
+    /// The retained message on a topic.
+    Retained {
+        /// Which topic.
+        topic: String,
+    },
+    /// A rule, section 9.1, which stops being node-local here.
+    Rule {
+        /// Which rule.
+        id: String,
+    },
+    /// Which node owns a session, section 8.4.
+    SessionOwner {
+        /// Whose session.
+        session: SessionKey,
+    },
+}
+
+/// What a replicated register holds, section 8.2.
+///
+/// One variant per [`MetadataKeyRecord`] variant, in the same order. A
+/// stored register whose key and value name different kinds is refused
+/// when it is read back, by the crate that knows what the pairs mean.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataValueRecord {
+    /// Presence, and nothing else.
+    ///
+    /// A unit variant because the key carries the node and the filter,
+    /// which is the whole fact. Anything here would be something about
+    /// that node's own clients, and that is the part which does not fit
+    /// in the budget.
+    NodeSubscription,
+    /// What is retained on the topic the key names.
+    Retained(RetainedRecord),
+    /// The rule the key names, whole.
+    ///
+    /// Boxed, which changes nothing on disk — serde writes a `Box<T>`
+    /// exactly as it writes a `T`, and the golden vectors pin that — and
+    /// keeps this variant from being three hundred bytes while the
+    /// smallest is sixteen. The same reason `rules::rule::Action` boxes
+    /// its bridge.
+    Rule(Box<RuleRecord>),
+    /// Which node owns the session the key names.
+    SessionOwner {
+        /// Its sixteen UUID bytes.
+        node: [u8; 16],
+    },
+}
+
+/// One replicated register, as a store holds it.
+///
+/// # An absent value is a tombstone, and that is the whole of deletion
+///
+/// Section 8.2: **a tombstone is a value competing by the same
+/// comparison, not a special case.** So there is no `MetadataRemoved`
+/// record beside this one: a deletion is one of these with
+/// [`Self::value`] absent, and it is stored, because a node that simply
+/// dropped the row would be handed its own older copy by the next peer
+/// it spoke to and would resurrect what it deleted. Collecting
+/// tombstones behind a cluster-wide watermark is a later task, and it is
+/// the only thing that ever removes one of these.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataRecord {
+    /// What the register is about.
+    pub key: MetadataKeyRecord,
+    /// What orders it against another copy.
+    pub stamp: StampRecord,
+    /// What is held, or `None` for a tombstone.
+    pub value: Option<MetadataValueRecord>,
+}
+
 /// A message held for future subscribers to a topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedRecord {
@@ -1087,6 +1227,21 @@ pub enum Record {
         /// The reading.
         reading: ClockRecord,
     },
+    /// One replicated register, section 8.2.
+    ///
+    /// **Replaced whole, and the store does not merge.** Which of two
+    /// copies wins is `cluster::register`'s one comparison, and a store
+    /// with an opinion about it would be a second answer in the layer
+    /// that cannot see the question — the same decision
+    /// [`Record::NodeIdentityPut`] and [`ClockRecord`] record at
+    /// length. A caller stores what it has already decided to keep.
+    ///
+    /// A deletion is one of these carrying no value. There is no
+    /// removal record, for the reason [`MetadataRecord`] gives.
+    MetadataPut {
+        /// The register, and what it is about.
+        entry: MetadataRecord,
+    },
 }
 
 impl Record {
@@ -1219,6 +1374,39 @@ impl Record {
             Self::NodeIdentityPut { identity } => identity.name.len(),
             // Two integers, both inside the record's own footprint.
             Self::ClockHighWaterPut { .. } => 0,
+            // A peer controls the size of a filter and a topic, an
+            // operator the size of a rule, and a client the size of a
+            // session key. The stamp is two integers and sixteen bytes,
+            // all inside the record's own footprint.
+            Self::MetadataPut { entry } => {
+                let key = match &entry.key {
+                    MetadataKeyRecord::NodeSubscription { filter, .. } => filter.len(),
+                    MetadataKeyRecord::Retained { topic } => topic.len(),
+                    MetadataKeyRecord::Rule { id } => id.len(),
+                    MetadataKeyRecord::SessionOwner { session } => weigh_key(session),
+                };
+                let value = match &entry.value {
+                    None
+                    | Some(
+                        MetadataValueRecord::NodeSubscription
+                        | MetadataValueRecord::SessionOwner { .. },
+                    ) => 0,
+                    Some(MetadataValueRecord::Retained(message)) => {
+                        message.payload.len() + message.properties.len()
+                    }
+                    // The same accounting a `RulePut` gets, and the one
+                    // place this estimate would otherwise miss a field
+                    // an operator can grow.
+                    Some(MetadataValueRecord::Rule(rule)) => {
+                        Self::RulePut {
+                            rule: (**rule).clone(),
+                        }
+                        .weight()
+                            - std::mem::size_of::<Self>()
+                    }
+                };
+                key + value
+            }
         };
         std::mem::size_of::<Self>() + variable
     }

@@ -15,16 +15,17 @@ the milestone you are moving to.** Everything else is description.
 milestone 4. It refuses to start, and says so:**
 
 ```
-store format version 4 is not readable by this build, which reads version 6.
+store format version 4 is not readable by this build, which reads version 7.
 The store is not damaged; it was written by a different build. Nothing is
 released yet, so there is no migration: see CHANGELOG.md for what moved and
 what starting with a fresh store directory throws away.
 ```
 
-**The same applies to a version 5 store**, which is one written by an
-earlier build of this same unreleased milestone: this milestone has
-moved the format twice, once for the node's identity and once for its
-clock, and the check is exact.
+**The same applies to a version 5 or version 6 store**, either of which
+is one written by an earlier build of this same unreleased milestone:
+this milestone has moved the format three times — once for the node's
+identity, once for its clock, and once for the replicated registers
+themselves — and the check is exact.
 
 The file is not damaged and the check is **exact rather than a
 range**, for the reason the milestone 4 section below gives at length:
@@ -35,14 +36,20 @@ reading healthy bytes with the wrong layout restores nonsense.
 which creates a fresh store. What that throws away is what the store
 held, and the list is the one in the milestone 4 section — durable
 sessions, queued messages, retained messages, wills, rules and
-outboxes — **with two additions: this node's identity, and its
-clock.** A fresh store mints a fresh UUID, so as far as the rest of a
-cluster is concerned the node that comes back is a new one; and a
-fresh store holds no clock reading, so the node starts its clock from
-the wall clock rather than resuming. Starting a *fresh* store from
-zero is safe — there are no earlier writes of this node's for a new
-stamp to collide with — and that is exactly why throwing the store
-away is the instruction rather than keeping half of it.
+outboxes — **with three additions: this node's identity, its clock,
+and the replicated registers it held.** A fresh store mints a fresh
+UUID, so as far as the rest of a cluster is concerned the node that
+comes back is a new one; and a fresh store holds no clock reading, so
+the node starts its clock from the wall clock rather than resuming.
+Starting a *fresh* store from zero is safe — there are no earlier
+writes of this node's for a new stamp to collide with — and that is
+exactly why throwing the store away is the instruction rather than
+keeping half of it. The registers go with it, which on a node that is
+already in a cluster costs nothing: it re-announces its filters as its
+clients re-subscribe and the next anti-entropy exchange hands it back
+everything the cluster holds. **On the last node of a cluster it costs
+the cluster's metadata**, so the instruction is the same one it has
+always been: throw away one store, not every store.
 
 **Why the version moved to 5.** Section 8.1 gives each node a stable
 identity — a UUID v7 minted on first start and a name beside it — and
@@ -64,6 +71,18 @@ from zero and re-issue stamps it had already used — and two values
 under one key carrying one stamp is the single divergence no later
 exchange repairs, because each side keeps its own and believes it
 already holds the winner.
+
+**Why it moved again to 7.** Section 8.2's registers are now stored,
+which is what makes a restart come back knowing what the cluster was
+told. That added one more record variant, the register and the three
+types it is made of, and one more table in each backend. The failure a
+version 6 store would produce is the quietest of the lot: **a node
+would come up holding no registers at all and looking perfectly
+healthy** — routing nothing to any peer, serving no replicated rule,
+claiming no session it owned — and would then re-create what it held
+locally under fresh stamps, which beat the tombstones every other node
+still holds. A restart that resurrects everything this node ever
+deleted.
 
 ### Added
 
@@ -95,6 +114,32 @@ already holds the winner.
   tombstone competing by that same comparison and not a special case**:
   "a delete always wins" diverges, because two nodes that saw a delete
   and a later write in different orders keep different things.
+- **Section 8.2's four replicated kinds, and what each of them is
+  keyed by**: that a node has at least one subscriber for a filter,
+  retained messages, rules, and which node owns a session. The
+  vocabulary is open, so milestone 7's users, access control rules and
+  API keys are a new variant rather than a new mechanism. A deletion of
+  any of them is a tombstone competing by the register's one
+  comparison; there is no removal record, because a node that dropped
+  the row would be handed its own older copy by the next peer it spoke
+  to and would resurrect what it deleted.
+- **Subscriptions replicate at node granularity, not per client.** What
+  travels is that a node has a subscriber for a filter; which of its
+  clients that is never leaves the node. A register per client
+  subscription would be fifty nodes holding a hundred thousand
+  registers each at the design ceiling, against an idle memory budget
+  of thirty megabytes. So each node keeps a reference count per filter,
+  local and unreplicated, and writes a register only when that count
+  leaves or reaches zero — **a second subscriber to a filter broadcasts
+  nothing, and the last unsubscribe broadcasts a tombstone.** The
+  departure is emitted on all three paths a filter can go on, not just
+  the one anybody thinks of: UNSUBSCRIBE, a connect that starts clean
+  (including a clean-start takeover), and a session expiring. A
+  departure missed on any of them leaves the node advertised for a
+  filter nobody is subscribed to, and a restart does not repair it.
+  A shared subscription counts under the filter a published topic is
+  matched against, not under its group: `$share/one/a/b` and
+  `$share/two/a/b` are two subscribers to `a/b`.
 - Section 8.1's node identity: a UUID v7 and a name, minted on first
   start and read back unchanged afterwards. Renaming a node moves the
   name and not the UUID. See `[node]` in `README.md` and
@@ -146,6 +191,18 @@ already holds the winner.
 
 ### Changed
 
+- **Rules stop being node-local**, which is what section 9.1 and
+  milestone 4 said would happen here. Installing, editing or removing
+  one still writes this node's own copy and now writes the
+  last-writer-wins register that carries it to every peer, in the same
+  batch: a rule stored without its register would be a rule this node
+  runs and nobody else has, and a removal writes a tombstone rather
+  than dropping the register, because a register merely dropped comes
+  back from the first peer this node speaks to and reinstalls the rule
+  an operator deleted. Nothing broadcasts yet, so the register is
+  written and held rather than sent; what changed is that a rule is in
+  the replicated vocabulary and is stamped by the same clock as
+  everything else.
 - **The admin API reports this node's real identity.** `/api/v1/nodes`
   answered with the word `local`, hardcoded, on a binary that has had
   a UUID since the first task of this milestone. It now reports that

@@ -32,9 +32,10 @@ use std::collections::BTreeSet;
 
 use storage::{
     ActionRecord, BodyRecord, ClockRecord, DeliveryRecord, HttpOutRecord, InflightRecord,
-    InflightState, MessageId, NodeIdentityRecord, OutboxRecord, ProtocolVersion, Qos, QueueEntry,
-    Record, Rejection, Restored, RestoredSession, RetainHandling, RetainedRecord, RuleRecord,
-    SessionKey, SessionRecord, Storage, StorageError, SubscriptionRecord, TriggerRecord,
+    InflightState, MessageId, MetadataKeyRecord, MetadataRecord, MetadataValueRecord,
+    NodeIdentityRecord, OutboxRecord, ProtocolVersion, Qos, QueueEntry, Record, Rejection,
+    Restored, RestoredSession, RetainHandling, RetainedRecord, RuleRecord, SessionKey,
+    SessionRecord, StampRecord, Storage, StorageError, SubscriptionRecord, TriggerRecord,
 };
 
 /// The contract, as functions over any backend.
@@ -1761,6 +1762,238 @@ mod contract {
         );
     }
 
+    // ---- the replicated registers ----------------------------------------
+
+    /// A register, for the metadata tests below.
+    fn register(
+        key: MetadataKeyRecord,
+        millis: u64,
+        value: Option<MetadataValueRecord>,
+    ) -> MetadataRecord {
+        MetadataRecord {
+            key,
+            stamp: StampRecord {
+                millis,
+                counter: 3,
+                node: [0x07; 16],
+            },
+            value,
+        }
+    }
+
+    /// Section 8.2's registers: held, replaced whole, and restored **in
+    /// key order**, which both backends must agree on.
+    ///
+    /// # The keys are chosen to catch a length-prefixed encoding
+    ///
+    /// `"a"`, `"ab"` and `"b"` sort as `a`, `ab`, `b` by content and as
+    /// `a`, `b`, `ab` by length-then-content. A backend keying on a
+    /// postcard encoding of the key would produce the second, because
+    /// postcard writes a string as a length and then its bytes — and
+    /// nothing else here would notice, because every register would
+    /// still be present and whole. The restart property compares two
+    /// backends' restores as one equality, so an order that differs is
+    /// an equality that fails somewhere far from its cause.
+    ///
+    /// All four kinds appear, in a scrambled insertion order, against a
+    /// hand-written expected order. Sorting a clone to build the
+    /// expectation would be convention 6's harness that mirrors the
+    /// implementation: it would accept whatever order the keys happened
+    /// to have.
+    pub fn metadata_registers_are_held_replaced_and_restored_in_key_order<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = new();
+        assert!(
+            restore(&store).metadata.is_empty(),
+            "an empty store holds no registers"
+        );
+
+        let subscription = |node: [u8; 16], filter: &str| MetadataKeyRecord::NodeSubscription {
+            node,
+            filter: filter.to_owned(),
+        };
+        let expected = vec![
+            register(
+                subscription([1; 16], "a"),
+                10,
+                Some(MetadataValueRecord::NodeSubscription),
+            ),
+            register(
+                subscription([1; 16], "ab"),
+                11,
+                Some(MetadataValueRecord::NodeSubscription),
+            ),
+            // A tombstone, so the order is proved over one too: a
+            // backend that filed deletions elsewhere would pass a test
+            // whose every register carried a value.
+            register(subscription([1; 16], "b"), 12, None),
+            register(
+                subscription([2; 16], "a"),
+                13,
+                Some(MetadataValueRecord::NodeSubscription),
+            ),
+            register(
+                MetadataKeyRecord::Retained {
+                    topic: "a".to_owned(),
+                },
+                14,
+                Some(MetadataValueRecord::Retained(retained("warm"))),
+            ),
+            register(
+                MetadataKeyRecord::Rule {
+                    id: "telemetry".to_owned(),
+                },
+                15,
+                Some(MetadataValueRecord::Rule(Box::new(rule("telemetry")))),
+            ),
+            register(
+                MetadataKeyRecord::SessionOwner { session: key("a") },
+                16,
+                Some(MetadataValueRecord::SessionOwner { node: [9; 16] }),
+            ),
+            register(
+                MetadataKeyRecord::SessionOwner { session: key("ab") },
+                17,
+                Some(MetadataValueRecord::SessionOwner { node: [9; 16] }),
+            ),
+        ];
+
+        // Applied in an order that is not the key order, so that a
+        // backend restoring in insertion order fails rather than
+        // passing by coincidence.
+        let scrambled = [7usize, 2, 5, 0, 6, 3, 1, 4];
+        apply(
+            &store,
+            &scrambled
+                .iter()
+                .map(|index| Record::MetadataPut {
+                    entry: expected[*index].clone(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            restore(&store).metadata,
+            expected,
+            "the registers did not come back in key order"
+        );
+
+        // Replaced whole, including by a register whose stamp is
+        // *older*: the store holds what it is given, and which of two
+        // copies wins is the caller's one comparison. A backend with an
+        // opinion about it would be a second answer in the layer that
+        // cannot see the question.
+        let older = register(subscription([1; 16], "a"), 1, None);
+        apply(
+            &store,
+            &[Record::MetadataPut {
+                entry: older.clone(),
+            }],
+        );
+        let held = restore(&store).metadata;
+        assert_eq!(
+            held[0], older,
+            "the store refused or merged a register, which is not its decision"
+        );
+        assert_eq!(
+            held.len(),
+            expected.len(),
+            "replacing a register added one instead"
+        );
+    }
+
+    /// Two nodes' subscriptions to one filter are two registers.
+    ///
+    /// The node is part of the key, because each node answers for its
+    /// own subscribers. A backend that keyed on the filter alone would
+    /// hold one register for the whole cluster, and the last node to
+    /// subscribe would silently un-route every other.
+    pub fn two_nodes_subscriptions_to_one_filter_are_two_registers<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = new();
+        let filter = |node: [u8; 16]| MetadataKeyRecord::NodeSubscription {
+            node,
+            filter: "sensor/+/temp".to_owned(),
+        };
+        apply(
+            &store,
+            &[
+                Record::MetadataPut {
+                    entry: register(
+                        filter([1; 16]),
+                        10,
+                        Some(MetadataValueRecord::NodeSubscription),
+                    ),
+                },
+                Record::MetadataPut {
+                    entry: register(
+                        filter([2; 16]),
+                        11,
+                        Some(MetadataValueRecord::NodeSubscription),
+                    ),
+                },
+            ],
+        );
+        let held = restore(&store).metadata;
+        assert_eq!(held.len(), 2, "one filter, two nodes, two registers");
+        assert_eq!(held[0].stamp.millis, 10);
+        assert_eq!(held[1].stamp.millis, 11);
+    }
+
+    /// A register survives the session and the rule its key names.
+    ///
+    /// A session's removal takes everything filed under the session with
+    /// it, and a rule's takes its outbox. Neither may take a register:
+    /// the register is the cluster's record of who owned that session
+    /// and of a rule every node holds, and a node that dropped it on a
+    /// local removal would have the deletion travel nowhere while every
+    /// peer went on holding the value.
+    pub fn a_register_survives_the_session_and_the_rule_its_key_names<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = new();
+        apply(
+            &store,
+            &[
+                Record::SessionPut(session("a")),
+                Record::RulePut {
+                    rule: rule("telemetry"),
+                },
+                Record::MetadataPut {
+                    entry: register(
+                        MetadataKeyRecord::SessionOwner { session: key("a") },
+                        10,
+                        Some(MetadataValueRecord::SessionOwner { node: [9; 16] }),
+                    ),
+                },
+                Record::MetadataPut {
+                    entry: register(
+                        MetadataKeyRecord::Rule {
+                            id: "telemetry".to_owned(),
+                        },
+                        11,
+                        Some(MetadataValueRecord::Rule(Box::new(rule("telemetry")))),
+                    ),
+                },
+            ],
+        );
+        apply(
+            &store,
+            &[
+                Record::SessionRemoved { session: key("a") },
+                Record::RuleRemoved {
+                    id: "telemetry".to_owned(),
+                },
+            ],
+        );
+        assert_eq!(
+            restore(&store).metadata.len(),
+            2,
+            "a local removal took a replicated register with it"
+        );
+    }
+
     // ---- rules -----------------------------------------------------------
 
     /// Rules are held, replaced whole, and removed. Section 9.1.
@@ -2406,6 +2639,9 @@ macro_rules! every_contract_test {
             a_body_can_be_read_back_on_its_own,
             the_node_identity_is_held_and_renamed_without_re_founding,
             the_clock_mark_is_held_with_both_of_its_halves,
+            metadata_registers_are_held_replaced_and_restored_in_key_order,
+            two_nodes_subscriptions_to_one_filter_are_two_registers,
+            a_register_survives_the_session_and_the_rule_its_key_names,
             a_flush_keeps_everything_and_leaves_the_store_usable,
         }
     };
