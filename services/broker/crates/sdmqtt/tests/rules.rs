@@ -41,7 +41,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -177,6 +177,11 @@ struct Endpoint {
     received: Arc<Mutex<Vec<Received>>>,
     accepting: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
+    /// Which request to record and then never answer, counted from one.
+    ///
+    /// Zero is every request answered, which is what every test but one
+    /// wants. See [`Endpoint::stall_request`] for the one.
+    stall: Arc<AtomicUsize>,
     /// What a request is answered with.
     ///
     /// Empty is the `204 No Content` this endpoint has always
@@ -199,12 +204,14 @@ impl Endpoint {
         let accepting = Arc::new(AtomicBool::new(true));
         let stopped = Arc::new(AtomicBool::new(false));
         let body = Arc::new(Mutex::new(Vec::new()));
+        let stall = Arc::new(AtomicUsize::new(0));
 
         std::thread::spawn({
             let received = Arc::clone(&received);
             let accepting = Arc::clone(&accepting);
             let stopped = Arc::clone(&stopped);
             let body = Arc::clone(&body);
+            let stall = Arc::clone(&stall);
             move || {
                 while !stopped.load(Ordering::SeqCst) {
                     match listener.accept() {
@@ -212,8 +219,10 @@ impl Endpoint {
                             let received = Arc::clone(&received);
                             let accepting = Arc::clone(&accepting);
                             let body = Arc::clone(&body);
+                            let stall = Arc::clone(&stall);
+                            let stopped = Arc::clone(&stopped);
                             std::thread::spawn(move || {
-                                serve(stream, &received, &accepting, &body);
+                                serve(stream, &received, &accepting, &body, &stall, &stopped);
                             });
                         }
                         Err(_) => std::thread::sleep(Duration::from_millis(5)),
@@ -228,6 +237,7 @@ impl Endpoint {
             accepting,
             stopped,
             body,
+            stall,
         }
     }
 
@@ -248,6 +258,26 @@ impl Endpoint {
     /// Answer 204 again.
     fn come_back(&self) {
         self.accepting.store(true, Ordering::SeqCst);
+    }
+
+    /// Record the `which`th request, counted from one, and never answer
+    /// it.
+    ///
+    /// **What makes a kill land in a known place.** A test that kills
+    /// the broker while an attempt is in flight otherwise has to guess
+    /// where the pump is, because an attempt against a refusing endpoint
+    /// takes microseconds and the backoff between attempts takes
+    /// milliseconds — so whether the kill lands between an attempt and
+    /// the record of it is up to the scheduler. Held open, the pump
+    /// cannot leave that point until the rule's own request deadline, so
+    /// the state the kill interrupts is the one the test named.
+    fn stall_request(&self, which: usize) {
+        self.stall.store(which, Ordering::SeqCst);
+    }
+
+    /// Answer everything again, including whatever is being held.
+    fn stall_nothing(&self) {
+        self.stall.store(0, Ordering::SeqCst);
     }
 
     fn requests(&self) -> Vec<Received> {
@@ -287,6 +317,8 @@ fn serve(
     received: &Arc<Mutex<Vec<Received>>>,
     accepting: &AtomicBool,
     body_to_answer: &Arc<Mutex<Vec<u8>>>,
+    stall: &AtomicUsize,
+    stopped: &AtomicBool,
 ) {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -323,10 +355,20 @@ fn serve(
         }
     }
 
-    received
-        .lock()
-        .expect("not poisoned")
-        .push(Received { body });
+    let which = {
+        let mut held = received.lock().expect("not poisoned");
+        held.push(Received { body });
+        held.len()
+    };
+
+    // Recorded and then held, which is what a test waiting for this
+    // request is waiting for: the attempt has reached the endpoint and
+    // the pump is still inside it. Released when the test says so, or
+    // when the endpoint shuts down, so nothing here outlives the test
+    // that asked for it.
+    while stall.load(Ordering::SeqCst) == which && !stopped.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     let answer = body_to_answer.lock().expect("not poisoned").clone();
     let status = if !accepting.load(Ordering::SeqCst) {
@@ -440,6 +482,17 @@ qos = 1
 
 /// A `[[rules]]` table posting to `url`.
 fn rule_posting_to(url: &str, retries: u8, backoff_ms: u32) -> String {
+    rule_posting_to_within(url, retries, backoff_ms, 2_000)
+}
+
+/// The same, saying how long one attempt may take.
+///
+/// One caller sets it, and it is the one that holds a request open
+/// deliberately: see [`Endpoint::stall_request`]. The deadline there has
+/// to outlast the test noticing the request and killing the process, or
+/// the pump would give up on its own and the kill would land somewhere
+/// else again.
+fn rule_posting_to_within(url: &str, retries: u8, backoff_ms: u32, timeout_ms: u32) -> String {
     format!(
         r#"
 [[rules]]
@@ -449,7 +502,7 @@ filter = "sensor/+/temp"
 
 [rules.http_out]
 url = "{url}"
-timeout_ms = 2000
+timeout_ms = {timeout_ms}
 retries = {retries}
 backoff_ms = {backoff_ms}
 "#
@@ -599,13 +652,114 @@ impl Drop for BrokerProcess {
     }
 }
 
-/// A port the operating system has just said is free.
+/// The lowest port these tests will use, and one past the highest.
+///
+/// **Below every platform's ephemeral range, deliberately.** Linux
+/// draws automatic ports from 32768 upwards, macOS and Windows from
+/// 49152, so nothing in this window is ever *assigned* by the kernel:
+/// not a bind of port zero and not the source port of an outbound
+/// connection. That is the whole difference between a reservation and a
+/// hint.
+///
+/// A port in here can still be in use by something already running on
+/// the machine, which is why one is taken by binding it and moving on if
+/// that fails, rather than by assuming it is free.
+const PORTS: std::ops::Range<u16> = 20_000..30_000;
+
+/// Every port this test binary has taken, including the ones it has
+/// already let go of.
+///
+/// **A port read from a bind of port zero is a hint and not a
+/// reservation**, and that was the whole of one flaky test. The listener
+/// that chose it is dropped before the caller can use the number, so the
+/// port is free again at once and anything on the machine may be given
+/// it next: another of these tests, a broker child process binding a
+/// listener, or the kernel picking a source port for any outbound
+/// connection any of them makes. Measured at one failure in six with the
+/// machine loaded, none on a quiet one and none single-threaded, which
+/// is the shape of exactly that.
+///
+/// Drawing from [`PORTS`] removes the kernel as a competitor. This
+/// removes the siblings: a port is spent for the life of the process and
+/// never handed out twice, so a test that has released an address can
+/// still rely on nothing here having taken it.
+static HANDED_OUT: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
+/// A listener holding a port nothing will take from it, and that port.
+///
+/// For the one test that has to **hold** an address and then free it: it
+/// keeps the listener while it wants the address taken and drops it to
+/// free the address. Between the two the port is not something the
+/// kernel can hand to anybody, because it is outside the range the
+/// kernel assigns from, and not something a sibling can be given,
+/// because it stays spent.
+fn reserved_port() -> (TcpListener, u16) {
+    // Started somewhere different in each process so that two runs in
+    // quick succession do not queue up on the same first candidate.
+    let offset = usize::from(std::process::id() as u16) % PORTS.len();
+    for step in 0..PORTS.len() {
+        let port = PORTS.start + u16::try_from((offset + step) % PORTS.len()).unwrap_or(0);
+        if !first_time(port) {
+            continue;
+        }
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            return (listener, port);
+        }
+        // Something else on the machine has it. Spent either way, so
+        // nothing here tries it twice.
+    }
+    panic!(
+        "no port between {} and {} could be bound",
+        PORTS.start, PORTS.end
+    );
+}
+
+/// Spend `port`, and say whether this binary had it already.
+///
+/// The decision the whole registry comes down to, in a function of its
+/// own so that it can be tested without a second thread: see
+/// [`a_port_this_binary_has_taken_is_never_handed_out_again`].
+fn first_time(port: u16) -> bool {
+    let mut handed = HANDED_OUT.lock().expect("not poisoned");
+    if handed.contains(&port) {
+        return false;
+    }
+    handed.push(port);
+    true
+}
+
+/// A port is spent once, and a second claim on it is refused.
+///
+/// **The race itself is not something a test can schedule.** Two
+/// parallel tests being handed one port depends on the kernel choosing
+/// to do it, which is why the defect showed up as one failure in six
+/// under load and never on a quiet machine. So what is guarded here is
+/// the decision that race turns on, and the number is one outside
+/// [`PORTS`] so that this test cannot be made to fail by whatever ports
+/// its siblings took.
+#[test]
+fn a_port_this_binary_has_taken_is_never_handed_out_again() {
+    let outside = PORTS.end;
+    assert!(
+        first_time(outside),
+        "a port nothing had claimed was reported as already spent"
+    );
+    assert!(
+        !first_time(outside),
+        "a port already handed out was offered a second time, so a port here is a hint \
+         rather than a reservation and two tests in parallel can be given one address"
+    );
+}
+
+/// A port nothing else will be given, with nothing listening on it.
+///
+/// What a test hands to a broker it is about to start. The listener goes
+/// immediately, because the broker has to bind it — and nothing can take
+/// it in between: see [`PORTS`] and [`HANDED_OUT`].
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("a port on the loopback")
-        .local_addr()
-        .expect("it has an address")
-        .port()
+    let (listener, port) = reserved_port();
+    drop(listener);
+    port
 }
 
 fn loopback(port: u16) -> SocketAddr {
@@ -1016,11 +1170,39 @@ fn a_message_reaches_an_endpoint_and_survives_the_broker_being_killed() {
 /// the same, so the first test cannot see the difference. What can see
 /// it is the total number of attempts an endpoint that never recovers
 /// receives before the envelope is given up on: with a durable count it
-/// is the rule's, and with a count that restarts with the process it is
-/// the rule's every time the process starts.
+/// is the rule's plus the one that was in flight, and with a count that
+/// restarts with the process it is the rule's every time the process
+/// starts.
+///
+/// # Where the kill lands, and why that had to be said
+///
+/// The pump records an attempt **after** it has made it, and waits for
+/// that record to be durable before it makes another. So an attempt that
+/// is in flight when the process dies is an attempt the store never
+/// heard of, and the node that comes back makes it again: the budget is
+/// a budget per stored count, and a crash can cost it one extra attempt.
+/// That is the design and it is not free to change — recording before
+/// the request would cap the budget and would cost a second flush on
+/// every *successful* delivery, which is the path that has to be fast.
+///
+/// This test used to leave that implicit and was flaky because of it. It
+/// waited for two attempts and killed the broker, and whether the third
+/// attempt had happened by then, and if so whether its record had
+/// reached the disk, was up to the scheduler: a kill between an attempt
+/// and its record gave a total of five where the test asserted four.
+/// Three failures across the milestone, all of them that.
+///
+/// So the kill is now put where the test means it to be. The endpoint
+/// holds the third request open, which pins the pump inside an attempt
+/// it cannot finish, and the state the kill interrupts is therefore
+/// exact: two attempts recorded, one in flight and unrecorded. The total
+/// below is five for a stated reason rather than four for a hopeful one,
+/// and a count that did not survive at all would still be six.
 #[test]
 fn the_attempt_count_survives_the_kill() {
     const RETRIES: u8 = 3;
+    /// Which attempt is held open when the broker is killed.
+    const HELD: usize = 3;
 
     let workspace = tempfile::tempdir().expect("a temporary directory");
     let store = workspace.path().join("store");
@@ -1034,27 +1216,39 @@ fn the_attempt_count_survives_the_kill() {
         mqtt,
         admin,
         loopback(free_port()),
-        &rule_posting_to(&endpoint.url(), RETRIES, 50),
+        // A request deadline far longer than this test needs to notice
+        // the held request and kill the process, so the pump is still
+        // inside that attempt when it dies.
+        &rule_posting_to_within(&endpoint.url(), RETRIES, 50, 60_000),
     );
     endpoint.go_down();
+    endpoint.stall_request(HELD);
 
     let broker = BrokerProcess::start(&config, &store, mqtt, workspace.path().join("first.log"));
     {
         let mut client = Client::connect(mqtt, "publisher");
         client.publish_and_wait(TOPIC, SECOND);
     }
-    // Two of the four attempts, and then the process dies. The pump
-    // makes its record of each attempt durable before it makes the
-    // next, so seeing the second request is seeing the first attempt on
-    // the disk.
-    endpoint.wait_for(2, "two attempts must be made before the broker is killed");
+    // The first two attempts are answered and recorded; the third is
+    // answered by nobody, so the pump is held inside it. The record of
+    // an attempt is durable before the next is made, so a third request
+    // having arrived means the first two are on the disk.
+    endpoint.wait_for(
+        HELD,
+        "three attempts must be made before the broker is killed",
+    );
     broker.kill();
 
     let before_the_kill = endpoint.count();
-    assert!(
-        before_the_kill >= 2,
-        "the endpoint saw {before_the_kill} attempts"
+    assert_eq!(
+        before_the_kill, HELD,
+        "the endpoint saw {before_the_kill} attempts, and the third was being held open, \
+         so the pump cannot have made a fourth"
     );
+    // Whatever is still holding that request can answer now: the socket
+    // it would answer on died with the process, and the attempts after
+    // the restart must be refused like the first two.
+    endpoint.stall_nothing();
 
     let _restarted =
         BrokerProcess::start(&config, &store, mqtt, workspace.path().join("second.log"));
@@ -1108,16 +1302,22 @@ fn the_attempt_count_survives_the_kill() {
     // **The assertion the durable count exists for.** The endpoint has
     // been refusing throughout and has never recovered, so the total
     // number of requests it has seen across both of the broker's lives
-    // is the rule's attempt budget — once. A count that restarted with
-    // the process would spend the whole budget again and the total
-    // would be larger.
+    // is the rule's attempt budget, plus the one attempt that was in
+    // flight when the process died and that the store therefore never
+    // heard of. Two of the four were recorded before the kill, so two
+    // follow the restart: three requests, then two, which is five. A
+    // count that restarted with the process would spend the whole budget
+    // again and the total would be seven.
+    let spent_before_the_kill = HELD - 1;
     let total = endpoint.count();
     assert_eq!(
         total,
-        usize::from(RETRIES) + 1,
-        "a failing endpoint received {total} attempts across a restart, and the rule allows {}; \
-         an attempt count that does not survive the kill spends the whole budget again",
-        u32::from(RETRIES) + 1
+        usize::from(RETRIES) + 1 + 1,
+        "a failing endpoint received {total} attempts across a restart; the rule allows {}, \
+         {spent_before_the_kill} of them were recorded before the kill and one more was in \
+         flight and unrecorded, so {} is the whole of what this node may do",
+        u32::from(RETRIES) + 1,
+        usize::from(RETRIES) + 2
     );
 }
 
@@ -2154,13 +2354,22 @@ fn an_ingest_rule_whose_listener_cannot_be_bound_is_refused_and_not_installed() 
     let config = workspace.path().join("sdmqtt.toml");
     let mqtt = loopback(free_port());
     let admin = loopback(free_port());
-    let ingest = loopback(free_port());
 
     // Something else is already on the ingest address, and stays
     // there. A broker with no ingest rule starts perfectly happily
     // beside it, which is the point: the address is only needed when
     // a rule needs it.
-    let squatter = TcpListener::bind(ingest).expect("the test can hold the ingest address");
+    //
+    // **The listener chooses the address rather than being pointed at
+    // one**, because the two halves of this test are the only place a
+    // port has to be held and then released: it asserts a refusal while
+    // the address is taken and an acceptance once it is free, so a
+    // sibling test given the same port in between would turn either
+    // half into a failure about nothing. See [`HANDED_OUT`]: this
+    // listener is the reservation, and dropping it below frees the
+    // address without spending it again.
+    let (squatter, ingest_port) = reserved_port();
+    let ingest = loopback(ingest_port);
 
     write_config(&config, &store, mqtt, admin, ingest, "");
     let broker = BrokerProcess::start(
