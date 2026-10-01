@@ -36,6 +36,7 @@ use storage::{
 
 use crate::clock::{HybridClock, DEFAULT_MAX_DRIFT_MILLIS};
 use crate::metadata::{MetadataKey, MetadataValue};
+use crate::register::Stamp;
 
 /// How many nodes most of these tests use.
 const NODES: usize = 3;
@@ -85,6 +86,43 @@ impl Node {
         self.replicator
             .published(&write)
             .expect("a write this node originated is publishable once")
+    }
+
+    /// Clear the retained message on `topic`: a tombstone, stored and
+    /// published.
+    fn clear(&self, topic: &str) -> Replication {
+        let write = self.replicated().retained_cleared(topic);
+        self.store
+            .apply(&self.replicated().records(&write))
+            .expect("a store must take what this node decided to write");
+        self.replicator
+            .published(&write)
+            .expect("a write this node originated is publishable once")
+    }
+
+    /// The stamp on the tombstone this node holds for `topic`.
+    fn tombstone_stamp(&self, topic: &str) -> Stamp {
+        let key = MetadataKey::Retained {
+            topic: topic.to_owned(),
+        };
+        self.replicated()
+            .tombstones()
+            .into_iter()
+            .find(|(held, _)| *held == key)
+            .unwrap_or_else(|| panic!("{} holds no tombstone for {topic}", self.name))
+            .1
+    }
+
+    /// Whether this node holds any register at all for `topic`.
+    ///
+    /// A tombstone is one; a collected tombstone is not. The difference is
+    /// the whole of what a sweep does.
+    fn holds_anything(&self, topic: &str) -> bool {
+        self.replicated()
+            .register(&MetadataKey::Retained {
+                topic: topic.to_owned(),
+            })
+            .is_some()
     }
 
     /// Retain `payload`, and have the store refuse the batch.
@@ -163,6 +201,8 @@ struct Cluster {
     /// And how many it threw away, which is what a link that has gone
     /// does.
     dropped: BTreeMap<(usize, usize), usize>,
+    /// What every frame of the last `settle` was answered with.
+    answered: Vec<Option<Replication>>,
 }
 
 impl Cluster {
@@ -181,6 +221,7 @@ impl Cluster {
             down: BTreeSet::new(),
             delivered: BTreeMap::new(),
             dropped: BTreeMap::new(),
+            answered: Vec::new(),
         }
     }
 
@@ -214,10 +255,18 @@ impl Cluster {
 
     /// Deliver everything in flight, storing what each node decided.
     ///
-    /// Returns how many frames were delivered.
+    /// Returns how many frames were delivered. Replies go back to whoever
+    /// sent the frame, which is what the mesh does with them, so a round
+    /// of the exchange runs to its end here in one call.
     fn settle(&mut self) -> usize {
         let mut carried = 0;
-        while !self.wire.is_empty() {
+        // Bounded, because a round that answered itself for ever would
+        // hang a test rather than failing it. Far more than the longest
+        // round any of these needs, which is two frames per batch.
+        for _ in 0..1_000 {
+            if self.wire.is_empty() {
+                return carried;
+            }
             for (from, to, frame) in std::mem::take(&mut self.wire) {
                 let origin = self.nodes[from].id();
                 let node = &self.nodes[to];
@@ -232,9 +281,62 @@ impl Cluster {
                 }
                 *self.delivered.entry((from, to)).or_default() += 1;
                 carried += 1;
+                self.answered.push(handled.reply.clone());
+                if let Some(reply) = handled.reply {
+                    self.say(to, from, reply);
+                }
             }
         }
-        carried
+        panic!("a round of the exchange never ended");
+    }
+
+    /// Send one frame from `from` to `to`, if that direction carries.
+    fn say(&mut self, from: usize, to: usize, frame: Replication) {
+        if self.down.contains(&(from, to)) {
+            *self.dropped.entry((from, to)).or_default() += 1;
+        } else {
+            self.wire.push((from, to, frame));
+        }
+    }
+
+    /// One round of the exchange: `from` asks `to` for what it is missing.
+    ///
+    /// Returns how many frames the round took, which is what the batch
+    /// bound is visible in: a peer far behind takes two frames per batch
+    /// rather than two frames in total.
+    fn exchange(&mut self, from: usize, to: usize) -> usize {
+        self.answered.clear();
+        let digest = self.nodes[from].replicator.digest_for(self.nodes[to].id());
+        self.say(from, to, digest);
+        self.settle()
+    }
+
+    /// Sweep node `which` against `now_millis`, storing what went.
+    ///
+    /// Every other node in the cluster is a peer, dead or not, which is
+    /// what a node's own member list is.
+    fn sweep(&mut self, which: usize, now_millis: u64) -> Swept {
+        let peers: Vec<NodeId> = (0..self.nodes.len())
+            .filter(|other| *other != which)
+            .map(|other| self.nodes[other].id())
+            .collect();
+        let node = &self.nodes[which];
+        let swept = node.replicator.sweep(now_millis, &peers);
+        if !swept.records.is_empty() {
+            node.store
+                .apply(&swept.records)
+                .expect("a store must take what a sweep decided");
+        }
+        swept
+    }
+
+    /// Every reply the last `settle` produced, `None` included.
+    ///
+    /// What "a node that has everything pulls nothing" is asserted on:
+    /// the answer to its digest has to be no frame at all, rather than a
+    /// frame carrying nothing.
+    fn answers(&self) -> &[Option<Replication>] {
+        &self.answered
     }
 
     /// How many frames `from` has delivered to `to`.
@@ -429,6 +531,613 @@ fn a_write_the_store_refused_is_broadcast_to_nobody_and_served_to_nobody() {
         cluster.nodes[1].text("site/1/state").as_deref(),
         Some("stored")
     );
+}
+
+// ---- the exchange that repairs what a broadcast lost ---------------------
+
+/// Two nodes that missed a broadcast converge without one.
+///
+/// The claim the log exists for, end to end: the broadcast is gone and
+/// nothing will ever replay it, so the only thing that can repair the peer
+/// is the digest round — and what it carries is this node's log rather than
+/// its registers.
+#[test]
+fn two_nodes_that_missed_a_broadcast_converge_without_one() {
+    let mut cluster = Cluster::of(2);
+    cluster.cut(0, 1);
+    for (topic, payload) in [("a", "one"), ("b", "two"), ("c", "three")] {
+        let frame = cluster.nodes[0].retain(topic, payload);
+        cluster.broadcast(0, &frame);
+        cluster.settle();
+    }
+    assert_eq!(cluster.lost(0, 1), 3, "the cut has to have bitten");
+    assert_eq!(cluster.nodes[1].text("a"), None);
+
+    // Healed, and then one round and nothing else. No broadcast happens
+    // in between, which is what makes this the exchange's doing.
+    cluster.heal(0, 1);
+    cluster.exchange(1, 0);
+
+    for (topic, payload) in [("a", "one"), ("b", "two"), ("c", "three")] {
+        assert_eq!(
+            cluster.nodes[1].text(topic).as_deref(),
+            Some(payload),
+            "the exchange did not carry {topic}"
+        );
+    }
+    assert_eq!(
+        cluster.nodes[1]
+            .replicated()
+            .seen_through(cluster.nodes[0].id()),
+        3,
+        "a node that has been served a batch must say so, or it is served it again"
+    );
+}
+
+/// Three nodes where one was partitioned converge after it returns.
+///
+/// Both directions and both halves: the node that was away has writes to
+/// learn and writes to teach, and each is a round of its own because a
+/// round is a pull. The two that stayed up learn the absent node's writes
+/// from the absent node, not from each other, which is what "the digest is
+/// a claim about an operation log" means in a cluster of three.
+#[test]
+fn three_nodes_where_one_was_partitioned_converge_after_it_returns() {
+    let mut cluster = Cluster::of(NODES);
+    // Gamma is cut off from both others, in both directions.
+    for other in 0..2 {
+        cluster.cut(other, 2);
+        cluster.cut(2, other);
+    }
+
+    let frame = cluster.nodes[0].retain("from/alpha", "alpha");
+    cluster.broadcast(0, &frame);
+    cluster.settle();
+    let frame = cluster.nodes[1].retain("from/beta", "beta");
+    cluster.broadcast(1, &frame);
+    cluster.settle();
+    let frame = cluster.nodes[2].retain("from/gamma", "gamma");
+    cluster.broadcast(2, &frame);
+    cluster.settle();
+
+    assert_eq!(cluster.nodes[0].text("from/beta").as_deref(), Some("beta"));
+    assert_eq!(cluster.nodes[2].text("from/alpha"), None);
+    assert_eq!(cluster.nodes[0].text("from/gamma"), None);
+
+    for other in 0..2 {
+        cluster.heal(other, 2);
+        cluster.heal(2, other);
+    }
+    // Every ordered pair that was severed gets one round. Gamma pulls from
+    // both, and both pull from gamma.
+    for other in 0..2 {
+        cluster.exchange(2, other);
+        cluster.exchange(other, 2);
+    }
+
+    for which in 0..NODES {
+        for (topic, payload) in [
+            ("from/alpha", "alpha"),
+            ("from/beta", "beta"),
+            ("from/gamma", "gamma"),
+        ] {
+            assert_eq!(
+                cluster.nodes[which].text(topic).as_deref(),
+                Some(payload),
+                "{} does not hold {topic} after the partition healed",
+                cluster.nodes[which].name
+            );
+        }
+    }
+}
+
+/// A node that has everything pulls nothing.
+///
+/// **The test that the digest is a digest** rather than a request for
+/// everything. The answer must be no frame at all: an implementation that
+/// answered every digest with its whole log would make the exchange a
+/// periodic full resynchronisation, and one that answered with an empty
+/// batch would be a frame per peer per interval for ever on an idle
+/// cluster.
+#[test]
+fn a_node_that_has_everything_pulls_nothing() {
+    let mut cluster = Cluster::of(2);
+    for (topic, payload) in [("a", "one"), ("b", "two")] {
+        let frame = cluster.nodes[0].retain(topic, payload);
+        cluster.broadcast(0, &frame);
+        cluster.settle();
+    }
+    assert_eq!(cluster.nodes[1].text("b").as_deref(), Some("two"));
+
+    let frames = cluster.exchange(1, 0);
+    assert_eq!(frames, 1, "the round should be the digest and no answer");
+    assert_eq!(
+        cluster.answers(),
+        &[None],
+        "a peer that has everything was sent something"
+    );
+
+    // And the digest still told the holder where that peer is, which is
+    // what the tombstone watermark is a minimum over.
+    assert_eq!(
+        cluster.nodes[0]
+            .replicator
+            .peer_holds_of_ours(cluster.nodes[1].id()),
+        2,
+        "a digest that carried nothing back still has to be heard"
+    );
+}
+
+/// The batch bound is honoured: a node far behind is served in batches.
+///
+/// A retained message can be a quarter of a megabyte and the link refuses
+/// a frame larger than it carries, so a batch that ignored its bound would
+/// be a repair that cannot happen on exactly the node that needs it most.
+/// What this asserts is the shape of the round rather than its length in
+/// bytes: with a bound of two and six entries missing, the round is three
+/// batches and the digests between them.
+#[test]
+fn the_batch_bound_is_honoured() {
+    const BEHIND: usize = 6;
+    const BOUND: usize = 2;
+
+    let mut cluster = Cluster::of(2);
+    cluster.nodes[0].replicator = Replicator::new(
+        std::sync::Arc::clone(cluster.nodes[0].replicated()),
+        ReplicationSettings {
+            batch: BOUND,
+            ..ReplicationSettings::default()
+        },
+    );
+    cluster.cut(0, 1);
+    for which in 0..BEHIND {
+        let frame = cluster.nodes[0].retain(&format!("t/{which}"), "payload");
+        cluster.broadcast(0, &frame);
+        cluster.settle();
+    }
+    cluster.heal(0, 1);
+
+    let frames = cluster.exchange(1, 0);
+    let batches: Vec<usize> = cluster
+        .answers()
+        .iter()
+        .filter_map(|answer| match answer {
+            Some(Replication::Batch { entries, .. }) => Some(entries.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        batches,
+        vec![BOUND, BOUND, BOUND],
+        "the bound was not applied: {frames} frames carried {batches:?}"
+    );
+    assert!(
+        batches.iter().all(|carried| *carried <= BOUND),
+        "a batch carried more than the bound"
+    );
+    assert_eq!(
+        cluster.nodes[1]
+            .replicated()
+            .seen_through(cluster.nodes[0].id()),
+        BEHIND as u64,
+        "the round did not finish"
+    );
+    for which in 0..BEHIND {
+        assert!(
+            cluster.nodes[1].text(&format!("t/{which}")).is_some(),
+            "t/{which} never arrived"
+        );
+    }
+}
+
+/// A batch that says there is no more ends the round.
+///
+/// The other half of the bound: a peer that was sent everything must not
+/// ask again, or an idle cluster is two frames per peer per interval for
+/// ever.
+#[test]
+fn a_batch_that_says_there_is_no_more_ends_the_round() {
+    let mut cluster = Cluster::of(2);
+    cluster.cut(0, 1);
+    let frame = cluster.nodes[0].retain("a", "one");
+    cluster.broadcast(0, &frame);
+    cluster.settle();
+    cluster.heal(0, 1);
+
+    let frames = cluster.exchange(1, 0);
+    assert_eq!(
+        frames,
+        2,
+        "the round should be a digest and one batch: {:?}",
+        cluster.answers()
+    );
+    assert!(matches!(
+        cluster.answers(),
+        [Some(Replication::Batch { more: false, .. }), None]
+    ));
+}
+
+/// The exchange interval is jittered, and a test can see it.
+///
+/// Section 8.2 asks for jitter and the plan asks whether a test can tell
+/// it is there. It can, because the jitter is a range rather than a
+/// distribution: every draw must land between half the interval and all of
+/// it, and an implementation that returned the interval itself would sit
+/// at the top of that range every time. Fifty draws all equal is a
+/// probability of nothing, so a bare interval fails here and the mutation
+/// is caught rather than merely argued about.
+#[test]
+fn the_exchange_interval_is_jittered() {
+    let interval = ReplicationSettings::default().exchange;
+    let draws: Vec<Duration> = (0..50).map(|_| jitter(interval)).collect();
+
+    for drawn in &draws {
+        assert!(
+            *drawn >= interval / 2 && *drawn <= interval,
+            "a jittered interval of {drawn:?} is outside half of {interval:?} and all of it; \
+             a backoff must never become no backoff"
+        );
+    }
+    assert!(
+        draws.iter().collect::<BTreeSet<_>>().len() > 1,
+        "fifty draws were all {:?}, so the interval is not jittered and fifty nodes \
+         started together ask each other in the same millisecond for ever",
+        draws[0]
+    );
+
+    // And an interval of nothing stays nothing, so a configuration that
+    // asks for a tight loop is not quietly turned into something else.
+    assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
+}
+
+// ---- tombstones go, once everyone has seen them --------------------------
+
+/// How long after a tombstone's own reading a sweep is run.
+///
+/// The grace period and a second, so that the grace is never what keeps
+/// one: every test below that wants it gone passes this.
+fn well_past_the_grace(stamp: Stamp) -> u64 {
+    stamp.reading().millis()
+        + u64::try_from(ReplicationSettings::default().tombstone_grace.as_millis())
+            .expect("an hour in milliseconds is a small number")
+        + 1_000
+}
+
+/// Everybody has read it and the grace has passed, so it is gone.
+///
+/// Both watermarks in one: the tombstone leaves every node's register
+/// table, and the log entry that carried it leaves the writer's log,
+/// because nothing will ever ask for an entry every node already holds.
+#[test]
+fn a_tombstone_every_node_has_read_and_whose_grace_has_passed_is_gone() {
+    let mut cluster = Cluster::of(NODES);
+    let written = cluster.nodes[0].retain("site/1/state", "warm");
+    cluster.broadcast(0, &written);
+    cluster.settle();
+    let deleted = cluster.nodes[0].clear("site/1/state");
+    cluster.broadcast(0, &deleted);
+    cluster.settle();
+
+    let stamp = cluster.nodes[0].tombstone_stamp("site/1/state");
+    for which in 0..NODES {
+        assert!(
+            cluster.nodes[which].holds_anything("site/1/state"),
+            "{} holds no tombstone to collect",
+            cluster.nodes[which].name
+        );
+        assert_eq!(cluster.nodes[which].text("site/1/state"), None);
+    }
+
+    // Both peers tell the writer where they are, which is the only thing
+    // that ever says so.
+    cluster.exchange(1, 0);
+    cluster.exchange(2, 0);
+    let swept = cluster.sweep(0, well_past_the_grace(stamp));
+    assert_eq!(
+        swept.collected,
+        vec![MetadataKey::Retained {
+            topic: "site/1/state".to_owned()
+        }]
+    );
+    assert_eq!(
+        swept.log_through, 2,
+        "the writer's own log was not truncated"
+    );
+    assert!(!cluster.nodes[0].holds_anything("site/1/state"));
+    assert_eq!(cluster.nodes[0].replicated().log_len(), 0);
+
+    // And the peers collect it once the writer's digest has told them
+    // everybody has read it. Before that they keep it, because nothing
+    // they hold says who has seen it.
+    assert!(cluster.sweep(1, well_past_the_grace(stamp)).is_empty());
+    assert!(cluster.nodes[1].holds_anything("site/1/state"));
+    cluster.exchange(0, 1);
+    cluster.exchange(0, 2);
+    for which in 1..NODES {
+        cluster.sweep(which, well_past_the_grace(stamp));
+        assert!(
+            !cluster.nodes[which].holds_anything("site/1/state"),
+            "{} kept a tombstone every node has read",
+            cluster.nodes[which].name
+        );
+    }
+}
+
+/// A tombstone whose grace has passed but which a node has not read is
+/// kept.
+///
+/// **The watermark, on its own.** The grace period is satisfied and the
+/// tombstone stays, because one of the three has read nothing past the
+/// value it is superseding.
+#[test]
+fn a_tombstone_whose_grace_has_passed_but_which_a_node_has_not_read_is_kept() {
+    let mut cluster = Cluster::of(NODES);
+    cluster.cut(0, 2);
+    let written = cluster.nodes[0].retain("site/1/state", "warm");
+    cluster.broadcast(0, &written);
+    cluster.settle();
+    let deleted = cluster.nodes[0].clear("site/1/state");
+    cluster.broadcast(0, &deleted);
+    cluster.settle();
+    let stamp = cluster.nodes[0].tombstone_stamp("site/1/state");
+
+    // Beta has both and says so; gamma has neither and says so. Gamma's
+    // digest reaches the writer — the cut is the other direction — and the
+    // batch answering it does not, which is exactly a node that is still
+    // away.
+    cluster.exchange(1, 0);
+    assert_eq!(
+        cluster.nodes[0]
+            .replicator
+            .peer_holds_of_ours(cluster.nodes[1].id()),
+        2
+    );
+    cluster.exchange(2, 0);
+    assert_eq!(
+        cluster.nodes[0]
+            .replicator
+            .peer_holds_of_ours(cluster.nodes[2].id()),
+        0,
+        "gamma received nothing, so it must claim nothing"
+    );
+
+    let swept = cluster.sweep(0, well_past_the_grace(stamp));
+    assert!(
+        swept.collected.is_empty(),
+        "a tombstone one node has never read was collected on the grace period alone, \
+         so that node keeps the deleted value for ever"
+    );
+    assert!(cluster.nodes[0].holds_anything("site/1/state"));
+    assert_eq!(
+        swept.log_through, 0,
+        "the log was truncated past what gamma has read, so the repair is gone too"
+    );
+    assert_eq!(cluster.nodes[0].replicated().log_len(), 2);
+}
+
+/// The watermark is the lowest a node has read, not the highest.
+///
+/// The mutation this is for is one character's worth: a maximum where the
+/// minimum belongs. The node that is up to date is the one node whose
+/// agreement proves nothing, so taking the highest is taking the answer of
+/// whichever peer needs the tombstone least.
+#[test]
+fn the_watermark_is_the_lowest_a_node_has_read_and_not_the_highest() {
+    let mut cluster = Cluster::of(NODES);
+    // A batch of one, so that gamma's round tells the writer where it was
+    // when it asked the second time: one entry read, which is more than
+    // nothing and less than everything. Replaced before anything is
+    // exchanged, because a replacement forgets what peers have said.
+    cluster.nodes[0].replicator = Replicator::new(
+        std::sync::Arc::clone(cluster.nodes[0].replicated()),
+        ReplicationSettings {
+            batch: 1,
+            ..ReplicationSettings::default()
+        },
+    );
+    cluster.cut(0, 2);
+    let written = cluster.nodes[0].retain("a", "one");
+    cluster.broadcast(0, &written);
+    cluster.settle();
+    let deleted = cluster.nodes[0].clear("a");
+    cluster.broadcast(0, &deleted);
+    cluster.settle();
+    let stamp = cluster.nodes[0].tombstone_stamp("a");
+
+    cluster.exchange(1, 0);
+    cluster.heal(0, 2);
+    cluster.exchange(2, 0);
+    assert_eq!(
+        cluster.nodes[0]
+            .replicator
+            .peer_holds_of_ours(cluster.nodes[2].id()),
+        1,
+        "gamma should have read exactly one entry"
+    );
+    assert_eq!(
+        cluster.nodes[0]
+            .replicator
+            .peer_holds_of_ours(cluster.nodes[1].id()),
+        2,
+        "beta should have read both"
+    );
+
+    let swept = cluster.sweep(0, well_past_the_grace(stamp));
+    assert!(
+        swept.collected.is_empty(),
+        "the highest of one and two was taken rather than the lowest, so a tombstone \
+         gamma has not read was collected"
+    );
+    assert_eq!(
+        swept.log_through, 1,
+        "the log was truncated to the highest rather than the lowest"
+    );
+    assert_eq!(cluster.nodes[0].replicated().log_len(), 1);
+}
+
+/// A tombstone from a node nothing has been heard from is kept.
+///
+/// Zero is "nothing of yours" and a node that has sent no digest has said
+/// nothing about who has read its writes. Collecting on no information is
+/// collecting on a guess.
+#[test]
+fn a_tombstone_from_a_node_nothing_has_been_heard_from_is_kept() {
+    let mut cluster = Cluster::of(2);
+    let written = cluster.nodes[0].retain("a", "one");
+    cluster.broadcast(0, &written);
+    cluster.settle();
+    let deleted = cluster.nodes[0].clear("a");
+    cluster.broadcast(0, &deleted);
+    cluster.settle();
+    let stamp = cluster.nodes[1].tombstone_stamp("a");
+
+    assert!(
+        cluster
+            .sweep(1, well_past_the_grace(stamp))
+            .collected
+            .is_empty(),
+        "a tombstone was collected although the node that wrote it has said nothing \
+         about who has read it"
+    );
+    assert!(cluster.nodes[1].holds_anything("a"));
+}
+
+/// A record deleted while a node was away is still deleted when it
+/// returns.
+///
+/// **The test that matters in this task.** The node that was away comes
+/// back holding the value, and what deletes it is the tombstone the
+/// deleting node kept *because* that node had not read it. Collect on the
+/// grace period alone and the deleting node has thrown away both the
+/// tombstone and the log entry carrying it, so the exchange has nothing to
+/// send: the absent node keeps a retained message every other node has
+/// deleted, answers subscribers with it, and no later exchange ever
+/// contradicts it.
+///
+/// That is the plan's resurrection seen from a client. It is not a value
+/// spreading back out — a node serves only the log it originated, so a
+/// register it merely holds is never offered to anybody — and the module
+/// documentation says why the distinction does not make it any less
+/// permanent.
+#[test]
+fn a_record_deleted_while_a_node_was_away_is_still_deleted_when_it_returns() {
+    let mut cluster = Cluster::of(NODES);
+    let written = cluster.nodes[0].retain("site/1/state", "warm");
+    cluster.broadcast(0, &written);
+    cluster.settle();
+    for which in 1..NODES {
+        assert_eq!(
+            cluster.nodes[which].text("site/1/state").as_deref(),
+            Some("warm")
+        );
+    }
+
+    // Gamma is away for the delete.
+    cluster.cut(0, 2);
+    let deleted = cluster.nodes[0].clear("site/1/state");
+    cluster.broadcast(0, &deleted);
+    cluster.settle();
+    assert_eq!(
+        cluster.nodes[2].text("site/1/state").as_deref(),
+        Some("warm"),
+        "gamma was supposed to miss the delete"
+    );
+
+    // Everything else carries on for long enough that the grace period is
+    // no longer what is keeping the tombstone. Beta tells the writer it has
+    // read both; gamma, still cut off, tells it nothing.
+    cluster.exchange(1, 0);
+    let stamp = cluster.nodes[0].tombstone_stamp("site/1/state");
+    let swept = cluster.sweep(0, well_past_the_grace(stamp));
+    assert!(
+        swept.collected.is_empty(),
+        "the delete was thrown away while a node still held the value"
+    );
+
+    // And now gamma comes back and one round deletes it.
+    cluster.heal(0, 2);
+    cluster.exchange(2, 0);
+    assert_eq!(
+        cluster.nodes[2].text("site/1/state"),
+        None,
+        "a node that missed a delete came back holding the value, and nothing will \
+         ever contradict it"
+    );
+    assert!(
+        cluster.nodes[2].holds_anything("site/1/state"),
+        "gamma must hold the tombstone rather than nothing, or the next peer it speaks \
+         to hands it its own older copy"
+    );
+
+    // With every node past it, it goes everywhere.
+    cluster.exchange(2, 0);
+    let swept = cluster.sweep(0, well_past_the_grace(stamp));
+    assert_eq!(
+        swept.collected,
+        vec![MetadataKey::Retained {
+            topic: "site/1/state".to_owned()
+        }],
+        "once every node has read it there is nothing left to keep it for"
+    );
+}
+
+/// A node with no peers collects behind its own published end.
+///
+/// A cluster of one is a supported way to run this broker, and a watermark
+/// that is a minimum over an empty set must not be zero: every node that
+/// exists has read everything this node wrote, because it is the only one.
+#[test]
+fn a_node_with_no_peers_collects_behind_its_own_published_end() {
+    let mut cluster = Cluster::of(1);
+    let _ = cluster.nodes[0].retain("a", "one");
+    let _ = cluster.nodes[0].clear("a");
+    let stamp = cluster.nodes[0].tombstone_stamp("a");
+
+    let swept = cluster.sweep(0, well_past_the_grace(stamp));
+    assert_eq!(swept.log_through, 2);
+    assert_eq!(
+        swept.collected,
+        vec![MetadataKey::Retained {
+            topic: "a".to_owned()
+        }]
+    );
+    assert_eq!(cluster.nodes[0].replicated().log_len(), 0);
+}
+
+/// A tombstone whose grace has not passed is kept, however far everyone has
+/// read.
+///
+/// The other half of the pair. The watermark says the delete has arrived
+/// everywhere; the grace period is what covers a node that is not in the
+/// member list at all yet — one being added, one whose process has not
+/// started — and section 8.2 asks for both.
+#[test]
+fn a_tombstone_whose_grace_has_not_passed_is_kept() {
+    let mut cluster = Cluster::of(2);
+    let written = cluster.nodes[0].retain("a", "one");
+    cluster.broadcast(0, &written);
+    cluster.settle();
+    let deleted = cluster.nodes[0].clear("a");
+    cluster.broadcast(0, &deleted);
+    cluster.settle();
+    let stamp = cluster.nodes[0].tombstone_stamp("a");
+    cluster.exchange(1, 0);
+
+    let swept = cluster.sweep(0, stamp.reading().millis() + 1);
+    assert!(
+        swept.collected.is_empty(),
+        "a tombstone was collected a millisecond after it was written"
+    );
+    assert_eq!(
+        swept.log_through, 2,
+        "the log is truncated behind what every node has read whatever the grace \
+         period says: an entry everybody holds is an entry nobody will ask for"
+    );
+    assert!(cluster.nodes[0].holds_anything("a"));
+
+    // And it goes once the hour has passed.
+    assert!(!cluster.sweep(0, well_past_the_grace(stamp)).is_empty());
+    assert!(!cluster.nodes[0].holds_anything("a"));
 }
 
 // ---- the log across a restart --------------------------------------------

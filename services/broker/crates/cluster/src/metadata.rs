@@ -881,6 +881,40 @@ impl Replicated {
         self.write(&mut state, MetadataKey::SessionOwner { session }, None)
     }
 
+    /// Every tombstone this node holds, with the stamp that ordered it.
+    ///
+    /// What a sweep looks at. A value is not here: a register with a value
+    /// is not a deletion and is never collected, because collecting it
+    /// would be losing it.
+    #[must_use]
+    pub fn tombstones(&self) -> Vec<(MetadataKey, Stamp)> {
+        self.held()
+            .registers
+            .iter()
+            .filter(|(_, register)| register.is_tombstone())
+            .map(|(key, register)| (key.clone(), register.stamp()))
+            .collect()
+    }
+
+    /// Forget the tombstone under `key`, and say what to store.
+    ///
+    /// **Only a tombstone, and only by a caller that has decided every
+    /// node has seen it.** A register with a value is left alone and an
+    /// empty batch comes back: collecting one would be deleting a record
+    /// nothing asked to delete, and the decision about what everybody has
+    /// seen is not one this type can make.
+    pub fn collect(&self, key: &MetadataKey) -> Vec<Record> {
+        let mut state = self.held();
+        match state.registers.get(key) {
+            Some(register) if register.is_tombstone() => {}
+            _ => return Vec::new(),
+        }
+        state.registers.remove(key);
+        vec![Record::MetadataRemoved {
+            key: key.to_record(),
+        }]
+    }
+
     /// Take a peer's copy of a register, and say whether anything changed.
     ///
     /// [`Register::merge`] and nothing else: there is one comparison and

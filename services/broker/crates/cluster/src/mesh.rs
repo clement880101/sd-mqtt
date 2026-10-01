@@ -944,7 +944,7 @@ async fn reading_from(
 /// back finds every peer dialling it in the same millisecond
 /// otherwise. Between half the delay and all of it, so a backoff never
 /// becomes no backoff.
-fn jitter(delay: Duration) -> Duration {
+pub(crate) fn jitter(delay: Duration) -> Duration {
     let nanos = u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX);
     let half = nanos / 2;
     if half == 0 {
