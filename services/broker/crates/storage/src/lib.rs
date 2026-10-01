@@ -31,11 +31,11 @@ pub use memory::MemoryStorage;
 
 pub use record::{
     ActionRecord, BodyRecord, ClockRecord, DeliveryRecord, FormatError, FormatMarker, HttpInRecord,
-    HttpOutRecord, InflightRecord, InflightState, MessageId, MetadataKeyRecord, MetadataRecord,
-    MetadataValueRecord, NodeIdentityRecord, OutboxRecord, ProtocolVersion, Qos, QueueEntry,
-    Record, RetainHandling, RetainedRecord, RuleRecord, Secret, SessionKey, SessionRecord,
-    StampRecord, SubscriptionRecord, TopicFromRecord, TopicFromRequestRecord, TriggerRecord,
-    WillRecord, FORMAT_MAGIC, FORMAT_VERSION,
+    HttpOutRecord, InflightRecord, InflightState, LoggedRecord, MessageId, MetadataKeyRecord,
+    MetadataRecord, MetadataValueRecord, NodeIdentityRecord, OutboxRecord, ProtocolVersion, Qos,
+    QueueEntry, Record, RetainHandling, RetainedRecord, RuleRecord, Secret, SeenRecord, SessionKey,
+    SessionRecord, StampRecord, SubscriptionRecord, TopicFromRecord, TopicFromRequestRecord,
+    TriggerRecord, WillRecord, FORMAT_MAGIC, FORMAT_VERSION,
 };
 pub use restore::{Restored, RestoredSession};
 pub use writer::{Applied, Durable, NotDurable, Writer, WriterConfig, WriterStopped};
@@ -231,6 +231,26 @@ pub enum Rejection {
         /// The number the append asked for.
         sequence: u64,
         /// The highest ever assigned to that rule.
+        highest: u64,
+    },
+    /// An append to this node's own operation log reused a sequence.
+    ///
+    /// Its own variant rather than either of the two above, for the
+    /// reason [`Rejection::OutboxSequenceReused`] gives: a refusal that
+    /// could be any of three is a refusal a test cannot assert on.
+    ///
+    /// Section 8.2: the digest exchange is a claim about this log, so a
+    /// sequence used twice tells one peer "this is my seventh write"
+    /// about two different writes, and whichever it asks for second it
+    /// never receives. The store holds the highest sequence ever
+    /// appended, truncation included, precisely so it can say no.
+    #[error(
+        "operation log sequence {sequence} is not past this node's highest, which is {highest}"
+    )]
+    OpLogSequenceReused {
+        /// The number the append asked for.
+        sequence: u64,
+        /// The highest ever appended by this node.
         highest: u64,
     },
     /// A body was released more often than it was stored.

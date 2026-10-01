@@ -16,7 +16,7 @@
 
 use super::*;
 
-use storage::{MemoryStorage, Qos, Storage, TriggerRecord};
+use storage::{MemoryStorage, Qos, Restored, Storage, TriggerRecord};
 
 use crate::clock::{HybridClock, Reading, DEFAULT_MAX_DRIFT_MILLIS};
 
@@ -30,7 +30,7 @@ fn node(index: u8) -> NodeId {
 
 /// This node's state, with nothing in it.
 fn fresh(me: NodeId) -> Replicated {
-    Replicated::open(me, HybridClock::resume(None, BOUND), &[])
+    Replicated::open(me, HybridClock::resume(None, BOUND), &Restored::default())
         .expect("an empty store holds nothing to refuse")
 }
 
@@ -238,12 +238,8 @@ fn every_kind_survives_a_restart() {
         before.records_held(),
         "the store and the node disagree about what is held"
     );
-    let after = Replicated::open(
-        me,
-        HybridClock::resume(restored.clock, BOUND),
-        &restored.metadata,
-    )
-    .expect("what this build wrote, it reads");
+    let after = Replicated::open(me, HybridClock::resume(restored.clock, BOUND), &restored)
+        .expect("what this build wrote, it reads");
     assert_eq!(
         after.records_held(),
         before.records_held(),

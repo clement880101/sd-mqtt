@@ -68,6 +68,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::config::ClusterConfig;
+use crate::frame::FrameError;
 use crate::handshake::{self, HandshakeError, Role};
 use crate::identity::{NodeId, NodeIdentity};
 use crate::link::{outgoing, pump, FrameReader, LinkConfig, Sent};
@@ -90,9 +91,9 @@ pub const DEFAULT_REFUSED_BACKOFF: Duration = Duration::from_secs(300);
 
 /// What a cluster link carries.
 ///
-/// One variant, and it is the whole of this milestone: section 8.2's
-/// replication and section 8.3's routing are later plans, and they
-/// arrive as variants here rather than as a second transport.
+/// Section 8.3's routing is a later plan and arrives as a variant here
+/// rather than as a second transport, which is what section 8.1 asks
+/// for: one framing, one authentication step and one failure model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
     /// Section 8.1's heartbeat.
@@ -105,6 +106,34 @@ pub enum Message {
         /// Which beat this is.
         beat: u64,
     },
+    /// Section 8.2's replication.
+    ///
+    /// **Which peer sent it is not in the frame.** A replicated entry is
+    /// a claim about the sender's own operation log, and a node named in
+    /// the frame would be a node any peer could claim to be; the link
+    /// has already proved who is on the other end of it, so that is
+    /// where the answer comes from.
+    Replicate(crate::replicate::Replication),
+}
+
+/// What something on top of the mesh does with a peer's message.
+///
+/// The seam section 8.2's replication sits on. Implemented by whoever
+/// holds the replicator and the storage writer, because what a frame
+/// changes has to be stored and the mesh writes nothing.
+///
+/// **Synchronous, and it must not block.** It is called from the task
+/// reading one link, so a handler that waited on a device would stop
+/// that peer's heartbeats being noticed. Storing is a channel send and
+/// taking the broker's lock is what this module already does, so there
+/// is nothing here that needs to wait.
+pub trait Deliver: Send + Sync {
+    /// `from` sent `message`. Returns whatever to say back to it.
+    ///
+    /// Replies go back to the sender and nowhere else, which is what
+    /// keeps this from needing the mesh: a handler that could send to
+    /// anybody would have to hold the thing that holds it.
+    fn delivered(&self, from: NodeId, message: Message) -> Vec<Message>;
 }
 
 /// Which end of a link between two nodes is the one to keep.
@@ -183,6 +212,24 @@ pub struct MeshStats {
     pub bytes_dropped: u64,
 }
 
+/// What became of one broadcast.
+///
+/// Three numbers rather than a count of peers, because the three are
+/// different facts: a peer that took it, a peer whose queue was full,
+/// and a message this build refused to frame at all. A caller that saw
+/// only "three peers" could not tell a healthy fan-out from a wedged
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Fanout {
+    /// Peers the message was queued for.
+    pub queued: usize,
+    /// Peers whose queue was full, so it was dropped and counted.
+    pub dropped: usize,
+    /// Peers it could not be framed for, which is the same message every
+    /// time and not the peer's doing.
+    pub unframed: usize,
+}
+
 /// One established link to one peer.
 #[derive(Debug)]
 struct Link {
@@ -247,6 +294,13 @@ struct State {
     /// What links that have gone dropped, kept because their counters
     /// go with them.
     dropped_retired: AtomicU64,
+    /// What to do with what a peer says, on a node that replicates.
+    ///
+    /// `None` is a mesh that reads frames and throws them away, which is
+    /// what section 8.1's own tests want: a heartbeat changes membership
+    /// and nothing else, and a handler would be a second thing to stand
+    /// up to assert it.
+    deliveries: Option<Arc<dyn Deliver>>,
 }
 
 fn locked<T>(what: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -274,6 +328,22 @@ impl Mesh {
         settings: MeshSettings,
         transport: Arc<dyn Transport>,
     ) -> Arc<Self> {
+        Self::start_delivering(identity, config, settings, transport, None)
+    }
+
+    /// The same, handing what peers say to `deliveries`.
+    ///
+    /// What the binary calls once section 8.2's replication is wired, and
+    /// what [`Mesh::start`] is in terms of. Two entry points rather than
+    /// one with an option everywhere, because every test of section 8.1
+    /// wants the one without.
+    pub fn start_delivering(
+        identity: NodeIdentity,
+        config: ClusterConfig,
+        settings: MeshSettings,
+        transport: Arc<dyn Transport>,
+        deliveries: Option<Arc<dyn Deliver>>,
+    ) -> Arc<Self> {
         let state = Arc::new(State {
             members: Mutex::new(Membership::new(settings.detection)),
             links: Mutex::new(HashMap::new()),
@@ -284,6 +354,7 @@ impl Mesh {
             sent: Arc::new(AtomicU64::new(0)),
             received: Arc::new(AtomicU64::new(0)),
             dropped_retired: AtomicU64::new(0),
+            deliveries,
             identity,
             config,
             settings,
@@ -338,6 +409,68 @@ impl Mesh {
     #[must_use]
     pub fn link_role(&self, peer: NodeId) -> Option<Role> {
         locked(&self.state.links).get(&peer).map(|link| link.role)
+    }
+
+    /// Every peer this node has a link to right now, in identity order.
+    ///
+    /// **Links, not members.** A member that is dead still has a row and
+    /// may still have a socket; what a broadcast can reach is what there
+    /// is a queue for, and that is this.
+    #[must_use]
+    pub fn linked(&self) -> Vec<NodeId> {
+        let mut peers: Vec<NodeId> = locked(&self.state.links).keys().copied().collect();
+        peers.sort();
+        peers
+    }
+
+    /// Hand `message` to one peer, if there is a link to it.
+    ///
+    /// `None` is a peer with no link. Otherwise what the queue did with
+    /// it, which may be [`Sent::Dropped`]: section 8.1 drops and counts
+    /// rather than letting a wedged peer block whoever had something to
+    /// say to it.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::FrameError`] when the message cannot be framed, which is
+    /// this build refusing to write what it would not read back rather
+    /// than anything the peer did.
+    pub fn send(&self, peer: NodeId, message: &Message) -> Option<Result<Sent, FrameError>> {
+        let queue = locked(&self.state.links)
+            .get(&peer)
+            .map(|link| link.outgoing.clone())?;
+        Some(queue.send(message))
+    }
+
+    /// Hand `message` to every peer there is a link to.
+    ///
+    /// **No queue of its own, and that is the point.** A peer whose link
+    /// has gone is not in the table, so it receives nothing and nothing
+    /// is kept for it: repairing what a broadcast lost is section 8.2's
+    /// exchange, and a broadcast that replayed a backlog on reconnection
+    /// would send every entry in it twice to every peer that never left.
+    ///
+    /// Collected under the lock and sent outside it, as the heartbeat is
+    /// and for the same reason: `send` never waits, but holding the link
+    /// table while touching every peer would put every accept and every
+    /// loss behind one write.
+    pub fn broadcast(&self, message: &Message) -> Fanout {
+        let queues: Vec<crate::link::Outgoing> = locked(&self.state.links)
+            .values()
+            .map(|link| link.outgoing.clone())
+            .collect();
+        let mut fanout = Fanout::default();
+        for queue in queues {
+            match queue.send(message) {
+                Ok(Sent::Queued) => fanout.queued += 1,
+                Ok(Sent::Dropped) => fanout.dropped += 1,
+                Err(why) => {
+                    tracing::error!(%why, "a cluster message could not be framed");
+                    fanout.unframed += 1;
+                }
+            }
+        }
+        fanout
     }
 
     /// Section 11.3's numbers.
@@ -694,9 +827,18 @@ fn install(state: &Arc<State>, stream: BoxStream, peer: handshake::Peer, role: R
             writer: writer.abort_handle(),
         },
     ) {
-        state
-            .dropped_retired
-            .fetch_add(previous.outgoing.dropped_bytes(), Ordering::Relaxed);
+        // **What it dropped and what it never got to write.** Replacing a
+        // link aborts its writer, so whatever is still queued for it is
+        // lost; counting only what the queue had refused would report a
+        // simultaneous dial as having lost nothing. A heartbeat lost here
+        // is invisible, but section 8.2's replication goes through the
+        // same queue, and the first thing to notice this was a broadcast
+        // that vanished because it was queued a millisecond before the
+        // rule chose the other link.
+        state.dropped_retired.fetch_add(
+            previous.outgoing.dropped_bytes() + previous.outgoing.pending_bytes(),
+            Ordering::Relaxed,
+        );
     }
     drop(links);
 
@@ -718,11 +860,34 @@ async fn reading_from(
         .unwrap_or_default();
     loop {
         match reader.next::<Message>().await {
-            Ok(Some(_message)) => {
+            Ok(Some(message)) => {
                 // **Anything, not only a beat.** A link carrying
                 // traffic is a link whose peer is answering; the
                 // heartbeat is what covers the links that are not.
                 locked(&state.members).heard(&identity, &advertised, Instant::now());
+                // Counted as a sign of life first and handled second, so
+                // that a handler which refuses a frame has not also made
+                // the peer look dead.
+                if let Some(deliveries) = &state.deliveries {
+                    for reply in deliveries.delivered(identity.id(), message) {
+                        // Back to the sender and nowhere else. A reply to
+                        // a peer whose link went in the meantime is a
+                        // drop, counted like any other.
+                        let queue = locked(&state.links)
+                            .get(&identity.id())
+                            .map(|link| link.outgoing.clone());
+                        match queue.map(|queue| queue.send(&reply)) {
+                            Some(Ok(Sent::Queued)) | None => {}
+                            Some(Ok(Sent::Dropped)) => tracing::warn!(
+                                peer = %identity,
+                                "a peer's queue was full, so the answer to it was dropped"
+                            ),
+                            Some(Err(why)) => {
+                                tracing::error!(%why, "an answer to a peer could not be framed");
+                            }
+                        }
+                    }
+                }
             }
             Ok(None) => {
                 tracing::info!(peer = %identity, "a cluster peer closed its link");
@@ -753,9 +918,10 @@ async fn reading_from(
     let ours = links.get(&id).is_some_and(|link| link.epoch == epoch);
     if ours {
         if let Some(link) = links.remove(&id) {
-            state
-                .dropped_retired
-                .fetch_add(link.outgoing.dropped_bytes(), Ordering::Relaxed);
+            state.dropped_retired.fetch_add(
+                link.outgoing.dropped_bytes() + link.outgoing.pending_bytes(),
+                Ordering::Relaxed,
+            );
         }
     }
     drop(links);
@@ -1242,5 +1408,220 @@ mod tests {
             a.members().len() == 1
         })
         .await;
+    }
+    // -----------------------------------------------------------
+    // What the mesh carries for section 8.2
+    // -----------------------------------------------------------
+
+    /// Every message a node was handed, and what it answered with.
+    ///
+    /// A [`Deliver`] that records rather than replicates, because what is
+    /// being proved here is the mesh's half: that a broadcast reaches
+    /// every peer there is a link to, that it reaches **only** those, and
+    /// that an answer goes back to whoever asked. What a replicated frame
+    /// means is `crate::replicate`'s and is tested there, without a
+    /// socket.
+    #[derive(Debug, Default)]
+    struct Recorder {
+        heard: Mutex<Vec<(NodeId, Message)>>,
+        /// What to answer the next message with, once.
+        answer: Mutex<Option<Message>>,
+    }
+
+    impl Recorder {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn answering(answer: Message) -> Arc<Self> {
+            Arc::new(Self {
+                heard: Mutex::new(Vec::new()),
+                answer: Mutex::new(Some(answer)),
+            })
+        }
+
+        /// Every replicated frame this node was handed, heartbeats aside.
+        fn replications(&self) -> Vec<Message> {
+            locked(&self.heard)
+                .iter()
+                .filter(|(_, message)| matches!(message, Message::Replicate(_)))
+                .map(|(_, message)| message.clone())
+                .collect()
+        }
+    }
+
+    impl Deliver for Recorder {
+        fn delivered(&self, from: NodeId, message: Message) -> Vec<Message> {
+            locked(&self.heard).push((from, message.clone()));
+            // Only a replicated frame is answered, so that a heartbeat
+            // does not consume the one answer. The guard is taken once and
+            // dropped before anything else: `locked` recovers a poisoned
+            // lock rather than failing, so taking it twice on one thread
+            // is a deadlock and not a panic.
+            let mut held = locked(&self.answer);
+            match (&message, held.is_some()) {
+                (Message::Replicate(_), true) => vec![held.take().expect("just checked")],
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    /// A frame to broadcast, carrying a tombstone nobody will apply.
+    ///
+    /// The contents are deliberately uninteresting: what is asserted here
+    /// is which nodes were handed it.
+    fn replication(sequence: u64) -> Message {
+        Message::Replicate(crate::replicate::Replication::Broadcast {
+            entry: storage::LoggedRecord {
+                sequence,
+                entry: storage::MetadataRecord {
+                    key: storage::MetadataKeyRecord::Retained {
+                        topic: "a/b".to_owned(),
+                    },
+                    stamp: storage::StampRecord {
+                        millis: 1,
+                        counter: 0,
+                        node: [1; 16],
+                    },
+                    value: None,
+                },
+            },
+        })
+    }
+
+    /// A node on the switch, handing what peers say to `deliveries`.
+    fn node_delivering(
+        switch: &Arc<Switch>,
+        name: &str,
+        seeds: &[&str],
+        identity: &NodeIdentity,
+        deliveries: Arc<dyn Deliver>,
+    ) -> Arc<Mesh> {
+        let transport = Arc::new(switch.listen(name));
+        Mesh::start_delivering(
+            identity.clone(),
+            config(SECRET),
+            settings(name, seeds),
+            transport,
+            Some(deliveries),
+        )
+    }
+
+    /// A broadcast reaches every peer there is a link to, and one answers.
+    ///
+    /// Three claims in one, because standing three meshes up is the
+    /// expensive part: the fan-out counts the peers it queued for, both
+    /// peers are handed the frame exactly once, and the answer one of them
+    /// returns goes back to the node that broadcast and to nobody else.
+    #[tokio::test]
+    async fn a_broadcast_reaches_every_peer_and_an_answer_comes_back() {
+        let switch = Switch::new();
+        let heard_by_a = Recorder::new();
+        let heard_by_b = Recorder::answering(replication(99));
+        let heard_by_c = Recorder::new();
+        let a = node_delivering(
+            &switch,
+            "a",
+            &["b", "c"],
+            &NodeIdentity::mint("a"),
+            Arc::clone(&heard_by_a) as Arc<dyn Deliver>,
+        );
+        let b = node_delivering(
+            &switch,
+            "b",
+            &["a", "c"],
+            &NodeIdentity::mint("b"),
+            Arc::clone(&heard_by_b) as Arc<dyn Deliver>,
+        );
+        let c = node_delivering(
+            &switch,
+            "c",
+            &["a", "b"],
+            &NodeIdentity::mint("c"),
+            Arc::clone(&heard_by_c) as Arc<dyn Deliver>,
+        );
+        until("every node sees the other two", || {
+            a.alive() == 2 && b.alive() == 2 && c.alive() == 2
+        })
+        .await;
+        // **Waited for, and this is the finding that put it here.** Two
+        // nodes dialling each other produce two links and `keeper`'s rule
+        // drops one of them, which aborts its writer — so a message
+        // queued a moment before the rule chose is never written and the
+        // peer never hears it. Three links and two live peers is true
+        // while that is still settling, so broadcasting there loses the
+        // frame, which is exactly what this test did until it waited.
+        //
+        // The loss is now counted rather than silent, which is what
+        // section 8.1 asks of a drop; see `crate::link::Outgoing::pending_bytes`.
+        // It is not prevented, and it does not need to be: section 8.2's
+        // exchange repairs anything a broadcast lost, and handing one
+        // link's queue to its replacement would mean deciding what a
+        // half-written batch means to a peer that has already read part
+        // of it.
+        keeps("the links have settled on one per pair", 6, || {
+            a.stats().links == 2 && b.stats().links == 2 && c.stats().links == 2
+        })
+        .await;
+        assert_eq!(a.linked().len(), 2, "a broadcast can reach two peers");
+
+        let frame = replication(1);
+        let fanout = a.broadcast(&frame);
+        assert_eq!(
+            fanout,
+            Fanout {
+                queued: 2,
+                dropped: 0,
+                unframed: 0
+            }
+        );
+
+        until("both peers were handed it", || {
+            heard_by_b.replications().len() == 1 && heard_by_c.replications().len() == 1
+        })
+        .await;
+        assert_eq!(heard_by_b.replications(), vec![frame.clone()]);
+        assert_eq!(heard_by_c.replications(), vec![frame]);
+
+        // The answer goes back to whoever asked, and to nobody else. `c`
+        // answered nothing, so a frame reaching `c` twice would be a
+        // broadcast of an answer rather than a reply to one.
+        until("the answer came back", || {
+            heard_by_a.replications() == vec![replication(99)]
+        })
+        .await;
+        keeps("and nothing else moved", 4, || {
+            heard_by_a.replications().len() == 1
+                && heard_by_b.replications().len() == 1
+                && heard_by_c.replications().len() == 1
+        })
+        .await;
+    }
+
+    /// A broadcast with no peers reaches nobody and says so.
+    ///
+    /// The shape a node coming up alone is in, and the one a broadcast
+    /// must not treat as an error: a cluster of one is a supported way to
+    /// run this broker.
+    #[tokio::test]
+    async fn a_broadcast_with_no_peers_reaches_nobody() {
+        let switch = Switch::new();
+        let heard = Recorder::new();
+        let alone = node_delivering(
+            &switch,
+            "alone",
+            &[],
+            &NodeIdentity::mint("alone"),
+            Arc::clone(&heard) as Arc<dyn Deliver>,
+        );
+        assert_eq!(alone.linked(), Vec::new());
+        assert_eq!(alone.broadcast(&replication(1)), Fanout::default());
+        assert!(
+            alone
+                .send(NodeId::from_bytes([9; 16]), &replication(1))
+                .is_none(),
+            "a peer with no link must be reported as such rather than silently dropped"
+        );
+        assert_eq!(heard.replications(), Vec::new());
     }
 }

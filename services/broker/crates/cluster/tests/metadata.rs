@@ -49,7 +49,7 @@ impl Node {
             replicated: Replicated::open(
                 me,
                 HybridClock::resume(None, DEFAULT_MAX_DRIFT_MILLIS),
-                &[],
+                &storage::Restored::default(),
             )
             .expect("an empty store holds nothing to refuse"),
             store: Arc::new(MemoryStorage::new()),
@@ -452,7 +452,7 @@ fn a_restart_comes_back_holding_the_registers_and_the_count() {
     let after = Replicated::open(
         it.replicated.me(),
         HybridClock::resume(restored.clock, DEFAULT_MAX_DRIFT_MILLIS),
-        &restored.metadata,
+        &restored,
     )
     .expect("what this build wrote, it reads");
     assert_eq!(after.records_held(), it.replicated.records_held());

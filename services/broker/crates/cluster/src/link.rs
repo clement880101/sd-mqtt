@@ -189,6 +189,12 @@ pub struct Outgoing {
     queue: mpsc::Sender<Vec<u8>>,
     dropped: Arc<AtomicU64>,
     dropped_bytes: Arc<AtomicU64>,
+    /// Bytes handed over and not yet written.
+    ///
+    /// Shared with [`Outbox`], which is what [`pump`] subtracts from once
+    /// a batch has reached the stream. What it is for is the one loss
+    /// nothing else counts: see [`Outgoing::pending_bytes`].
+    pending_bytes: Arc<AtomicU64>,
     limits: FrameLimits,
 }
 
@@ -199,20 +205,27 @@ pub struct Outgoing {
 #[derive(Debug)]
 pub struct Outbox {
     queue: mpsc::Receiver<Vec<u8>>,
+    /// The other end of [`Outgoing::pending_bytes`].
+    pending_bytes: Arc<AtomicU64>,
 }
 
 /// A queue to one peer, and the end that drains it.
 #[must_use]
 pub fn outgoing(config: &LinkConfig) -> (Outgoing, Outbox) {
     let (sender, receiver) = mpsc::channel(config.outgoing_depth);
+    let pending_bytes = Arc::new(AtomicU64::new(0));
     (
         Outgoing {
             queue: sender,
             dropped: Arc::new(AtomicU64::new(0)),
             dropped_bytes: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::clone(&pending_bytes),
             limits: config.frames,
         },
-        Outbox { queue: receiver },
+        Outbox {
+            queue: receiver,
+            pending_bytes,
+        },
     )
 }
 
@@ -238,7 +251,10 @@ impl Outgoing {
         // taken is a frame this no longer owns.
         let weight = frame.len() as u64;
         match self.queue.try_send(frame) {
-            Ok(()) => Ok(Sent::Queued),
+            Ok(()) => {
+                self.pending_bytes.fetch_add(weight, Ordering::Relaxed);
+                Ok(Sent::Queued)
+            }
             Err(_) => {
                 // Counted before it is reported, so that a caller which
                 // ignores the answer still leaves a trace. Relaxed: the
@@ -274,6 +290,31 @@ impl Outgoing {
     #[must_use]
     pub fn dropped_bytes(&self) -> u64 {
         self.dropped_bytes.load(Ordering::Relaxed)
+    }
+
+    /// How many bytes are queued for this peer and not yet written.
+    ///
+    /// **This is what a link replaced loses.** Two nodes dialling each
+    /// other produce two links and one of them is dropped by
+    /// [`crate::mesh::keeper`]'s rule; dropping it aborts its writer, so
+    /// anything still in its queue is never written and nothing else would
+    /// ever say so. A heartbeat lost that way is invisible — another
+    /// follows within the interval — but section 8.2's replication puts
+    /// real writes through the same queue, and section 8.1 is explicit
+    /// that a drop nobody counted is a message nobody will know was lost.
+    ///
+    /// Counted as the frame would have weighed on the wire, which is what
+    /// makes it comparable with [`Self::dropped_bytes`] and with the
+    /// mesh's bytes sent.
+    ///
+    /// It is an upper bound by at most one batch: [`pump`] takes frames
+    /// out of the queue before it writes them and subtracts once the write
+    /// has landed, so a batch in flight is still counted here. That is the
+    /// safe direction — a batch abandoned mid-write did not reach the peer
+    /// either.
+    #[must_use]
+    pub fn pending_bytes(&self) -> u64 {
+        self.pending_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -311,6 +352,12 @@ pub async fn pump<W: AsyncWrite + Unpin>(
         }
         writer.write_all(&batch).await?;
         writer.flush().await?;
+        // Subtracted once it has reached the stream, not when it left the
+        // queue: see [`Outgoing::pending_bytes`] for what reads this and
+        // why the count must not go down before the bytes have gone.
+        outbox
+            .pending_bytes
+            .fetch_sub(batch.len() as u64, Ordering::Relaxed);
         batch.clear();
     }
     Ok(())
@@ -684,6 +731,60 @@ mod tests {
             0,
             "refusing to frame something is not dropping it, and must not be counted as one"
         );
+    }
+
+    /// What is queued and not yet written is counted, and clears.
+    ///
+    /// The one loss nothing else could see: a link replaced by the rule
+    /// that keeps one per pair aborts its writer, and whatever was still
+    /// in its queue is never written. Section 8.1 is explicit that a drop
+    /// nobody counted is a message nobody will know was lost, and this is
+    /// what the mesh folds into its dropped bytes when it retires a link;
+    /// see [`Outgoing::pending_bytes`].
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_is_queued_and_never_written_is_counted() {
+        let config = LinkConfig::default();
+        let one = encode(&message(0), &config.frames)
+            .expect("it encodes")
+            .len();
+        let (out, outbox) = outgoing(&config);
+        assert_eq!(out.pending_bytes(), 0, "nothing is queued yet");
+
+        for beat in 0..3 {
+            assert_eq!(out.send(&message(beat)).expect("it frames"), Sent::Queued);
+        }
+        assert_eq!(
+            out.pending_bytes(),
+            (one * 3) as u64,
+            "a frame handed over and not written is not counted, so a link replaced \
+             while it held one would report having lost nothing"
+        );
+        assert_eq!(
+            out.dropped_bytes(),
+            0,
+            "queued is not dropped, and counting it as both would report one loss twice"
+        );
+
+        // And once the pump has written them it is back to nothing, so the
+        // count is what is outstanding rather than what has ever been sent.
+        let (writing, reading) = duplex(4096);
+        let pumping = tokio::spawn(async move { pump(writing, outbox, &config).await });
+        let mut reader = FrameReader::new(reading, config.frames);
+        for beat in 0..3 {
+            let read: Message = within(reader.next())
+                .await
+                .expect("it reads")
+                .expect("a frame");
+            assert_eq!(read, message(beat));
+        }
+        within(async {
+            while out.pending_bytes() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        drop(out);
+        pumping.await.expect("no panic").expect("the writes landed");
     }
 
     /// A send to a peer whose pump has gone is a drop, and counted.

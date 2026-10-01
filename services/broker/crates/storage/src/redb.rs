@@ -44,8 +44,9 @@ use ::redb::{
 use serde::Serialize;
 
 use crate::record::{
-    decode_exact, BodyRecord, ClockRecord, FormatError, FormatMarker, MessageId, MetadataKeyRecord,
-    NodeIdentityRecord, OutboxRecord, QueueEntry, Record, SessionKey, SessionRecord,
+    decode_exact, BodyRecord, ClockRecord, FormatError, FormatMarker, LoggedRecord, MessageId,
+    MetadataKeyRecord, MetadataRecord, NodeIdentityRecord, OutboxRecord, QueueEntry, Record,
+    SeenRecord, SessionKey, SessionRecord,
 };
 use crate::restore::{Restored, RestoredSession};
 use crate::{Rejection, Storage, StorageError, SyncMode};
@@ -67,6 +68,19 @@ const NODE_KEY: &str = "node";
 /// argument: there is exactly one clock per store, because there is one
 /// node per store.
 const CLOCK_KEY: &str = "clock";
+/// Where the last sequence collected out of [`OPLOG`] lives in [`META`].
+///
+/// A row beside the clock, for the same reason: there is one log per
+/// store because there is one node per store.
+///
+/// **The only number held about the log.** [`OPLOG`] holds every entry
+/// from here to the top, so the highest sequence ever used is this or the
+/// last key, whichever is larger, and it is derived rather than stored. A
+/// second row saying the same thing was there first and was deleted,
+/// because a mutation that ignored it could not be made to fail a test —
+/// nothing can tell the two answers apart, which is what convention 5
+/// calls a test that cannot fail.
+const OPLOG_COLLECTED_KEY: &str = "oplog_collected";
 /// Session key to [`SessionRecord`].
 const SESSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sessions");
 /// Session key and filter, to [`SubscriptionRecord`].
@@ -132,6 +146,26 @@ const OUTBOX_STATE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("outbox
 /// The value carries its own key, so a restore reads the rows in order
 /// and never has to decode one of these back.
 const METADATA: TableDefinition<&[u8], &[u8]> = TableDefinition::new("metadata");
+/// Big-endian sequence to the [`crate::record::MetadataRecord`] this
+/// node wrote at it, section 8.2.
+///
+/// **Big-endian**, like a queue's and for the same reason: redb orders by
+/// bytes, and an exchange asks for everything after a sequence, which is
+/// a range over this table. Native-endian keys would make that range
+/// return the wrong entries on every little-endian machine, which is all
+/// of them.
+///
+/// No prefix, because a store belongs to one node and this is that
+/// node's own log. What it has read of *other* nodes' logs is
+/// [`METADATA_SEEN`], which holds a watermark rather than entries: a node
+/// keeps its peers' registers, not their logs.
+const OPLOG: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oplog");
+/// A node's sixteen UUID bytes to how far this node has read its log.
+///
+/// Keyed by the raw bytes, which is prefix-free because it is a fixed
+/// width, and which gives the same order the in-memory backend's
+/// `BTreeMap` produces.
+const METADATA_SEEN: TableDefinition<&[u8], &[u8]> = TableDefinition::new("metadata_seen");
 
 /// A [`Storage`] backed by a redb database on a path.
 #[derive(Debug)]
@@ -305,6 +339,8 @@ impl Storage for RedbStorage {
             .map_err(StorageError::from)?;
         let rules = transaction.open_table(RULES).map_err(StorageError::from)?;
         let metadata = open_read(&transaction, METADATA)?;
+        let oplog = open_read(&transaction, OPLOG)?;
+        let metadata_seen = open_read(&transaction, METADATA_SEEN)?;
         let meta = transaction.open_table(META).map_err(StorageError::from)?;
 
         let mut restored = Restored::default();
@@ -372,6 +408,29 @@ impl Storage for RedbStorage {
         for entry in metadata.iter().map_err(StorageError::from)? {
             let (_, value) = entry.map_err(StorageError::from)?;
             restored.metadata.push(decode(value.value())?);
+        }
+        // In sequence order, which is what the big-endian key buys and
+        // what an exchange asking for everything after a sequence needs.
+        for entry in oplog.iter().map_err(StorageError::from)? {
+            let (key, value) = entry.map_err(StorageError::from)?;
+            restored.oplog.push(LoggedRecord {
+                sequence: sequence_of(key.value())?,
+                entry: decode::<MetadataRecord>(value.value())?,
+            });
+        }
+        restored.oplog_collected_through =
+            match meta.get(OPLOG_COLLECTED_KEY).map_err(StorageError::from)? {
+                Some(held) => decode(held.value())?,
+                None => 0,
+            };
+        // In node order, which is the order the in-memory backend's
+        // `BTreeMap` over the same sixteen bytes produces.
+        for entry in metadata_seen.iter().map_err(StorageError::from)? {
+            let (key, value) = entry.map_err(StorageError::from)?;
+            restored.seen.push(SeenRecord {
+                node: node_bytes(key.value())?,
+                through: decode(value.value())?,
+            });
         }
         Ok(restored)
     }
@@ -484,6 +543,8 @@ struct Tables<'txn> {
     outboxes: ByteTable<'txn>,
     outbox_state: ByteTable<'txn>,
     metadata: ByteTable<'txn>,
+    oplog: ByteTable<'txn>,
+    metadata_seen: ByteTable<'txn>,
 }
 
 impl<'txn> Tables<'txn> {
@@ -524,7 +585,37 @@ impl<'txn> Tables<'txn> {
             metadata: transaction
                 .open_table(METADATA)
                 .map_err(StorageError::from)?,
+            oplog: transaction.open_table(OPLOG).map_err(StorageError::from)?,
+            metadata_seen: transaction
+                .open_table(METADATA_SEEN)
+                .map_err(StorageError::from)?,
         })
+    }
+
+    /// The last sequence collected out of this node's log.
+    ///
+    /// Zero for a node that has collected nothing — the same reading
+    /// [`crate::Restored::oplog_collected_through`] has.
+    fn oplog_collected_through(&self) -> Result<u64, StorageError> {
+        match self
+            .meta
+            .get(OPLOG_COLLECTED_KEY)
+            .map_err(StorageError::from)?
+        {
+            Some(held) => decode(held.value()),
+            None => Ok(0),
+        }
+    }
+
+    /// The highest sequence this node's log has ever used.
+    ///
+    /// Derived rather than held: see [`OPLOG_COLLECTED_KEY`].
+    fn oplog_highest(&self) -> Result<u64, StorageError> {
+        let last = match self.oplog.last().map_err(StorageError::from)? {
+            Some((key, _)) => sequence_of(key.value())?,
+            None => 0,
+        };
+        Ok(std::cmp::max(self.oplog_collected_through()?, last))
     }
 
     /// The session a record names, as a key prefix, or a refusal.
@@ -782,6 +873,65 @@ impl<'txn> Tables<'txn> {
                     )
                     .map_err(StorageError::from)?;
             }
+            Record::MetadataRemoved { key } => {
+                // A key the store does not hold is a no-op rather than a
+                // refusal: see `Record::MetadataRemoved`.
+                self.metadata
+                    .remove(metadata_key(key).as_slice())
+                    .map_err(StorageError::from)?;
+            }
+            Record::MetadataSeenPut { seen } => {
+                // Replaced whole, and not compared with what is held:
+                // whether a watermark moved forwards is the caller's
+                // question, as it is for the clock.
+                self.metadata_seen
+                    .insert(seen.node.as_slice(), encode(&seen.through).as_slice())
+                    .map_err(StorageError::from)?;
+            }
+            Record::OpLogAppended { entry } => {
+                // **Already held, or already collected** — not "below the
+                // high-water mark". Two of this node's own writes can be
+                // numbered under two different locks and reach a store in
+                // either order, so a refusal of anything below the highest
+                // would refuse the earlier of two perfectly good writes.
+                // What must never happen is one number carrying two
+                // writes, and these two conditions are exactly that.
+                let held = self
+                    .oplog
+                    .get(entry.sequence.to_be_bytes().as_slice())
+                    .map_err(StorageError::from)?
+                    .is_some();
+                if entry.sequence <= self.oplog_collected_through()? || held {
+                    return Err(Rejection::OpLogSequenceReused {
+                        sequence: entry.sequence,
+                        highest: self.oplog_highest()?,
+                    }
+                    .into());
+                }
+                self.oplog
+                    .insert(
+                        entry.sequence.to_be_bytes().as_slice(),
+                        encode(&entry.entry).as_slice(),
+                    )
+                    .map_err(StorageError::from)?;
+            }
+            Record::OpLogTruncated { through } => {
+                // Inclusive of `through`, and the high-water mark is
+                // untouched: the numbers are spent. `..=` over big-endian
+                // keys is the range this table is keyed that way for.
+                let last = through.to_be_bytes();
+                self.oplog
+                    .retain_in::<&[u8], _>(..=last.as_slice(), |_, _| false)
+                    .map_err(StorageError::from)?;
+                // The watermark moves even where it is past the last
+                // entry: the numbers are spent whether or not anything was
+                // held at them, and this is the only record of that.
+                if *through > self.oplog_collected_through()? {
+                    self.meta
+                        .insert(OPLOG_COLLECTED_KEY, encode(through).as_slice())
+                        .map_err(StorageError::from)?;
+                }
+            }
             Record::OutboxAppended { rule, entry } => {
                 let prefix = self.rule_prefix_of(rule)?;
                 let mut state = read_queue_state(&self.outbox_state, &prefix)?;
@@ -1001,6 +1151,27 @@ fn message_id(bytes: &[u8]) -> Result<MessageId, StorageError> {
 }
 
 /// The packet identifier a key ends with.
+/// An operation log key, back as the sequence it is.
+///
+/// Eight big-endian bytes and nothing else: this table has no prefix,
+/// because a store belongs to one node and the log is that node's own.
+fn sequence_of(key: &[u8]) -> Result<u64, StorageError> {
+    key.try_into().map(u64::from_be_bytes).map_err(|_| {
+        StorageError::Corrupt(FormatError::Trailing {
+            extra: key.len().saturating_sub(8),
+        })
+    })
+}
+
+/// A node's sixteen UUID bytes, back from a key that is only them.
+fn node_bytes(key: &[u8]) -> Result<[u8; 16], StorageError> {
+    key.try_into().map_err(|_| {
+        StorageError::Corrupt(FormatError::Trailing {
+            extra: key.len().saturating_sub(16),
+        })
+    })
+}
+
 fn trailing_u16(key: &[u8]) -> Result<u16, StorageError> {
     let tail = key.get(key.len().saturating_sub(2)..).unwrap_or_default();
     tail.try_into().map(u16::from_be_bytes).map_err(|_| {

@@ -111,7 +111,9 @@ pub mod link;
 pub mod membership;
 pub mod mesh;
 pub mod metadata;
+pub mod oplog;
 pub mod register;
+pub mod replicate;
 pub mod testing;
 pub mod transport;
 
@@ -122,7 +124,12 @@ pub use handshake::{accept, dial, HandshakeError, Peer, Role};
 pub use identity::{IdentityError, NodeId, NodeIdentity, Reconciled};
 pub use link::{outgoing, pump, FrameReader, LinkConfig, LinkError, Outgoing, Sent};
 pub use membership::{Member, MemberState, Membership};
-pub use mesh::{keeper, Mesh, MeshSettings, MeshStats};
+pub use mesh::{keeper, Deliver, Fanout, Mesh, MeshSettings, MeshStats};
 pub use metadata::{MetadataError, MetadataKey, MetadataValue, MetadataWrite, Replicated};
+pub use oplog::{Logged, OpLog, FIRST_SEQUENCE};
 pub use register::{Register, Stamp};
+pub use replicate::{
+    Handled, Replication, ReplicationError, ReplicationSettings, Replicator, DEFAULT_BATCH,
+    DEFAULT_EXCHANGE, DEFAULT_TOMBSTONE_GRACE,
+};
 pub use transport::{BoxStream, TcpTransport, Transport};

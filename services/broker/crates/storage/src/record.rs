@@ -1013,6 +1013,61 @@ pub struct MetadataRecord {
     pub value: Option<MetadataValueRecord>,
 }
 
+/// One entry in a node's own operation log, section 8.2.
+///
+/// A sequence number and the register the node wrote at it. The log is
+/// **gapless in the sequence**, which is what makes "everything after
+/// sequence N from node X" a question with an answer, and it is the
+/// claim the anti-entropy digest makes: a record's most recent writer
+/// changes whenever another node overwrites it, so the question cannot
+/// be answered by looking at the registers.
+///
+/// # The whole register, not a reference to one
+///
+/// [`Self::entry`] duplicates what a [`MetadataPut`] in the same batch
+/// stored, and the alternative — a log of keys, read back through the
+/// register table — was rejected. A key's register is replaced by
+/// whatever wins later, including by a tombstone another node's
+/// collection has since removed, so a log of keys has entries that
+/// resolve to nothing and a peer asking for them gets silence where the
+/// log promised an answer. Holding the write makes an entry
+/// self-contained, and the duplication is bounded by the truncation the
+/// log's own watermark drives.
+///
+/// [`MetadataPut`]: Record::MetadataPut
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggedRecord {
+    /// Where in this node's log it sits. Counted from one.
+    pub sequence: u64,
+    /// What was written.
+    pub entry: MetadataRecord,
+}
+
+/// How far this node has read one other node's operation log, section
+/// 8.2.
+///
+/// **Durable, and that is not an optimisation.** A node that came back
+/// claiming to have seen nothing would be served every peer's log from
+/// the beginning — and a peer whose log has been truncated behind its
+/// watermark cannot serve that, because the entries are gone. Worse, the
+/// claim drags every peer's watermark to nothing, so no node in the
+/// cluster could truncate a log or collect a tombstone until it caught
+/// up. So what a node has seen is written down beside the registers it
+/// saw, in the same batch, and a restart resumes from it.
+///
+/// [`Self::through`] is the **highest contiguous** sequence, not the
+/// highest seen: a broadcast that was dropped leaves a gap, and a node
+/// that counted past it would never be sent the entry it is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeenRecord {
+    /// Whose log. Its sixteen UUID bytes.
+    pub node: [u8; 16],
+    /// The highest sequence of that node's log this node holds, with
+    /// nothing missing below it. Zero is a node nothing has been read
+    /// from.
+    pub through: u64,
+}
+
 /// A message held for future subscribers to a topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedRecord {
@@ -1242,6 +1297,75 @@ pub enum Record {
         /// The register, and what it is about.
         entry: MetadataRecord,
     },
+    /// One replicated register is gone, section 8.2.
+    ///
+    /// **The only thing that ever removes one**, and it is tombstone
+    /// collection rather than a deletion: a deletion is a
+    /// [`Record::MetadataPut`] carrying no value, and it is *stored*,
+    /// because a node that dropped the row would be handed its own older
+    /// copy by the next peer it spoke to and would resurrect what it
+    /// deleted. This is what happens afterwards, once every node has
+    /// seen the tombstone and the grace period has passed, and the
+    /// caller is the only thing that can know both of those.
+    ///
+    /// Removing a key the store does not hold is a no-op rather than a
+    /// refusal. A sweep that ran twice, or on a node that had already
+    /// collected the same tombstone through a restart, is not a
+    /// caller's mistake.
+    MetadataRemoved {
+        /// Which register.
+        key: MetadataKeyRecord,
+    },
+    /// How far this node has read one other node's log, section 8.2.
+    ///
+    /// Written in the **same batch as the registers it covers**, for the
+    /// reason [`Record::ClockHighWaterPut`] is: a batch is all or
+    /// nothing, so a node that survived a crash claiming to have read a
+    /// peer's log through sequence N holds everything up to N, and one
+    /// that claimed it without the registers beside it would never be
+    /// sent them again.
+    ///
+    /// Replaced whole, and the store does not decide whether the number
+    /// moved forwards. See [`SeenRecord`].
+    MetadataSeenPut {
+        /// Whose log, and how far.
+        seen: SeenRecord,
+    },
+    /// One entry in this node's own operation log, section 8.2.
+    ///
+    /// Written in the same batch as the [`Record::MetadataPut`] it
+    /// duplicates, so that a node cannot come back holding a register
+    /// its log does not mention — which is a register no exchange would
+    /// ever repair, because the exchange serves the origin's log and the
+    /// origin would have forgotten.
+    ///
+    /// # Refused when the sequence is spent
+    ///
+    /// Section 7.4's rule, one table across: two entries sharing a
+    /// number, or a number going backwards, is what must never happen,
+    /// and the store holds the highest sequence ever appended precisely
+    /// so it can say no. A log that restarted from one would hand a peer
+    /// one node's second write where the peer was told to expect its
+    /// first, which is the same defect as a clock resuming from zero.
+    OpLogAppended {
+        /// The entry, with the sequence it claims.
+        entry: LoggedRecord,
+    },
+    /// This node's own log is collected up to and including `through`.
+    ///
+    /// Section 8.2's second watermark, the one distinct from the
+    /// tombstone one: a node truncates its own log behind what every
+    /// other node has read of it, because nothing will ever ask for an
+    /// entry every node already holds.
+    ///
+    /// **The highest sequence ever appended is not touched**, so a
+    /// restart after a truncation that emptied the log still knows which
+    /// number comes next. Truncating past the end, or twice, is a no-op
+    /// rather than a refusal.
+    OpLogTruncated {
+        /// The last sequence to remove.
+        through: u64,
+    },
 }
 
 impl Record {
@@ -1378,37 +1502,55 @@ impl Record {
             // operator the size of a rule, and a client the size of a
             // session key. The stamp is two integers and sixteen bytes,
             // all inside the record's own footprint.
-            Self::MetadataPut { entry } => {
-                let key = match &entry.key {
-                    MetadataKeyRecord::NodeSubscription { filter, .. } => filter.len(),
-                    MetadataKeyRecord::Retained { topic } => topic.len(),
-                    MetadataKeyRecord::Rule { id } => id.len(),
-                    MetadataKeyRecord::SessionOwner { session } => weigh_key(session),
-                };
-                let value = match &entry.value {
-                    None
-                    | Some(
-                        MetadataValueRecord::NodeSubscription
-                        | MetadataValueRecord::SessionOwner { .. },
-                    ) => 0,
-                    Some(MetadataValueRecord::Retained(message)) => {
-                        message.payload.len() + message.properties.len()
-                    }
-                    // The same accounting a `RulePut` gets, and the one
-                    // place this estimate would otherwise miss a field
-                    // an operator can grow.
-                    Some(MetadataValueRecord::Rule(rule)) => {
-                        Self::RulePut {
-                            rule: (**rule).clone(),
-                        }
-                        .weight()
-                            - std::mem::size_of::<Self>()
-                    }
-                };
-                key + value
-            }
+            Self::MetadataPut { entry } => weigh_metadata(entry),
+            // The key alone: a removal carries no value, because what it
+            // removes is a tombstone and a tombstone has none.
+            Self::MetadataRemoved { key } => weigh_metadata_key(key),
+            // Sixteen bytes and an integer, both inside the record's own
+            // footprint.
+            Self::MetadataSeenPut { .. } | Self::OpLogTruncated { .. } => 0,
+            // The same accounting a `MetadataPut` gets, because it holds
+            // the same register: see `LoggedRecord`.
+            Self::OpLogAppended { entry } => weigh_metadata(&entry.entry),
         };
         std::mem::size_of::<Self>() + variable
+    }
+}
+
+/// What a replicated register holds beyond the record's own footprint.
+///
+/// A peer controls the size of a filter and a topic, an operator the size
+/// of a rule, and a client the size of a session key. The stamp is two
+/// integers and sixteen bytes, all inside the record's own footprint.
+fn weigh_metadata(entry: &MetadataRecord) -> usize {
+    let value = match &entry.value {
+        None
+        | Some(MetadataValueRecord::NodeSubscription | MetadataValueRecord::SessionOwner { .. }) => {
+            0
+        }
+        Some(MetadataValueRecord::Retained(message)) => {
+            message.payload.len() + message.properties.len()
+        }
+        // The same accounting a `RulePut` gets, and the one place this
+        // estimate would otherwise miss a field an operator can grow.
+        Some(MetadataValueRecord::Rule(rule)) => {
+            Record::RulePut {
+                rule: (**rule).clone(),
+            }
+            .weight()
+                - std::mem::size_of::<Record>()
+        }
+    };
+    weigh_metadata_key(&entry.key) + value
+}
+
+/// What a register's key holds beyond the record's own footprint.
+fn weigh_metadata_key(key: &MetadataKeyRecord) -> usize {
+    match key {
+        MetadataKeyRecord::NodeSubscription { filter, .. } => filter.len(),
+        MetadataKeyRecord::Retained { topic } => topic.len(),
+        MetadataKeyRecord::Rule { id } => id.len(),
+        MetadataKeyRecord::SessionOwner { session } => weigh_key(session),
     }
 }
 

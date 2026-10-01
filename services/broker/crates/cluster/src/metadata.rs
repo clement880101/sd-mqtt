@@ -63,34 +63,46 @@
 //! stamp the store has no record of, which is a clock resuming behind
 //! itself. One call returns both so that there is no way to take one.
 //!
-//! # A known limitation: a write is held before the store has taken it
+//! # A write is numbered before the store has taken it, and shown to
+//! nobody until it has
 //!
-//! Every method below stamps the value and holds it, and the caller then
-//! gives [`Replicated::records`] to a store. **A store that refuses the
-//! batch leaves this node holding a register the store does not have**,
-//! and the restart after it resumes the clock from the older mark and
-//! holds no such register.
+//! Every method below stamps the value, holds it, and **reserves a
+//! sequence in this node's own operation log**; the caller then gives
+//! [`Replicated::records`] to a store and says what the store did, with
+//! [`Replicated::published`] or [`Replicated::refused`].
 //!
-//! Recorded rather than papered over, because it is narrow and the two
-//! cheap-looking repairs are both worse. Nothing is lost by it: the stamp
-//! the refused write used was shown to nobody, which is exactly the case
-//! [`crate::clock`] documents, and the next successful write of that key
-//! supersedes the one held. What it does cost is a window in which an
-//! exchange would offer a peer a register this node could not store — and
-//! the caller whose batch was refused has already failed whatever it was
-//! doing and said so. Closing it properly means a two-phase write, and
-//! that belongs with the broadcast that would expose it rather than here.
+//! That second call is the two-phase write this module recorded as a
+//! known limitation while nothing showed a stamp to anybody, and the note
+//! said the closure belonged with the broadcast that would expose it. It
+//! does, and this is it. A peer told about a register whose batch the
+//! store refused holds a value this node will never hold again, and **no
+//! exchange repairs that**: an exchange serves the origin's own log, and
+//! the origin's log lost the entry in the same refused batch. Each side
+//! then believes it holds the winner, which is the one divergence section
+//! 8.2 has no answer to. So nothing is broadcast and nothing is servable
+//! until the store has taken the batch; see [`crate::oplog`].
+//!
+//! What is deliberately *not* closed is the register table here being
+//! ahead of the store after a refusal. That is unobservable from outside
+//! the node: the broker's own state — the subscription, the retained
+//! message, the rule — went into the same refused batch, so this node
+//! behaves consistently with itself until it restarts, and the caller
+//! whose batch was refused has already failed whatever it was doing and
+//! said so. Rolling it back would mean a second answer to which copy of a
+//! register this node holds, in the layer whose whole purpose is that
+//! there is one.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use storage::{
-    MetadataKeyRecord, MetadataRecord, MetadataValueRecord, Record, RetainedRecord, RuleRecord,
-    SessionKey, StampRecord,
+    MetadataKeyRecord, MetadataRecord, MetadataValueRecord, Record, Restored, RetainedRecord,
+    RuleRecord, SeenRecord, SessionKey, StampRecord,
 };
 
 use crate::clock::HybridClock;
 use crate::identity::NodeId;
+use crate::oplog::{Logged, OpLog};
 use crate::register::{Register, Stamp};
 
 /// What a replicated register is about.
@@ -367,6 +379,47 @@ pub enum MetadataError {
     },
 }
 
+/// What taking a peer's entries changed.
+///
+/// Three answers from one call, because a caller needs all three and
+/// deriving any of them a second way would be a second answer: what to
+/// apply locally, what to store, and how far this node has now read the
+/// peer's log.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Taken {
+    /// The writes that won, in sequence order.
+    ///
+    /// What a caller turns into local effect: a rule installed, a retained
+    /// message set, a route to a peer added or dropped. A write that lost
+    /// told this node nothing, so it is not here.
+    pub applied: Vec<MetadataWrite>,
+    /// What to store: the registers that won, and the watermark if it
+    /// moved.
+    ///
+    /// **One batch**, because a watermark stored without the registers it
+    /// covers is a claim to hold writes this node would never be sent
+    /// again.
+    pub records: Vec<Record>,
+    /// How far this node has now read the log, contiguously.
+    pub through: u64,
+}
+
+/// Take `write` into `state`'s registers, and say whether it won.
+///
+/// [`Register::merge`] and nothing else, in one place so that a broadcast,
+/// an exchange and a test cannot reach three different answers.
+fn merge(state: &mut State, write: &MetadataWrite) -> bool {
+    match state.registers.get_mut(&write.key) {
+        Some(held) => held.merge(write.register.clone()),
+        None => {
+            state
+                .registers
+                .insert(write.key.clone(), write.register.clone());
+            true
+        }
+    }
+}
+
 /// This node's replicated state, and the one thing that is not.
 ///
 /// # Behind a lock, for the reason [`HybridClock`] is
@@ -401,15 +454,35 @@ struct State {
     /// are actually subscribed to rather than with every filter it has
     /// ever seen.
     local_filters: HashMap<String, usize>,
+    /// This node's own operation log, section 8.2.
+    ///
+    /// **In the same state as the registers, behind the same lock**,
+    /// because a write reserves a sequence and holds a register in one
+    /// step and the two must not be separable: a register held with no
+    /// sequence is a write no exchange can ever carry.
+    oplog: OpLog,
+    /// How far this node has read each other node's log, section 8.2.
+    ///
+    /// The highest *contiguous* sequence, so a broadcast that was dropped
+    /// leaves a gap rather than being counted past; see
+    /// [`storage::SeenRecord`].
+    seen: BTreeMap<NodeId, u64>,
 }
 
 impl Replicated {
     /// This node's replicated state, resumed from what the store held.
     ///
-    /// `stored` is [`storage::Restored::metadata`], tombstones included:
-    /// a node that dropped a tombstone on restart would be handed its own
-    /// older copy by the next peer it spoke to and would resurrect what
-    /// it deleted.
+    /// `restored` is the whole of what the store held, and all four of the
+    /// parts this reads come out of it together: the registers, tombstones
+    /// included — a node that dropped a tombstone on restart would be
+    /// handed its own older copy by the next peer it spoke to and would
+    /// resurrect what it deleted — this node's own log and the highest
+    /// sequence it has ever used, and how far it had read each peer's log.
+    ///
+    /// **One restore rather than four**, for the reason section 7.5 gives
+    /// about reading the store once, and a sharper one: the clock, the log
+    /// and the watermarks are written in one batch and a second read could
+    /// see a different moment of any of them.
     ///
     /// The clock is resumed too, by the caller, and from the store: see
     /// [`HybridClock::resume`] for why not from zero.
@@ -422,19 +495,30 @@ impl Replicated {
     pub fn open(
         me: NodeId,
         clock: HybridClock,
-        stored: &[MetadataRecord],
+        restored: &Restored,
     ) -> Result<Self, MetadataError> {
         let mut registers = BTreeMap::new();
-        for record in stored {
+        for record in &restored.metadata {
             let write = MetadataWrite::from_record(record.clone())?;
             registers.insert(write.key, write.register);
         }
+        let mut logged = Vec::with_capacity(restored.oplog.len());
+        for record in &restored.oplog {
+            logged.push(Logged::from_record(record.clone())?);
+        }
+        let seen = restored
+            .seen
+            .iter()
+            .map(|seen| (NodeId::from_bytes(seen.node), seen.through))
+            .collect();
         Ok(Self {
             me,
             clock,
             state: Mutex::new(State {
                 registers,
                 local_filters: HashMap::new(),
+                oplog: OpLog::resume(logged, restored.oplog_collected_through),
+                seen,
             }),
         })
     }
@@ -453,22 +537,176 @@ impl Replicated {
 
     /// What a store must be given for `write`.
     ///
-    /// **The register and the clock's mark, together**, because section
-    /// 8.2's resume depends on the mark riding in the same batch as the
-    /// write it stamps: a batch is all or nothing, so a stamp that
-    /// survived a crash has its mark beside it and a stamp that did not
-    /// was shown to nobody. Returned as a pair from one call so that
-    /// there is no way for a caller to take the register alone.
+    /// **The register, the clock's mark and this node's log entry,
+    /// together**, because section 8.2's two resumes both depend on riding
+    /// in the same batch as the write they cover: a batch is all or
+    /// nothing, so a stamp that survived a crash has its mark beside it
+    /// and a register that survived has its log entry beside it. Returned
+    /// from one call so that there is no way for a caller to take one
+    /// without the others.
+    ///
+    /// The log entry is absent for a write this node did not originate,
+    /// which is one taken from a peer: a node logs what it wrote and not
+    /// what it was told.
     #[must_use]
-    pub fn records(&self, write: &MetadataWrite) -> [Record; 2] {
-        [
+    pub fn records(&self, write: &MetadataWrite) -> Vec<Record> {
+        let mut records = vec![
             Record::MetadataPut {
                 entry: write.to_record(),
             },
             Record::ClockHighWaterPut {
                 reading: self.clock.mark(),
             },
-        ]
+        ];
+        if let Some(sequence) = self.held().oplog.held_at(write.stamp()) {
+            records.push(Record::OpLogAppended {
+                entry: Logged::new(sequence, write.clone()).to_record(),
+            });
+        }
+        records
+    }
+
+    /// The store took the batch: the write may be shown to peers now.
+    ///
+    /// Returns the log entry, which is what a broadcast carries, or `None`
+    /// for a write this node did not originate or has already resolved.
+    /// Until this is called the entry is in no digest and in no batch an
+    /// exchange serves; see [`crate::oplog`] for why that is the whole
+    /// closure of the hole this module used to record.
+    pub fn published(&self, write: &MetadataWrite) -> Option<Logged> {
+        let mut state = self.held();
+        let sequence = state.oplog.held_at(write.stamp())?;
+        state.oplog.publish(sequence)
+    }
+
+    /// The store refused the batch: the write never happened.
+    ///
+    /// Returns whether there was one to refuse. The sequence goes back in
+    /// the pool, because a number nothing was ever told about can be used
+    /// again; see [`crate::oplog::OpLog::discard`].
+    ///
+    /// The register this node holds is **not** rolled back, and the module
+    /// documentation says why.
+    pub fn refused(&self, write: &MetadataWrite) -> bool {
+        let mut state = self.held();
+        match state.oplog.held_at(write.stamp()) {
+            Some(sequence) => state.oplog.discard(sequence),
+            None => false,
+        }
+    }
+
+    /// The highest contiguous sequence of this node's log a peer may ask
+    /// past.
+    #[must_use]
+    pub fn log_published_through(&self) -> u64 {
+        self.held().oplog.published_through()
+    }
+
+    /// The highest sequence this node's log has ever used.
+    #[must_use]
+    pub fn log_high_water(&self) -> u64 {
+        self.held().oplog.high_water()
+    }
+
+    /// How many entries of this node's log are still held.
+    #[must_use]
+    pub fn log_len(&self) -> usize {
+        self.held().oplog.len()
+    }
+
+    /// Up to `limit` of this node's log entries after `sequence`.
+    ///
+    /// What an exchange serves a peer that asked. Never past
+    /// [`Self::log_published_through`].
+    #[must_use]
+    pub fn log_after(&self, sequence: u64, limit: usize) -> Vec<Logged> {
+        self.held().oplog.after(sequence, limit)
+    }
+
+    /// The reading the entry at `sequence` of this node's log carries.
+    ///
+    /// What turns "every peer has read my log through here" into "every
+    /// peer has seen every write of mine up to this reading", which is
+    /// what a tombstone may be collected behind.
+    #[must_use]
+    pub fn log_reading_at(&self, sequence: u64) -> Option<crate::clock::Reading> {
+        self.held().oplog.reading_at(sequence)
+    }
+
+    /// Remove this node's own log entries up to and including `sequence`.
+    ///
+    /// Section 8.2's second watermark. Returns the records to store, which
+    /// are empty when nothing went.
+    pub fn collect_log_through(&self, sequence: u64) -> Vec<Record> {
+        if self.held().oplog.collect_through(sequence) == 0 {
+            return Vec::new();
+        }
+        vec![Record::OpLogTruncated { through: sequence }]
+    }
+
+    /// How far this node has read `origin`'s log.
+    ///
+    /// Zero for a node nothing has been read from, which is why a log
+    /// numbers from one; see [`crate::oplog::FIRST_SEQUENCE`].
+    #[must_use]
+    pub fn seen_through(&self, origin: NodeId) -> u64 {
+        self.held().seen.get(&origin).copied().unwrap_or(0)
+    }
+
+    /// Every node this one has read anything of, with how far.
+    ///
+    /// What a digest carries, and what the tombstone watermark is a
+    /// minimum over.
+    #[must_use]
+    pub fn seen(&self) -> Vec<(NodeId, u64)> {
+        self.held()
+            .seen
+            .iter()
+            .map(|(node, through)| (*node, *through))
+            .collect()
+    }
+
+    /// Take entries `origin` logged, and say what happened.
+    ///
+    /// Every entry is merged by [`Register::merge`], whatever its
+    /// sequence: a register that wins is worth keeping however it arrived.
+    /// **The watermark only advances over a contiguous run**, because a
+    /// peer told this node holds its log through sequence seven will never
+    /// send five again — so a broadcast that was dropped must leave the
+    /// watermark below the gap and let the exchange fill it.
+    pub fn observed_from(&self, origin: NodeId, entries: Vec<Logged>) -> Taken {
+        let mut state = self.held();
+        let mut taken = Taken::default();
+        let mut through = state.seen.get(&origin).copied().unwrap_or(0);
+        // In sequence order, so that a batch delivered out of order still
+        // advances the watermark over whatever run it holds.
+        let mut entries = entries;
+        entries.sort_by_key(Logged::sequence);
+        for entry in entries {
+            let sequence = entry.sequence();
+            let write = entry.into_write();
+            if merge(&mut state, &write) {
+                taken.records.push(Record::MetadataPut {
+                    entry: write.to_record(),
+                });
+                taken.applied.push(write);
+            }
+            if sequence == through + 1 {
+                through += 1;
+            }
+        }
+        let before = state.seen.get(&origin).copied().unwrap_or(0);
+        if through > before {
+            state.seen.insert(origin, through);
+            taken.records.push(Record::MetadataSeenPut {
+                seen: SeenRecord {
+                    node: origin.to_bytes(),
+                    through,
+                },
+            });
+        }
+        taken.through = through;
+        taken
     }
 
     /// What this node holds for `key`, if anything.
@@ -651,13 +889,7 @@ impl Replicated {
     /// not to pass it on.
     pub fn observed(&self, write: MetadataWrite) -> bool {
         let mut state = self.held();
-        match state.registers.get_mut(&write.key) {
-            Some(held) => held.merge(write.register),
-            None => {
-                state.registers.insert(write.key, write.register);
-                true
-            }
-        }
+        merge(&mut state, &write)
     }
 
     /// Stamp a value, hold it, and hand back the write.
@@ -678,7 +910,13 @@ impl Replicated {
             None => Register::deleted(stamp),
         };
         state.registers.insert(key.clone(), register.clone());
-        MetadataWrite::new(key, register)
+        let write = MetadataWrite::new(key, register);
+        // Numbered here and published later, which is the two-phase write
+        // the module documentation is about: the number is spent now so
+        // that two writes cannot share one, and the entry is servable only
+        // once the store has taken the batch.
+        state.oplog.reserve(write.clone());
+        write
     }
 
     /// The state behind the lock, recovering from a poisoned one.

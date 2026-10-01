@@ -32,9 +32,9 @@ use std::collections::BTreeSet;
 
 use storage::{
     ActionRecord, BodyRecord, ClockRecord, DeliveryRecord, HttpOutRecord, InflightRecord,
-    InflightState, MessageId, MetadataKeyRecord, MetadataRecord, MetadataValueRecord,
+    InflightState, LoggedRecord, MessageId, MetadataKeyRecord, MetadataRecord, MetadataValueRecord,
     NodeIdentityRecord, OutboxRecord, ProtocolVersion, Qos, QueueEntry, Record, Rejection,
-    Restored, RestoredSession, RetainHandling, RetainedRecord, RuleRecord, SessionKey,
+    Restored, RestoredSession, RetainHandling, RetainedRecord, RuleRecord, SeenRecord, SessionKey,
     SessionRecord, StampRecord, Storage, StorageError, SubscriptionRecord, TriggerRecord,
 };
 
@@ -1994,6 +1994,290 @@ mod contract {
         );
     }
 
+    // ---- the operation log, and what has been read of other nodes' ------
+
+    /// Section 8.2's log: appended in order, restored in order, and a
+    /// sequence is never used twice.
+    ///
+    /// The order is the whole value of the table. An exchange asks for
+    /// everything after a sequence, so a backend that restored these in
+    /// any other order would serve a peer entries it already had and
+    /// withhold the one it was missing — and every entry would still be
+    /// present and whole, so nothing else here would notice.
+    ///
+    /// The sequences below are chosen to catch a native-endian key:
+    /// 1, 2 and 256 sort as 1, 2, 256 big-endian and as 256, 1, 2 on a
+    /// little-endian machine, which is every machine this runs on.
+    pub fn the_operation_log_is_appended_in_order_and_refuses_a_reused_sequence<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = new();
+        let restored = restore(&store);
+        assert!(restored.oplog.is_empty(), "an empty store holds no log");
+        assert_eq!(
+            restored.oplog_collected_through, 0,
+            "a node that has never originated a write has collected nothing"
+        );
+
+        for (sequence, millis) in [(1_u64, 10_u64), (2, 20), (256, 30)] {
+            apply(
+                &store,
+                &[Record::OpLogAppended {
+                    entry: LoggedRecord {
+                        sequence,
+                        entry: register(
+                            MetadataKeyRecord::Retained {
+                                topic: format!("t/{sequence}"),
+                            },
+                            millis,
+                            None,
+                        ),
+                    },
+                }],
+            );
+        }
+        let restored = restore(&store);
+        assert_eq!(
+            restored
+                .oplog
+                .iter()
+                .map(|logged| logged.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 256],
+            "the log did not come back in sequence order"
+        );
+        assert_eq!(
+            restored.oplog[2].entry.stamp.millis, 30,
+            "an entry came back under the wrong sequence"
+        );
+        assert_eq!(
+            restored.oplog_collected_through, 0,
+            "appending does not collect anything"
+        );
+
+        // And a sequence at or below the highest is refused, which is
+        // section 7.4's rule one table across: a log that restarted from
+        // one would tell a peer "this is my seventh write" about two
+        // different writes.
+        for reused in [1_u64, 256] {
+            let outcome = store.apply(&[Record::OpLogAppended {
+                entry: LoggedRecord {
+                    sequence: reused,
+                    entry: register(
+                        MetadataKeyRecord::Retained {
+                            topic: "again".to_owned(),
+                        },
+                        40,
+                        None,
+                    ),
+                },
+            }]);
+            match refusal(outcome) {
+                Rejection::OpLogSequenceReused { sequence, highest } => {
+                    assert_eq!(sequence, reused);
+                    assert_eq!(highest, 256);
+                }
+                other => panic!("refused as {other:?}"),
+            }
+        }
+        assert_eq!(
+            restore(&store).oplog.len(),
+            3,
+            "a refused append left something behind"
+        );
+    }
+
+    /// A truncated log loses its entries and keeps the numbers it spent.
+    ///
+    /// The second half is the one that matters. Truncation is driven by
+    /// what every other node has read, so a healthy cluster's log is
+    /// almost always empty — and a node that resumed from one because its
+    /// table was empty would re-issue a sequence every peer had already
+    /// been served, which is the same defect as a clock resuming from
+    /// zero.
+    pub fn a_truncated_operation_log_keeps_the_sequence_it_has_spent<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = new();
+        for sequence in 1_u64..=4 {
+            apply(
+                &store,
+                &[Record::OpLogAppended {
+                    entry: LoggedRecord {
+                        sequence,
+                        entry: register(
+                            MetadataKeyRecord::Retained {
+                                topic: format!("t/{sequence}"),
+                            },
+                            sequence,
+                            None,
+                        ),
+                    },
+                }],
+            );
+        }
+
+        // Inclusive of the sequence named, which is what a watermark
+        // means: everybody has read through here.
+        apply(&store, &[Record::OpLogTruncated { through: 2 }]);
+        let restored = restore(&store);
+        assert_eq!(
+            restored
+                .oplog
+                .iter()
+                .map(|logged| logged.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4],
+            "truncation took the wrong entries"
+        );
+        assert_eq!(
+            restored.oplog_collected_through, 2,
+            "the watermark is what a resuming log reads, and it did not move"
+        );
+
+        // Past the end empties it and still spends nothing, and twice is
+        // a no-op rather than a refusal.
+        apply(&store, &[Record::OpLogTruncated { through: 99 }]);
+        apply(&store, &[Record::OpLogTruncated { through: 99 }]);
+        let restored = restore(&store);
+        assert!(restored.oplog.is_empty(), "the log was not emptied");
+        assert_eq!(
+            restored.oplog_collected_through, 99,
+            "an empty log forgot the sequences it had spent, so this node would reuse one"
+        );
+        let outcome = store.apply(&[Record::OpLogAppended {
+            entry: LoggedRecord {
+                sequence: 4,
+                entry: register(
+                    MetadataKeyRecord::Retained {
+                        topic: "again".to_owned(),
+                    },
+                    9,
+                    None,
+                ),
+            },
+        }]);
+        assert!(
+            matches!(
+                refusal(outcome),
+                Rejection::OpLogSequenceReused { sequence: 4, .. }
+            ),
+            "a sequence spent before the truncation was accepted again"
+        );
+    }
+
+    /// A register is removed only by a collection, and only that one.
+    ///
+    /// Section 8.2: a deletion is a register carrying no value and is
+    /// *stored*, because a node that dropped the row would be handed its
+    /// own older copy by the next peer it spoke to. This record is what
+    /// happens afterwards, once every node has seen the tombstone, and it
+    /// must take exactly the key it names.
+    pub fn a_collected_register_is_the_only_thing_that_removes_one<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = new();
+        let gone = MetadataKeyRecord::Retained {
+            topic: "a".to_owned(),
+        };
+        let kept = MetadataKeyRecord::Retained {
+            topic: "ab".to_owned(),
+        };
+        apply(
+            &store,
+            &[
+                Record::MetadataPut {
+                    entry: register(gone.clone(), 1, None),
+                },
+                Record::MetadataPut {
+                    entry: register(kept.clone(), 2, None),
+                },
+            ],
+        );
+        apply(&store, &[Record::MetadataRemoved { key: gone.clone() }]);
+        let held = restore(&store).metadata;
+        assert_eq!(
+            held.iter().map(|entry| &entry.key).collect::<Vec<_>>(),
+            vec![&kept],
+            "a collection took the wrong register, or more than one"
+        );
+
+        // Twice, and for a key nothing holds, are both no-ops: a sweep
+        // that ran again after a restart is not a caller's mistake.
+        apply(&store, &[Record::MetadataRemoved { key: gone }]);
+        apply(
+            &store,
+            &[Record::MetadataRemoved {
+                key: MetadataKeyRecord::Rule {
+                    id: "never-held".to_owned(),
+                },
+            }],
+        );
+        assert_eq!(restore(&store).metadata.len(), 1);
+    }
+
+    /// What this node has read of each other node's log is held, replaced
+    /// and restored in node order.
+    ///
+    /// Durable because a node that came back claiming to have read
+    /// nothing would be served logs that have been truncated, and would
+    /// hold every peer's watermark down until it caught up. Replaced
+    /// whole and not compared: whether a watermark moved forwards is the
+    /// caller's question, as it is for the clock mark beside it.
+    pub fn what_has_been_read_of_each_peers_log_is_held_in_node_order<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = new();
+        assert!(
+            restore(&store).seen.is_empty(),
+            "an empty store has read nobody's log"
+        );
+        apply(
+            &store,
+            &[
+                Record::MetadataSeenPut {
+                    seen: SeenRecord {
+                        node: [0x20; 16],
+                        through: 7,
+                    },
+                },
+                Record::MetadataSeenPut {
+                    seen: SeenRecord {
+                        node: [0x10; 16],
+                        through: 3,
+                    },
+                },
+            ],
+        );
+        assert_eq!(
+            restore(&store).seen,
+            vec![
+                SeenRecord {
+                    node: [0x10; 16],
+                    through: 3
+                },
+                SeenRecord {
+                    node: [0x20; 16],
+                    through: 7
+                },
+            ],
+            "the watermarks did not come back in node order"
+        );
+
+        // Replaced whole, backwards included: the store holds what it was
+        // given.
+        apply(
+            &store,
+            &[Record::MetadataSeenPut {
+                seen: SeenRecord {
+                    node: [0x10; 16],
+                    through: 1,
+                },
+            }],
+        );
+        assert_eq!(restore(&store).seen[0].through, 1);
+    }
+
     // ---- rules -----------------------------------------------------------
 
     /// Rules are held, replaced whole, and removed. Section 9.1.
@@ -2642,6 +2926,10 @@ macro_rules! every_contract_test {
             metadata_registers_are_held_replaced_and_restored_in_key_order,
             two_nodes_subscriptions_to_one_filter_are_two_registers,
             a_register_survives_the_session_and_the_rule_its_key_names,
+            the_operation_log_is_appended_in_order_and_refuses_a_reused_sequence,
+            a_truncated_operation_log_keeps_the_sequence_it_has_spent,
+            a_collected_register_is_the_only_thing_that_removes_one,
+            what_has_been_read_of_each_peers_log_is_held_in_node_order,
             a_flush_keeps_everything_and_leaves_the_store_usable,
         }
     };

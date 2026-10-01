@@ -911,6 +911,106 @@ mod golden {
             expected,
         );
     }
+
+    /// A collection takes a key and carries nothing else.
+    ///
+    /// The one record that removes a register. Its key is `Retained`
+    /// rather than `NodeSubscription` so that the variant index of the key
+    /// (`0x01`) differs from the record's own discriminant and from the
+    /// topic's length, which is what makes a transposition visible.
+    #[test]
+    fn metadata_removed() {
+        let expected: &[u8] = &[
+            0x16, // Record::MetadataRemoved is variant 22
+            0x01, // MetadataKeyRecord::Retained is variant 1
+            0x03, b'a', b'/', b'b', // topic "a/b"
+        ];
+        pins(
+            &Record::MetadataRemoved {
+                key: MetadataKeyRecord::Retained {
+                    topic: "a/b".to_owned(),
+                },
+            },
+            expected,
+        );
+    }
+
+    /// How far a peer's log has been read: sixteen bytes and a number.
+    ///
+    /// The node's bytes are not all the same and none of them is the
+    /// two-byte varint that follows, so neither a transposition nor a
+    /// width mistake can hide.
+    #[test]
+    fn metadata_seen_put() {
+        let expected: &[u8] = &[
+            0x17, // Record::MetadataSeenPut is variant 23
+            0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // the node
+            0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, //
+            0xac, 0x02, // through 300
+        ];
+        pins(
+            &Record::MetadataSeenPut {
+                seen: SeenRecord {
+                    node: [
+                        0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c,
+                        0x3d, 0x3e, 0x3f, 0x40,
+                    ],
+                    through: 300,
+                },
+            },
+            expected,
+        );
+    }
+
+    /// One entry of this node's own log: the sequence, then the register.
+    ///
+    /// **The sequence comes first**, which is what pins the field order of
+    /// `LoggedRecord`: swapped, the register's key variant would be read
+    /// as the sequence and the whole entry would land under a number
+    /// nobody asked for. It is a two-byte varint and nothing else here is,
+    /// so the swap is visible.
+    #[test]
+    fn oplog_appended() {
+        let expected: &[u8] = &[
+            0x18, // Record::OpLogAppended is variant 24
+            0x81, 0x01, // sequence 129
+            0x02, // MetadataKeyRecord::Rule is variant 2
+            0x09, b't', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y', // id
+            0x05, // stamp millis 5
+            0x00, // stamp counter 0
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, // the stamp's node
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, //
+            0x00, // the value is absent, which is what a tombstone is
+        ];
+        pins(
+            &Record::OpLogAppended {
+                entry: LoggedRecord {
+                    sequence: 129,
+                    entry: MetadataRecord {
+                        key: MetadataKeyRecord::Rule {
+                            id: "telemetry".to_owned(),
+                        },
+                        stamp: StampRecord {
+                            millis: 5,
+                            counter: 0,
+                            node: [0x22; 16],
+                        },
+                        value: None,
+                    },
+                },
+            },
+            expected,
+        );
+    }
+
+    #[test]
+    fn oplog_truncated() {
+        let expected: &[u8] = &[
+            0x19, // Record::OpLogTruncated is variant 25
+            0xac, 0x02, // through 300
+        ];
+        pins(&Record::OpLogTruncated { through: 300 }, expected);
+    }
 }
 
 /// The format version, and what a reader does when it does not know one.
@@ -1652,6 +1752,18 @@ mod roundtrip {
                 }
             }),
             metadata_entry().prop_map(|entry| Record::MetadataPut { entry }),
+            metadata_key().prop_map(|key| Record::MetadataRemoved { key }),
+            (any::<[u8; 16]>(), any::<u64>()).prop_map(|(node, through)| {
+                Record::MetadataSeenPut {
+                    seen: SeenRecord { node, through },
+                }
+            }),
+            (any::<u64>(), metadata_entry()).prop_map(|(sequence, entry)| {
+                Record::OpLogAppended {
+                    entry: LoggedRecord { sequence, entry },
+                }
+            }),
+            any::<u64>().prop_map(|through| Record::OpLogTruncated { through }),
         ]
     }
 

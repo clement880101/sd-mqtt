@@ -7,8 +7,9 @@
 use std::collections::HashMap;
 
 use crate::record::{
-    BodyRecord, ClockRecord, InflightRecord, MessageId, MetadataRecord, NodeIdentityRecord,
-    QueueEntry, RetainedRecord, RuleRecord, SessionRecord, SubscriptionRecord,
+    BodyRecord, ClockRecord, InflightRecord, LoggedRecord, MessageId, MetadataRecord,
+    NodeIdentityRecord, QueueEntry, RetainedRecord, RuleRecord, SeenRecord, SessionRecord,
+    SubscriptionRecord,
 };
 
 /// Everything needed to rebuild the broker, read once at startup.
@@ -129,6 +130,44 @@ pub struct Restored {
     /// the same value and the restart property can compare them as one
     /// equality — the same reason [`Self::rules`] is ordered.
     pub metadata: Vec<MetadataRecord>,
+    /// This node's own operation log, in sequence order.
+    ///
+    /// Section 8.2: the anti-entropy digest is a claim about this and not
+    /// about [`Self::metadata`], because a register's most recent writer
+    /// changes whenever another node overwrites it. Truncated behind what
+    /// every other node has read of it, so a healthy cluster's log is
+    /// short; a cluster with a node that has been away holds everything
+    /// that node has not seen.
+    pub oplog: Vec<LoggedRecord>,
+    /// The last sequence collected out of this node's log.
+    ///
+    /// Zero for a node that has collected nothing. Section 8.2's second
+    /// watermark, as the store last saw it: everything at or below it has
+    /// been read by every node and is gone, so nothing will ever ask for
+    /// it and nothing may ever be numbered there again.
+    ///
+    /// **This and [`Self::oplog`] are what a resuming log needs**, and
+    /// between them they say which number comes next: the entries run from
+    /// here to the top, so the highest sequence ever used is this or the
+    /// highest entry, whichever is larger. A node that resumed from one
+    /// would re-issue a sequence every peer had already been served, which
+    /// is the same defect as a clock resuming from zero, in the other of
+    /// section 8.2's two counters — and the case that makes this field
+    /// rather than the entries the answer is a log collected down to
+    /// nothing, which is what a healthy cluster's log almost always is.
+    ///
+    /// A third field holding the highest sequence outright was here first
+    /// and was deleted: it is this or the highest entry by construction,
+    /// so no test could tell an implementation that ignored it from one
+    /// that did not, which is convention 5's test that cannot fail.
+    pub oplog_collected_through: u64,
+    /// How far this node has read each other node's log, in node order.
+    ///
+    /// Section 8.2, and durable for the reason [`SeenRecord`] gives: a
+    /// node that came back claiming to have seen nothing would be served
+    /// logs that have been truncated, and would hold every peer's
+    /// watermark down until it caught up.
+    pub seen: Vec<SeenRecord>,
 }
 
 /// One session and everything that belongs to it.

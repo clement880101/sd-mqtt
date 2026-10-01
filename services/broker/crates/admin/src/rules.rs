@@ -662,8 +662,12 @@ mod tests {
                 writer,
                 Arc::new(Membership::alone(me)),
                 Arc::new(
-                    Replicated::open(me, HybridClock::resume(None, DEFAULT_MAX_DRIFT_MILLIS), &[])
-                        .expect("an empty store holds nothing to refuse"),
+                    Replicated::open(
+                        me,
+                        HybridClock::resume(None, DEFAULT_MAX_DRIFT_MILLIS),
+                        &storage::Restored::default(),
+                    )
+                    .expect("an empty store holds nothing to refuse"),
                 ),
             );
             // The same wiring the binary does, and the reason a rule

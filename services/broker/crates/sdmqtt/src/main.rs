@@ -510,7 +510,7 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, Sta
         Replicated::open(
             reconciled.identity.id(),
             HybridClock::resume(restored.clock, DEFAULT_MAX_DRIFT_MILLIS),
-            &restored.metadata,
+            &restored,
         )
         .map_err(StartupError::Metadata)?,
     );
