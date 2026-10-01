@@ -44,8 +44,8 @@ use ::redb::{
 use serde::Serialize;
 
 use crate::record::{
-    decode_exact, BodyRecord, FormatError, FormatMarker, MessageId, NodeIdentityRecord,
-    OutboxRecord, QueueEntry, Record, SessionKey, SessionRecord,
+    decode_exact, BodyRecord, ClockRecord, FormatError, FormatMarker, MessageId,
+    NodeIdentityRecord, OutboxRecord, QueueEntry, Record, SessionKey, SessionRecord,
 };
 use crate::restore::{Restored, RestoredSession};
 use crate::{Rejection, Storage, StorageError, SyncMode};
@@ -61,6 +61,12 @@ const FORMAT_KEY: &str = "format";
 /// Global to the database for the same reason the format marker is: it
 /// is a fact about the store rather than about anything in it.
 const NODE_KEY: &str = "node";
+/// Where [`crate::record::ClockRecord`] lives in [`META`].
+///
+/// A row beside [`NODE_KEY`], for the same reason and with the same
+/// argument: there is exactly one clock per store, because there is one
+/// node per store.
+const CLOCK_KEY: &str = "clock";
 /// Session key to [`SessionRecord`].
 const SESSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sessions");
 /// Session key and filter, to [`SubscriptionRecord`].
@@ -339,6 +345,10 @@ impl Storage for RedbStorage {
         }
         restored.node = match meta.get(NODE_KEY).map_err(StorageError::from)? {
             Some(held) => Some(decode::<NodeIdentityRecord>(held.value())?),
+            None => None,
+        };
+        restored.clock = match meta.get(CLOCK_KEY).map_err(StorageError::from)? {
+            Some(held) => Some(decode::<ClockRecord>(held.value())?),
             None => None,
         };
         Ok(restored)
@@ -723,6 +733,15 @@ impl<'txn> Tables<'txn> {
                 // belongs to one node.
                 self.meta
                     .insert(NODE_KEY, encode(identity).as_slice())
+                    .map_err(StorageError::from)?;
+            }
+            Record::ClockHighWaterPut { reading } => {
+                // One row in `META`, beside the format marker and the
+                // identity, because a store belongs to one node and
+                // therefore to one clock. Replaced whole; whether the
+                // reading moved forwards is not this layer's question.
+                self.meta
+                    .insert(CLOCK_KEY, encode(reading).as_slice())
                     .map_err(StorageError::from)?;
             }
             Record::OutboxAppended { rule, entry } => {

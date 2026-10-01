@@ -105,17 +105,21 @@ mod golden {
     #[test]
     fn the_format_marker() {
         // A fixed-size array is its elements with no length prefix, and a
-        // u16 is a varint, so version 5 is one byte. The version moved
+        // u16 is a varint, so version 6 is one byte. The version moved
         // from 1 when the reference count of a body left the body's own
         // row, from 2 when rules were added, from 3 when each rule
         // gained an outbox — a version 3 store has no outbox table at
         // all and would come up looking healthy with every undelivered
-        // envelope missing — and from 4 when the node's own identity
+        // envelope missing — from 4 when the node's own identity
         // was stored, because a store from before it holds none and the
-        // node reading it would mint a second UUID for itself.
+        // node reading it would mint a second UUID for itself, and from
+        // 5 when the clock's high-water mark was stored, because a
+        // store from before it holds none and the node reading it would
+        // resume its clock from zero and re-issue stamps it has already
+        // used.
         let expected: &[u8] = &[
             b's', b'd', b'm', b'q', b't', b't', b's', b't', // magic "sdmqttst"
-            0x05, // version 5
+            0x06, // version 6
         ];
         assert_eq!(FormatMarker::current().encode(), expected);
         assert_eq!(
@@ -741,6 +745,30 @@ mod golden {
                         0x0c, 0x0d, 0x0e, 0x0f,
                     ],
                     name: "edge-1".to_owned(),
+                },
+            },
+            expected,
+        );
+    }
+
+    /// Section 8.2's clock mark.
+    ///
+    /// Two varints, and the vector is chosen so that a transposition of
+    /// the fields would not decode: a realistic millisecond reading is
+    /// six bytes of varint and the counter is two, so reading them the
+    /// other way round runs off the end of the record.
+    #[test]
+    fn clock_high_water_put() {
+        let expected: &[u8] = &[
+            0x14, // Record::ClockHighWaterPut is variant 20
+            0xfb, 0xd0, 0x95, 0xff, 0xbc, 0x31, // millis 1_700_000_000_123
+            0xac, 0x02, // counter 300
+        ];
+        pins(
+            &Record::ClockHighWaterPut {
+                reading: ClockRecord {
+                    millis: 1_700_000_000_123,
+                    counter: 300,
                 },
             },
             expected,
@@ -1438,6 +1466,21 @@ mod roundtrip {
             ),
             (text(), any::<u64>())
                 .prop_map(|(rule, sequence)| Record::OutboxRemoved { rule, sequence }),
+            // Section 8.1's identity and section 8.2's clock mark. Both
+            // were missing from this list, which the comment above says
+            // cannot happen and `prop_oneof!` does not in fact enforce:
+            // it is a list and not a match, so a variant left out is
+            // silently never generated. Convention 5's "a generator that
+            // cannot produce a case", in the generator that exists to
+            // catch everything nobody thought of.
+            (any::<[u8; 16]>(), text()).prop_map(|(uuid, name)| Record::NodeIdentityPut {
+                identity: NodeIdentityRecord { uuid, name },
+            }),
+            (any::<u64>(), any::<u32>()).prop_map(|(millis, counter)| {
+                Record::ClockHighWaterPut {
+                    reading: ClockRecord { millis, counter },
+                }
+            }),
         ]
     }
 

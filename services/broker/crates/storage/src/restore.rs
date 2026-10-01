@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 
 use crate::record::{
-    BodyRecord, InflightRecord, MessageId, NodeIdentityRecord, QueueEntry, RetainedRecord,
-    RuleRecord, SessionRecord, SubscriptionRecord,
+    BodyRecord, ClockRecord, InflightRecord, MessageId, NodeIdentityRecord, QueueEntry,
+    RetainedRecord, RuleRecord, SessionRecord, SubscriptionRecord,
 };
 
 /// Everything needed to rebuild the broker, read once at startup.
@@ -99,6 +99,20 @@ pub struct Restored {
     /// startup reads the store once. It is one row, and it is wanted at
     /// exactly the moment everything else is.
     pub node: Option<NodeIdentityRecord>,
+    /// The highest clock reading this node has ever issued, if it has
+    /// ever issued one.
+    ///
+    /// `None` for a store that has never been written to by a clock,
+    /// which is a node whose first write is still to come. Section 8.2:
+    /// **the clock resumes from this and not from zero**, because a
+    /// clock that restarts behind itself re-issues a stamp, and two
+    /// writes sharing a stamp is the one divergence no exchange
+    /// repairs.
+    ///
+    /// Read back here rather than through a call of its own, for the
+    /// reason [`Self::node`] gives: it is one row, and it is wanted at
+    /// exactly the moment everything else is.
+    pub clock: Option<ClockRecord>,
 }
 
 /// One session and everything that belongs to it.

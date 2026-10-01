@@ -30,8 +30,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, PoisonError};
 
 use crate::record::{
-    BodyRecord, InflightRecord, MessageId, NodeIdentityRecord, OutboxRecord, QueueEntry, Record,
-    RetainedRecord, RuleRecord, SessionKey, SessionRecord, SubscriptionRecord,
+    BodyRecord, ClockRecord, InflightRecord, MessageId, NodeIdentityRecord, OutboxRecord,
+    QueueEntry, Record, RetainedRecord, RuleRecord, SessionKey, SessionRecord, SubscriptionRecord,
 };
 use crate::restore::{Restored, RestoredSession};
 use crate::{Rejection, Storage, StorageError};
@@ -82,6 +82,11 @@ struct State {
     ///
     /// One row rather than a table: a store belongs to one node.
     node: Option<NodeIdentityRecord>,
+    /// The highest clock reading this node has issued. Section 8.2.
+    ///
+    /// One row, beside the identity and for the same reason: a store
+    /// belongs to one node, and this is that node's clock.
+    clock: Option<ClockRecord>,
     /// Each rule's outbox, by the same identifier.
     ///
     /// Beside the rules rather than inside a rule's own entry, because a
@@ -343,6 +348,13 @@ impl State {
                 // store's.
                 self.node = Some(identity.clone());
             }
+            Record::ClockHighWaterPut { reading } => {
+                // Replaced whole, and not compared with what is held:
+                // whether a reading moved forwards is the clock's
+                // question and `ClockRecord` says why it is not the
+                // store's.
+                self.clock = Some(*reading);
+            }
             Record::OutboxRemoved { rule, sequence } => {
                 let held = self.outbox_mut(rule)?;
                 // Only what was actually there is subtracted, for the
@@ -413,6 +425,7 @@ impl Storage for MemoryStorage {
                 .collect::<HashMap<_, _>>(),
             rules: state.rules.values().cloned().collect(),
             node: state.node.clone(),
+            clock: state.clock,
         })
     }
 

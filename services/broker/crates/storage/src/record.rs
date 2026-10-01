@@ -83,7 +83,18 @@ use serde::{Deserialize, Serialize};
 /// thing singleton ownership and every conflict tie-break order by, so a
 /// silent re-founding is not a node that lost a name; it is two answers
 /// to "which node" separated by a restart.
-pub const FORMAT_VERSION: u16 = 5;
+///
+/// Version 6 added the hybrid logical clock's high-water mark, section
+/// 8.2: one variant at the end of [`Record`], a [`ClockRecord`] to go
+/// in it, and one global row in each backend. The same argument again,
+/// and it is the sharpest instance yet for the same reason version 5
+/// was — **a version 5 store opened by this build holds no reading, so
+/// this node's clock would resume from zero and re-issue stamps it has
+/// already used.** Section 8.2 makes convergence conditional on no two
+/// writes ever sharing a stamp, so a clock that restarts behind itself
+/// is not a node that lost some counter; it is two values under one key
+/// that no later exchange can ever separate.
+pub const FORMAT_VERSION: u16 = 6;
 
 /// What every sd-mqtt store begins with, so a file that is not one is
 /// refused as such rather than as a corrupt store.
@@ -823,6 +834,45 @@ pub struct NodeIdentityRecord {
     pub name: String,
 }
 
+/// The highest hybrid logical clock reading this node has ever issued.
+///
+/// Section 8.2: **a node resumes its clock from the highest reading it
+/// has ever written, read back from the store, not from zero.** A clock
+/// that restarts behind itself re-issues a stamp it has already used,
+/// and two writes under one key carrying one stamp is the single thing
+/// convergence cannot repair: each side keeps its own and re-gossiping
+/// changes nothing, because each believes it already holds the winner.
+///
+/// One of these per store, like [`NodeIdentityRecord`] and for the same
+/// reason: it is a fact about this node rather than about anything in
+/// the store.
+///
+/// # The store holds it and does not police it
+///
+/// A put replaces the row with whatever it carries, including a lower
+/// reading. That is the same decision [`Record::NodeIdentityPut`]
+/// records at length: only the caller knows whether a reading is this
+/// node's own next one or a peer's, and a store with an opinion about
+/// it would be a second answer in the layer that cannot see the
+/// question. `cluster::HybridClock` is the one place that decides, and
+/// it only ever moves forwards.
+///
+/// # Both halves, because milliseconds alone are not a reading
+///
+/// The counter is what makes two writes inside one millisecond
+/// distinguishable, so a resume that recovered [`Self::millis`] and
+/// dropped [`Self::counter`] would be a clock resuming behind itself by
+/// up to a millisecond's worth of writes. Section 8.2 again: dropping
+/// the counter makes one node ambiguous with itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClockRecord {
+    /// The physical half: milliseconds since the Unix epoch.
+    pub millis: u64,
+    /// The logical half: how many readings this build has issued inside
+    /// [`Self::millis`] already.
+    pub counter: u32,
+}
+
 /// A message held for future subscribers to a topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedRecord {
@@ -1021,6 +1071,22 @@ pub enum Record {
         /// Who this node is.
         identity: NodeIdentityRecord,
     },
+    /// The highest clock reading this node has issued, section 8.2.
+    ///
+    /// Written **in the same batch as the write it stamps**, which is
+    /// what makes the resume safe rather than nearly safe: a batch is
+    /// all or nothing, so a stamp that survived a crash has its mark
+    /// beside it, and a stamp that did not was never shown to anybody.
+    /// A mark written in a batch of its own could be lost while the
+    /// write it covers survived, which is a clock resuming behind
+    /// itself with no sign that anything went wrong.
+    ///
+    /// Replaced whole, and the store does not decide whether the
+    /// reading moved forwards; see [`ClockRecord`].
+    ClockHighWaterPut {
+        /// The reading.
+        reading: ClockRecord,
+    },
 }
 
 impl Record {
@@ -1151,6 +1217,8 @@ impl Record {
             // the UUID is sixteen bytes counted by the record's own
             // footprint.
             Self::NodeIdentityPut { identity } => identity.name.len(),
+            // Two integers, both inside the record's own footprint.
+            Self::ClockHighWaterPut { .. } => 0,
         };
         std::mem::size_of::<Self>() + variable
     }

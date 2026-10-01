@@ -31,10 +31,10 @@
 use std::collections::BTreeSet;
 
 use storage::{
-    ActionRecord, BodyRecord, DeliveryRecord, HttpOutRecord, InflightRecord, InflightState,
-    MessageId, NodeIdentityRecord, OutboxRecord, ProtocolVersion, Qos, QueueEntry, Record,
-    Rejection, Restored, RestoredSession, RetainHandling, RetainedRecord, RuleRecord, SessionKey,
-    SessionRecord, Storage, StorageError, SubscriptionRecord, TriggerRecord,
+    ActionRecord, BodyRecord, ClockRecord, DeliveryRecord, HttpOutRecord, InflightRecord,
+    InflightState, MessageId, NodeIdentityRecord, OutboxRecord, ProtocolVersion, Qos, QueueEntry,
+    Record, Rejection, Restored, RestoredSession, RetainHandling, RetainedRecord, RuleRecord,
+    SessionKey, SessionRecord, Storage, StorageError, SubscriptionRecord, TriggerRecord,
 };
 
 /// The contract, as functions over any backend.
@@ -1698,6 +1698,69 @@ mod contract {
         assert_eq!(held.uuid, minted.uuid, "and it did not re-found the node");
     }
 
+    // ---- this node's clock -----------------------------------------------
+
+    /// Section 8.2's clock mark: absent until something writes one,
+    /// then held, both halves of it.
+    ///
+    /// **The second put carries a lower reading and the store takes
+    /// it.** That is not an oversight dressed up: `ClockRecord` says
+    /// the store holds what it is given and the clock is the one thing
+    /// that decides whether a reading moved forwards, for the same
+    /// reason `Record::NodeIdentityPut` gives about a UUID. A backend
+    /// that quietly kept the higher of the two would be a second
+    /// opinion in the layer that cannot see the question, and would
+    /// hide a clock that had started going backwards instead of letting
+    /// `cluster`'s own tests catch it.
+    ///
+    /// The counter is asserted separately from the milliseconds,
+    /// because a backend that stored only the milliseconds would leave
+    /// a resumed clock up to a millisecond's worth of writes behind
+    /// itself, which is the one thing section 8.2 says must not happen
+    /// and the one thing a single equality on the millisecond would
+    /// miss.
+    pub fn the_clock_mark_is_held_with_both_of_its_halves<S: Storage>(new: impl Fn() -> S) {
+        let store = new();
+        assert_eq!(
+            restore(&store).clock,
+            None,
+            "a store no clock has written to says so, rather than answering zero, \
+             which is a reading a clock could have issued"
+        );
+
+        let issued = ClockRecord {
+            millis: 1_700_000_000_123,
+            counter: 7,
+        };
+        apply(&store, &[Record::ClockHighWaterPut { reading: issued }]);
+        let held = restore(&store).clock.expect("the store holds the mark");
+        assert_eq!(held.millis, 1_700_000_000_123);
+        assert_eq!(
+            held.counter, 7,
+            "the counter is half the reading and a store that dropped it would \
+             resume a clock behind itself"
+        );
+
+        let later = ClockRecord {
+            millis: 1_700_000_000_124,
+            counter: 0,
+        };
+        apply(&store, &[Record::ClockHighWaterPut { reading: later }]);
+        assert_eq!(restore(&store).clock, Some(later));
+
+        let lower = ClockRecord {
+            millis: 1,
+            counter: 0,
+        };
+        apply(&store, &[Record::ClockHighWaterPut { reading: lower }]);
+        assert_eq!(
+            restore(&store).clock,
+            Some(lower),
+            "the store holds what it was given; whether a reading moved forwards \
+             is the clock's question"
+        );
+    }
+
     // ---- rules -----------------------------------------------------------
 
     /// Rules are held, replaced whole, and removed. Section 9.1.
@@ -2342,6 +2405,7 @@ macro_rules! every_contract_test {
             removing_an_envelope_does_not_release_the_body_it_named,
             a_body_can_be_read_back_on_its_own,
             the_node_identity_is_held_and_renamed_without_re_founding,
+            the_clock_mark_is_held_with_both_of_its_halves,
             a_flush_keeps_everything_and_leaves_the_store_usable,
         }
     };

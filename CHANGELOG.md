@@ -15,11 +15,16 @@ the milestone you are moving to.** Everything else is description.
 milestone 4. It refuses to start, and says so:**
 
 ```
-store format version 4 is not readable by this build, which reads version 5.
+store format version 4 is not readable by this build, which reads version 6.
 The store is not damaged; it was written by a different build. Nothing is
 released yet, so there is no migration: see CHANGELOG.md for what moved and
 what starting with a fresh store directory throws away.
 ```
+
+**The same applies to a version 5 store**, which is one written by an
+earlier build of this same unreleased milestone: this milestone has
+moved the format twice, once for the node's identity and once for its
+clock, and the check is exact.
 
 The file is not damaged and the check is **exact rather than a
 range**, for the reason the milestone 4 section below gives at length:
@@ -30,12 +35,16 @@ reading healthy bytes with the wrong layout restores nonsense.
 which creates a fresh store. What that throws away is what the store
 held, and the list is the one in the milestone 4 section — durable
 sessions, queued messages, retained messages, wills, rules and
-outboxes — **with one addition: this node's identity.** A fresh store
-mints a fresh UUID, so as far as the rest of a cluster is concerned
-the node that comes back is a new one. Nothing else in a cluster
-depends on that yet, because nothing joins one yet; it will.
+outboxes — **with two additions: this node's identity, and its
+clock.** A fresh store mints a fresh UUID, so as far as the rest of a
+cluster is concerned the node that comes back is a new one; and a
+fresh store holds no clock reading, so the node starts its clock from
+the wall clock rather than resuming. Starting a *fresh* store from
+zero is safe — there are no earlier writes of this node's for a new
+stamp to collide with — and that is exactly why throwing the store
+away is the instruction rather than keeping half of it.
 
-**Why the version moved.** Section 8.1 gives each node a stable
+**Why the version moved to 5.** Section 8.1 gives each node a stable
 identity — a UUID v7 minted on first start and a name beside it — and
 it is stored, because a node that minted a new one on every restart
 would stop being the node its peers know without ever saying so. That
@@ -43,8 +52,38 @@ added one record variant, a record to go in it, and one global row in
 each backend. A version 4 store opened by this build holds no
 identity, and the node reading it would found itself a second time.
 
+**Why it moved again to 6.** Section 8.2 stamps every replicated
+record with a hybrid logical clock reading, and **convergence is
+conditional on no two writes ever sharing a stamp.** A clock cannot
+issue a duplicate, but a clock that restarts behind itself can, so a
+node resumes from the highest reading it has ever written, read back
+from the store. That added one more record variant, a record to go in
+it, and one more global row in each backend. A version 5 store opened
+by this build holds no reading, so the node would resume its clock
+from zero and re-issue stamps it had already used — and two values
+under one key carrying one stamp is the single divergence no later
+exchange repairs, because each side keeps its own and believes it
+already holds the winner.
+
 ### Added
 
+- Section 8.2's hybrid logical clock, which is what makes two nodes'
+  writes comparable: milliseconds from the wall clock, then a counter
+  that moves when the millisecond does not. It is the first wall-clock
+  read on a write path in this broker — the existing coarse clock is a
+  count from an arbitrary origin, and two nodes' counts are not
+  comparable. Two decisions in it reverse the obvious implementation,
+  and both are there because convergence is conditional on no two
+  writes ever sharing a stamp:
+  - **A peer whose reading is further ahead than the configured bound
+    is refused, not clamped.** Clamping still advances the local clock,
+    so one node with a wrong year would poison every node it reached,
+    permanently, and no later write anywhere could win a conflict
+    against it. Refusing confines the damage to that node's own frames.
+  - **A node resumes its clock from the highest reading its store
+    holds, not from zero.** The reading rides in the same batch as the
+    write it stamps, so a stamp that survived a crash has its mark
+    beside it and a stamp that did not was shown to nobody.
 - Section 8.1's node identity: a UUID v7 and a name, minted on first
   start and read back unchanged afterwards. Renaming a node moves the
   name and not the UUID. See `[node]` in `README.md` and

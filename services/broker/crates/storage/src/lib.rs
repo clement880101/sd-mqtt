@@ -30,7 +30,7 @@ pub use self::redb::RedbStorage;
 pub use memory::MemoryStorage;
 
 pub use record::{
-    ActionRecord, BodyRecord, DeliveryRecord, FormatError, FormatMarker, HttpInRecord,
+    ActionRecord, BodyRecord, ClockRecord, DeliveryRecord, FormatError, FormatMarker, HttpInRecord,
     HttpOutRecord, InflightRecord, InflightState, MessageId, NodeIdentityRecord, OutboxRecord,
     ProtocolVersion, Qos, QueueEntry, Record, RetainHandling, RetainedRecord, RuleRecord, Secret,
     SessionKey, SessionRecord, SubscriptionRecord, TopicFromRecord, TopicFromRequestRecord,

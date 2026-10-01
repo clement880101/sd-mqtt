@@ -61,6 +61,12 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 storage = { path = "../storage", version = "0.1.0", features = ["redb"] }
 # The directory those stores live in, thrown away with them.
 tempfile.workspace = true
+# Section 8.2's two properties are properties: a clock that resumes from
+# the store never re-issues a reading, and two nodes handed the same
+# writes in any order agree. Both are over sequences nobody would
+# enumerate, and the second one *found* the condition convergence
+# depends on rather than having it explained.
+proptest.workspace = true
 # `rt` and `macros` for `#[tokio::test]`; `io-util` for `duplex`, which
 # is the pair of ends every handshake test runs over; `time` for the
 # bounds that make a stalled handshake fail rather than hang.

@@ -40,6 +40,18 @@
 //! batches, and **dropping and counting** rather than letting a wedged
 //! peer block whoever had something to say to it.
 
+//! # A stamp is a reading and an identity, and the reading is new
+//!
+//! [`clock`] is section 8.2's hybrid logical clock: the first wall-clock
+//! read on a write path in this broker, because `broker-core`'s coarse
+//! clock is a count from an arbitrary origin and two nodes' counts are
+//! not comparable. A peer further ahead than the configured bound is
+//! **refused rather than clamped**, and a node resumes its clock from
+//! the highest reading the store holds rather than from zero. Both of
+//! those reverse the obvious implementation and both are there for the
+//! same reason: convergence is conditional on no two writes ever sharing
+//! a stamp.
+//!
 //! # And it is opened over something, which is not always a socket
 //!
 //! [`transport`] is the seam. Section 14 committed to three nodes in
@@ -59,6 +71,7 @@
 //! nobody remembers to name it. Nothing above reaches it: the release
 //! binary links none of it, because nothing it links calls it.
 
+pub mod clock;
 pub mod config;
 pub mod frame;
 pub mod handshake;
@@ -69,6 +82,7 @@ pub mod mesh;
 pub mod testing;
 pub mod transport;
 
+pub use clock::{ClockError, HybridClock, Reading, DEFAULT_MAX_DRIFT_MILLIS};
 pub use config::{ClusterConfig, ClusterSettings, ConfigError, DEFAULT_CLUSTER_NAME};
 pub use frame::{FrameError, FrameLimits, FRAME_VERSION};
 pub use handshake::{accept, dial, HandshakeError, Peer, Role};
