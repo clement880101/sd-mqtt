@@ -2311,21 +2311,41 @@ fn a_rule_created_over_the_api_fires_and_still_fires_after_a_restart() {
 
     let mut client = Client::connect(mqtt, "after-the-restart");
     client.publish_and_wait(API_TOPIC, AFTER_THE_RESTART);
-    endpoint.wait_for(
-        2,
-        "the rule was read back after the restart but did not fire, so it was restored \
-         as a row and not as a running rule",
-    );
-    let seen = endpoint.requests();
+
+    // Wait for the envelope carrying *this* publication, rather than
+    // for a second request and then assuming it is this one.
+    //
+    // The two are not the same, and the difference is a guarantee
+    // rather than a timing detail. An envelope's removal from the
+    // outbox is durable at the next flush, not at the moment it was
+    // delivered, so a broker killed just after a delivery redelivers
+    // on the way back. That is at-least-once behaving as documented,
+    // and it costs this test nothing — except that the redelivery can
+    // be the second request to arrive, in which case asserting about
+    // "the second" is asserting about the wrong one. It failed that
+    // way once in thirty runs.
+    let deadline = Instant::now() + PATIENCE;
+    let fired = loop {
+        if let Some(seen) = endpoint
+            .requests()
+            .into_iter()
+            .find(|seen| seen.field("payload").as_bytes() == AFTER_THE_RESTART)
+        {
+            break seen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the rule was read back after the restart but did not fire on a new \
+             publication, so it was restored as a row and not as a running rule; the \
+             endpoint saw {} request(s)",
+            endpoint.count()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert_eq!(
-        seen[1].field("topic"),
+        fired.field("topic"),
         API_TOPIC,
-        "the second post was not the message published after the restart"
-    );
-    assert_ne!(
-        seen[0].field("id"),
-        seen[1].field("id"),
-        "the endpoint saw the same envelope twice rather than two publications"
+        "the envelope carrying the publication made after the restart names another topic"
     );
 
     drop(broker);
