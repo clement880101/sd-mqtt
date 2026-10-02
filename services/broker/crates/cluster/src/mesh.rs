@@ -25,6 +25,26 @@
 //! matters whenever only one of the two ends has an address for the
 //! other.
 //!
+//! # A peer that was declared dead is arriving again, not racing
+//!
+//! The rule breaks a tie between two **live** connections, and the
+//! link this node keeps for a peer it has declared dead is not one of
+//! them. It is kept on purpose — see the next section — and nothing
+//! about it says whether the socket under it still goes anywhere.
+//!
+//! So a connection carrying the identity of a peer this node has
+//! declared dead **replaces** that link rather than being judged
+//! against it. Deciding it with [`keeper`] is how a node that was seen
+//! dead stops being able to come back: half the time the rule names
+//! the corpse, the live connection is dropped, and the dialler on this
+//! side does not try either, because [`targets`] asks for peers with
+//! no link and this peer has one. A restart, a deploy or a crash would
+//! be permanent.
+//!
+//! Nothing is lost on the race this guards. A simultaneous dial is two
+//! connections to a peer that has just been heard from, which is a
+//! peer that is alive, and the rule applies to it unchanged.
+//!
 //! # A member that dies keeps its link, and its link keeps its socket
 //!
 //! Section 8.1 gives failure detection two signals, and this module
@@ -57,7 +77,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -301,6 +321,20 @@ struct State {
     /// and nothing else, and a handler would be a second thing to stand
     /// up to assert it.
     deliveries: Option<Arc<dyn Deliver>>,
+    /// Whether this mesh has been stopped.
+    ///
+    /// **Because a handshake is a task of its own.** Dialling and
+    /// accepting each hand the connection to a spawned task for the
+    /// length of the handshake, and those tasks are not the three
+    /// [`Mesh::shutdown`] holds, so aborting the three does not reach
+    /// them. One still in flight goes on to install a link on a mesh
+    /// that has stopped, with a reader and a writer nobody will ever
+    /// abort, holding its end of the connection open for as long as
+    /// the process lives. The peer on the other end then has a link
+    /// to a node that is gone and will never see it close — which is
+    /// a corpse in its link table rather than the closed socket a
+    /// stopped node is supposed to be.
+    stopped: AtomicBool,
 }
 
 fn locked<T>(what: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -354,6 +388,7 @@ impl Mesh {
             sent: Arc::new(AtomicU64::new(0)),
             received: Arc::new(AtomicU64::new(0)),
             dropped_retired: AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
             deliveries,
             identity,
             config,
@@ -497,6 +532,9 @@ impl Mesh {
 
     /// Stop dialling, accepting and beating, and close every link.
     pub fn shutdown(&self) {
+        // Before the aborts, so that a handshake already past them
+        // cannot install what nothing would take down afterwards.
+        self.state.stopped.store(true, Ordering::Relaxed);
         for task in locked(&self.tasks).drain(..) {
             task.abort();
         }
@@ -773,20 +811,39 @@ async fn beating(state: Arc<State>) {
 enum Installed {
     /// It is this pair's link now.
     Kept,
-    /// The pair already had the link the rule says to keep.
+    /// It was not taken: the pair already had the link the rule says
+    /// to keep, or this mesh has stopped.
     Dropped,
 }
 
 /// Take an authenticated connection, unless this pair already has the
 /// one the rule says to keep.
 fn install(state: &Arc<State>, stream: BoxStream, peer: handshake::Peer, role: Role) -> Installed {
+    if state.stopped.load(Ordering::Relaxed) {
+        tracing::debug!(
+            peer = %peer.identity,
+            "a cluster handshake finished after this node stopped, so its connection is closed"
+        );
+        drop(stream);
+        return Installed::Dropped;
+    }
     let id = peer.identity.id();
     let wanted = keeper(state.identity.id(), id);
+    // Read before the link table is locked, so that the two are never
+    // held at once and no order between them has to be kept.
+    let declared_dead = locked(&state.members)
+        .member(id)
+        .is_some_and(|member| member.state == MemberState::Dead);
     let mut links = locked(&state.links);
     if let Some(existing) = links.get(&id) {
         // A lone link is never dropped for its role; the rule breaks a
-        // tie and nothing else. Here there are two, so it decides.
-        if existing.role == wanted || role != wanted {
+        // tie and nothing else. Here there are two, so it decides —
+        // unless the one already here belongs to a peer this node has
+        // declared dead, in which case they are not two. That link is
+        // the corpse this node keeps on purpose, and this is the same
+        // peer arriving again rather than a rival; judging it against
+        // the corpse is how half of all rejoins become permanent.
+        if !declared_dead && (existing.role == wanted || role != wanted) {
             tracing::debug!(
                 peer = %peer.identity,
                 ?role,
@@ -795,6 +852,14 @@ fn install(state: &Arc<State>, stream: BoxStream, peer: handshake::Peer, role: R
             drop(links);
             drop(stream);
             return Installed::Dropped;
+        }
+        if declared_dead {
+            tracing::info!(
+                peer = %peer.identity,
+                ?role,
+                "a peer this node had declared dead is back on a new connection, so the \
+                 link it left behind is replaced rather than raced against"
+            );
         }
     }
 
@@ -1182,6 +1247,130 @@ mod tests {
             2,
             "the node that came back is the node that went, not a third"
         );
+    }
+
+    /// A peer declared dead on a link that never closed rejoins on a
+    /// new connection.
+    ///
+    /// The half-open link, and the case [`keeper`] must not settle. A
+    /// node whose host died, or one behind a router that stopped
+    /// forwarding, leaves this one a socket that goes nowhere and says
+    /// nothing. The window declares the peer dead and **the link is
+    /// kept on purpose**, because that is what lets a one-way partition
+    /// heal without anything reconnecting. What is asserted here is
+    /// that the connection the peer makes when it comes back is the one
+    /// that survives.
+    ///
+    /// Before the fix this hung whichever way the two identities
+    /// ordered, because both connections are ones `a` accepted: with
+    /// `wanted` the listener the corpse already has that role, and with
+    /// `wanted` the dialler neither of them does. So the rule dropped
+    /// the live connection every time, and nothing dialled either —
+    /// [`targets`] asks for peers with no link, and this peer had one.
+    ///
+    /// **Why a cut and a second mesh rather than a restart.** The
+    /// corpse has to be a link whose socket is still open, and a node
+    /// that merely stops closes its end: [`crate::testing::relay`]
+    /// propagates that, `a` removes the link, and the rejoin is the
+    /// ordinary one the test above covers. So the node that is declared
+    /// dead stays up behind a black hole on what it says, and the
+    /// identity comes back on a connection of its own. Two meshes share
+    /// an identity for a moment, which no deployment should do; what is
+    /// under test is what `a` does with a connection carrying an
+    /// identity it has declared dead, and this is the only way to hand
+    /// it one.
+    ///
+    /// Only the peers have seeds, so `a` never dials. The assertion is
+    /// about what it does with a connection it accepted, and a dial of
+    /// its own would be a second route to the same link.
+    #[tokio::test]
+    async fn a_peer_dead_on_a_link_that_never_closed_rejoins_on_a_new_one() {
+        let switch = Switch::new();
+        let identity = NodeIdentity::mint("c");
+        let a = node(&switch, "a", &[], &NodeIdentity::mint("a"), SECRET);
+        let stopped = node(&switch, "c", &["a"], &identity, SECRET);
+        until("both see each other", || {
+            a.alive() == 1 && stopped.alive() == 1
+        })
+        .await;
+        assert_eq!(a.link_role(identity.id()), Some(Role::Listener));
+
+        switch.cut("c", "a");
+        until("it is dead, on a link that is still here", || {
+            how_a_peer_looks(&a, identity.id()) == Some(MemberState::Dead) && a.stats().links == 1
+        })
+        .await;
+
+        let back = node(&switch, "c2", &["a"], &identity, SECRET);
+        until("it rejoins", || a.alive() == 1 && back.alive() == 1).await;
+        keeps("one link each, and both stay alive on it", 8, || {
+            a.stats().links == 1 && back.stats().links == 1 && a.alive() == 1 && back.alive() == 1
+        })
+        .await;
+        // The row it came back into is the row it left, carrying the
+        // address the greeting on the new connection advertised.
+        let members = a.members();
+        assert_eq!(members.len(), 1, "the peer that came back is not a second");
+        assert_eq!(members[0].advertised, "c2");
+    }
+
+    /// A mesh that has stopped takes no link from a handshake that was
+    /// in flight when it stopped.
+    ///
+    /// **Because a handshake is a task of its own**, and not one of the
+    /// three [`Mesh::shutdown`] holds. One past the aborts goes on to
+    /// install a link on a mesh that has stopped, with a reader and a
+    /// writer nothing will ever abort, holding its end of the connection
+    /// open for as long as the process lives — so the peer at the other
+    /// end has a link to a node that is gone and never sees it close.
+    /// That is the corpse the test above has to be contrived to produce,
+    /// and the first thing it did was make a stopped node look alive.
+    ///
+    /// The window is otherwise the scheduler's: at rest a mesh has no
+    /// handshake in flight, and this one exists only between a
+    /// connection being accepted and the greeting answering it. So the
+    /// connection is driven by hand with what `a` says back held, which
+    /// pins `a` inside [`handshake::accept`] — it cannot leave until it
+    /// reads a proof that cannot be sent until its greeting arrives —
+    /// and makes the moment it finishes this test's to choose.
+    #[tokio::test]
+    async fn a_mesh_that_has_stopped_takes_no_link_from_a_handshake_in_flight() {
+        let switch = Switch::new();
+        let a = node(&switch, "a", &[], &NodeIdentity::mint("a"), SECRET);
+
+        // Before the dial, which is what the switch's valves are made on
+        // demand for: the pair is severed before either end connects.
+        switch.stall("a", "peer");
+        let transport = switch.listen("peer");
+        let stream = transport.dial("a").await.expect("a is listening");
+        let dialling = tokio::spawn({
+            let config = config(SECRET);
+            let peer = NodeIdentity::mint("peer");
+            async move {
+                let mut stream = stream;
+                handshake::dial(&mut stream, &config, &peer, "peer").await
+            }
+        });
+        until("a is inside the handshake", || {
+            switch.valve("peer", "a").passed() > 0
+        })
+        .await;
+
+        a.shutdown();
+        switch.heal("a", "peer");
+        let settled = dialling.await.expect("the dial ran to completion");
+        assert!(
+            settled.is_ok(),
+            "the handshake itself must succeed, or this test is about a refusal instead: \
+             {settled:?}"
+        );
+
+        keeps(
+            "a mesh that has stopped holds no link and no member",
+            8,
+            || a.stats().links == 0 && a.members().is_empty(),
+        )
+        .await;
     }
 
     /// Two nodes dialling each other at once settle on one link.
