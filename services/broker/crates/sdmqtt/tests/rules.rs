@@ -175,6 +175,15 @@ impl Received {
 struct Endpoint {
     address: SocketAddr,
     received: Arc<Mutex<Vec<Received>>>,
+    /// Connections no request was read from.
+    ///
+    /// **A request thrown away used to be invisible**, and that is what
+    /// made one cause look like three unrelated flaky tests: a read
+    /// that had not completed yet was read as a peer that had closed,
+    /// the request went nowhere, and the only trace was a test waiting
+    /// for an attempt the broker had in fact made. Counted so that the
+    /// next one says so — see [`Endpoint::wait_for`], which reports it.
+    abandoned: Arc<AtomicUsize>,
     accepting: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     /// Which request to record and then never answer, counted from one.
@@ -201,6 +210,7 @@ impl Endpoint {
             .expect("the accept loop polls");
 
         let received = Arc::new(Mutex::new(Vec::new()));
+        let abandoned = Arc::new(AtomicUsize::new(0));
         let accepting = Arc::new(AtomicBool::new(true));
         let stopped = Arc::new(AtomicBool::new(false));
         let body = Arc::new(Mutex::new(Vec::new()));
@@ -208,6 +218,7 @@ impl Endpoint {
 
         std::thread::spawn({
             let received = Arc::clone(&received);
+            let abandoned = Arc::clone(&abandoned);
             let accepting = Arc::clone(&accepting);
             let stopped = Arc::clone(&stopped);
             let body = Arc::clone(&body);
@@ -217,12 +228,16 @@ impl Endpoint {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             let received = Arc::clone(&received);
+                            let abandoned = Arc::clone(&abandoned);
                             let accepting = Arc::clone(&accepting);
                             let body = Arc::clone(&body);
                             let stall = Arc::clone(&stall);
                             let stopped = Arc::clone(&stopped);
                             std::thread::spawn(move || {
-                                serve(stream, &received, &accepting, &body, &stall, &stopped);
+                                serve(
+                                    stream, &received, &abandoned, &accepting, &body, &stall,
+                                    &stopped,
+                                );
                             });
                         }
                         Err(_) => std::thread::sleep(Duration::from_millis(5)),
@@ -234,6 +249,7 @@ impl Endpoint {
         Self {
             address,
             received,
+            abandoned,
             accepting,
             stopped,
             body,
@@ -288,6 +304,11 @@ impl Endpoint {
         self.received.lock().expect("not poisoned").len()
     }
 
+    /// How many connections it read no request from.
+    fn abandoned(&self) -> usize {
+        self.abandoned.load(Ordering::SeqCst)
+    }
+
     /// Wait until at least `wanted` requests have arrived.
     #[track_caller]
     fn wait_for(&self, wanted: usize, what: &str) {
@@ -299,8 +320,10 @@ impl Endpoint {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!(
-            "{what}: the endpoint saw {} requests and was waiting for {wanted}",
-            self.count()
+            "{what}: the endpoint saw {} requests and was waiting for {wanted}, having read \
+             no request at all from {} connection(s)",
+            self.count(),
+            self.abandoned()
         );
     }
 }
@@ -315,11 +338,34 @@ impl Drop for Endpoint {
 fn serve(
     mut stream: TcpStream,
     received: &Arc<Mutex<Vec<Received>>>,
+    abandoned: &AtomicUsize,
     accepting: &AtomicBool,
     body_to_answer: &Arc<Mutex<Vec<u8>>>,
     stall: &AtomicUsize,
     stopped: &AtomicBool,
 ) {
+    // **This socket inherited the listener's non-blocking flag**, and
+    // putting it back is the whole of one bug. The listener is
+    // non-blocking so that the accept loop can notice [`Endpoint`] being
+    // dropped without a connection arriving to wake it, and `accept` on
+    // this platform hands back a descriptor carrying that flag — which
+    // POSIX does not require and Linux does not do, so it is not
+    // something reading the code here would suggest.
+    //
+    // On a non-blocking socket the deadline below does nothing and the
+    // first read returns `WouldBlock` whenever the request has not
+    // landed yet, which is sometimes: `accept` returns when the
+    // handshake completes and the bytes follow. Read as a peer that had
+    // closed, that threw the request away and recorded nothing, and the
+    // broker saw a connector that had closed on it mid-request. One
+    // failure in twenty-five in each of three tests in this file, with
+    // three different symptoms, which is why it looked like three bugs:
+    // an attempt waited for that never arrived, an attempt made twice
+    // where the second was a retry of the first, and an attempt spent
+    // against a budget nothing counted.
+    stream
+        .set_nonblocking(false)
+        .expect("the accepted socket goes back to blocking reads");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("a read deadline");
@@ -330,7 +376,13 @@ fn serve(
         }
         let mut chunk = [0u8; 1024];
         match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => return,
+            // A signal is not an answer about the request; everything
+            // else here is the connection ending before one arrived.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Ok(0) | Err(_) => {
+                abandoned.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
             Ok(read) => buffer.extend_from_slice(&chunk[..read]),
         }
     };
@@ -350,7 +402,16 @@ fn serve(
     while body.len() < length {
         let mut chunk = [0u8; 1024];
         match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Ok(0) | Err(_) => {
+                // **Abandoned rather than recorded short.** A body that
+                // stopped early is not what the broker sent, and
+                // recording it makes the lie surface somewhere else: as
+                // an envelope with no `sd-hops` property, or no `topic`,
+                // in a test about neither.
+                abandoned.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
             Ok(read) => body.extend_from_slice(&chunk[..read]),
         }
     }
@@ -748,6 +809,98 @@ fn a_port_this_binary_has_taken_is_never_handed_out_again() {
         !first_time(outside),
         "a port already handed out was offered a second time, so a port here is a hint \
          rather than a reservation and two tests in parallel can be given one address"
+    );
+}
+
+/// A request whose bytes arrive after its connection does is recorded.
+///
+/// **The one cause under three flaky tests in this file**, and it was
+/// the harness rather than the broker: see the note at the top of
+/// [`serve`] for what the socket does and why nothing in the code there
+/// suggested it.
+///
+/// The race itself is the scheduler's — whether the request has landed
+/// by the time `serve` first reads — so what is guarded here is the
+/// condition it turns on, in the shape convention 5 asks for: the gap is
+/// made deliberate, so a `serve` that cannot wait for the bytes records
+/// nothing and this fails every time rather than once in twenty-five.
+///
+/// The head and the body are written apart, because the second read is
+/// the one that used to record a short envelope rather than nothing, and
+/// the two surface in different places: a missing attempt, and an
+/// envelope with no fields in a test about neither.
+#[test]
+fn a_request_whose_bytes_arrive_after_its_connection_is_recorded() {
+    const LATE_BODY: &[u8] = br#"{"topic":"written after the connection"}"#;
+    /// Long enough that the connection has been accepted and whoever is
+    /// serving it has reached a read with nothing yet to read.
+    const GAP: Duration = Duration::from_millis(250);
+
+    let endpoint = Endpoint::start();
+    let mut stream = TcpStream::connect(endpoint.address).expect("the endpoint accepts");
+    std::thread::sleep(GAP);
+    write!(
+        stream,
+        "POST /hook HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        LATE_BODY.len()
+    )
+    .expect("the head is written");
+    stream.flush().expect("and sent");
+    std::thread::sleep(GAP);
+    stream.write_all(LATE_BODY).expect("the body is written");
+    stream.flush().expect("and sent");
+
+    endpoint.wait_for(1, "a request written after its connection was accepted");
+    assert_eq!(
+        endpoint.requests()[0].body,
+        LATE_BODY,
+        "the endpoint recorded a body other than the one it was sent"
+    );
+    // Beside the assertion above rather than instead of it: convention 5
+    // on tests that assert an absence. What carries this test is the
+    // body; this says which way it failed when it does.
+    assert_eq!(
+        endpoint.abandoned(),
+        0,
+        "the endpoint read no request from a connection that carried one"
+    );
+}
+
+/// A request that stops partway is not recorded as if it had arrived.
+///
+/// The other half of the note at the top of [`serve`]. A body that
+/// stopped early is not what the broker sent, and recording it short
+/// moves the failure somewhere it makes no sense: an envelope with no
+/// `topic` and no `sd-hops`, in a test about neither. It is counted as
+/// abandoned instead, which is what [`Endpoint::wait_for`] reports when
+/// it gives up — so the next time this happens the message says so.
+#[test]
+fn a_request_that_stops_partway_is_not_recorded() {
+    let endpoint = Endpoint::start();
+    let mut stream = TcpStream::connect(endpoint.address).expect("the endpoint accepts");
+    // A length the body will not reach, and then a close.
+    write!(stream, "POST /hook HTTP/1.1\r\nContent-Length: 64\r\n\r\n")
+        .expect("the head is written");
+    stream
+        .write_all(b"the first few bytes and no more")
+        .expect("and part of the body");
+    stream.flush().expect("and sent");
+    drop(stream);
+
+    let deadline = Instant::now() + PATIENCE;
+    while endpoint.abandoned() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        endpoint.count(),
+        0,
+        "a request that stopped partway was recorded as though it had all arrived: {:?}",
+        endpoint.requests()
+    );
+    assert_eq!(
+        endpoint.abandoned(),
+        1,
+        "and the endpoint has to say it threw one away, or the next flake is silent too"
     );
 }
 
@@ -1191,6 +1344,11 @@ fn a_message_reaches_an_endpoint_and_survives_the_broker_being_killed() {
 /// reached the disk, was up to the scheduler: a kill between an attempt
 /// and its record gave a total of five where the test asserted four.
 /// Three failures across the milestone, all of them that.
+///
+/// It then failed once more in twenty-five, and that one was something
+/// else entirely: the endpoint threw a request away, so an attempt was
+/// spent that nothing counted. See
+/// [`a_request_whose_bytes_arrive_after_its_connection_is_recorded`].
 ///
 /// So the kill is now put where the test means it to be. The endpoint
 /// holds the third request open, which pins the pump inside an attempt
@@ -1697,6 +1855,12 @@ retries = 0
 /// each time round, the broker carries it while it is under the limit,
 /// it refuses the publication that would take it over with a `508`, and
 /// the counter section 9.2 asks for has moved.
+///
+/// It failed once in twenty-five, and the cause was not in the cycle:
+/// the endpoint threw a request away, and with `retries = 0` the
+/// envelope was dead-lettered rather than tried again, so the turn of
+/// the circle this waits for never came. See
+/// [`a_request_whose_bytes_arrive_after_its_connection_is_recorded`].
 #[test]
 fn a_cycle_of_connectors_is_driven_into_the_hop_limit() {
     let endpoint = Endpoint::start();
@@ -2011,6 +2175,12 @@ fn a_rule_created_over_the_api_fires_and_still_fires_after_a_restart() {
     // envelope coming back rather than the second publication, which
     // is a different test passing under this one's name — and is what
     // the assertion on the two identifiers below caught.
+    //
+    // That wait is not the whole of it. This test failed once more in
+    // twenty-five with the same symptom and a different cause: the
+    // endpoint threw the first request away, the pump retried it, and
+    // the two requests the assertion compares were one envelope twice.
+    // See [`a_request_whose_bytes_arrive_after_its_connection_is_recorded`].
     until(
         admin,
         &format!("/api/v1/rules/{API_RULE}/stats"),
