@@ -42,7 +42,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -575,11 +575,62 @@ struct BrokerProcess {
     child: Child,
     address: SocketAddr,
     log: PathBuf,
+    /// Held for this broker's lifetime; see [`a_slot`].
+    _slot: Slot,
+}
+
+/// How many of these tests may hold a broker process at once.
+///
+/// **This is not a timing workaround, it is the scenario being
+/// corrected.** Every test here spawns a real broker, and a test
+/// binary runs its tests on as many threads as the machine has cores,
+/// so seventeen brokers can be starting, restoring a store, binding
+/// three listeners and being killed simultaneously. Nobody deploys
+/// seventeen brokers to one machine to watch them race, and the cost
+/// of pretending otherwise is paid in assertions that time out: four
+/// separate causes were found and fixed in this file, and each
+/// measurement afterwards surfaced a different test timing out at
+/// about one run in forty.
+///
+/// Four is chosen to keep the suite's wall clock close to what it was
+/// while leaving every core something to do other than fight. It
+/// bounds no assertion and weakens none; a test that failed for a
+/// reason of its own still fails.
+const BROKERS_AT_ONCE: usize = 4;
+
+/// A permit to hold one broker process.
+struct Slot;
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let (lock, woken) = brokers();
+        *lock.lock().expect("the broker count is not poisoned") -= 1;
+        woken.notify_one();
+    }
+}
+
+fn brokers() -> &'static (Mutex<usize>, Condvar) {
+    static BROKERS: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+    BROKERS.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+/// Wait until fewer than [`BROKERS_AT_ONCE`] are held, then take one.
+fn a_slot() -> Slot {
+    let (lock, woken) = brokers();
+    let mut held = lock.lock().expect("the broker count is not poisoned");
+    while *held >= BROKERS_AT_ONCE {
+        held = woken
+            .wait(held)
+            .expect("the broker count is not poisoned while waiting");
+    }
+    *held += 1;
+    Slot
 }
 
 impl BrokerProcess {
     /// Start a broker against `config`, and wait until it accepts.
     fn start(config: &Path, store: &Path, address: SocketAddr, log: PathBuf) -> Self {
+        let slot = a_slot();
         let mut command = Command::new(env!("CARGO_BIN_EXE_sdmqtt"));
         command
             .arg("serve")
@@ -607,6 +658,7 @@ impl BrokerProcess {
             child,
             address,
             log: log.clone(),
+            _slot: slot,
         };
         if let Err(why) = broker.wait_until_listening() {
             panic!("the broker never started: {why}");
