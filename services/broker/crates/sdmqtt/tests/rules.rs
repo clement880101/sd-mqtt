@@ -614,19 +614,37 @@ impl BrokerProcess {
         broker
     }
 
+    /// Wait until the broker **answers MQTT**, not until its port
+    /// accepts.
+    ///
+    /// Those are different instants and the gap between them is a
+    /// real one: the listener is bound a moment before the process is
+    /// warm, and on a machine running several of these tests at once,
+    /// each spawning its own broker, that moment can be seconds. A
+    /// readiness check that stops at the accept leaves the test body
+    /// as the first thing to require an answer, so a slow start
+    /// arrives as a failed assertion about the feature under test
+    /// rather than as a slow readiness wait. That is what it was:
+    /// one run in twenty-five failed inside `Client::connect`,
+    /// expecting an acknowledgement, twenty seconds after a successful
+    /// connect.
+    ///
+    /// So the probe completes a round trip. It uses a clean start and
+    /// no session expiry, under an identifier no test uses, so it
+    /// leaves nothing of itself behind for the test that follows.
     fn wait_until_listening(&mut self) -> Result<(), String> {
         let deadline = Instant::now() + STARTUP;
         while Instant::now() < deadline {
             if let Ok(Some(status)) = self.child.try_wait() {
                 return Err(format!("it exited with {status}: {}", self.logged()));
             }
-            if TcpStream::connect_timeout(&self.address, Duration::from_millis(200)).is_ok() {
+            if answers_mqtt(self.address) {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         Err(format!(
-            "it did not accept on {} within {STARTUP:?}: {}",
+            "it did not answer MQTT on {} within {STARTUP:?}: {}",
             self.address,
             self.logged()
         ))
@@ -1048,6 +1066,80 @@ fn refusing(address: SocketAddr, what: &str) {
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("{what} is still accepting on {address}");
+}
+
+/// Which protocols the broker says its listeners serve.
+///
+/// A positive answer from the broker's own inventory, for assertions
+/// that would otherwise have to probe a port and so would depend on
+/// nothing else on the machine happening to hold it.
+fn listener_protocols(admin: SocketAddr, token: &str) -> Vec<String> {
+    let answered = http(admin, "GET", "/api/v1/listeners", token, None);
+    assert_eq!(
+        answered.status, 200,
+        "the listeners resource answers: {}",
+        answered.body
+    );
+    let page: serde_json::Value =
+        serde_json::from_str(&answered.body).expect("the listeners resource answers JSON");
+    page["items"]
+        .as_array()
+        .expect("a page of listeners has items")
+        .iter()
+        .map(|item| {
+            item["protocol"]
+                .as_str()
+                .expect("a listener says what it serves")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Whether a broker on `address` answers a connect with an
+/// acknowledgement.
+///
+/// Every failure is a `false` rather than a panic: this is asked in a
+/// loop while a process is starting, so a refused connection, a read
+/// that times out and a half-written reply are all simply "not yet".
+/// The one thing it must not do is report success for anything other
+/// than an acknowledgement, which is the whole of what it is for.
+fn answers_mqtt(address: SocketAddr) -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(200)) else {
+        return false;
+    };
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
+        return false;
+    }
+    let connect = Packet::Connect(Box::new(Connect {
+        version: Version::V5,
+        client_id: "$sdmqtt-readiness-probe".into(),
+        clean_start: true,
+        keep_alive: 0,
+        username: None,
+        password: None,
+        will: None,
+        properties: Properties::default(),
+    }));
+    let mut out = BytesMut::new();
+    if encode(&connect, Version::V5, &mut out).is_err() || stream.write_all(&out).is_err() {
+        return false;
+    }
+    let mut buf = BytesMut::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        match decode(&mut buf, Version::V5, &Limits::default()) {
+            Ok(Some(Packet::ConnAck(ack))) => return ack.reason == ReasonCode::Success,
+            Ok(Some(_)) | Err(_) => return false,
+            Ok(None) => {}
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return false,
+            Ok(read) => buf.extend_from_slice(&chunk[..read]),
+        }
+    }
 }
 
 /// Wait until something is accepting on `address`.
@@ -2688,11 +2780,24 @@ fn an_ingest_rule_created_over_the_api_is_reachable_on_the_admin_listener() {
         .expect("what was posted must reach the subscriber");
     assert_eq!(&delivered.payload[..], POSTED_LATE);
 
-    // And no second socket was bound, because this configuration
-    // asked for one listener rather than two.
-    assert!(
-        TcpStream::connect_timeout(&ingest, Duration::from_millis(200)).is_err(),
-        "the routes are on the admin listener and something bound {ingest} as well"
+    // And no second listener was bound, because this configuration
+    // asked for one rather than two.
+    //
+    // Asked of the broker rather than of the port. Probing the port
+    // was an assertion about an absence, which convention 5 warns
+    // about, and worse: it is an absence on an address this test
+    // never bound, so anything else on the machine taking it makes
+    // the test fail for a reason that has nothing to do with the
+    // broker. That is what it did, once in twenty-five runs. What
+    // the test means is that this broker bound one ingest listener,
+    // and the broker is the thing that knows.
+    let mut bound = listener_protocols(admin, LATE_TOKEN);
+    bound.sort();
+    assert_eq!(
+        bound,
+        ["admin", "mqtt"],
+        "the routes ride the admin listener, so ingest has no listener of its own \
+         and nothing else was bound either"
     );
 
     drop(broker);
