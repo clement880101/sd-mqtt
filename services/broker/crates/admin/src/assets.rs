@@ -45,6 +45,7 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 
 use crate::error::{ApiError, ErrorCode};
 
@@ -350,7 +351,24 @@ fn is_api(path: &str) -> bool {
 /// listener has never heard of. Anything else — a mistyped API path,
 /// a fetch, a missing asset — gets the `404` every other failure of
 /// this API gets.
-pub(crate) async fn fallback(method: Method, uri: Uri, headers: HeaderMap) -> Response {
+///
+/// **The request's body is read before anything is answered**, and
+/// that is not tidiness. A socket closed while bytes the peer sent are
+/// still unread is closed with a reset rather than an end, so a client
+/// posting to a mistyped path would see its connection broken instead
+/// of the `404` this function went to the trouble of writing. It is
+/// timing-dependent, because the answer sometimes arrives first: it
+/// cost two failures in forty runs of a test that posts to a path on
+/// purpose. The read is bounded by the body limit every other route
+/// on this listener is bounded by, so a large body sent to a wrong
+/// path is refused rather than swallowed.
+pub(crate) async fn fallback(
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    drop(body);
     if method != Method::GET && method != Method::HEAD {
         return ApiError::not_found("no such resource on this listener").into_response();
     }

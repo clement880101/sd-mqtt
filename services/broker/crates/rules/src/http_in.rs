@@ -557,7 +557,13 @@ fn not_found_body() -> Response {
 /// shape at all: "the path you asked for is not served" is a failure a
 /// client has to be able to tell from a proxy that swallowed the
 /// request.
-pub async fn not_found() -> Response {
+pub async fn not_found(body: Bytes) -> Response {
+    // Read before answering. A socket closed while bytes the peer
+    // sent are still unread is closed with a reset rather than an
+    // end, so a caller posting to a mistyped rule identifier would
+    // see a broken connection instead of this answer. Bounded by the
+    // same body limit every ingest route is bounded by.
+    drop(body);
     not_found_body()
 }
 
