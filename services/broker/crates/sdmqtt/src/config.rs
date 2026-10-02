@@ -630,17 +630,60 @@ pub struct Node {
     pub name: String,
 }
 
-/// The default node name.
+/// What a node is called when the machine will not say.
 ///
-/// The same word the admin API has always reported as the only row in
-/// its node listing, so a configuration that says nothing reads the
-/// same as it did before there was anything to say.
+/// The word the admin API reported as the only row in its node listing
+/// before there was more than one node, kept as the fallback so that a
+/// node with no name and no hostname reads the way it always did.
 const DEFAULT_NODE_NAME: &str = "local";
+
+/// Where the machine says what it is called.
+///
+/// `/etc/hostname` and nothing else. In a container it is the container's
+/// name or identifier, in Kubernetes it is the pod's, and on a host
+/// running systemd it is the machine's — which is the three places this
+/// broker is built to run, and in all three it is the word an operator
+/// already uses to mean "that node".
+///
+/// Not read through `libc::gethostname`, which would be a direct
+/// dependency for one call, and not through `$HOSTNAME`, which most
+/// shells set and do not export: a name that depended on how the process
+/// was started would differ between a node run by hand and the same node
+/// run by its unit file.
+const MACHINE_NAME: &str = "/etc/hostname";
+
+/// What this node is called by default, given what the machine says.
+///
+/// **Derived rather than constant**, and the plan asked whether it should
+/// be: a default that is the same word on every node shows an operator
+/// three identically named rows in a cluster of three, which is a column
+/// carrying no information in exactly the case it was added for. The name
+/// is for operators and is never compared — the identity is the stored
+/// UUID — so there is no correctness argument either way, and the one
+/// that decides it is that `local` is useless the moment there is a
+/// second node.
+///
+/// Whitespace is trimmed, because `/etc/hostname` ends in a newline, and
+/// an empty or absent name falls back to [`DEFAULT_NODE_NAME`] rather
+/// than to nothing: `Config::validate` refuses an empty name, and a node
+/// that would not start because its hostname file was empty would be a
+/// default that broke a working deployment.
+///
+/// A node whose hostname changes is **renamed and not re-founded**: the
+/// stored UUID does not move, which is `cluster::NodeIdentity`'s rule and
+/// is what makes this safe for a pod that is rescheduled onto the same
+/// volume.
+fn node_name(machine: Option<String>) -> String {
+    match machine.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => name.to_owned(),
+        _ => DEFAULT_NODE_NAME.to_owned(),
+    }
+}
 
 impl Default for Node {
     fn default() -> Self {
         Self {
-            name: DEFAULT_NODE_NAME.to_owned(),
+            name: node_name(std::fs::read_to_string(MACHINE_NAME).ok()),
         }
     }
 }
@@ -3681,22 +3724,44 @@ dead_after_ms = 4000
         );
     }
 
-    /// Section 8.1's node name: a default, an override, and a refusal.
+    /// Section 8.1's node name: derived, overridable, and never empty.
     ///
     /// The name is not the identity — the stored UUID is — so this is
     /// about what an operator reads, and the one thing that can go
     /// wrong with it is an environment variable that expanded to
     /// nothing. Refused rather than read as absent, which is the rule
     /// `an_empty_token_is_refused_wherever_it_came_from` records.
+    ///
+    /// **The default is the machine's name**, and this asserts the
+    /// derivation rather than the machine: a test that read
+    /// `/etc/hostname` would assert something about whoever is running
+    /// it. What the default must be on *this* machine is only that it
+    /// is not empty, because an empty one is a node that refuses to
+    /// start.
     #[test]
-    fn the_node_name_defaults_can_be_set_and_may_not_be_empty() {
+    fn the_node_name_is_the_machines_and_can_be_set_and_may_not_be_empty() {
         assert_eq!(
-            Config::from_toml("")
+            node_name(Some("edge-7\n".to_owned())),
+            "edge-7",
+            "a hostname file ends in a newline, and a name is not whitespace"
+        );
+        assert_eq!(
+            node_name(Some("  \n".to_owned())),
+            "local",
+            "a hostname of nothing falls back rather than refusing to start"
+        );
+        assert_eq!(
+            node_name(None),
+            "local",
+            "a machine that will not say what it is called reads as it always did"
+        );
+        assert!(
+            !Config::from_toml("")
                 .expect("an empty file is a valid one")
                 .node
-                .name,
-            "local",
-            "a configuration that says nothing reads as it always did"
+                .name
+                .is_empty(),
+            "a derived default that is empty is a node that will not start"
         );
 
         let named = Config::from_toml("[node]\nname = \"edge-1\"\n").expect("it parses");

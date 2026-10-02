@@ -162,7 +162,7 @@ use crate::{Ingest, Outbox};
 /// to name the type, and a second path to it invites a second one in the
 /// process. `HybridClock` and the drift bound come with it, because
 /// opening a `Replicated` means resuming a clock.
-pub use cluster::{HybridClock, Replicated, DEFAULT_MAX_DRIFT_MILLIS};
+pub use cluster::{HybridClock, MetadataWrite, Replicated, DEFAULT_MAX_DRIFT_MILLIS};
 
 /// The HTTP client every rule on this node shares.
 ///
@@ -478,6 +478,12 @@ pub struct Registry {
     /// this node's copy, the second is what travels. The two go in one
     /// batch, so a rule that survived a crash has the register that
     /// carries it beside it.
+    ///
+    /// **Which installs write one is [`Origin`]'s answer**, and it is not
+    /// "all of them": a rule read back out of the store at startup, or
+    /// handed over by a peer, already has a register with the stamp
+    /// whoever wrote it used, and stamping it again would make this node
+    /// the last writer for a rule it merely holds.
     replicated: Arc<Replicated>,
     /// The one HTTP client.
     client: HttpClient,
@@ -525,6 +531,28 @@ pub struct Registry {
     /// The task that closes one interval of every rule's series and
     /// starts the next. See [`crate::stats`].
     sampler: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Who asked for a rule, which decides whether the cluster is told.
+///
+/// Section 8.2: a rule is a replicated register, so an operator's install
+/// stamps one and broadcasts it. **A peer's install must not**, and the
+/// reason is not tidiness: a rule that arrived because a peer replicated
+/// it, stamped again here, is a later write carrying the same rule — and
+/// two nodes doing that to each other is one rule bouncing between them
+/// for as long as they are both up.
+#[derive(Debug)]
+enum Origin {
+    /// An operator, over the API or out of the configuration file.
+    ///
+    /// This node stamps a register, stores it in the same batch as its own
+    /// copy, and broadcasts it once the store has taken the batch.
+    Ours,
+    /// A peer replicated it, and these are the records that came with it.
+    ///
+    /// The register is the peer's, so it rides in the batch unchanged and
+    /// nothing is stamped. See [`Registry::apply_replicated`].
+    Replicated(Vec<Record>),
 }
 
 impl Registry {
@@ -689,7 +717,30 @@ impl Registry {
     /// its rule can be reached and not whether a map was written.
     pub async fn install(&self, rule: Rule) -> Result<(), InstallError> {
         let _changing = self.changing.lock().await;
-        self.install_locked(rule).await
+        self.install_locked(rule, Origin::Ours).await
+    }
+
+    /// Install a rule the store already holds, without stamping it.
+    ///
+    /// What startup does with a rule it is not being *told* to create: the
+    /// register that carries it is in the store beside it, with the stamp
+    /// whoever wrote it used.
+    ///
+    /// **Stamping it again would make this node the last writer for every
+    /// rule it holds, every time it restarts.** A node that was down while
+    /// an operator edited a rule on another node would come back, stamp its
+    /// own stale copy with a reading later than the edit, and overwrite the
+    /// edit everywhere — which is a lost change that looks like nothing
+    /// happened. A rule declared in the *configuration file* is stamped,
+    /// because an edited file is an operator saying this is the rule now.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Registry::install`] can say.
+    pub async fn install_held(&self, rule: Rule) -> Result<(), InstallError> {
+        let _changing = self.changing.lock().await;
+        self.install_locked(rule, Origin::Replicated(Vec::new()))
+            .await
     }
 
     /// Store `rule` and start it, refusing a name this node already
@@ -714,12 +765,12 @@ impl Registry {
                 id: rule.id.as_str().to_owned(),
             });
         }
-        self.install_locked(rule).await
+        self.install_locked(rule, Origin::Ours).await
     }
 
     /// The whole of an install, with [`Registry::changing`] already
     /// held.
-    async fn install_locked(&self, rule: Rule) -> Result<(), InstallError> {
+    async fn install_locked(&self, rule: Rule, origin: Origin) -> Result<(), InstallError> {
         let id = rule.id.clone();
         // **Before anything changes**, like the route below and for
         // the same reason: a pair of bridges that would loop is a
@@ -732,7 +783,7 @@ impl Registry {
         if Self::wants_a_route(&rule) {
             self.reconcile_ingest(&id, true).await?;
         }
-        let installed = self.install_now(rule).await;
+        let installed = self.install_now(rule, origin).await;
         // And again afterwards, because installing a rule can take a
         // route away as well as add one: the rule this replaced may
         // have been the last one with a route, and an install that
@@ -747,7 +798,7 @@ impl Registry {
     ///
     /// Split from [`Registry::install`] so that the socket is settled
     /// on every path out of this, including the ones that fail.
-    async fn install_now(&self, rule: Rule) -> Result<(), InstallError> {
+    async fn install_now(&self, rule: Rule, origin: Origin) -> Result<(), InstallError> {
         // **Durable before anything hangs off it**, and before the old
         // one is taken away: a store that refuses the record leaves
         // the node exactly as it was.
@@ -763,15 +814,18 @@ impl Registry {
         let mut records = vec![Record::RulePut {
             rule: rule.to_record(),
         }];
-        records.extend(
-            self.replicated
-                .records(&self.replicated.rule(rule.to_record())),
-        );
-        self.writer
-            .apply_durable(records)
-            .map_err(|error| InstallError::storage(&rule.id, error))?
-            .await
-            .map_err(|error| InstallError::storage(&rule.id, error))?;
+        let ours = match origin {
+            Origin::Ours => {
+                let write = self.replicated.rule(rule.to_record());
+                records.extend(self.replicated.records(&write));
+                Some(write)
+            }
+            Origin::Replicated(registers) => {
+                records.extend(registers);
+                None
+            }
+        };
+        self.durable(&rule.id, records, ours).await?;
 
         // The outbox is opened before the old installation is stopped,
         // so that a store that will not answer is a failed install
@@ -924,8 +978,145 @@ impl Registry {
             return Ok(rule);
         }
         rule.enabled = enabled;
-        self.install_locked(rule.clone()).await?;
+        self.install_locked(rule.clone(), Origin::Ours).await?;
         Ok(rule)
+    }
+
+    /// Take a rule a peer replicated: install it, or remove it.
+    ///
+    /// `write` is the register that won and `registers` is what to store
+    /// for it — [`cluster::Handled::records`], which holds the register
+    /// itself and the watermark if it moved. Both ride in the same batch as
+    /// this node's own copy of the rule, so a node cannot come back running
+    /// a rule whose register it does not hold, or holding a register for a
+    /// rule it is not running.
+    ///
+    /// Nothing is stamped: see [`Origin`].
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError`] for a rule this node cannot run — an ingest address
+    /// something else is on, a bridge that would loop, a rule past the
+    /// node's limit. **The register is stored anyway**, because it is the
+    /// cluster's answer and this node disagreeing with it silently would be
+    /// worse: what the caller owes an operator is a loud line saying this
+    /// node holds a rule it is not running, and the register is what makes
+    /// that visible in the API.
+    ///
+    /// A tombstone for a rule this node does not hold is not an error. It
+    /// is the ordinary case for a node that never had the rule, and the
+    /// register still has to be stored so that the next peer does not hand
+    /// this node the rule back.
+    pub async fn apply_replicated(
+        &self,
+        write: &MetadataWrite,
+        registers: Vec<Record>,
+    ) -> Result<(), InstallError> {
+        let _changing = self.changing.lock().await;
+        let id = match write.key() {
+            cluster::MetadataKey::Rule { id } => id.clone(),
+            // Not this registry's to apply. The caller decides what each
+            // kind means and only hands rules here.
+            other => {
+                tracing::error!(
+                    kind = other.kind(),
+                    "a register that is not a rule reached the rule registry"
+                );
+                return Ok(());
+            }
+        };
+        let Some(cluster::MetadataValue::Rule(record)) = write.register().value() else {
+            // A tombstone. The rule goes if this node has it, and the
+            // register is stored either way.
+            // A peer's identifier, through this node's own validation: a
+            // rule this build will not name is one it cannot be running,
+            // and the register is stored regardless below.
+            let Ok(held) = RuleId::new(&id) else {
+                tracing::error!(
+                    rule = id.as_str(),
+                    "a peer replicated a tombstone for a rule identifier this build \
+                     refuses, so there is nothing here to remove"
+                );
+                self.writer
+                    .apply_durable(registers)
+                    .map_err(|error| InstallError::Storage {
+                        id: id.clone(),
+                        why: error.to_string(),
+                    })?
+                    .await
+                    .map_err(|error| InstallError::Storage {
+                        id: id.clone(),
+                        why: error.to_string(),
+                    })?;
+                return Ok(());
+            };
+            if self.installed.read().contains_key(&held) {
+                return self
+                    .remove_locked(&held, Origin::Replicated(registers))
+                    .await;
+            }
+            self.writer
+                .apply_durable(registers)
+                .map_err(|error| InstallError::storage(&held, error))?
+                .await
+                .map_err(|error| InstallError::storage(&held, error))?;
+            return Ok(());
+        };
+        let rule = Rule::try_from(record.as_ref()).map_err(|why| {
+            tracing::error!(
+                rule = id.as_str(),
+                %why,
+                "a peer replicated a rule this build cannot read, so this node is not \
+                 running it; the register is held, so the API will show the disagreement"
+            );
+            InstallError::NoSuchRule { id: id.clone() }
+        })?;
+        self.install_locked(rule, Origin::Replicated(registers))
+            .await
+    }
+
+    /// Write `records`, wait for them, and tell the cluster if they are
+    /// ours.
+    ///
+    /// **The one place a rule's batch reaches the store**, so that the two
+    /// orderings section 8.2 depends on cannot differ between an install
+    /// and a removal: the batch is one batch, and the write it carries is
+    /// shown to a peer only once the store has taken it.
+    ///
+    /// `ours` is the register this node stamped, or `None` for a peer's.
+    /// It is handed to the shell's queue rather than broadcast here,
+    /// because what holds the mesh is the binary and a registry that held
+    /// it would hold the thing that holds the registry.
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::Storage`] when the writer has stopped or the batch
+    /// was refused, in which case **nothing is broadcast**: the write that
+    /// was refused is abandoned by the same queue.
+    async fn durable(
+        &self,
+        id: &RuleId,
+        records: Vec<Record>,
+        ours: Option<MetadataWrite>,
+    ) -> Result<(), InstallError> {
+        let Some(write) = ours else {
+            self.writer
+                .apply_durable(records)
+                .map_err(|error| InstallError::storage(id, error))?
+                .await
+                .map_err(|error| InstallError::storage(id, error))?;
+            return Ok(());
+        };
+        // Two waiters on one batch: this call, which must not report
+        // success before the rule is durable, and whoever broadcasts,
+        // which must not tell a peer before the same moment. One batch,
+        // because whether the store took it is one fact.
+        let (mine, theirs) = self
+            .writer
+            .apply_durable_twice(records)
+            .map_err(|error| InstallError::storage(id, error))?;
+        self.shared.broadcast_when_durable(theirs, vec![write]);
+        mine.await.map_err(|error| InstallError::storage(id, error))
     }
 
     /// Delete a rule and everything running for it.
@@ -942,27 +1133,43 @@ impl Registry {
     /// gone and its socket did not close, which is a port serving
     /// nothing rather than anything a caller has lost.
     pub async fn remove(&self, id: &RuleId) -> Result<(), InstallError> {
+        let _changing = self.changing.lock().await;
+        self.remove_locked(id, Origin::Ours).await
+    }
+
+    /// The whole of a removal, with [`Registry::changing`] already held.
+    ///
+    /// The two refusals below are an **operator's** refusals and are
+    /// skipped for a peer's deletion, which is not a request: the register
+    /// says the rule is gone and the comparison that decided it has
+    /// already happened. Refusing it here would leave this node running a
+    /// rule every other node has deleted, with nothing to repair it,
+    /// because the next exchange would hand this node the same tombstone
+    /// it already holds. The envelopes that go with it go with it, and the
+    /// operator who deleted the rule on another node is who decided that.
+    async fn remove_locked(&self, id: &RuleId, origin: Origin) -> Result<(), InstallError> {
         // For the reason the others take it, and one of its own: the
         // depth is read, the record is written and the rule is taken
         // out of the map, and an install landing between the first two
         // would delete a rule the node had just been given.
-        let _changing = self.changing.lock().await;
         if !self.installed.read().contains_key(id) {
             return Err(InstallError::NoSuchRule {
                 id: id.as_str().to_owned(),
             });
         }
-        // A maintained number in the store rather than a walk of the
-        // outbox: see `Storage::outbox_depth`.
-        let waiting = self
-            .store
-            .outbox_depth(id.as_str())
-            .map_err(|error| InstallError::storage(id, error))?;
-        if waiting > 0 {
-            return Err(InstallError::OutboxNotEmpty {
-                id: id.as_str().to_owned(),
-                waiting,
-            });
+        if matches!(origin, Origin::Ours) {
+            // A maintained number in the store rather than a walk of the
+            // outbox: see `Storage::outbox_depth`.
+            let waiting = self
+                .store
+                .outbox_depth(id.as_str())
+                .map_err(|error| InstallError::storage(id, error))?;
+            if waiting > 0 {
+                return Err(InstallError::OutboxNotEmpty {
+                    id: id.as_str().to_owned(),
+                    waiting,
+                });
+            }
         }
 
         // **A tombstone, not the absence of a register.** Section 8.2: a
@@ -975,15 +1182,18 @@ impl Registry {
         let mut records = vec![Record::RuleRemoved {
             id: id.as_str().to_owned(),
         }];
-        records.extend(
-            self.replicated
-                .records(&self.replicated.rule_removed(id.as_str())),
-        );
-        self.writer
-            .apply_durable(records)
-            .map_err(|error| InstallError::storage(id, error))?
-            .await
-            .map_err(|error| InstallError::storage(id, error))?;
+        let ours = match origin {
+            Origin::Ours => {
+                let write = self.replicated.rule_removed(id.as_str());
+                records.extend(self.replicated.records(&write));
+                Some(write)
+            }
+            Origin::Replicated(registers) => {
+                records.extend(registers);
+                None
+            }
+        };
+        self.durable(id, records, ours).await?;
 
         self.uninstall(id);
         // Its route went with it, and it may have been the last one:

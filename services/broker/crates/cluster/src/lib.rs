@@ -129,7 +129,7 @@ pub use metadata::{MetadataError, MetadataKey, MetadataValue, MetadataWrite, Rep
 pub use oplog::{Logged, OpLog, FIRST_SEQUENCE};
 pub use register::{Register, Stamp};
 pub use replicate::{
-    jitter, Handled, Replication, ReplicationError, ReplicationSettings, Replicator, Swept,
+    choose, jitter, Handled, Replication, ReplicationError, ReplicationSettings, Replicator, Swept,
     DEFAULT_BATCH, DEFAULT_EXCHANGE, DEFAULT_TOMBSTONE_GRACE,
 };
 pub use transport::{BoxStream, TcpTransport, Transport};

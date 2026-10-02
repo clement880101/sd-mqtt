@@ -8,7 +8,7 @@ use std::sync::Arc;
 use broker_core::broker::{Addressed, Broker, BrokerConfig};
 use broker_core::session::Action;
 use broker_core::subscriptions::{FilterEvent, SubscriberId};
-use cluster::Replicated;
+use cluster::{MetadataWrite, Replicated};
 use foldhash::fast::RandomState;
 use mqtt_codec::Packet;
 use parking_lot::{Mutex, RwLock};
@@ -51,6 +51,42 @@ pub fn promises_durability(actions: &[Addressed]) -> bool {
             Action::Send(Packet::PubAck(_) | Packet::PubRec(_) | Packet::PubComp(_))
         )
     })
+}
+
+/// Writes waiting for the store before anybody is told about them.
+///
+/// Section 8.2's two-phase write, as it crosses from the broker's lock to
+/// whatever holds the mesh. [`Self::durable`] is the batch that carries
+/// them; [`Self::writes`] is what to broadcast once it has landed and what
+/// to abandon if it has not.
+#[derive(Debug)]
+#[must_use = "a write nobody waits for is a write no peer is ever told about"]
+pub struct Broadcastable {
+    /// The batch the writes rode in.
+    durable: Durable,
+    /// What they were, in the order the broker produced them.
+    writes: Vec<MetadataWrite>,
+}
+
+impl Broadcastable {
+    /// Wait for the batch, and say what to do with the writes.
+    ///
+    /// `Ok` is a batch the store took and a flush covered, so every write
+    /// in it may be published and broadcast. `Err` is a batch that was
+    /// refused or a flush that failed, so every write in it must be
+    /// abandoned: see `cluster::oplog` for why telling a peer about one
+    /// anyway is the single divergence no exchange repairs.
+    ///
+    /// # Errors
+    ///
+    /// [`NotDurable`], unchanged from the writer, so that whoever logs it
+    /// can say which of the two causes it was.
+    pub async fn landed(self) -> Result<Vec<MetadataWrite>, (NotDurable, Vec<MetadataWrite>)> {
+        match self.durable.await {
+            Ok(()) => Ok(self.writes),
+            Err(why) => Err((why, self.writes)),
+        }
+    }
 }
 
 /// A journal already on its way to the store, and what is left to wait
@@ -204,6 +240,25 @@ pub struct Shared {
     /// the events are drained and dropped. Drained, not ignored, for the
     /// reason [`Self::writer`] gives about the journal.
     replicated: Option<Arc<Replicated>>,
+    /// Where writes go to wait for the store before they are broadcast.
+    ///
+    /// Section 8.2, and the order is the whole of it: **a peer told about
+    /// a register whose batch the store refused holds a value this node
+    /// will never hold again**, and no exchange repairs it, because an
+    /// exchange serves the origin's own log and the origin's log lost the
+    /// entry in the same batch. So a write is stamped and numbered here
+    /// and shown to nobody until the batch carrying it is durable; what
+    /// does the showing is a task of the binary's, draining
+    /// [`Shared::waiting_to_broadcast`].
+    ///
+    /// Unbounded, and bounded in practice by what the writer will take:
+    /// one entry per batch that carried a replicated write, held only
+    /// until that batch's flush. A bound here would mean choosing between
+    /// blocking the broker's lock and dropping a broadcast, and neither is
+    /// a choice this has to make.
+    broadcasts: Option<mpsc::UnboundedSender<Broadcastable>>,
+    /// The other end of it, handed out once.
+    waiting: Mutex<Option<mpsc::UnboundedReceiver<Broadcastable>>>,
     outboxes: RwLock<HashMap<SubscriberId, mpsc::Sender<Action>, RandomState>>,
     /// How often a caller was told the writer is behind. See
     /// [`Shared::report_pacing`].
@@ -262,10 +317,19 @@ impl Shared {
         writer: Option<Arc<Writer>>,
         replicated: Option<Arc<Replicated>>,
     ) -> Self {
+        let (broadcasts, waiting) = match replicated {
+            Some(_) => {
+                let (sender, receiver) = mpsc::unbounded_channel();
+                (Some(sender), Some(receiver))
+            }
+            None => (None, None),
+        };
         Self {
             broker: Mutex::new(broker),
             writer,
             replicated,
+            broadcasts,
+            waiting: Mutex::new(waiting),
             outboxes: RwLock::new(HashMap::with_hasher(RandomState::default())),
             paced: AtomicU64::new(0),
             pacing_reported: AtomicU64::new(0),
@@ -285,6 +349,32 @@ impl Shared {
     /// cluster.
     pub fn replicated(&self) -> Option<&Arc<Replicated>> {
         self.replicated.as_ref()
+    }
+
+    /// The queue of writes waiting for the store, taken once.
+    ///
+    /// `None` on a node that does not replicate, and `None` on the second
+    /// call: two drains on one queue would be two halves of the broadcast,
+    /// each silently missing what the other took.
+    pub fn waiting_to_broadcast(&self) -> Option<mpsc::UnboundedReceiver<Broadcastable>> {
+        self.waiting.lock().take()
+    }
+
+    /// Hand `writes` to whatever broadcasts them, once `durable` lands.
+    ///
+    /// For a producer of replicated writes that is **not** the broker's
+    /// journal, which is the rule registry: a rule is an operator's and
+    /// goes through `rules::live`, not through a packet. Section 8.2's
+    /// ordering is the same either way — nothing is shown to a peer until
+    /// the store has taken the batch — so there is one queue and one task
+    /// draining it rather than two answers to when a write may be sent.
+    ///
+    /// Never blocks and never fails: a queue nothing drains is a node that
+    /// does not cluster, and the write is still stored.
+    pub fn broadcast_when_durable(&self, durable: Durable, writes: Vec<MetadataWrite>) {
+        if let Some(broadcasts) = &self.broadcasts {
+            let _ = broadcasts.send(Broadcastable { durable, writes });
+        }
     }
 
     /// Turn the filters that gained or lost a subscriber into registers.
@@ -311,7 +401,12 @@ impl Shared {
     /// and the alternative is a caller that holds a register without
     /// the mark that covers its stamp, which is what
     /// `Replicated::records` exists to make impossible.
-    fn take_filter_events(&self, broker: &mut Broker, records: &mut Vec<Record>) {
+    fn take_filter_events(
+        &self,
+        broker: &mut Broker,
+        records: &mut Vec<Record>,
+        originated: &mut Vec<MetadataWrite>,
+    ) {
         let mut events = Vec::new();
         broker.take_filter_events(&mut events);
         let Some(replicated) = &self.replicated else {
@@ -324,7 +419,56 @@ impl Shared {
             };
             if let Some(write) = write {
                 records.extend(replicated.records(&write));
+                originated.push(write);
             }
+        }
+    }
+
+    /// Turn the retained messages the broker just changed into registers.
+    ///
+    /// Section 8.2 replicates retained messages, and **the broker's own
+    /// journal is what says one changed.** A second signal beside it — an
+    /// event buffer of its own, the way filters have one — was rejected
+    /// for section 7.3's reason read the other way round: the journal
+    /// already carries the fact, and a second copy of "a retained message
+    /// was set" would drift from it the first time one of them was
+    /// corrected. Filters need their own buffer because what is
+    /// replicated is a count the journal says nothing about; a retained
+    /// message is replicated whole and the record holds it.
+    ///
+    /// **Appended to the same batch**, so a node cannot end up holding a
+    /// retained message the cluster was never told about, or a register
+    /// for a message it did not keep.
+    ///
+    /// `peer` is the one case this must not run: a retained message that
+    /// arrived *because* a peer replicated it would be stamped again by
+    /// this node, which is a write with a later stamp and the same value
+    /// bouncing between every pair of nodes for ever.
+    fn take_retained(&self, records: &mut Vec<Record>, originated: &mut Vec<MetadataWrite>) {
+        let Some(replicated) = &self.replicated else {
+            return;
+        };
+        // Over what is in the batch now, and the registers are appended
+        // after the loop: reading by index rather than over a copy, because
+        // a fan-out to a thousand offline subscribers is a batch of two
+        // thousand records and cloning it on every publish would be a
+        // clone nobody asked for.
+        let before = records.len();
+        let mut made = Vec::new();
+        for record in &records[..before] {
+            match record {
+                Record::RetainedPut { topic, message } => {
+                    made.push(replicated.retained(topic, message.clone()));
+                }
+                Record::RetainedRemoved { topic } => {
+                    made.push(replicated.retained_cleared(topic));
+                }
+                _ => {}
+            }
+        }
+        for write in made {
+            records.extend(replicated.records(&write));
+            originated.push(write);
         }
     }
 
@@ -433,9 +577,72 @@ impl Shared {
     /// the one task that drives every deadline in the process behind a
     /// disk would be the stall this is trying to avoid.
     fn hand_over(&self, broker: &mut Broker, promised: bool) -> Committed {
+        self.hand_over_originating(broker, promised, true, Vec::new())
+    }
+
+    /// Apply what a peer replicated: the local effect and the registers
+    /// that caused it, in one batch.
+    ///
+    /// `registers` is `cluster::Handled::records` — the registers that won
+    /// and the watermark if it moved — and `f` is what they mean to this
+    /// node: a retained message set or cleared. **One batch**, because a
+    /// watermark stored without the effect it covers is a claim to hold a
+    /// write this node would never be sent again, and an effect stored
+    /// without the register is a retained message no peer can tell this
+    /// node already has.
+    ///
+    /// Nothing is stamped again; see
+    /// [`Shared::hand_over_originating`].
+    ///
+    /// What comes back is waited on by the caller the way every other
+    /// commit is, and it promises nobody anything: a peer is not a
+    /// publisher waiting for an acknowledgement.
+    pub fn apply_replicated(
+        &self,
+        registers: Vec<Record>,
+        f: impl FnOnce(&mut Broker),
+    ) -> Committed {
+        let mut broker = self.broker.lock();
+        f(&mut broker);
+        self.hand_over_originating(&mut broker, false, false, registers)
+    }
+
+    /// The same, saying whether this node is the author of what it is
+    /// handing over.
+    ///
+    /// `originate` is false on exactly one path: applying what a peer
+    /// replicated. The records still go to the store — this node holds a
+    /// copy of every register, so its own retained store and its own
+    /// journal carry the message like any other — but **nothing is stamped
+    /// again**. A retained message that arrived because a peer replicated
+    /// it, re-stamped here, is a later write with the same value, and two
+    /// nodes doing that to each other is one message bouncing between them
+    /// for ever.
+    fn hand_over_originating(
+        &self,
+        broker: &mut Broker,
+        promised: bool,
+        originate: bool,
+        extra: Vec<Record>,
+    ) -> Committed {
         let mut records = Vec::new();
         broker.take_journal(&mut records);
-        self.take_filter_events(broker, &mut records);
+        let mut originated = Vec::new();
+        // **Always drained**, originating or not: a buffer nobody reads is
+        // a buffer that grows for the life of the process, and a filter
+        // event is this node's own whoever caused the call.
+        self.take_filter_events(broker, &mut records, &mut originated);
+        records.extend(extra);
+        // The broker's own facts first and what the cluster is told about
+        // them after, which is both the order a reader of the batch wants
+        // and the order this has to happen in: the registers are derived
+        // from the records, `extra` included. A peer's write arrives as an
+        // `extra` record, so **this is the one place the rule that a peer's
+        // write is not stamped again is kept** — stamp it and the two nodes
+        // tell each other about the same retained message for ever.
+        if originate {
+            self.take_retained(&mut records, &mut originated);
+        }
 
         let Some(writer) = &self.writer else {
             // No store: nothing is written down and nothing can be
@@ -444,6 +651,39 @@ impl Shared {
             // to grow.
             return Committed::Nothing;
         };
+        if !originated.is_empty() {
+            // Section 8.2's two-phase write. The batch is waited on twice:
+            // once by whoever is about to broadcast, and once by this
+            // caller if it promised a publisher anything. One batch and
+            // one outcome, because whether the store took it is one fact.
+            let Some(broadcasts) = &self.broadcasts else {
+                // Unreachable: writes are only originated by a node that
+                // has a `Replicated`, and the queue is made beside it.
+                // Refusing to broadcast is the safe answer if it ever
+                // happens, rather than broadcasting without the store.
+                return Committed::Nothing;
+            };
+            return match writer.apply_durable_twice(records) {
+                Ok((mine, theirs)) => {
+                    // Never blocks: the queue is unbounded, and a send
+                    // that fails is a binary with nothing draining it,
+                    // which is a node that does not cluster.
+                    let _ = broadcasts.send(Broadcastable {
+                        durable: theirs,
+                        writes: originated,
+                    });
+                    if promised {
+                        Committed::Waiting(mine)
+                    } else {
+                        // Nothing was promised to a publisher, so nobody
+                        // here waits. The broadcast still does.
+                        drop(mine);
+                        Committed::Nothing
+                    }
+                }
+                Err(_) => Committed::Stopped,
+            };
+        }
         if !promised {
             if records.is_empty() {
                 return Committed::Nothing;

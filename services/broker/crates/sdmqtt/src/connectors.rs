@@ -188,8 +188,15 @@ pub async fn start(
             "the store holds a rule this configuration does not name; it was created \
              over the API or by an earlier configuration, and it is being installed"
         );
+        // **Installed without being stamped**, section 8.2: the register
+        // that carries this rule is in the store beside it. Stamping it
+        // again would make this node the last writer for every rule it
+        // holds on every restart, so a node that was down while an operator
+        // edited a rule elsewhere would come back and overwrite the edit
+        // with its own stale copy. A rule the *file* names is stamped, just
+        // above, because an edited file is an operator saying so.
         registry
-            .install(rule)
+            .install_held(rule)
             .await
             .map_err(|error| StartupError::Connector(error.to_string()))?;
     }

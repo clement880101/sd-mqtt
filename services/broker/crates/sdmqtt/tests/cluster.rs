@@ -36,7 +36,7 @@
 
 #![cfg(unix)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -71,6 +71,14 @@ const HEARTBEAT_MS: u64 = 200;
 
 /// How long a peer may be silent before it is dead, in milliseconds.
 const DEAD_AFTER_MS: u64 = 1_500;
+
+/// What each node is called, in the order they are started.
+///
+/// Written into each node's `node.name`, so the default derived from the
+/// machine's hostname is not what three nodes on one machine would show —
+/// which is the whole reason that default was changed, and the reason this
+/// test says what it expects instead of relying on it.
+const LABELS: [&str; 3] = ["alpha", "beta", "gamma"];
 
 /// The secret all three share.
 const SECRET: &str = "a-cluster-secret-for-the-test";
@@ -169,6 +177,98 @@ impl Node {
             None => panic!("no body in {raw:?}"),
         }
     }
+
+    /// Publish a retained message through the admin API.
+    ///
+    /// At least once, so the answer does not come back until the store
+    /// has the message — which is also the moment section 8.2 allows the
+    /// register to be broadcast. A test that published at most once would
+    /// be asserting about a race it had set up itself.
+    fn retain(&self, topic: &str, payload: &str) {
+        let body = format!(
+            "{{\"topic\":\"{topic}\",\"payload\":\"{payload}\",\"qos\":1,\"retain\":true}}"
+        );
+        let answered = self.post("/api/v1/publish", &body);
+        assert!(
+            answered.contains("\"delivered\""),
+            "{} would not publish to {topic}: {answered}",
+            self.label
+        );
+    }
+
+    /// What this node holds retained, as topic and text.
+    fn retained(&self) -> BTreeMap<String, String> {
+        let body = self.get("/api/v1/retained?limit=100");
+        let document: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or_else(|why| panic!("{body:?} is not JSON: {why}"));
+        document["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no items in {document}"))
+            .iter()
+            .map(|item| {
+                (
+                    item["topic"].as_str().unwrap_or_default().to_owned(),
+                    item["text"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// Create a rule through the admin API.
+    fn create_rule(&self, id: &str) {
+        let body = format!(
+            "{{\"id\":\"{id}\",\"name\":\"{id}\",\"filter\":\"nothing/{id}\",\
+               \"http_out\":{{\"url\":\"https://example.invalid/{id}\",\"timeout_ms\":1000,\
+               \"retries\":0,\"backoff_ms\":1000}}}}"
+        );
+        let answered = self.post("/api/v1/rules", &body);
+        assert!(
+            answered.contains(id),
+            "{} would not create the rule {id}: {answered}",
+            self.label
+        );
+    }
+
+    /// Which rules this node holds, by identifier.
+    fn rules(&self) -> BTreeSet<String> {
+        let body = self.get("/api/v1/rules?limit=100");
+        let document: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or_else(|why| panic!("{body:?} is not JSON: {why}"));
+        document["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no items in {document}"))
+            .iter()
+            .map(|item| item["id"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// The body of a `POST` of JSON, without its head.
+    fn post(&self, path: &str, body: &str) -> String {
+        let mut socket =
+            TcpStream::connect_timeout(&self.admin, REPLY).expect("the listener accepts");
+        socket
+            .set_read_timeout(Some(REPLY))
+            .expect("a read deadline");
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {TOKEN}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            self.admin,
+            body.len()
+        );
+        socket
+            .write_all(head.as_bytes())
+            .expect("the head is written");
+        socket.write_all(body.as_bytes()).expect("and the body");
+        socket.flush().expect("and flushed");
+        let mut raw = Vec::new();
+        socket.read_to_end(&mut raw).expect("the response ends");
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        match text.split_once("\r\n\r\n") {
+            Some((_head, body)) => body.to_owned(),
+            None => panic!("no body in {text:?}"),
+        }
+    }
 }
 
 impl Drop for Node {
@@ -207,13 +307,51 @@ fn raw_get(address: SocketAddr, path: &str) -> String {
     String::from_utf8_lossy(&raw).into_owned()
 }
 
-/// A port the operating system has just said is free.
+/// The lowest port this test will use, and one past the highest.
+///
+/// **Below every platform's ephemeral range, deliberately.** Linux draws
+/// automatic ports from 32768 upwards, macOS and Windows from 49152, so
+/// nothing in this window is ever assigned by the kernel: not a bind of
+/// port zero and not the source port of an outbound connection. A port
+/// read from a bind of port zero is a hint and not a reservation — it is
+/// free again before the caller has it — and this test hands nine of them
+/// to three child processes that bind them milliseconds later. The same
+/// defect was measured in `tests/rules.rs` at one failure in six under
+/// load; this is the same fix.
+const PORTS: std::ops::Range<u16> = 30_000..40_000;
+
+/// Every port this test binary has taken.
+static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+
+/// A port nothing else will be given, with nothing listening on it.
+///
+/// Drawing from [`PORTS`] removes the kernel as a competitor; remembering
+/// what has been handed out removes this binary's own tests. A port in
+/// that range can still be in use by something already running, so one is
+/// taken by binding it and moving on if that fails rather than by assuming
+/// it is free.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("a port on the loopback")
-        .local_addr()
-        .expect("it has an address")
-        .port()
+    // Started somewhere different in each process so that two runs in
+    // quick succession do not queue up on the same first candidate.
+    let offset = usize::from(std::process::id() as u16) % PORTS.len();
+    for step in 0..PORTS.len() {
+        let port = PORTS.start + u16::try_from((offset + step) % PORTS.len()).unwrap_or(0);
+        let mut handed = HANDED_OUT.lock().expect("not poisoned");
+        if handed.contains(&port) {
+            continue;
+        }
+        handed.push(port);
+        drop(handed);
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+        // Something else on the machine has it. Spent either way, so
+        // nothing here tries it twice.
+    }
+    panic!(
+        "no port between {} and {} could be bound",
+        PORTS.start, PORTS.end
+    );
 }
 
 fn loopback(port: u16) -> SocketAddr {
@@ -294,6 +432,160 @@ fn keeps(what: &str, for_how_long: Duration, mut holds: impl FnMut() -> bool) {
     assert!(holds(), "{what} stopped being true");
 }
 
+/// Three `sdmqtt` processes behind gates, meshed and settled.
+///
+/// Factored out because section 8.2's convergence test needs the same
+/// three processes section 8.1's partition test does, and a second copy of
+/// this would be a second answer to how a node behind a gate is
+/// configured — which is the one thing in here that is easy to get subtly
+/// wrong, because every address a node advertises has to be a gate's.
+///
+/// Returns the nodes, the gate per ordered pair, and what each node
+/// advertises. Nothing here asserts; the caller does.
+struct Cluster {
+    nodes: Vec<Node>,
+    /// `gates[&(from, to)]` is what `from` dials to reach `to`.
+    gates: BTreeMap<(usize, usize), Gate>,
+    advertised: Vec<SocketAddr>,
+}
+
+impl Cluster {
+    /// Start three nodes under `directory`, each with a store of its own.
+    async fn start(directory: &Path) -> Self {
+        let labels = LABELS;
+
+        // The three cluster ports, chosen before anything starts so that
+        // the gates in front of them can be opened first and written into
+        // the configurations.
+        let ports: Vec<SocketAddr> = (0..NODES).map(|_| loopback(free_port())).collect();
+
+        // One gate per ordered pair: `gates[&(from, to)]` is what `from`
+        // dials to reach `to`. A flag on `to`'s own port would sever it
+        // from everybody rather than from `from`.
+        let mut gates: BTreeMap<(usize, usize), Gate> = BTreeMap::new();
+        for from in 0..NODES {
+            for (to, port) in ports.iter().enumerate() {
+                if from != to {
+                    gates.insert((from, to), Gate::open(*port).await.expect("a gate opens"));
+                }
+            }
+        }
+
+        // **Every advertised address is a gate's.** Behind a gate a node's
+        // dialable address is the gate's and not its own, which is the
+        // case section 8.1 names, and advertising the real port would give
+        // a peer a way round the partition.
+        let advertised: Vec<SocketAddr> = (0..NODES)
+            .map(|to| gates[&((to + 1) % NODES, to)].address())
+            .collect();
+
+        let mut nodes = Vec::new();
+        for at in 0..NODES {
+            let label = labels[at];
+            let config = directory.join(format!("{label}.toml"));
+            let store = directory.join(format!("{label}-store"));
+            let admin = loopback(free_port());
+            let seeds: Vec<SocketAddr> = (0..NODES)
+                .filter(|to| *to != at)
+                .map(|to| gates[&(at, to)].address())
+                .collect();
+            write_config(
+                &config,
+                &store,
+                label,
+                loopback(free_port()),
+                admin,
+                ports[at],
+                advertised[at],
+                &seeds,
+            );
+            let log = directory.join(format!("{label}.log"));
+            let child = Command::new(env!("CARGO_BIN_EXE_sdmqtt"))
+                .arg("serve")
+                .arg("--config")
+                .arg(&config)
+                // On the command line as well as in the file, because the
+                // environment is emptied below and an empty
+                // `SDMQTT_STORAGE_DIRECTORY` takes a store *away*. A flag
+                // overrides both, which is what `tests/bridge.rs` does and
+                // for the same reason.
+                .arg("--store-directory")
+                .arg(&store)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                // Emptied so that a configuration in the environment of
+                // whoever is running the tests cannot reach these brokers.
+                .env("SDMQTT_CONFIG", "")
+                .env("SDMQTT_STORAGE_DIRECTORY", "")
+                .stderr(Stdio::from(
+                    File::create(&log).expect("a log file can be created"),
+                ))
+                .spawn()
+                .expect("the broker binary runs");
+            let mut node = Node {
+                child,
+                admin,
+                log,
+                label,
+            };
+            if let Err(why) = node.wait_until_listening() {
+                panic!("{why}");
+            }
+            nodes.push(node);
+        }
+        Self {
+            nodes,
+            gates,
+            advertised,
+        }
+    }
+
+    /// How many connections each gate has carried.
+    fn connections(&self) -> BTreeMap<(usize, usize), u64> {
+        self.gates
+            .iter()
+            .map(|(pair, gate)| (*pair, gate.connections()))
+            .collect()
+    }
+
+    /// Wait until every node sees the other two, and settle the dialling.
+    ///
+    /// The second half is not the same moment as the first: a node starts
+    /// before its peers, so its first dials are refused, and a node that
+    /// dialled a peer it already had a link to opens one connection and has
+    /// it dropped by the rule that keeps the link the lower identity
+    /// dialled. Both are startup, both are finite, and the count a
+    /// partition is measured against has to be taken afterwards.
+    fn settle(&self) -> BTreeMap<(usize, usize), u64> {
+        until("every node sees the other two", || {
+            self.nodes.iter().all(|node| {
+                let seen = node.nodes();
+                seen.len() == NODES && seen.iter().all(|row| row.state == "up")
+            })
+        });
+        let mut established = self.connections();
+        let settled = Duration::from_millis(HEARTBEAT_MS * 8);
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the cluster never stopped opening connections: {established:?}"
+            );
+            std::thread::sleep(settled);
+            let now = self.connections();
+            if now == established {
+                break;
+            }
+            established = now;
+        }
+        assert!(
+            established.values().all(|opened| *opened > 0),
+            "every gate should have carried a dial by now: {established:?}"
+        );
+        established
+    }
+}
+
 // ---- the test ------------------------------------------------------
 
 /// Three processes form a mesh, survive a one-way partition, and agree
@@ -306,87 +598,11 @@ fn keeps(what: &str, for_how_long: Duration, mut holds: impl FnMut() -> bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_processes_form_a_mesh_and_survive_a_partition() {
     let directory = tempfile::tempdir().expect("a temporary directory");
-    let labels = ["alpha", "beta", "gamma"];
-
-    // The three cluster ports, chosen before anything starts so that
-    // the gates in front of them can be opened first and written into
-    // the configurations.
-    let ports: Vec<SocketAddr> = (0..NODES).map(|_| loopback(free_port())).collect();
-
-    // One gate per ordered pair: `gates[&(from, to)]` is what `from`
-    // dials to reach `to`. A flag on `to`'s own port would sever it
-    // from everybody rather than from `from`.
-    let mut gates: BTreeMap<(usize, usize), Gate> = BTreeMap::new();
-    for from in 0..NODES {
-        for (to, port) in ports.iter().enumerate() {
-            if from != to {
-                gates.insert((from, to), Gate::open(*port).await.expect("a gate opens"));
-            }
-        }
-    }
-
-    // **Every advertised address is a gate's.** Behind a gate a node's
-    // dialable address is the gate's and not its own, which is the
-    // case section 8.1 names, and advertising the real port would give
-    // a peer a way round the partition.
-    let advertised: Vec<SocketAddr> = (0..NODES)
-        .map(|to| gates[&((to + 1) % NODES, to)].address())
-        .collect();
-
-    let mut nodes = Vec::new();
-    for at in 0..NODES {
-        let label = labels[at];
-        let config = directory.path().join(format!("{label}.toml"));
-        let store = directory.path().join(format!("{label}-store"));
-        let admin = loopback(free_port());
-        let seeds: Vec<SocketAddr> = (0..NODES)
-            .filter(|to| *to != at)
-            .map(|to| gates[&(at, to)].address())
-            .collect();
-        write_config(
-            &config,
-            &store,
-            label,
-            loopback(free_port()),
-            admin,
-            ports[at],
-            advertised[at],
-            &seeds,
-        );
-        let log = directory.path().join(format!("{label}.log"));
-        let child = Command::new(env!("CARGO_BIN_EXE_sdmqtt"))
-            .arg("serve")
-            .arg("--config")
-            .arg(&config)
-            // On the command line as well as in the file, because the
-            // environment is emptied below and an empty
-            // `SDMQTT_STORAGE_DIRECTORY` takes a store *away*. A flag
-            // overrides both, which is what `tests/bridge.rs` does and
-            // for the same reason.
-            .arg("--store-directory")
-            .arg(&store)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            // Emptied so that a configuration in the environment of
-            // whoever is running the tests cannot reach these brokers.
-            .env("SDMQTT_CONFIG", "")
-            .env("SDMQTT_STORAGE_DIRECTORY", "")
-            .stderr(Stdio::from(
-                File::create(&log).expect("a log file can be created"),
-            ))
-            .spawn()
-            .expect("the broker binary runs");
-        let mut node = Node {
-            child,
-            admin,
-            log,
-            label,
-        };
-        if let Err(why) = node.wait_until_listening() {
-            panic!("{why}");
-        }
-        nodes.push(node);
-    }
+    let Cluster {
+        nodes,
+        gates,
+        advertised,
+    } = Cluster::start(directory.path()).await;
 
     // ---- they all find each other --------------------------------
     until("every node sees the other two", || {
@@ -428,7 +644,7 @@ async fn three_processes_form_a_mesh_and_survive_a_partition() {
                 node.label
             );
             assert!(
-                labels.contains(&row.name.as_str()),
+                LABELS.contains(&row.name.as_str()),
                 "{} reports a node called {:?}",
                 node.label,
                 row.name
@@ -545,6 +761,238 @@ async fn three_processes_form_a_mesh_and_survive_a_partition() {
             established[pair],
             "the cluster healed by reconnecting through the gate {pair:?} rather \
              than on the connection it already had"
+        );
+    }
+}
+
+/// Three nodes converge on subscriptions, retained messages and rules
+/// after a partition heals, and the agreement is the last writer's.
+///
+/// Section 8.2 against the real binary, over real sockets, through the
+/// gate. Everything it asserts is a property of three operating system
+/// processes that share nothing but loopback: three stores, three clocks,
+/// three logs and three copies of every timer.
+///
+/// # Why a retained message and a rule
+///
+/// They are the two of this milestone's four kinds that an operator can
+/// make happen and then read back, and they travel by different paths: a
+/// retained message is the broker's own journal turned into a register by
+/// the shell, and a rule is `rules::live`'s own write. A test of one would
+/// leave the other's path unwalked, which is convention 5's "a path no
+/// test walks" — and the rule's path is the one with an outbox and a
+/// listener hanging off it.
+///
+/// The other two are not reachable from outside: a node subscription is
+/// replicated at node granularity and is read by section 8.3's routing,
+/// and a session owner is read by section 8.4's migration. Both are
+/// milestone 6. What this milestone owes them is that the registers are
+/// there, and `crates/cluster/tests/metadata.rs` is where that is proved
+/// from a SUBSCRIBE packet.
+///
+/// # What the last writer means here
+///
+/// Two writes to one topic, one on each side of the partition, separated
+/// by long enough that the later one's clock reading is certainly higher:
+/// the two processes share a wall clock, so a hundred milliseconds apart is
+/// not a tie. **Both orders are exercised** — once alpha first and once
+/// gamma first — because a cluster that simply took whichever value
+/// arrived last, or whichever node asked last, would get one of the two
+/// right by accident.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_nodes_converge_after_a_partition_heals() {
+    /// A topic alpha writes first and gamma writes later.
+    const GAMMA_WINS: &str = "site/0001/state";
+    /// And one the other way round.
+    const ALPHA_WINS: &str = "site/0002/state";
+    /// Long enough that two wall-clock readings cannot be the same
+    /// millisecond, and short enough to be nothing in a test.
+    const APART: Duration = Duration::from_millis(250);
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cluster = Cluster::start(directory.path()).await;
+    let established = cluster.settle();
+    let nodes = &cluster.nodes;
+
+    // ---- a retained message on one node reaches all three -----------
+    //
+    // **By broadcast, and only by broadcast.** An exchange is a pull: gamma
+    // sends alpha a digest and alpha answers it, so cutting what gamma says
+    // to alpha leaves gamma unable to ask for anything while alpha can still
+    // tell it something. Both gates between the two are cut in that
+    // direction, because which of the two connections the mesh kept depends
+    // on which identity is lower and that is minted at first start.
+    //
+    // Without this the step proves nothing: the exchange runs every couple
+    // of seconds, so a broadcast that never happened would be repaired
+    // before any patience ran out, and deleting the broadcast entirely
+    // passed this test until the cut was added.
+    cluster.gates[&(0, 2)].cut(Direction::Backward);
+    cluster.gates[&(2, 0)].cut(Direction::Forward);
+    // **Waited for before anything is published.** A cut takes effect on
+    // the relay's next decision, and what proves it has is a byte thrown
+    // away — which is gamma's next heartbeat, within the interval. Asserted
+    // after the write instead, it would be an assertion about a window of
+    // milliseconds in which there was nothing yet to throw away.
+    until("the cut bites, so gamma cannot ask for anything", || {
+        cluster.gates[&(0, 2)]
+            .valve(Direction::Backward)
+            .swallowed()
+            + cluster.gates[&(2, 0)].valve(Direction::Forward).swallowed()
+            > 0
+    });
+    nodes[0].retain("before/the/partition", "everywhere");
+    until("the write reaches all three", || {
+        nodes.iter().all(|node| {
+            node.retained()
+                .get("before/the/partition")
+                .map(String::as_str)
+                == Some("everywhere")
+        })
+    });
+    cluster.gates[&(0, 2)].heal(Direction::Backward);
+    cluster.gates[&(2, 0)].heal(Direction::Forward);
+    until("gamma is answering again", || {
+        nodes[0].how(&nodes[2].identity()).as_deref() == Some("up")
+    });
+
+    // ---- gamma is severed, in both directions ------------------------
+    //
+    // Both directions, which is what makes this two halves of a cluster
+    // rather than one node that can be heard and cannot hear: each half
+    // takes writes, and neither sees the other's.
+    for other in 0..NODES - 1 {
+        cluster.gates[&(other, NODES - 1)].cut(Direction::Forward);
+        cluster.gates[&(other, NODES - 1)].cut(Direction::Backward);
+        cluster.gates[&(NODES - 1, other)].cut(Direction::Forward);
+        cluster.gates[&(NODES - 1, other)].cut(Direction::Backward);
+    }
+    until("alpha declares gamma dead", || {
+        let gamma = nodes[2].identity();
+        nodes[0].how(&gamma).as_deref() == Some("down")
+            && nodes[1].how(&gamma).as_deref() == Some("down")
+    });
+
+    // ---- each side writes -------------------------------------------
+    nodes[0].retain(GAMMA_WINS, "from-alpha");
+    nodes[2].retain(ALPHA_WINS, "from-gamma");
+    nodes[0].create_rule("rule-from-alpha");
+    nodes[2].create_rule("rule-from-gamma");
+    std::thread::sleep(APART);
+    nodes[2].retain(GAMMA_WINS, "from-gamma");
+    nodes[0].retain(ALPHA_WINS, "from-alpha");
+
+    // And the disagreement is real while it lasts, which is what makes
+    // the convergence below something that had to happen rather than
+    // something that was already true.
+    assert_eq!(
+        nodes[0].retained().get(GAMMA_WINS).map(String::as_str),
+        Some("from-alpha"),
+        "alpha should still hold its own write"
+    );
+    assert_eq!(
+        nodes[2].retained().get(GAMMA_WINS).map(String::as_str),
+        Some("from-gamma")
+    );
+    assert!(
+        !nodes[0].rules().contains("rule-from-gamma"),
+        "alpha cannot have gamma's rule yet"
+    );
+    assert!(
+        !nodes[2].rules().contains("rule-from-alpha"),
+        "gamma cannot have alpha's rule yet"
+    );
+
+    // ---- and it heals ------------------------------------------------
+    for other in 0..NODES - 1 {
+        cluster.gates[&(other, NODES - 1)].heal(Direction::Forward);
+        cluster.gates[&(other, NODES - 1)].heal(Direction::Backward);
+        cluster.gates[&(NODES - 1, other)].heal(Direction::Forward);
+        cluster.gates[&(NODES - 1, other)].heal(Direction::Backward);
+    }
+
+    // **Nothing is published after the heal**, so everything below
+    // arrives through the exchange: a broadcast reaches only the peers a
+    // node has a link to at the moment of the write, and these writes
+    // were made into a gate that threw them away.
+    let expected: BTreeMap<&str, &str> = [
+        ("before/the/partition", "everywhere"),
+        (GAMMA_WINS, "from-gamma"),
+        (ALPHA_WINS, "from-alpha"),
+    ]
+    .into_iter()
+    .collect();
+    let rules: BTreeSet<String> = ["rule-from-alpha", "rule-from-gamma"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+    until("all three agree on every retained message", || {
+        nodes.iter().all(|node| {
+            let held = node.retained();
+            expected
+                .iter()
+                .all(|(topic, text)| held.get(*topic).map(String::as_str) == Some(*text))
+        })
+    });
+    until("all three hold both rules", || {
+        nodes.iter().all(|node| node.rules().is_superset(&rules))
+    });
+
+    // **The last writer's value, and not whichever arrived last.** One
+    // topic resolves each way, which is what no rule about arrival order
+    // could produce for both.
+    for node in nodes {
+        let held = node.retained();
+        assert_eq!(
+            held.get(GAMMA_WINS).map(String::as_str),
+            Some("from-gamma"),
+            "{} kept the earlier write on {GAMMA_WINS}",
+            node.label
+        );
+        assert_eq!(
+            held.get(ALPHA_WINS).map(String::as_str),
+            Some("from-alpha"),
+            "{} kept the earlier write on {ALPHA_WINS}",
+            node.label
+        );
+    }
+
+    // And it stays agreed, which is the answer to convention 5's test
+    // asserting an absence: a cluster that converged and then started
+    // overwriting itself would pass an assertion made once. An exchange
+    // runs every couple of seconds, so this covers several rounds.
+    keeps("and they go on agreeing", Duration::from_secs(6), || {
+        nodes.iter().all(|node| {
+            let held = node.retained();
+            expected
+                .iter()
+                .all(|(topic, text)| held.get(*topic).map(String::as_str) == Some(*text))
+        })
+    });
+
+    // Nothing reconnected: the partition was imposed and lifted on the
+    // connections the cluster already had, which is what a gate can do and
+    // a closed socket cannot.
+    for (pair, gate) in &cluster.gates {
+        assert_eq!(
+            gate.connections(),
+            established[pair],
+            "the cluster healed by reconnecting through the gate {pair:?} rather than on \
+             the connection it already had"
+        );
+    }
+
+    // And every node still sees every other, by name: three nodes on one
+    // machine would otherwise show an operator three identical rows, which
+    // is what the derived default name was changed for.
+    for node in nodes {
+        let names: BTreeSet<String> = node.nodes().into_iter().map(|row| row.name).collect();
+        assert_eq!(
+            names,
+            LABELS.iter().map(|label| (*label).to_owned()).collect(),
+            "{} does not see three distinctly named nodes",
+            node.label
         );
     }
 }

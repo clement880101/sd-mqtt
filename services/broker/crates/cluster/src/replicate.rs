@@ -148,6 +148,35 @@ pub fn jitter(interval: Duration) -> Duration {
     crate::mesh::jitter(interval)
 }
 
+/// One of `peers`, chosen at random.
+///
+/// Section 8.2 asks for a **random** peer rather than the next in a list,
+/// and the reason is the shape of a repair: a ring would make every node's
+/// exchange the same pair for ever, so a write that reached only one node
+/// would travel one hop per interval around the whole cluster. A random
+/// peer reaches everybody in a number of rounds that grows with the
+/// logarithm of the cluster rather than with the cluster.
+///
+/// `None` for no peers, which is a cluster of one and a supported way to
+/// run this broker.
+///
+/// The randomness is the one this crate already links for section 8.1's
+/// nonces and its backoff jitter. If it fails there is still a peer to
+/// ask — the first — because asking the same peer every time is worse than
+/// asking nobody.
+#[must_use]
+pub fn choose(peers: &[NodeId]) -> Option<NodeId> {
+    let first = *peers.first()?;
+    let mut bytes = [0_u8; 8];
+    if aws_lc_rs::rand::SecureRandom::fill(&aws_lc_rs::rand::SystemRandom::new(), &mut bytes)
+        .is_err()
+    {
+        return Some(first);
+    }
+    let which = usize::try_from(u64::from_le_bytes(bytes) % peers.len() as u64).unwrap_or(0);
+    peers.get(which).copied().or(Some(first))
+}
+
 /// How a node replicates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicationSettings {

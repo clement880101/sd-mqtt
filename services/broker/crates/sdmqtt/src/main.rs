@@ -9,6 +9,7 @@
 mod config;
 mod connectors;
 mod ingest;
+mod replication;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -22,7 +23,8 @@ use clap::{Args, Parser, Subcommand};
 use cluster::membership::MemberState;
 use cluster::mesh::Mesh;
 use cluster::{
-    HybridClock, MetadataError, NodeIdentity, Replicated, TcpTransport, DEFAULT_MAX_DRIFT_MILLIS,
+    HybridClock, MetadataError, NodeIdentity, Replicated, ReplicationSettings, Replicator,
+    TcpTransport, DEFAULT_MAX_DRIFT_MILLIS,
 };
 use config::{Config, ConfigError, IngestListener, LogLevel, Overrides};
 use ingest::IngestSocket;
@@ -309,6 +311,7 @@ struct Node<'a> {
 async fn start_cluster(
     config: &Config,
     rebuilt: Option<&Rebuilt>,
+    deliveries: Option<Arc<dyn cluster::mesh::Deliver>>,
 ) -> Result<Option<Arc<Mesh>>, StartupError> {
     let Some(address) = config.cluster.address else {
         if config.cluster.secret.is_some() {
@@ -336,11 +339,12 @@ async fn start_cluster(
             .await
             .map_err(|source| StartupError::ClusterListener { address, source })?,
     );
-    let mesh = Mesh::start(
+    let mesh = Mesh::start_delivering(
         rebuilt.identity.clone(),
         settings,
         config.cluster.mesh(),
         transport,
+        deliveries,
     );
     tracing::info!(
         node = %rebuilt.identity,
@@ -855,7 +859,67 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     // link in this milestone — and binding this one last means a
     // cluster port already in use is not discovered after the broker
     // has started answering clients.
-    let mesh = start_cluster(&config, rebuilt.as_ref()).await?;
+    // Section 8.2's replication, which needs the mesh and is needed by it:
+    // the mesh hands a peer's frames to this, and the tasks below hand this
+    // node's writes to the mesh. Built before the mesh and given to it, so
+    // that a frame arriving on the first link has somewhere to go.
+    let replication = rebuilt.as_ref().map(|rebuilt| {
+        let replicator = Arc::new(Replicator::new(
+            Arc::clone(&rebuilt.replicated),
+            ReplicationSettings::default(),
+        ));
+        let (handler, applying) = replication::Replication::new(Arc::clone(&replicator));
+        (replicator, handler, applying)
+    });
+    let deliveries = replication
+        .as_ref()
+        .map(|(_, handler, _)| Arc::clone(handler) as Arc<dyn cluster::mesh::Deliver>);
+
+    let mesh = start_cluster(&config, rebuilt.as_ref(), deliveries).await?;
+    // The four tasks of section 8.2, started once there is a mesh for them
+    // to talk over. A node that does not cluster starts none of them: its
+    // writes are stored and stamped and go nowhere, which is what a cluster
+    // of one is.
+    let mut replicating: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if let (Some((replicator, _, applying)), Some(rebuilt)) = (replication, rebuilt.as_ref()) {
+        // **Whether or not this node clusters.** A node with a store has
+        // an identity, a clock and a log, so its writes are stamped and
+        // numbered and the queue that holds them until the store has
+        // taken them fills either way — and a queue nothing drains is
+        // every retained payload this node ever wrote, held for the life
+        // of the process.
+        if let Some(waiting) = rebuilt.shared.waiting_to_broadcast() {
+            replicating.push(tokio::spawn(replication::broadcasting(
+                waiting,
+                Arc::clone(&replicator),
+                mesh.clone(),
+            )));
+        }
+        if let Some(mesh) = &mesh {
+            // And these three only where there are peers. Applying needs
+            // the registry, which a node with no rules does not have.
+            if let Some(registry) = connectors.registry() {
+                replicating.push(tokio::spawn(replication::applying(
+                    applying,
+                    Arc::clone(&rebuilt.shared),
+                    Arc::clone(registry),
+                )));
+            }
+            replicating.push(tokio::spawn(replication::exchanging(
+                Arc::clone(&replicator),
+                Arc::clone(mesh),
+            )));
+            replicating.push(tokio::spawn(replication::sweeping(
+                Arc::clone(&replicator),
+                Arc::clone(mesh),
+                Arc::clone(&rebuilt.writer),
+            )));
+            tracing::info!(
+                node = %rebuilt.identity,
+                "this node is replicating its metadata to its peers"
+            );
+        }
+    }
     if let Some(mesh) = &mesh {
         let metrics: Arc<dyn sdmqtt_server::metrics::ClusterMetrics> =
             Arc::new(MeshView(Arc::clone(mesh)));
@@ -965,6 +1029,14 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         }
     }
     running.shutdown().await;
+    // Section 8.2's tasks, after the listener and before the pumps: a
+    // broadcast of something a client did is worth finishing, and an
+    // exchange with a peer is not worth starting. Aborted rather than
+    // joined — nothing was promised to a peer, and the exchange repairs
+    // whatever a stop loses, which is what it is for.
+    for task in replicating {
+        task.abort();
+    }
     // After the listener, so that nothing can enter an outbox while its
     // pump is being stopped, and before the process ends, so that a
     // pump in the middle of a store write is joined rather than left.
