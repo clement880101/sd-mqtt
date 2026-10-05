@@ -12,6 +12,24 @@ description = "Node identity, the authenticated link and the membership view for
 # `broker-core` takes it that way: which engine a node's identity is
 # written to is the binary's choice and nothing this crate can see.
 storage = { path = "../storage", version = "0.1.0", default-features = false }
+# Section 8.3's routing map asks the same question the subscription trie
+# answers — which filters does this topic match — about other nodes'
+# filters rather than this node's sessions. So it is the same trie, in a
+# second instance: `broker_core::subscriptions::FilterIndex`.
+#
+# **The direction is the layering and not a cycle.** `broker-core` knows
+# nothing about a cluster and must not: it reads no clock, holds no
+# identity and counts nothing. `rules` already depends on it for the
+# reference matcher and on this crate for the node identity, so this
+# edge puts `cluster` where `rules` already is rather than anywhere new.
+#
+# The alternative was a linear scan over every remote filter on every
+# publish, which at the design's fifty-node ceiling is the cost the trie
+# exists to avoid, with a second matcher to keep in step with the first.
+# Nothing new reaches the binary: `broker-core` is already in it, and the
+# direct-dependency budget counts external crates, of which this adds
+# none.
+broker-core = { path = "../broker-core", version = "0.1.0" }
 # Section 8.1's identity is a UUID v7. The same features `broker-core`
 # names, and the same crate: a second version 7 generator in one binary
 # would be two answers to what a fresh identifier looks like.

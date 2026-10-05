@@ -695,3 +695,257 @@ fn a_local_write_after_a_peers_copy_beats_it() {
     );
     assert_eq!(held.register(&key).expect("held").stamp(), mine.stamp());
 }
+
+// ---- the routing map, which is an index over the registers -------------
+//
+// Section 8.3's map is fed by [`index`] from the four paths that change a
+// register, and all four are in this file. These assert it through the
+// registers rather than through `Routes`' own methods — `routes.rs` tests
+// the map and this tests the wiring, which is the half that can be missed
+// by a path nobody thought of.
+
+/// A peer's register for `filter`, stamped later than anything local.
+fn theirs(peer: NodeId, filter: &str, millis: u64) -> MetadataWrite {
+    MetadataWrite::new(
+        MetadataKey::NodeSubscription {
+            node: peer,
+            filter: filter.to_owned(),
+        },
+        Register::written(
+            MetadataValue::NodeSubscription,
+            Stamp::new(Reading::new(millis, 0), peer),
+        ),
+    )
+}
+
+/// And its tombstone, later still.
+fn theirs_gone(peer: NodeId, filter: &str, millis: u64) -> MetadataWrite {
+    MetadataWrite::new(
+        MetadataKey::NodeSubscription {
+            node: peer,
+            filter: filter.to_owned(),
+        },
+        Register::deleted(Stamp::new(Reading::new(millis, 0), peer)),
+    )
+}
+
+/// A register arriving puts its node on the route for a matching topic.
+#[test]
+fn a_peers_register_adds_it_to_the_routing_map() {
+    let me = node(1);
+    let peer = node(2);
+    let held = fresh(me);
+    assert!(held.nodes_for("sensor/1/temp").is_empty());
+
+    assert!(held.observed(theirs(peer, "sensor/+/temp", 100)));
+    assert_eq!(
+        held.nodes_for("sensor/1/temp"),
+        vec![peer],
+        "the register is held and the map does not know about it"
+    );
+    assert!(
+        held.nodes_for("sensor/1/humidity").is_empty(),
+        "a filter that does not match is not a route"
+    );
+}
+
+/// A tombstone takes it off again.
+#[test]
+fn a_peers_tombstone_removes_it_from_the_routing_map() {
+    let me = node(1);
+    let peer = node(2);
+    let held = fresh(me);
+    held.observed(theirs(peer, "a/b", 100));
+    assert_eq!(held.nodes_for("a/b"), vec![peer]);
+
+    assert!(held.observed(theirs_gone(peer, "a/b", 200)));
+    assert!(
+        held.nodes_for("a/b").is_empty(),
+        "a tombstone is not a subscriber, in the map as in the registers"
+    );
+    assert_eq!(held.routes().filters_held(), 0, "and the row went with it");
+}
+
+/// A copy that lost does not move the map.
+///
+/// The register table already decided which write won, and an index fed
+/// the loser would answer by the earlier of the two while the registers
+/// answered by the later — which is the shape of every index that drifts.
+#[test]
+fn a_register_that_lost_does_not_move_the_routing_map() {
+    let me = node(1);
+    let peer = node(2);
+    let held = fresh(me);
+    held.observed(theirs_gone(peer, "a/b", 200));
+    assert!(held.nodes_for("a/b").is_empty());
+
+    assert!(
+        !held.observed(theirs(peer, "a/b", 100)),
+        "an earlier copy must lose"
+    );
+    assert!(
+        held.nodes_for("a/b").is_empty(),
+        "the map took a write the registers refused"
+    );
+}
+
+/// This node's own subscription is in the map like anybody else's.
+///
+/// Leaving this node out here would be a map whose answer depended on
+/// who was asking; `cluster::forward` is where the subtraction belongs.
+#[test]
+fn this_nodes_own_subscription_is_in_the_routing_map() {
+    let me = node(1);
+    let held = fresh(me);
+    held.subscriber_arrived("a/+")
+        .expect("the first subscriber");
+    assert_eq!(held.nodes_for("a/b"), vec![me]);
+
+    held.subscriber_arrived("a/+");
+    assert_eq!(
+        held.nodes_for("a/b"),
+        vec![me],
+        "a second local subscriber writes no register and changes nothing"
+    );
+    held.subscriber_departed("a/+");
+    assert_eq!(
+        held.nodes_for("a/b"),
+        vec![me],
+        "and one departure of two leaves the node on the route"
+    );
+    held.subscriber_departed("a/+")
+        .expect("the last subscriber tombstones");
+    assert!(held.nodes_for("a/b").is_empty());
+}
+
+/// Two nodes wanting one filter are both forwarded to.
+#[test]
+fn two_nodes_wanting_one_filter_are_both_on_the_route() {
+    let me = node(1);
+    let peer = node(2);
+    let held = fresh(me);
+    held.subscriber_arrived("a/b");
+    held.observed(theirs(peer, "a/b", 100));
+    assert_eq!(held.nodes_for("a/b"), vec![me, peer]);
+}
+
+/// A restart comes back with the map, not only with the registers.
+///
+/// The path that is easiest to leave out, and the one whose absence no
+/// test about a running cluster can see: a node that came back holding
+/// every register and an empty routing map would forward nothing to
+/// anybody until every peer happened to write again, which for a quiet
+/// cluster is never.
+#[test]
+fn a_restart_rebuilds_the_routing_map_from_the_registers() {
+    let me = node(1);
+    let peer = node(2);
+    let store = MemoryStorage::new();
+    let before = fresh(me);
+    let mine = before
+        .subscriber_arrived("sensor/+/temp")
+        .expect("the first subscriber");
+    store
+        .apply(&before.records(&mine))
+        .expect("the store takes it");
+    let yours = theirs(peer, "site/#", 100);
+    assert!(before.observed(yours.clone()));
+    store
+        .apply(&[Record::MetadataPut {
+            entry: yours.to_record(),
+        }])
+        .expect("and the peer's");
+
+    let restored = store.restore().expect("the store reads back");
+    let after = Replicated::open(me, HybridClock::resume(restored.clock, BOUND), &restored)
+        .expect("what this build wrote, it reads");
+    assert_eq!(
+        after.nodes_for("sensor/9/temp"),
+        vec![me],
+        "this node's own filter did not come back in the map"
+    );
+    assert_eq!(
+        after.nodes_for("site/one/two"),
+        vec![peer],
+        "the peer's filter did not come back in the map"
+    );
+}
+
+/// Collecting a tombstone leaves the map holding nothing for it.
+///
+/// A collected tombstone and a tombstone mean the same thing to routing
+/// — this node does not believe that node has a subscriber — so the
+/// answer does not change. What this guards is the row: an index that
+/// kept one would grow with every filter the cluster ever held.
+#[test]
+fn collecting_a_tombstone_leaves_no_row_behind() {
+    let me = node(1);
+    let peer = node(2);
+    let held = fresh(me);
+    held.observed(theirs(peer, "a/b", 100));
+    held.observed(theirs_gone(peer, "a/b", 200));
+    let key = MetadataKey::NodeSubscription {
+        node: peer,
+        filter: "a/b".to_owned(),
+    };
+    assert!(!held.collect(&key).is_empty(), "the tombstone is collected");
+    assert!(held.nodes_for("a/b").is_empty());
+    assert_eq!(held.routes().filters_held(), 0);
+    assert_eq!(held.routes().filters_matched(), 0);
+}
+
+/// A node this one has judged dead stops being forwarded to.
+///
+/// Membership is not replicated, so nothing was written down. The
+/// register is still held — this node's judgement is local and may be
+/// the wrong one — and the route is withheld.
+#[test]
+fn a_node_judged_dead_is_not_on_the_route_although_its_register_is_held() {
+    let me = node(1);
+    let peer = node(2);
+    let held = fresh(me);
+    held.observed(theirs(peer, "a/b", 100));
+
+    held.routes().died(peer);
+    assert!(held.nodes_for("a/b").is_empty());
+    assert_eq!(
+        held.nodes_subscribed("a/b"),
+        vec![peer],
+        "the register is the truth and is kept"
+    );
+
+    held.routes().revived(peer);
+    assert_eq!(
+        held.nodes_for("a/b"),
+        vec![peer],
+        "nothing was replayed, because nothing was thrown away"
+    );
+}
+
+/// And a register taken from a peer's log moves the map too.
+///
+/// [`Replicated::observed_from`] is the exchange's door and
+/// [`Replicated::observed`] is the broadcast's. They are two call sites
+/// of one merge, so an index wired into one of them is an index that is
+/// right until a broadcast is dropped — which is the case the exchange
+/// exists for, and the one nobody tests by hand.
+#[test]
+fn a_register_taken_from_a_peers_log_moves_the_routing_map() {
+    let me = node(1);
+    let peer = node(2);
+    let held = fresh(me);
+    let taken = held.observed_from(
+        peer,
+        vec![
+            Logged::new(1, theirs(peer, "a/+", 100)),
+            Logged::new(2, theirs_gone(peer, "a/+", 300)),
+            Logged::new(3, theirs(peer, "c/#", 200)),
+        ],
+    );
+    assert_eq!(taken.through, 3);
+    assert!(
+        held.nodes_for("a/b").is_empty(),
+        "the later tombstone wins, in the map as in the registers"
+    );
+    assert_eq!(held.nodes_for("c/d/e"), vec![peer]);
+}

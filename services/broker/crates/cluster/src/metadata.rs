@@ -104,6 +104,7 @@ use crate::clock::HybridClock;
 use crate::identity::NodeId;
 use crate::oplog::{Logged, OpLog};
 use crate::register::{Register, Stamp};
+use crate::routes::Routes;
 
 /// What a replicated register is about.
 ///
@@ -420,6 +421,34 @@ fn merge(state: &mut State, write: &MetadataWrite) -> bool {
     }
 }
 
+/// Tell `routes` what a register now says, whatever it is about.
+///
+/// **One function, called from every path that changes a register**:
+/// a restore, this node's own write, a peer's write that won, and a
+/// tombstone collected. Section 8.3's map is an index over the
+/// registers, and an index fed from three of the four places they
+/// change is an index that is wrong in the fourth — which is convention
+/// 5's "a path no test walks" waiting to happen, because the fourth is
+/// always the one nobody thought of.
+///
+/// A kind the map is not about is nothing to tell it, which is most of
+/// them: a retained message, a rule and a session owner are registers
+/// routing does not read.
+fn index(routes: &Routes, key: &MetadataKey, register: Option<&Register<MetadataValue>>) {
+    let MetadataKey::NodeSubscription { node, filter } = key else {
+        return;
+    };
+    // An absent register and a tombstone are the same fact: this node
+    // does not believe that node has a subscriber for that filter. A
+    // collected tombstone is the first of the two and arrives here the
+    // same way, which is why the argument is an `Option` rather than a
+    // `Register`.
+    match register {
+        Some(register) if !register.is_tombstone() => routes.added(*node, filter),
+        _ => routes.removed(*node, filter),
+    }
+}
+
 /// This node's replicated state, and the one thing that is not.
 ///
 /// # Behind a lock, for the reason [`HybridClock`] is
@@ -437,6 +466,20 @@ pub struct Replicated {
     clock: HybridClock,
     /// Everything behind one lock.
     state: Mutex<State>,
+    /// Section 8.3's routing map, kept in step with the registers.
+    ///
+    /// **Beside the state rather than in it**, with a lock of its own.
+    /// The registers are written on the subscribe path and read by an
+    /// exchange; this is read on every publish, and one lock over both
+    /// would put every publish behind every register write. See
+    /// [`Routes`] for what that costs.
+    ///
+    /// It is held here rather than by the shell for the reason [`index`]
+    /// gives: there are four paths that change a register and they are
+    /// all in this file, so an index maintained here cannot be missed by
+    /// one of them. A map the shell maintained would be fed by whichever
+    /// of the four the shell happens to see.
+    routes: Routes,
 }
 
 /// What [`Replicated`] holds.
@@ -497,9 +540,15 @@ impl Replicated {
         clock: HybridClock,
         restored: &Restored,
     ) -> Result<Self, MetadataError> {
+        let routes = Routes::new();
         let mut registers = BTreeMap::new();
         for record in &restored.metadata {
             let write = MetadataWrite::from_record(record.clone())?;
+            // The first of [`index`]'s four paths. A node that came back
+            // with the registers and an empty routing map would forward
+            // nothing to anybody until every peer happened to write
+            // again, which for a quiet cluster is never.
+            index(&routes, &write.key, Some(&write.register));
             registers.insert(write.key, write.register);
         }
         let mut logged = Vec::with_capacity(restored.oplog.len());
@@ -520,6 +569,7 @@ impl Replicated {
                 oplog: OpLog::resume(logged, restored.oplog_collected_through),
                 seen,
             }),
+            routes,
         })
     }
 
@@ -686,6 +736,11 @@ impl Replicated {
             let sequence = entry.sequence();
             let write = entry.into_write();
             if merge(&mut state, &write) {
+                // The third of [`index`]'s four paths, and only for a
+                // write that won: a copy that lost told this node
+                // nothing, and feeding it to the map would undo the
+                // later write the map already holds.
+                index(&self.routes, write.key(), Some(write.register()));
                 taken.records.push(Record::MetadataPut {
                     entry: write.to_record(),
                 });
@@ -735,7 +790,35 @@ impl Replicated {
             .collect()
     }
 
+    /// Section 8.3's routing map, as the publish path reads it.
+    ///
+    /// Every node with a matching subscriber for a topic, which is what
+    /// a forward goes to — and what a dead node is taken out of, by
+    /// [`Routes::died`], because membership is not replicated and no
+    /// register covers it.
+    #[must_use]
+    pub const fn routes(&self) -> &Routes {
+        &self.routes
+    }
+
+    /// Every node with a subscriber matching `topic`, in identity order.
+    ///
+    /// [`Routes::nodes_for`], which is the one that is an index rather
+    /// than a walk. [`Self::nodes_subscribed`] below answers about one
+    /// filter exactly and walks every register to do it; this answers
+    /// about a topic and is what a publish asks.
+    #[must_use]
+    pub fn nodes_for(&self, topic: &str) -> Vec<NodeId> {
+        self.routes.nodes_for(topic)
+    }
+
     /// Which nodes have a subscriber for `filter`, in identity order.
+    ///
+    /// **Exactly `filter`, as a string**, which is not what routing
+    /// asks: a publication on `sensor/1/temp` has to reach a node
+    /// subscribed to `sensor/+/temp`, and that is [`Self::nodes_for`].
+    /// This walks every register, so it is for a test and for an
+    /// operator asking what a register says.
     ///
     /// A tombstone is not a subscriber, which is the whole point of
     /// keeping one.
@@ -910,6 +993,13 @@ impl Replicated {
             _ => return Vec::new(),
         }
         state.registers.remove(key);
+        // The fourth of [`index`]'s four paths. Only a tombstone reaches
+        // here, so the map is already answering without this node for
+        // this filter and nothing changes — which is exactly why it has
+        // to be said anyway: an index left holding a row for a register
+        // that no longer exists is a leak, and the row is the only thing
+        // that would notice.
+        index(&self.routes, key, None);
         vec![Record::MetadataRemoved {
             key: key.to_record(),
         }]
@@ -923,7 +1013,11 @@ impl Replicated {
     /// not to pass it on.
     pub fn observed(&self, write: MetadataWrite) -> bool {
         let mut state = self.held();
-        merge(&mut state, &write)
+        let won = merge(&mut state, &write);
+        if won {
+            index(&self.routes, write.key(), Some(write.register()));
+        }
+        won
     }
 
     /// Stamp a value, hold it, and hand back the write.
@@ -944,6 +1038,12 @@ impl Replicated {
             None => Register::deleted(stamp),
         };
         state.registers.insert(key.clone(), register.clone());
+        // The second of [`index`]'s four paths: this node's own write.
+        // Its own registers are in the map like any other node's, and
+        // [`crate::forward`] is what leaves this node out of a forward —
+        // see [`Routes::nodes_for`] for why the subtraction is there and
+        // not here.
+        index(&self.routes, &key, Some(&register));
         let write = MetadataWrite::new(key, register);
         // Numbered here and published later, which is the two-phase write
         // the module documentation is about: the number is spent now so

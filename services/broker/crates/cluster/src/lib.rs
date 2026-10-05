@@ -114,6 +114,7 @@ pub mod metadata;
 pub mod oplog;
 pub mod register;
 pub mod replicate;
+pub mod routes;
 pub mod testing;
 pub mod transport;
 
@@ -132,4 +133,5 @@ pub use replicate::{
     choose, jitter, Handled, Replication, ReplicationError, ReplicationSettings, Replicator, Swept,
     DEFAULT_BATCH, DEFAULT_EXCHANGE, DEFAULT_TOMBSTONE_GRACE,
 };
+pub use routes::Routes;
 pub use transport::{BoxStream, TcpTransport, Transport};
