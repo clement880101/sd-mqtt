@@ -17,11 +17,30 @@ use crate::subscriptions::trie::SubscriptionTrie;
 /// member, so matching a topic yields the matching groups directly instead
 /// of requiring a scan over every group that exists.
 ///
-/// Selection is round-robin within a group. The specification's fuller
-/// policy, preferring a local online member and then the least loaded
-/// remote node, needs session and cluster state that does not exist yet;
-/// [`SharedSubscriptions::next_member`] is the seam where that policy
-/// will go.
+/// # Selection is in two layers, and only one of them is here
+///
+/// Section 6: selection "prefers a local online member, then the least
+/// loaded remote node, round-robin within a node". The last clause is
+/// this type's and is what [`SharedSubscriptions::next_member`] does.
+///
+/// **The first clause is not here, and cannot be.** Choosing between
+/// nodes has to happen *before* a publication is forwarded rather than
+/// after: a group spanning three nodes has a matching subscriber on
+/// each, so a copy sent to each interested node is delivered three
+/// times. `cluster::groups` is what holds that choice, over a map from
+/// group to member nodes that section 8.2 replicates for it, and it
+/// prefers this node when this node has a member — which is section 6's
+/// local preference, expressed where it can be true.
+///
+/// What remains deferred is the **least loaded** remote node, which
+/// needs a queue depth from another node. Queue replication in milestone
+/// 6 is what makes a depth worth reading; until then the choice among
+/// remote member nodes is a rotation. `cluster::groups` says so where it
+/// makes it.
+///
+/// So this seam's note about preferring a local online member is
+/// discharged: nothing above this type asks it to choose between nodes,
+/// and nothing here can see one.
 ///
 /// Nothing here can see a session, deliberately. The one clause of the
 /// policy that is implemented, skipping a member whose queue is full,
@@ -214,6 +233,25 @@ impl SharedSubscriptions {
         out.extend(matched.into_iter().map(|s| GroupId(s.subscriber.0)));
     }
 
+    /// What `group` is called and what filter it is on.
+    ///
+    /// `None` for a group that has gone, which a caller holding a
+    /// [`GroupId`] from [`SharedSubscriptions::matching`] can still see
+    /// if it was emptied in between.
+    ///
+    /// Exposed because a publication a peer forwarded carries **which
+    /// groups this node was chosen to serve**, by name and filter, and
+    /// routing it has to admit those and no others. A [`GroupId`] is a
+    /// number this node made up and means nothing to a peer, so the
+    /// comparison has to be on the pair the whole cluster agrees about.
+    pub fn key_of(&self, group: GroupId) -> Option<(String, String)> {
+        self.groups
+            .read()
+            .by_id
+            .get(&group.0)
+            .map(|entry| (entry.key.0.to_string(), entry.key.1.to_string()))
+    }
+
     /// How many members `group` has, or zero if it no longer exists.
     ///
     /// The bound on how many times a caller may ask for a member before
@@ -228,9 +266,10 @@ impl SharedSubscriptions {
 
     /// Take the next member of `group` in the rotation.
     ///
-    /// This is the seam for delivery policy. Today it is round-robin
-    /// within the group; it will later prefer a local online member and
-    /// then the least loaded remote node.
+    /// Round-robin **within this node**, which is the whole of section
+    /// 6's last clause and the whole of what this type can answer: see
+    /// the note on it for where choosing between nodes happens and why
+    /// it cannot happen here.
     ///
     /// **Every call is a turn.** The cursor advances whether or not the
     /// caller goes on to use the member it was given, so a member the

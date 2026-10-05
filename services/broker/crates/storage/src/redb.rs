@@ -1269,6 +1269,16 @@ fn metadata_key(key: &MetadataKeyRecord) -> Vec<u8> {
             out.push(3);
             out.extend_from_slice(&session_prefix(session));
         }
+        MetadataKeyRecord::NodeGroup {
+            node,
+            group,
+            filter,
+        } => {
+            out.push(4);
+            out.extend_from_slice(node);
+            push_component(&mut out, group);
+            push_component(&mut out, filter);
+        }
     }
     out
 }

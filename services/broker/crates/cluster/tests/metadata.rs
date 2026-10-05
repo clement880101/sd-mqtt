@@ -80,6 +80,16 @@ impl Node {
             let write = match &event {
                 FilterEvent::Arrived(filter) => self.replicated.subscriber_arrived(filter),
                 FilterEvent::Departed(filter) => self.replicated.subscriber_departed(filter),
+                // Section 8.3: a shared group is its own register and
+                // its own map, because a group spanning three nodes
+                // reported as three ordinary subscribers to one filter
+                // is delivered to three times.
+                FilterEvent::GroupJoined { group, filter } => {
+                    self.replicated.group_joined(group, filter)
+                }
+                FilterEvent::GroupLeft { group, filter } => {
+                    self.replicated.group_left(group, filter)
+                }
             };
             if let Some(write) = write {
                 // The register and the clock mark beside it, which is

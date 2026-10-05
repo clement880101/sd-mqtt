@@ -167,11 +167,12 @@ impl Deliver for Replication {
         // thing that can tell the routing map, and nothing is written
         // down. The register stays: this node's judgement is local and
         // may be the wrong half of a one-way partition, and the filters
-        // are the truth either way — see `cluster::routes`.
-        let routes = self.replicator.replicated().routes();
+        // are the truth either way — see `cluster::routes`. One
+        // judgement, honoured by both of section 8.3's maps.
+        let replicated = self.replicator.replicated();
         match state {
-            MemberState::Dead => routes.died(peer),
-            MemberState::Alive => routes.revived(peer),
+            MemberState::Dead => replicated.died(peer),
+            MemberState::Alive => replicated.revived(peer),
             // **Suspect is not dead, and is deliberately nothing here.**
             // Section 8.1 gives failure detection two windows precisely
             // so that a peer that missed a beat is not treated as gone;
@@ -198,10 +199,16 @@ impl Replication {
     /// before it answered its client.
     fn forwarded(&self, forwarded: cluster::Forwarded) {
         let topic = forwarded.body.topic.clone();
+        // **The groups the sending node chose this one for**, which is
+        // the whole of section 8.3's answer to the shared-subscription
+        // trap: the choice is made before the forward, so a group this
+        // node has a member of and was not named for was served
+        // elsewhere.
+        let groups = forwarded.groups.clone();
         let actions = self.shared.with_broker(|broker| {
             let now = broker.clock().now();
             let mut out = Vec::new();
-            let reached = broker.accept_forwarded(forwarded.into_message(), now, &mut out);
+            let reached = broker.accept_forwarded(forwarded.into_message(), &groups, now, &mut out);
             if reached == 0 {
                 // Not an error and not a defect: the routing map a peer
                 // forwarded by is its copy of this node's registers, and

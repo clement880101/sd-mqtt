@@ -41,12 +41,13 @@
 //!
 //! Section 6 prefers "a local online member, then the least loaded
 //! remote node" for a shared subscription. The local preference is
-//! implemented — see [`crate::groups`] — and **the remote ordering waits
-//! for milestone 6**, because a queue depth from another node is not a
-//! number this cluster carries yet. Queue replication is what makes a
-//! depth worth reading; until then the choice among remote member nodes
-//! is a rotation, which is the honest answer rather than a load
-//! comparison against a figure that does not exist.
+//! implemented — [`crate::groups`] is where, and [`targets`] is where it
+//! turns into a forward that is not sent — and **the remote ordering
+//! waits for milestone 6**, because a queue depth from another node is
+//! not a number this cluster carries yet. Queue replication is what
+//! makes a depth worth reading; until then the choice among remote
+//! member nodes is a rotation, which is the honest answer rather than a
+//! load comparison against a figure that does not exist.
 
 use std::sync::Arc;
 
@@ -55,6 +56,7 @@ use broker_core::session::message::Message;
 use serde::{Deserialize, Serialize};
 use storage::record::BodyRecord;
 
+use crate::groups::Groups;
 use crate::identity::NodeId;
 use crate::mesh::{self, Mesh};
 use crate::metadata::Replicated;
@@ -72,15 +74,32 @@ pub struct Forwarded {
     pub id: [u8; 16],
     /// Everything else about it.
     pub body: BodyRecord,
+    /// The shared groups the sending node chose this one to serve, by
+    /// share name and inner filter.
+    ///
+    /// **Usually empty, and that is not the same as "all".** A
+    /// publication forwarded because the receiving node has an ordinary
+    /// subscriber carries no group, and the receiving node must then
+    /// deliver to its ordinary subscribers and to **no** group of its
+    /// own: a group it has a member of was either served by the sending
+    /// node — section 6's local preference — or named here, and
+    /// delivering to it on both grounds is the triple delivery section
+    /// 8.3's separate map exists to prevent.
+    ///
+    /// Named by the pair rather than by an identifier, because a group
+    /// identifier is a number one node made up: the pair is what the
+    /// whole cluster agrees about.
+    pub groups: Vec<(String, String)>,
 }
 
 impl Forwarded {
-    /// The frame for `message`.
+    /// The frame for `message`, serving `groups` on the far node.
     #[must_use]
-    pub fn of(message: &Message) -> Self {
+    pub fn of(message: &Message, groups: Vec<(String, String)>) -> Self {
         Self {
             id: *message.id.as_bytes(),
             body: broker_core::journal::body_record(message),
+            groups,
         }
     }
 
@@ -96,22 +115,72 @@ impl Forwarded {
     }
 }
 
-/// Which nodes a publication on `topic` goes to.
+/// One node a publication is forwarded to, and what for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    /// Which node.
+    pub node: NodeId,
+    /// The shared groups it was chosen to serve, possibly none.
+    pub groups: Vec<(String, String)>,
+}
+
+/// Where one publication on `topic` goes, and what each node serves.
 ///
-/// Everything [`Routes`] answers, less this node. The subtraction is
-/// here rather than in the map because a map that quietly left one node
-/// out would be a map whose answer depended on who was asking — and
-/// because this node has already delivered to its own subscribers by
-/// the time anything asks: forwarding to itself would be a second copy
-/// to every one of them.
+/// Two maps and one answer, which is section 8.3's whole shape:
 ///
-/// A node this one has judged dead is already absent; [`Routes`] says
-/// why that is a withholding rather than a forgetting.
+/// - [`Routes`] says which nodes have an **ordinary** subscriber
+///   matching the topic. Each gets a copy.
+/// - [`Groups`] says, for each shared group matching the topic, the one
+///   node chosen to serve it. That node gets a copy carrying the
+///   group's name, and the other member nodes get nothing for it.
+///
+/// A node that is on the route *and* was chosen for a group gets **one**
+/// copy carrying the group, not two: it delivers to its ordinary
+/// subscribers and to one member of the group it was named for, which is
+/// exactly one delivery each.
+///
+/// # This node is never a target
+///
+/// It has already delivered to its own subscribers by the time anything
+/// asks, so a copy to itself is a second copy to every one of them. And
+/// a group it has a member of was chosen for *it* — section 6's local
+/// preference — so there is nothing to forward for that either. The
+/// subtraction is here rather than in the maps because a map that
+/// quietly left one node out would be a map whose answer depended on
+/// who was asking.
+///
+/// A node this one has judged dead is absent from both maps' answers;
+/// [`crate::routes`] says why that is a withholding rather than a
+/// forgetting.
 #[must_use]
-pub fn targets(me: NodeId, routes: &Routes, topic: &str) -> Vec<NodeId> {
-    let mut nodes = routes.nodes_for(topic);
-    nodes.retain(|node| *node != me);
-    nodes
+pub fn targets(me: NodeId, routes: &Routes, groups: &Groups, topic: &str) -> Vec<Target> {
+    let mut targets: Vec<Target> = routes
+        .nodes_for(topic)
+        .into_iter()
+        .filter(|node| *node != me)
+        .map(|node| Target {
+            node,
+            groups: Vec::new(),
+        })
+        .collect();
+    for chosen in groups.chosen_for(topic, me) {
+        if chosen.node == me {
+            // Served here. Section 6's local preference, and the reason
+            // the map is asked with `me` at all.
+            continue;
+        }
+        let pair = (chosen.group, chosen.filter);
+        match targets.iter_mut().find(|target| target.node == chosen.node) {
+            // Already going there for an ordinary subscriber: one copy,
+            // carrying the group as well.
+            Some(target) => target.groups.push(pair),
+            None => targets.push(Target {
+                node: chosen.node,
+                groups: vec![pair],
+            }),
+        }
+    }
+    targets
 }
 
 /// What forwards a publication over a mesh.
@@ -154,7 +223,12 @@ impl Forwarding {
 
 impl Forwarder for Forwarding {
     fn forward(&self, message: &Message) -> usize {
-        let targets = targets(self.me, self.replicated.routes(), &message.topic);
+        let targets = targets(
+            self.me,
+            self.replicated.routes(),
+            self.replicated.groups(),
+            &message.topic,
+        );
         if targets.is_empty() {
             // **The economy, and the thing a delivery test cannot see.**
             // A publication nobody else wants is framed once for nobody
@@ -162,9 +236,14 @@ impl Forwarder for Forwarding {
             // the far end.
             return 0;
         }
-        let frame = mesh::Message::Forward(Forwarded::of(message));
         let mut sent = 0;
-        for peer in targets {
+        for target in targets {
+            let peer = target.node;
+            // Framed per target rather than once, because the groups a
+            // node was chosen for are part of what it is told. A
+            // publication with no group anywhere — which is the ordinary
+            // case — pays an empty vector per peer for it.
+            let frame = mesh::Message::Forward(Forwarded::of(message, target.groups));
             match self.mesh.send(peer, &frame) {
                 Some(Ok(crate::link::Sent::Queued)) => sent += 1,
                 // Section 8.1 drops and counts rather than letting a
@@ -203,6 +282,19 @@ mod tests {
         NodeId::from_bytes([index; 16])
     }
 
+    /// The nodes a publication on `topic` goes to, in identity order.
+    ///
+    /// The groups each one serves are asserted by the tests about
+    /// groups; these are about which nodes there are.
+    fn plan(me: NodeId, held: &Replicated, topic: &str) -> Vec<NodeId> {
+        let mut nodes: Vec<NodeId> = targets(me, held.routes(), held.groups(), topic)
+            .into_iter()
+            .map(|target| target.node)
+            .collect();
+        nodes.sort();
+        nodes
+    }
+
     fn replicated(me: NodeId) -> Replicated {
         Replicated::open(
             me,
@@ -226,7 +318,7 @@ mod tests {
             vec![me],
             "the map holds this node like any other"
         );
-        assert!(targets(me, held.routes(), "a/b").is_empty());
+        assert!(plan(me, &held, "a/b").is_empty());
     }
 
     #[test]
@@ -256,10 +348,10 @@ mod tests {
             ),
         ));
 
-        assert_eq!(targets(me, held.routes(), "a/b"), vec![wants]);
-        assert_eq!(targets(me, held.routes(), "z/y"), vec![does_not]);
+        assert_eq!(plan(me, &held, "a/b"), vec![wants]);
+        assert_eq!(plan(me, &held, "z/y"), vec![does_not]);
         assert!(
-            targets(me, held.routes(), "nobody/wants/this").is_empty(),
+            plan(me, &held, "nobody/wants/this").is_empty(),
             "a topic nobody wants is forwarded nowhere at all"
         );
     }
@@ -276,7 +368,7 @@ mod tests {
             true,
         );
         message.expires_at = Some(42);
-        let back = Forwarded::of(&message).into_message();
+        let back = Forwarded::of(&message, Vec::new()).into_message();
 
         assert_eq!(back.id, message.id, "the identifier changed across a hop");
         assert_eq!(&*back.topic, "site/1/temp");

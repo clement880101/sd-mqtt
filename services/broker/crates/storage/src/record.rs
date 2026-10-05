@@ -958,6 +958,31 @@ pub enum MetadataKeyRecord {
         /// Whose session.
         session: SessionKey,
     },
+    /// That a node has at least one member of a shared group.
+    ///
+    /// **Separate from [`Self::NodeSubscription`], and section 8.3 says
+    /// why.** A group spanning three nodes has a matching subscriber on
+    /// each, so a routing map built from node subscriptions says all
+    /// three want the topic and one copy to each delivers three times
+    /// where the semantics demand one. A group needs its own map and a
+    /// selection *before* forwarding, and a map needs a register of its
+    /// own to be built from: the group's name is what a node subscription
+    /// deliberately does not carry.
+    ///
+    /// **Last of the variants, which is what keeps the format.** The
+    /// variant order is the format, as the type documentation says, and
+    /// a new kind goes at the end or [`FORMAT_VERSION`] moves. This is
+    /// the end.
+    NodeGroup {
+        /// Whose member. Its sixteen UUID bytes.
+        node: [u8; 16],
+        /// The share name, which is what makes two groups on one filter
+        /// two groups.
+        group: String,
+        /// The inner filter, with the `$share/<name>/` prefix stripped,
+        /// because that is what a published topic is matched against.
+        filter: String,
+    },
 }
 
 /// What a replicated register holds, section 8.2.
@@ -989,6 +1014,14 @@ pub enum MetadataValueRecord {
         /// Its sixteen UUID bytes.
         node: [u8; 16],
     },
+    /// Presence, and nothing else.
+    ///
+    /// A unit variant for [`MetadataKeyRecord::NodeGroup`]'s reason:
+    /// the key carries the node, the group and the filter, which is the
+    /// whole fact. How many of that node's clients are in the group is
+    /// the part section 8.2 keeps on the node, as it does for a node
+    /// subscription.
+    NodeGroup,
 }
 
 /// One replicated register, as a store holds it.
@@ -1525,9 +1558,11 @@ impl Record {
 fn weigh_metadata(entry: &MetadataRecord) -> usize {
     let value = match &entry.value {
         None
-        | Some(MetadataValueRecord::NodeSubscription | MetadataValueRecord::SessionOwner { .. }) => {
-            0
-        }
+        | Some(
+            MetadataValueRecord::NodeSubscription
+            | MetadataValueRecord::SessionOwner { .. }
+            | MetadataValueRecord::NodeGroup,
+        ) => 0,
         Some(MetadataValueRecord::Retained(message)) => {
             message.payload.len() + message.properties.len()
         }
@@ -1551,6 +1586,7 @@ fn weigh_metadata_key(key: &MetadataKeyRecord) -> usize {
         MetadataKeyRecord::Retained { topic } => topic.len(),
         MetadataKeyRecord::Rule { id } => id.len(),
         MetadataKeyRecord::SessionOwner { session } => weigh_key(session),
+        MetadataKeyRecord::NodeGroup { group, filter, .. } => group.len() + filter.len(),
     }
 }
 

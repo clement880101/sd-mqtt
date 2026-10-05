@@ -413,9 +413,20 @@ impl Shared {
             return;
         };
         for event in events {
+            // **Four events and two counts.** A shared group is its own
+            // register, because a group spanning three nodes reported as
+            // three ordinary subscribers to one filter puts all three on
+            // the ordinary route and is delivered to three times; see
+            // `cluster::groups`. A match with no wildcard, so that an
+            // event added to the vocabulary does not compile until it
+            // has been given a register.
             let write = match &event {
                 FilterEvent::Arrived(filter) => replicated.subscriber_arrived(filter),
                 FilterEvent::Departed(filter) => replicated.subscriber_departed(filter),
+                FilterEvent::GroupJoined { group, filter } => {
+                    replicated.group_joined(group, filter)
+                }
+                FilterEvent::GroupLeft { group, filter } => replicated.group_left(group, filter),
             };
             if let Some(write) = write {
                 records.extend(replicated.records(&write));

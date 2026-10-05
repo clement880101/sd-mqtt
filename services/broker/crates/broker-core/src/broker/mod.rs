@@ -414,22 +414,53 @@ impl Broker {
         out.append(&mut self.filter_events);
     }
 
-    /// How many of this node's sessions are subscribed to `filter`.
+    /// How many of this node's sessions hold an **ordinary**
+    /// subscription to `filter`.
     ///
-    /// Walks the trie, so it is for a test and for an operator and not
-    /// for a routing path. The count the replication layer keeps is its
-    /// own, fed by [`Self::take_filter_events`]; this is what says the
-    /// two agree.
+    /// Walks the sessions, so it is for a test and for an operator and
+    /// not for a routing path. The count the replication layer keeps is
+    /// its own, fed by [`Self::take_filter_events`]; this is what says
+    /// the two agree.
+    ///
+    /// **A shared subscription is not one of these.** It is counted by
+    /// [`Self::local_members`] instead, because section 8.3 replicates
+    /// the two as separate registers into separate maps: a group with a
+    /// member on each of three nodes counted as three ordinary
+    /// subscribers to one filter is delivered to three times. A figure
+    /// that mixed them would be the cross-check agreeing with a count it
+    /// is not about.
     #[must_use]
     pub fn local_subscribers(&self, filter: &str) -> usize {
-        let mut matched = 0;
-        for (_, session) in self.registry.iter() {
-            matched += session
-                .filters()
-                .filter(|held| crate::subscriptions::inner_filter(held) == filter)
-                .count();
-        }
-        matched
+        self.held_filters()
+            .filter(|held| {
+                matches!(mqtt_codec::topic::parse_shared(held), Ok(None)) && *held == filter
+            })
+            .count()
+    }
+
+    /// How many of this node's sessions are members of `group` on
+    /// `filter`.
+    ///
+    /// The group's name and the **inner** filter, which is the pair the
+    /// whole cluster agrees about. Beside [`Self::local_subscribers`]
+    /// and for the same purpose.
+    #[must_use]
+    pub fn local_members(&self, group: &str, filter: &str) -> usize {
+        self.held_filters()
+            .filter(|held| {
+                matches!(
+                    mqtt_codec::topic::parse_shared(held),
+                    Ok(Some((name, inner))) if name == group && inner == filter
+                )
+            })
+            .count()
+    }
+
+    /// Every filter every session on this node holds, as written.
+    fn held_filters(&self) -> impl Iterator<Item = &str> {
+        self.registry
+            .iter()
+            .flat_map(|(_, session)| session.filters())
     }
 
     /// Throw away everything said so far, everywhere it is held.
@@ -1474,6 +1505,7 @@ impl Broker {
     pub fn accept_forwarded(
         &mut self,
         mut message: Message,
+        groups: &[(String, String)],
         now: u32,
         out: &mut Vec<Addressed>,
     ) -> usize {
@@ -1485,7 +1517,13 @@ impl Broker {
         // No publisher, so no-local cannot apply: this is nobody on this
         // node's own message. The node it came from withheld it from its
         // own publisher already, which is where that subscription is.
-        self.publish(message, None, now, out)
+        //
+        // **And only the groups the sending node chose this one for.**
+        // Section 8.3: the choice between nodes is made before the
+        // forward, so a group this node has a member of and was not
+        // chosen for was served elsewhere. Delivering to it as well is
+        // the triple delivery the separate group map exists to prevent.
+        self.route_publication(message, None, route::Groups::Named(groups), now, out)
     }
 
     /// Route a message to every subscriber that wants it, updating the
@@ -1502,6 +1540,25 @@ impl Broker {
         &mut self,
         message: Message,
         publisher: Option<SubscriberId>,
+        now: u32,
+        out: &mut Vec<Addressed>,
+    ) -> usize {
+        // Every group that matches, because a publication that entered
+        // here is one this node is choosing for: see
+        // [`route::Groups::All`].
+        self.route_publication(message, publisher, route::Groups::All, now, out)
+    }
+
+    /// The one routing path, told which shared groups it is for.
+    ///
+    /// [`Self::publish`] and [`Self::accept_forwarded`] differ in that
+    /// and in nothing else, and they are one function here so that the
+    /// retain rule, the mark and the counters cannot be two answers.
+    fn route_publication(
+        &mut self,
+        message: Message,
+        publisher: Option<SubscriberId>,
+        groups: route::Groups<'_>,
         now: u32,
         out: &mut Vec<Addressed>,
     ) -> usize {
@@ -1567,6 +1624,7 @@ impl Broker {
             &self.shared,
             &message,
             publisher,
+            groups,
             &mut has_room,
             &mut routed,
         );
@@ -2743,9 +2801,7 @@ mod tests {
             .into_iter()
             .map(|event| match event {
                 FilterEvent::Departed(filter) => filter,
-                FilterEvent::Arrived(filter) => {
-                    panic!("an expiring session reported an arrival for {filter}")
-                }
+                other => panic!("an expiring session reported {other:?} rather than a departure"),
             })
             .collect();
         departed.sort();
@@ -2782,15 +2838,24 @@ mod tests {
         assert_eq!(broker.local_subscribers("a/b"), 0);
     }
 
-    /// A shared subscription is an arrival on the filter topics match.
+    /// A shared subscription is a group event on its inner filter.
     ///
-    /// Section 8.3 routes by matching a published topic, and `$share/g/`
-    /// is how this node shares a delivery among its own clients: a peer
-    /// has nothing to do with the group. So two groups on one filter are
-    /// two subscribers to that filter, and the last of them to go is what
-    /// departs.
+    /// **This test asserted the opposite, and the assertion was the
+    /// defect.** It said a shared subscription was an arrival on its
+    /// inner filter, on the argument that `$share/g/` is how this node
+    /// shares a delivery among its own clients and that a peer has
+    /// nothing to do with the group. Section 8.3 is why that was wrong:
+    /// a group with a member on each of three nodes, reported as three
+    /// ordinary subscribers to one filter, puts all three on the
+    /// ordinary route — and one copy to each interested node is
+    /// delivered three times where the semantics demand one.
+    ///
+    /// So the group travels, and two groups on one filter are two
+    /// groups rather than two subscribers to it. The filter is still the
+    /// inner one, because that is what a published topic is matched
+    /// against.
     #[test]
-    fn a_shared_subscription_arrives_and_departs_on_its_inner_filter() {
+    fn a_shared_subscription_is_a_group_event_on_its_inner_filter() {
         let mut broker = Broker::new(BrokerConfig::default());
         let mut out = Vec::new();
         let only = durable(&mut broker, "worker", &mut out);
@@ -2800,17 +2865,30 @@ mod tests {
             .expect("the subscribe is accepted");
         assert_eq!(
             filter_events(&mut broker),
-            vec![FilterEvent::Arrived("a/b".to_owned())],
-            "a shared subscription was reported under its group"
+            vec![FilterEvent::GroupJoined {
+                group: "one".to_owned(),
+                filter: "a/b".to_owned()
+            }],
+            "a shared subscription was reported without its group"
         );
         broker
             .handle(only, &subscribe_to("$share/two/a/b"), &mut out)
             .expect("the subscribe is accepted");
         assert_eq!(
             filter_events(&mut broker),
-            vec![FilterEvent::Arrived("a/b".to_owned())]
+            vec![FilterEvent::GroupJoined {
+                group: "two".to_owned(),
+                filter: "a/b".to_owned()
+            }],
+            "two groups on one filter are two groups"
         );
-        assert_eq!(broker.local_subscribers("a/b"), 2);
+        assert_eq!(
+            broker.local_subscribers("a/b"),
+            0,
+            "a group member is not an ordinary subscriber to the filter"
+        );
+        assert_eq!(broker.local_members("one", "a/b"), 1);
+        assert_eq!(broker.local_members("two", "a/b"), 1);
 
         broker
             .handle(only, &unsubscribe_from("$share/one/a/b"), &mut out)
@@ -2821,11 +2899,67 @@ mod tests {
         assert_eq!(
             filter_events(&mut broker),
             vec![
-                FilterEvent::Departed("a/b".to_owned()),
-                FilterEvent::Departed("a/b".to_owned())
+                FilterEvent::GroupLeft {
+                    group: "one".to_owned(),
+                    filter: "a/b".to_owned()
+                },
+                FilterEvent::GroupLeft {
+                    group: "two".to_owned(),
+                    filter: "a/b".to_owned()
+                }
+            ],
+            "a departure that lost its group would never tombstone the group"
+        );
+        assert_eq!(broker.local_members("one", "a/b"), 0);
+        assert_eq!(broker.local_members("two", "a/b"), 0);
+    }
+
+    /// An ordinary subscription and a shared one are counted apart.
+    ///
+    /// One client holding both is one ordinary subscriber and one group
+    /// member. A single count would tombstone neither when one of them
+    /// went, and the node would stay advertised for whichever is gone.
+    #[test]
+    fn an_ordinary_subscription_and_a_shared_one_are_counted_apart() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let both = durable(&mut broker, "both", &mut out);
+
+        broker
+            .handle(both, &subscribe_to("a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        broker
+            .handle(both, &subscribe_to("$share/g/a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![
+                FilterEvent::Arrived("a/b".to_owned()),
+                FilterEvent::GroupJoined {
+                    group: "g".to_owned(),
+                    filter: "a/b".to_owned()
+                }
             ]
         );
-        assert_eq!(broker.local_subscribers("a/b"), 0);
+        assert_eq!(broker.local_subscribers("a/b"), 1);
+        assert_eq!(broker.local_members("g", "a/b"), 1);
+
+        broker
+            .handle(both, &unsubscribe_from("$share/g/a/b"), &mut out)
+            .expect("the unsubscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::GroupLeft {
+                group: "g".to_owned(),
+                filter: "a/b".to_owned()
+            }]
+        );
+        assert_eq!(
+            broker.local_subscribers("a/b"),
+            1,
+            "leaving the group must not take the ordinary subscription with it"
+        );
+        assert_eq!(broker.local_members("g", "a/b"), 0);
     }
 
     /// A refused subscribe is not an arrival.

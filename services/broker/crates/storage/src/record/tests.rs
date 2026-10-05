@@ -831,6 +831,66 @@ mod golden {
         );
     }
 
+    /// A group membership register, which is the last variant.
+    ///
+    /// **Pinned because the variant index is the format.** A node
+    /// subscription and a group membership differ by their leading
+    /// byte and by one extra string, and section 8.3 depends on the two
+    /// being different registers: a group whose membership were filed
+    /// as a node subscription would put every member node on the
+    /// ordinary route and deliver one publication once per node.
+    ///
+    /// Four, and at the end of the enum, which is what lets this be
+    /// added without moving `FORMAT_VERSION`: every register a previous
+    /// build wrote still decodes to the variant it was written as.
+    ///
+    /// The group and the filter are two separate strings rather than
+    /// one joined by a slash, and a vector is where that is visible: a
+    /// share name containing a slash is refused by the codec, but a
+    /// format that relied on it would be a format whose meaning changed
+    /// if that ever stopped being true.
+    #[test]
+    fn metadata_put_for_a_group_membership() {
+        let expected: &[u8] = &[
+            0x15, // Record::MetadataPut is variant 21
+            0x04, // MetadataKeyRecord::NodeGroup is variant 4
+            0x01, 0x93, 0x4e, 0x3a, 0x7c, 0x10, 0x70, 0x00, // the key's node
+            0x80, 0x00, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, //
+            0x07, b'w', b'o', b'r', b'k', b'e', b'r', b's', // group "workers"
+            0x03, b'a', b'/', b'b', // filter "a/b"
+            0xfb, 0xd0, 0x95, 0xff, 0xbc, 0x31, // stamp millis 1_700_000_000_123
+            0xac, 0x02, // stamp counter 300
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // the stamp's node
+            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, //
+            0x01, // the value is present
+            0x04, // MetadataValueRecord::NodeGroup is variant 4
+        ];
+        pins(
+            &Record::MetadataPut {
+                entry: MetadataRecord {
+                    key: MetadataKeyRecord::NodeGroup {
+                        node: [
+                            0x01, 0x93, 0x4e, 0x3a, 0x7c, 0x10, 0x70, 0x00, 0x80, 0x00, 0x0a, 0x0b,
+                            0x0c, 0x0d, 0x0e, 0x0f,
+                        ],
+                        group: "workers".to_owned(),
+                        filter: "a/b".to_owned(),
+                    },
+                    stamp: StampRecord {
+                        millis: 1_700_000_000_123,
+                        counter: 300,
+                        node: [
+                            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+                            0x1d, 0x1e, 0x1f, 0x20,
+                        ],
+                    },
+                    value: Some(MetadataValueRecord::NodeGroup),
+                },
+            },
+            expected,
+        );
+    }
+
     /// The same record carrying a tombstone.
     ///
     /// **The only thing that distinguishes a deletion is one byte**, the

@@ -10,7 +10,7 @@ use crate::session::message::Message;
 use crate::session::queue::Delivery;
 use crate::session::state::Session;
 use crate::session::Action;
-use crate::subscriptions::events::{inner_filter, FilterEvent};
+use crate::subscriptions::events::FilterEvent;
 use crate::subscriptions::{SharedSubscriptions, Subscription, SubscriptionTrie};
 
 /// Apply a subscribe request, returning one reason code per filter.
@@ -76,9 +76,12 @@ pub fn subscribe(
         // Section 8.2: the cluster is told that this node has a
         // subscriber for the filter, and the filter is the one a
         // published topic is matched against — the inner filter for a
-        // shared subscription, because the group is how this node
-        // shares a delivery among its own clients and is nothing a peer
-        // can route by.
+        // shared subscription.
+        //
+        // **The group travels with it**, and section 8.3 is why: a
+        // group with a member on each of three nodes reported as three
+        // ordinary subscribers to one filter is delivered to three
+        // times. See [`crate::subscriptions::events`].
         //
         // **Only when the trie actually gained an entry.** A second
         // subscribe to a filter this session already holds changes the
@@ -87,8 +90,9 @@ pub fn subscribe(
         // down: the filter would stay advertised to the cluster after
         // its last subscriber left.
         if !existed {
-            events.push(FilterEvent::Arrived(
-                inner_filter(&options.filter).to_owned(),
+            events.push(FilterEvent::joined(
+                group.map(|(name, _)| name),
+                &options.filter,
             ));
         }
         // Everything the filter was taken under, not just its name. The
@@ -202,7 +206,7 @@ pub fn unsubscribe(
                 // filter nothing held would take the count below zero,
                 // and a count that cannot reach zero again never
                 // tombstones the filter.
-                events.push(FilterEvent::Departed(inner_filter(filter).to_owned()));
+                events.push(FilterEvent::left_filter(filter));
                 ReasonCode::Success
             } else {
                 ReasonCode::NoSubscriptionExisted
@@ -259,7 +263,7 @@ pub fn remove_held(
         // holds none of these. One departure per filter the handle held
         // is the claim, and `held` is one entry per filter.
         session.remove_filter(filter);
-        events.push(FilterEvent::Departed(inner_filter(filter).to_owned()));
+        events.push(FilterEvent::left_filter(filter));
     }
 }
 

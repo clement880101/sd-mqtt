@@ -184,6 +184,22 @@ impl Node {
         mesh
     }
 
+    /// Join a shared group, and return the writes to tell the cluster
+    /// about.
+    ///
+    /// Through a SUBSCRIBE packet carrying `$share/<group>/<filter>`,
+    /// because the whole question is what the subscribe path reports and
+    /// what the cluster is told about it. A test that put the group into
+    /// the map by hand would be answering its own question.
+    fn join_group(
+        &self,
+        client: &str,
+        group: &str,
+        filter: &str,
+    ) -> (SubscriberId, Vec<MetadataWrite>) {
+        self.subscribe(client, &format!("$share/{group}/{filter}"))
+    }
+
     /// Connect a client, subscribe it, and return the writes to tell the
     /// cluster about.
     fn subscribe(&self, client: &str, filter: &str) -> (SubscriberId, Vec<MetadataWrite>) {
@@ -236,6 +252,12 @@ impl Node {
             let write = match &event {
                 FilterEvent::Arrived(filter) => self.replicated.subscriber_arrived(filter),
                 FilterEvent::Departed(filter) => self.replicated.subscriber_departed(filter),
+                FilterEvent::GroupJoined { group, filter } => {
+                    self.replicated.group_joined(group, filter)
+                }
+                FilterEvent::GroupLeft { group, filter } => {
+                    self.replicated.group_left(group, filter)
+                }
             };
             if let Some(write) = write {
                 writes.push(write);
@@ -336,10 +358,11 @@ impl Deliver for Node {
             return Vec::new();
         };
         let actions = {
+            let groups = forwarded.groups.clone();
             let mut broker = locked(&self.broker);
             let now = broker.clock().now();
             let mut out = Vec::new();
-            broker.accept_forwarded(forwarded.into_message(), now, &mut out);
+            broker.accept_forwarded(forwarded.into_message(), &groups, now, &mut out);
             out
         };
         self.record(actions);
@@ -348,8 +371,8 @@ impl Deliver for Node {
 
     fn member_changed(&self, peer: NodeId, state: MemberState) {
         match state {
-            MemberState::Dead => self.replicated.routes().died(peer),
-            MemberState::Alive => self.replicated.routes().revived(peer),
+            MemberState::Dead => self.replicated.died(peer),
+            MemberState::Alive => self.replicated.revived(peer),
             MemberState::Suspect => {}
         }
     }
@@ -621,7 +644,7 @@ async fn a_dead_node_stops_being_forwarded_to() {
     // declares it dead on silence rather than on a close.
     it.switch.cut("gamma", "alpha");
     until("alpha has declared gamma dead", || {
-        it.nodes[0].replicated.routes().is_dead(it.nodes[2].me())
+        it.nodes[0].replicated.liveness().is_dead(it.nodes[2].me())
     })
     .await;
     assert_eq!(
@@ -646,7 +669,7 @@ async fn a_dead_node_stops_being_forwarded_to() {
     // being re-announced: `Routes` withholds rather than forgets.
     it.switch.heal("gamma", "alpha");
     until("alpha routes to gamma again", || {
-        !it.nodes[0].replicated.routes().is_dead(it.nodes[2].me())
+        !it.nodes[0].replicated.liveness().is_dead(it.nodes[2].me())
     })
     .await;
     it.nodes[0].publish(publisher, "dead/healed", b"again");
@@ -698,4 +721,232 @@ async fn a_forwarded_retained_publication_is_delivered_and_not_retained() {
         || it.nodes[2].retained() == 0,
     )
     .await;
+}
+
+/// A shared group spanning three nodes receives one message, not three.
+///
+/// **The trap the whole plan is arranged around.** A group with a member
+/// on each of three nodes has a matching subscriber on each, so the
+/// routing map says all three want the topic — and forwarding one copy
+/// to each interested node delivers three times where the semantics
+/// demand one. Section 6: a shared subscription balances across the
+/// cluster, and section 8.3: "shared subscriptions need their own map
+/// and cannot use this one".
+///
+/// Counted across all three nodes, because which node delivers is
+/// exactly what is not being asserted: what the group is owed is one
+/// delivery somewhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_group_spanning_three_nodes_is_delivered_once() {
+    let it = Cluster::start(["alpha", "beta", "gamma"]).await;
+    for at in 0..3 {
+        let (_, writes) = it.nodes[at].join_group(&format!("worker-{at}"), "workers", "jobs/+");
+        it.announce(at, &writes);
+    }
+
+    // And a second group with a member on the two *other* nodes only,
+    // so that both halves of the choice are under test: a publishing
+    // node that has a member of its own, and one that does not. The
+    // first is the pre-fix triple delivery; the second is what catches a
+    // build that files a group as an ordinary subscription and then
+    // refuses to serve it on arrival, which delivers nothing at all.
+    for at in [1, 2] {
+        let (_, writes) = it.nodes[at].join_group(&format!("remote-{at}"), "remotes", "work/+");
+        it.announce(at, &writes);
+    }
+
+    let publisher = it.nodes[0].connect("publisher");
+    it.nodes[0].publish(publisher, "jobs/one", b"do it once");
+
+    // Held rather than read once: the local delivery is made before
+    // `publish` returns and a forward arrives a beat later, so an
+    // assertion made immediately would read one and pass against a
+    // build that was about to deliver two more.
+    keeps("exactly one member of the group is delivered to", || {
+        let delivered: usize = (0..3).map(|at| it.nodes[at].deliveries()).sum();
+        delivered == 1
+    })
+    .await;
+
+    it.nodes[0].publish(publisher, "work/one", b"and this one too");
+    until("the group with no local member is delivered to", || {
+        let delivered: usize = (0..3).map(|at| it.nodes[at].deliveries()).sum();
+        delivered == 2
+    })
+    .await;
+    keeps(
+        "exactly once, on one of the two nodes that have a member",
+        || {
+            let delivered: usize = (0..3).map(|at| it.nodes[at].deliveries()).sum();
+            delivered == 2 && it.nodes[0].deliveries() == 1
+        },
+    )
+    .await;
+}
+
+/// Over many publications every member node is chosen.
+///
+/// **What makes it a shared subscription rather than a fixed route.** A
+/// cluster that always chose the same node would pass the test above and
+/// would have balanced nothing: every message to the group would go to
+/// one node's members and the others would idle.
+///
+/// Published from alpha, which has no member of its own, because a node
+/// that has one serves the group itself — that is section 6's local
+/// preference and it is the test below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_member_node_is_chosen_over_many_publications() {
+    const PUBLICATIONS: usize = 20;
+
+    let it = Cluster::start(["alpha", "beta", "gamma"]).await;
+    for at in [1, 2] {
+        let (_, writes) = it.nodes[at].join_group(&format!("worker-{at}"), "workers", "jobs/+");
+        it.announce(at, &writes);
+    }
+
+    let publisher = it.nodes[0].connect("publisher");
+    for _ in 0..PUBLICATIONS {
+        it.nodes[0].publish(publisher, "jobs/one", b"one of many");
+    }
+
+    until("every publication has been delivered once", || {
+        it.nodes[1].deliveries() + it.nodes[2].deliveries() == PUBLICATIONS
+    })
+    .await;
+    keeps("and not more than once", || {
+        it.nodes[1].deliveries() + it.nodes[2].deliveries() == PUBLICATIONS
+    })
+    .await;
+    assert!(
+        it.nodes[1].deliveries() > 0 && it.nodes[2].deliveries() > 0,
+        "one member node took everything: beta {} and gamma {}",
+        it.nodes[1].deliveries(),
+        it.nodes[2].deliveries()
+    );
+    assert_eq!(
+        it.nodes[0].deliveries(),
+        0,
+        "alpha has no member and must have delivered nothing"
+    );
+}
+
+/// A local member is preferred, which saves a hop and a network copy.
+///
+/// Section 6: selection "prefers a local online member". Every node has
+/// a member here, so a cluster that rotated without looking would send
+/// two publications out of three over a link for nothing — and would
+/// also make the delivery arrive later than it had to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_member_of_a_group_is_preferred() {
+    const PUBLICATIONS: usize = 10;
+
+    let it = Cluster::start(["alpha", "beta", "gamma"]).await;
+    for at in 0..3 {
+        let (_, writes) = it.nodes[at].join_group(&format!("worker-{at}"), "workers", "jobs/+");
+        it.announce(at, &writes);
+    }
+
+    let publisher = it.nodes[0].connect("publisher");
+    for _ in 0..PUBLICATIONS {
+        it.nodes[0].publish(publisher, "jobs/one", b"stay at home");
+    }
+
+    assert_eq!(
+        it.nodes[0].deliveries(),
+        PUBLICATIONS,
+        "every publication should have been served by alpha's own member"
+    );
+    keeps("and nothing left alpha for the group", || {
+        it.nodes[1].deliveries() == 0 && it.nodes[2].deliveries() == 0
+    })
+    .await;
+    assert_eq!(
+        it.nodes[0].matches().remote,
+        0,
+        "a group served locally is not forwarded anywhere"
+    );
+}
+
+/// An ordinary subscription and a shared one both deliver.
+///
+/// **The case the group map can easily swallow.** They are independent
+/// mechanisms rather than alternatives: a client subscribed to `jobs/+`
+/// is owed every publication, and the group is owed one. A node chosen
+/// for neither must get nothing, and a node that is both on the ordinary
+/// route and chosen for the group must get **one** copy and make two
+/// deliveries from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ordinary_subscription_and_a_shared_one_both_deliver() {
+    let it = Cluster::start(["alpha", "beta", "gamma"]).await;
+    // Beta holds both: an ordinary subscriber and the group's only
+    // member. One copy reaches it, and both are owed a delivery.
+    let (watching, writes) = it.nodes[1].subscribe("watcher", "jobs/+");
+    it.announce(1, &writes);
+    let (worker, writes) = it.nodes[1].join_group("worker", "workers", "jobs/+");
+    it.announce(1, &writes);
+
+    let publisher = it.nodes[0].connect("publisher");
+    it.nodes[0].publish(publisher, "jobs/one", b"for both");
+
+    until("both of beta's subscribers have it", || {
+        !it.nodes[1].topics(watching).is_empty() && !it.nodes[1].topics(worker).is_empty()
+    })
+    .await;
+    assert_eq!(
+        it.nodes[0].matches().remote,
+        1,
+        "one copy to beta, not one for the subscriber and one for the group"
+    );
+    keeps(
+        "and exactly two deliveries, on beta and nowhere else",
+        || it.nodes[1].deliveries() == 2 && it.nodes[2].deliveries() == 0,
+    )
+    .await;
+}
+
+/// A node with a group member it was not chosen for delivers nothing.
+///
+/// **The triple delivery, from the other side.** Beta is on the ordinary
+/// route because it has a subscriber for the topic, so it is forwarded a
+/// copy whatever happens to the group. If that copy were delivered to
+/// every group beta has a member of, beta would serve a group gamma had
+/// been chosen for and the group would be delivered to twice.
+///
+/// So this is the test that the frame's list of groups is read: beta's
+/// ordinary subscriber receives, beta's group member does not, and the
+/// group is served once on gamma.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_another_node_was_chosen_for_is_not_served_here_as_well() {
+    let it = Cluster::start(["alpha", "beta", "gamma"]).await;
+    // Alpha has a member too, so it serves the group itself — section
+    // 6's local preference — and beta is forwarded a copy only for its
+    // ordinary subscriber.
+    let (_, writes) = it.nodes[0].join_group("worker-alpha", "workers", "jobs/+");
+    it.announce(0, &writes);
+    let (watching, writes) = it.nodes[1].subscribe("watcher", "jobs/+");
+    it.announce(1, &writes);
+    let (worker, writes) = it.nodes[1].join_group("worker-beta", "workers", "jobs/+");
+    it.announce(1, &writes);
+
+    let publisher = it.nodes[0].connect("publisher");
+    it.nodes[0].publish(publisher, "jobs/one", b"once for the group");
+
+    until("beta's ordinary subscriber has it", || {
+        !it.nodes[1].topics(watching).is_empty()
+    })
+    .await;
+    keeps("and beta's group member never does", || {
+        it.nodes[1].topics(worker).is_empty()
+    })
+    .await;
+    assert_eq!(
+        it.nodes[0].deliveries(),
+        1,
+        "alpha's own member served the group, once"
+    );
+    assert_eq!(
+        it.nodes[1].deliveries(),
+        1,
+        "beta delivered to its ordinary subscriber and to nobody else"
+    );
 }

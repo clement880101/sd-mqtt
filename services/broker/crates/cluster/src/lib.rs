@@ -106,6 +106,7 @@ pub mod clock;
 pub mod config;
 pub mod forward;
 pub mod frame;
+pub mod groups;
 pub mod handshake;
 pub mod identity;
 pub mod link;
@@ -123,6 +124,7 @@ pub use clock::{ClockError, HybridClock, Reading, DEFAULT_MAX_DRIFT_MILLIS};
 pub use config::{ClusterConfig, ClusterSettings, ConfigError, DEFAULT_CLUSTER_NAME};
 pub use forward::{targets, Forwarded, Forwarding};
 pub use frame::{FrameError, FrameLimits, FRAME_VERSION};
+pub use groups::{Chosen, Groups};
 pub use handshake::{accept, dial, HandshakeError, Peer, Role};
 pub use identity::{IdentityError, NodeId, NodeIdentity, Reconciled};
 pub use link::{outgoing, pump, FrameReader, LinkConfig, LinkError, Outgoing, Sent};
@@ -135,5 +137,5 @@ pub use replicate::{
     choose, jitter, Handled, Replication, ReplicationError, ReplicationSettings, Replicator, Swept,
     DEFAULT_BATCH, DEFAULT_EXCHANGE, DEFAULT_TOMBSTONE_GRACE,
 };
-pub use routes::Routes;
+pub use routes::{Liveness, Routes};
 pub use transport::{BoxStream, TcpTransport, Transport};

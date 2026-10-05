@@ -107,6 +107,14 @@ fn every_kind(me: NodeId) -> Vec<(MetadataKey, MetadataValue)> {
             },
             MetadataValue::SessionOwner { node: node(9) },
         ),
+        (
+            MetadataKey::NodeGroup {
+                node: me,
+                group: "workers".to_owned(),
+                filter: "jobs/+".to_owned(),
+            },
+            MetadataValue::NodeGroup,
+        ),
     ]
 }
 
@@ -215,6 +223,9 @@ fn every_kind_survives_a_restart() {
                 };
                 before.session_owned(session, owner)
             }
+            MetadataValue::NodeGroup => before
+                .group_joined("workers", "jobs/+")
+                .expect("the first member writes a register"),
         });
     }
     // And a tombstone, which is the last unsubscribe: the register that
@@ -906,7 +917,7 @@ fn a_node_judged_dead_is_not_on_the_route_although_its_register_is_held() {
     let held = fresh(me);
     held.observed(theirs(peer, "a/b", 100));
 
-    held.routes().died(peer);
+    held.died(peer);
     assert!(held.nodes_for("a/b").is_empty());
     assert_eq!(
         held.nodes_subscribed("a/b"),
@@ -914,7 +925,7 @@ fn a_node_judged_dead_is_not_on_the_route_although_its_register_is_held() {
         "the register is the truth and is kept"
     );
 
-    held.routes().revived(peer);
+    held.revived(peer);
     assert_eq!(
         held.nodes_for("a/b"),
         vec![peer],
@@ -948,4 +959,161 @@ fn a_register_taken_from_a_peers_log_moves_the_routing_map() {
         "the later tombstone wins, in the map as in the registers"
     );
     assert_eq!(held.nodes_for("c/d/e"), vec![peer]);
+}
+
+// ---- the group map, which is the one the ordinary map cannot do -------
+
+/// A second local member of a group writes nothing.
+///
+/// Section 8.2's granularity rule, applied to the kind section 8.3
+/// added: what is replicated is that a node has **a** member, so a
+/// second one says nothing new and saying it again would be a register
+/// and a frame per client rather than per group.
+#[test]
+fn a_second_local_member_of_a_group_writes_nothing() {
+    let me = node(1);
+    let held = fresh(me);
+    let first = held
+        .group_joined("workers", "jobs/+")
+        .expect("the first member writes a register");
+    assert_eq!(
+        first.key(),
+        &MetadataKey::NodeGroup {
+            node: me,
+            group: "workers".to_owned(),
+            filter: "jobs/+".to_owned()
+        }
+    );
+    assert_eq!(first.register().value(), Some(&MetadataValue::NodeGroup));
+    assert_eq!(held.group_joined("workers", "jobs/+"), None);
+    assert_eq!(held.local_members("workers", "jobs/+"), 2);
+}
+
+/// The last local member to leave writes a tombstone.
+///
+/// Dropping the register instead would leave every peer choosing this
+/// node for a group it has nobody in — and a publication chosen for it
+/// is delivered to nobody at all, because the group's other members were
+/// passed over for it. That is worse than an ordinary filter going
+/// stale, which merely wastes a copy.
+#[test]
+fn the_last_local_member_of_a_group_writes_a_tombstone() {
+    let me = node(1);
+    let held = fresh(me);
+    held.group_joined("workers", "jobs/+");
+    held.group_joined("workers", "jobs/+");
+    assert_eq!(held.group_left("workers", "jobs/+"), None, "one of two");
+    let last = held
+        .group_left("workers", "jobs/+")
+        .expect("the last member writes a register");
+    assert!(last.is_tombstone());
+    assert_eq!(held.local_members("workers", "jobs/+"), 0);
+    assert!(held.groups().members_of("workers", "jobs/+").is_empty());
+}
+
+/// Two groups on one filter are counted and routed apart.
+#[test]
+fn two_groups_on_one_filter_are_two_groups() {
+    let me = node(1);
+    let held = fresh(me);
+    held.group_joined("one", "jobs/+");
+    held.group_joined("two", "jobs/+");
+    assert_eq!(held.local_members("one", "jobs/+"), 1);
+    assert_eq!(held.local_members("two", "jobs/+"), 1);
+    assert_eq!(held.groups().groups_held(), 2);
+    assert_eq!(
+        held.groups().chosen_for("jobs/x", me).len(),
+        2,
+        "each group is owed its own delivery"
+    );
+}
+
+/// A group membership is not an ordinary subscription, in either map.
+///
+/// **The separation is the whole of section 8.3's answer**: a group
+/// membership indexed into the routing map would put every member node
+/// on the ordinary route, and one copy to each would be one delivery per
+/// node.
+#[test]
+fn a_group_membership_is_in_the_group_map_and_not_the_routing_map() {
+    let me = node(1);
+    let peer = node(2);
+    let held = fresh(me);
+    held.observed(MetadataWrite::new(
+        MetadataKey::NodeGroup {
+            node: peer,
+            group: "workers".to_owned(),
+            filter: "jobs/+".to_owned(),
+        },
+        Register::written(
+            MetadataValue::NodeGroup,
+            Stamp::new(Reading::new(100, 0), peer),
+        ),
+    ));
+    assert!(
+        held.nodes_for("jobs/one").is_empty(),
+        "a group member must not be on the ordinary route"
+    );
+    assert_eq!(held.groups().members_of("workers", "jobs/+"), vec![peer]);
+    assert_eq!(
+        held.groups().chosen_for("jobs/one", me),
+        vec![crate::groups::Chosen {
+            group: "workers".to_owned(),
+            filter: "jobs/+".to_owned(),
+            node: peer
+        }]
+    );
+}
+
+/// And a peer's tombstone takes it out of the group map.
+#[test]
+fn a_peers_group_tombstone_removes_it_from_the_group_map() {
+    let me = node(1);
+    let peer = node(2);
+    let held = fresh(me);
+    let key = MetadataKey::NodeGroup {
+        node: peer,
+        group: "workers".to_owned(),
+        filter: "jobs/+".to_owned(),
+    };
+    held.observed(MetadataWrite::new(
+        key.clone(),
+        Register::written(
+            MetadataValue::NodeGroup,
+            Stamp::new(Reading::new(100, 0), peer),
+        ),
+    ));
+    held.observed(MetadataWrite::new(
+        key.clone(),
+        Register::deleted(Stamp::new(Reading::new(200, 0), peer)),
+    ));
+    assert!(held.groups().chosen_for("jobs/one", me).is_empty());
+    assert_eq!(held.groups().groups_held(), 0, "and the row went with it");
+
+    assert!(!held.collect(&key).is_empty(), "the tombstone is collected");
+    assert_eq!(held.groups().groups_held(), 0);
+    assert_eq!(held.groups().groups_matched(), 0);
+}
+
+/// A restart rebuilds the group map as well as the routing map.
+#[test]
+fn a_restart_rebuilds_the_group_map_from_the_registers() {
+    let me = node(1);
+    let store = MemoryStorage::new();
+    let before = fresh(me);
+    let mine = before
+        .group_joined("workers", "jobs/+")
+        .expect("the first member");
+    store
+        .apply(&before.records(&mine))
+        .expect("the store takes it");
+
+    let restored = store.restore().expect("the store reads back");
+    let after = Replicated::open(me, HybridClock::resume(restored.clock, BOUND), &restored)
+        .expect("what this build wrote, it reads");
+    assert_eq!(after.groups().members_of("workers", "jobs/+"), vec![me]);
+    assert!(
+        after.nodes_for("jobs/one").is_empty(),
+        "and it did not come back as an ordinary route"
+    );
 }

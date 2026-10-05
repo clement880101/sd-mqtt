@@ -59,7 +59,7 @@
 //! per publish, over a set that is empty in a healthy cluster.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use broker_core::subscriptions::FilterIndex;
 
@@ -105,8 +105,60 @@ struct Table {
     /// years to exhaust it; reusing one would mean a matcher entry that
     /// outlived its row pointing at somebody else's.
     next: u64,
-    /// Nodes this node has judged dead. See the module documentation.
-    dead: BTreeSet<NodeId>,
+}
+
+/// Which nodes this one has judged dead.
+///
+/// **One answer, shared by both maps.** Section 8.3's routing map and
+/// section 8.3's group map both have to stop choosing a node that has
+/// gone, and two sets would be two answers to one question — the kind
+/// that disagree the first time a path updates one of them. So the
+/// judgement is a thing of its own, held by [`crate::metadata::Replicated`]
+/// and consulted by both.
+///
+/// See the [module documentation](crate::routes) for why a dead node's
+/// filters are withheld rather than forgotten.
+#[derive(Debug, Default)]
+pub struct Liveness {
+    dead: Mutex<BTreeSet<NodeId>>,
+}
+
+impl Liveness {
+    /// Nothing is dead.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// This node has judged `node` dead.
+    pub fn died(&self, node: NodeId) {
+        self.held().insert(node);
+    }
+
+    /// And `node` is answering again.
+    pub fn revived(&self, node: NodeId) {
+        self.held().remove(&node);
+    }
+
+    /// Whether `node` is one this node has judged dead.
+    #[must_use]
+    pub fn is_dead(&self, node: NodeId) -> bool {
+        self.held().contains(&node)
+    }
+
+    /// Whether anything is dead at all.
+    ///
+    /// The fast path: in a healthy cluster this is false, and a
+    /// publication then pays one lock and one `is_empty` rather than a
+    /// lookup per candidate node.
+    #[must_use]
+    pub fn all_alive(&self) -> bool {
+        self.held().is_empty()
+    }
+
+    fn held(&self) -> MutexGuard<'_, BTreeSet<NodeId>> {
+        self.dead.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Which nodes have a subscriber matching a topic.
@@ -132,21 +184,22 @@ pub struct Routes {
     /// Which filters a topic matches, by slot.
     matcher: FilterIndex,
     table: Mutex<Table>,
-}
-
-impl Default for Routes {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Which nodes this one has judged dead, shared with the group map.
+    liveness: Arc<Liveness>,
 }
 
 impl Routes {
     /// An empty map: nobody wants anything.
+    ///
+    /// `liveness` is shared with [`crate::groups::Groups`], because both
+    /// have to stop choosing a node that has gone and two sets would be
+    /// two answers.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(liveness: Arc<Liveness>) -> Self {
         Self {
             matcher: FilterIndex::new(SHARDS),
             table: Mutex::new(Table::default()),
+            liveness,
         }
     }
 
@@ -229,29 +282,13 @@ impl Routes {
         }
     }
 
-    /// This node has judged `node` dead.
+    /// Which nodes this one has judged dead.
     ///
-    /// Section 8.2's membership is not replicated, so this is the only
-    /// thing that can say so and nothing is written down. The node's
-    /// filters stay in the map and stop being answered with; the module
-    /// documentation says why that is not the same as forgetting them.
-    pub fn died(&self, node: NodeId) {
-        self.held().dead.insert(node);
-    }
-
-    /// And `node` is answering again.
-    ///
-    /// Its filters were never removed, so there is nothing to replay:
-    /// section 8.1 heals a one-way partition on the connection it
-    /// already had, and this is what makes routing heal with it.
-    pub fn revived(&self, node: NodeId) {
-        self.held().dead.remove(&node);
-    }
-
-    /// Whether `node` is one this node has judged dead.
+    /// Shared with the group map. [`Liveness::died`] is what takes a
+    /// node out of both.
     #[must_use]
-    pub fn is_dead(&self, node: NodeId) -> bool {
-        self.held().dead.contains(&node)
+    pub fn liveness(&self) -> &Arc<Liveness> {
+        &self.liveness
     }
 
     /// Every node with a subscriber matching `topic`, in identity order.
@@ -276,8 +313,9 @@ impl Routes {
                 nodes.extend(holders.nodes.iter().copied());
             }
         }
-        for dead in &table.dead {
-            nodes.remove(dead);
+        drop(table);
+        if !self.liveness.all_alive() {
+            nodes.retain(|node| !self.liveness.is_dead(*node));
         }
         nodes.into_iter().collect()
     }
@@ -323,9 +361,14 @@ mod tests {
         NodeIdentity::mint(name).id()
     }
 
+    /// An empty map with a liveness of its own.
+    fn fresh() -> Routes {
+        Routes::new(Arc::new(Liveness::new()))
+    }
+
     #[test]
     fn a_node_that_said_it_wants_a_filter_is_returned_for_a_matching_topic() {
-        let routes = Routes::new();
+        let routes = fresh();
         let a = node("a");
         routes.added(a, "sensor/+/temp");
         assert_eq!(routes.nodes_for("sensor/1/temp"), vec![a]);
@@ -336,7 +379,7 @@ mod tests {
         // The mutation: a map keyed by string equality answers nothing
         // here, and every publication to a real topic is forwarded
         // nowhere while a node subscribed to the wildcard waits.
-        let routes = Routes::new();
+        let routes = fresh();
         let a = node("a");
         routes.added(a, "sensor/+/temp");
         routes.added(a, "site/#");
@@ -350,7 +393,7 @@ mod tests {
 
     #[test]
     fn two_nodes_subscribing_to_one_filter_are_both_returned() {
-        let routes = Routes::new();
+        let routes = fresh();
         let (a, b) = (node("a"), node("b"));
         routes.added(a, "a/b");
         routes.added(b, "a/b");
@@ -362,7 +405,7 @@ mod tests {
 
     #[test]
     fn a_topic_nobody_wants_is_nobody() {
-        let routes = Routes::new();
+        let routes = fresh();
         routes.added(node("a"), "a/b");
         assert!(routes.nodes_for("c/d").is_empty());
     }
@@ -373,7 +416,7 @@ mod tests {
         // longer has a subscriber. A map that ignored it would forward
         // to that node for ever, which is section 8.2's reason for
         // writing a tombstone rather than dropping the register.
-        let routes = Routes::new();
+        let routes = fresh();
         let (a, b) = (node("a"), node("b"));
         routes.added(a, "a/b");
         routes.added(b, "a/b");
@@ -385,7 +428,7 @@ mod tests {
 
     #[test]
     fn the_last_node_to_leave_a_filter_takes_the_filter_with_it() {
-        let routes = Routes::new();
+        let routes = fresh();
         let a = node("a");
         routes.added(a, "a/b");
         routes.added(a, "c/#");
@@ -401,7 +444,7 @@ mod tests {
 
     #[test]
     fn removing_something_that_was_never_added_changes_nothing() {
-        let routes = Routes::new();
+        let routes = fresh();
         let a = node("a");
         routes.added(a, "a/b");
         routes.removed(node("b"), "a/b");
@@ -415,7 +458,7 @@ mod tests {
         // An exchange serves whatever it was asked for rather than only
         // what is new, so the same register arrives more than once as a
         // matter of course.
-        let routes = Routes::new();
+        let routes = fresh();
         let a = node("a");
         routes.added(a, "a/b");
         routes.added(a, "a/b");
@@ -433,14 +476,14 @@ mod tests {
     fn a_node_judged_dead_stops_being_returned() {
         // The case **no register covers**: membership is not
         // replicated, so nothing was written down when this happened.
-        let routes = Routes::new();
+        let routes = fresh();
         let (a, b) = (node("a"), node("b"));
         routes.added(a, "a/b");
         routes.added(b, "a/b");
         routes.added(a, "only/a");
 
-        routes.died(a);
-        assert!(routes.is_dead(a));
+        routes.liveness().died(a);
+        assert!(routes.liveness().is_dead(a));
         assert_eq!(
             routes.nodes_for("a/b"),
             vec![b],
@@ -458,14 +501,14 @@ mod tests {
         // and such a peer comes back on that same connection having
         // written nothing new. A map that had forgotten its filters
         // would never route to it again.
-        let routes = Routes::new();
+        let routes = fresh();
         let a = node("a");
         routes.added(a, "a/b");
-        routes.died(a);
+        routes.liveness().died(a);
         assert!(routes.nodes_for("a/b").is_empty());
 
-        routes.revived(a);
-        assert!(!routes.is_dead(a));
+        routes.liveness().revived(a);
+        assert!(!routes.liveness().is_dead(a));
         assert_eq!(
             routes.nodes_for("a/b"),
             vec![a],
@@ -478,18 +521,18 @@ mod tests {
         // A register that arrives for a node this one believes is dead
         // is held: the judgement is local and this node may be the one
         // that is wrong, and the register is the truth either way.
-        let routes = Routes::new();
+        let routes = fresh();
         let a = node("a");
-        routes.died(a);
+        routes.liveness().died(a);
         routes.added(a, "a/b");
         assert!(routes.nodes_for("a/b").is_empty(), "still dead");
-        routes.revived(a);
+        routes.liveness().revived(a);
         assert_eq!(routes.nodes_for("a/b"), vec![a]);
     }
 
     #[test]
     fn forgetting_a_node_is_not_the_same_as_judging_it_dead() {
-        let routes = Routes::new();
+        let routes = fresh();
         let (a, b) = (node("a"), node("b"));
         routes.added(a, "a/b");
         routes.added(b, "a/b");
@@ -499,12 +542,12 @@ mod tests {
         assert_eq!(routes.nodes_for("a/b"), vec![b]);
         assert_eq!(routes.filters_held(), 1, "its own filter went with it");
         assert_eq!(routes.filters_matched(), 1);
-        assert!(!routes.is_dead(a), "forgotten is not dead");
+        assert!(!routes.liveness().is_dead(a), "forgotten is not dead");
     }
 
     #[test]
     fn several_filters_matching_one_topic_name_each_node_once() {
-        let routes = Routes::new();
+        let routes = fresh();
         let a = node("a");
         routes.added(a, "a/b");
         routes.added(a, "a/+");
@@ -521,7 +564,7 @@ mod tests {
         // The trie's rule, inherited rather than reimplemented. A map
         // that answered otherwise would forward a broker status
         // publication to a node whose own matching then dropped it.
-        let routes = Routes::new();
+        let routes = fresh();
         let (a, b) = (node("a"), node("b"));
         routes.added(a, "#");
         routes.added(b, "$SYS/#");

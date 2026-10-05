@@ -40,32 +40,133 @@
 //!
 //! # The filter named is the one a topic is matched against
 //!
-//! A shared subscription to `$share/g/a/b` means this node has a
-//! subscriber for `a/b`: the group name is how deliveries are shared
-//! among this node's own clients and is nothing a peer routing a
-//! publication can use. So [`inner_filter`] is applied before the event
-//! is made, and `$share/g1/a/b` and `$share/g2/a/b` are two subscribers
-//! to one filter rather than subscribers to two.
+//! A shared subscription to `$share/g/a/b` means this node has a member
+//! of the group `g` on the filter `a/b`, so [`inner_filter`] is applied
+//! before the event is made: the inner filter is what a published topic
+//! is matched against, and `$share/g/a/b` and `a/b` must mean the same
+//! thing to a matcher.
+//!
+//! # A shared group is its own event, and section 8.3 says why
+//!
+//! The group name used to be dropped here, on the argument that it is
+//! how this node shares a delivery among its own clients and is nothing
+//! a peer can route by. **That argument was wrong, and it was the one
+//! defect in this milestone's design.** A group with a member on each of
+//! three nodes reported as three ordinary subscribers to one filter puts
+//! all three on the ordinary route, and one copy to each interested node
+//! delivers three times where the semantics demand one.
+//!
+//! So a shared subscription is [`FilterEvent::GroupJoined`] and not
+//! [`FilterEvent::Arrived`]: four events rather than two, and the group
+//! and the filter both travel. What reads them is
+//! `cluster::metadata`, which keeps two maps — one for ordinary
+//! subscribers and one for groups — and chooses **one** node per group
+//! before forwarding rather than after.
+//!
+//! The two are exclusive. A shared subscription is not also an ordinary
+//! subscriber for its inner filter, and must not be reported as one: a
+//! node whose only interest in a topic is a group member would otherwise
+//! be on the ordinary route as well, be forwarded a copy for that, and
+//! deliver to a group member that had not been chosen.
 
 /// A filter gained or lost a subscriber on this node.
 ///
-/// Carries the filter and nothing else. Which session it was is exactly
-/// the part section 8.2 says never leaves the node, and a type that
-/// carried it would invite a caller to replicate it.
+/// Carries the filter, the group where there is one, and nothing else.
+/// Which session it was is exactly the part section 8.2 says never
+/// leaves the node, and a type that carried it would invite a caller to
+/// replicate it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FilterEvent {
     /// One more of this node's sessions is subscribed to the filter.
+    ///
+    /// An ordinary subscription. A shared one is [`Self::GroupJoined`].
     Arrived(String),
     /// One fewer of this node's sessions is subscribed to the filter.
     Departed(String),
+    /// One more of this node's sessions is a member of a shared group.
+    GroupJoined {
+        /// The share name.
+        group: String,
+        /// The inner filter, which is what a topic is matched against.
+        filter: String,
+    },
+    /// One fewer of this node's sessions is a member of a shared group.
+    GroupLeft {
+        /// The share name.
+        group: String,
+        /// The inner filter.
+        filter: String,
+    },
 }
 
 impl FilterEvent {
     /// Which filter, whichever this is.
+    ///
+    /// The inner filter in every case, so that a caller asking what a
+    /// topic would be matched against gets one answer.
     #[must_use]
     pub fn filter(&self) -> &str {
         match self {
             Self::Arrived(filter) | Self::Departed(filter) => filter,
+            Self::GroupJoined { filter, .. } | Self::GroupLeft { filter, .. } => filter,
+        }
+    }
+
+    /// The share name, for the two that have one.
+    #[must_use]
+    pub fn group(&self) -> Option<&str> {
+        match self {
+            Self::Arrived(_) | Self::Departed(_) => None,
+            Self::GroupJoined { group, .. } | Self::GroupLeft { group, .. } => Some(group),
+        }
+    }
+
+    /// The arrival or departure for one filter, shared or not.
+    ///
+    /// **One place that decides which of the four an event is**, because
+    /// the subscribe path has three callers that must agree and the
+    /// consequence of disagreeing is a node advertised for a filter it
+    /// does not serve, for ever.
+    #[must_use]
+    pub fn joined(group: Option<&str>, filter: &str) -> Self {
+        match group {
+            Some(group) => Self::GroupJoined {
+                group: group.to_owned(),
+                filter: inner_filter(filter).to_owned(),
+            },
+            None => Self::Arrived(inner_filter(filter).to_owned()),
+        }
+    }
+
+    /// And the departure, by the same decision.
+    #[must_use]
+    pub fn left(group: Option<&str>, filter: &str) -> Self {
+        match group {
+            Some(group) => Self::GroupLeft {
+                group: group.to_owned(),
+                filter: inner_filter(filter).to_owned(),
+            },
+            None => Self::Departed(inner_filter(filter).to_owned()),
+        }
+    }
+
+    /// The departure for a filter as a client wrote it.
+    ///
+    /// The group is read out of the filter rather than passed in,
+    /// because the teardown paths hold a list of filters and nothing
+    /// else: a session's record of what it subscribed to is the filter
+    /// as written, `$share/` prefix and all.
+    #[must_use]
+    pub fn left_filter(filter: &str) -> Self {
+        match mqtt_codec::topic::parse_shared(filter) {
+            Ok(Some((group, inner))) => Self::GroupLeft {
+                group: group.to_owned(),
+                filter: inner.to_owned(),
+            },
+            // A filter this cannot parse is itself, for the reason
+            // [`inner_filter`] gives: dropping the event would leave
+            // the node advertised for something in the trie.
+            _ => Self::Departed(inner_filter(filter).to_owned()),
         }
     }
 }
@@ -114,8 +215,57 @@ mod tests {
     }
 
     #[test]
-    fn an_event_names_its_filter_and_nothing_else() {
+    fn an_event_names_its_filter_and_its_group_if_it_has_one() {
         assert_eq!(FilterEvent::Arrived("a/b".to_owned()).filter(), "a/b");
         assert_eq!(FilterEvent::Departed("a/b".to_owned()).filter(), "a/b");
+        assert_eq!(FilterEvent::Arrived("a/b".to_owned()).group(), None);
+
+        let joined = FilterEvent::joined(Some("workers"), "$share/workers/a/b");
+        assert_eq!(joined.filter(), "a/b", "the inner filter, in every case");
+        assert_eq!(joined.group(), Some("workers"));
+    }
+
+    #[test]
+    fn a_shared_subscription_is_a_group_event_and_not_an_ordinary_one() {
+        // Section 8.3's trap, at the layer that reports it. A node whose
+        // only interest in a topic is a group member must not be on the
+        // ordinary route as well: it would be forwarded a copy for that
+        // and deliver to a member that had not been chosen.
+        assert_eq!(
+            FilterEvent::joined(Some("g"), "$share/g/a/b"),
+            FilterEvent::GroupJoined {
+                group: "g".to_owned(),
+                filter: "a/b".to_owned()
+            }
+        );
+        assert_eq!(
+            FilterEvent::joined(None, "a/b"),
+            FilterEvent::Arrived("a/b".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_departure_read_from_a_written_filter_keeps_its_group() {
+        // The teardown paths hold the filter as the client wrote it and
+        // nothing else, so the group has to come back out of it. A
+        // departure that lost the group would decrement the ordinary
+        // count for a filter that never incremented it, and the group's
+        // own count would never reach zero.
+        assert_eq!(
+            FilterEvent::left_filter("$share/workers/a/b"),
+            FilterEvent::GroupLeft {
+                group: "workers".to_owned(),
+                filter: "a/b".to_owned()
+            }
+        );
+        assert_eq!(
+            FilterEvent::left_filter("a/b"),
+            FilterEvent::Departed("a/b".to_owned())
+        );
+        assert_eq!(
+            FilterEvent::left_filter("$share/"),
+            FilterEvent::Departed("$share/".to_owned()),
+            "a filter nothing can parse is itself, not a dropped event"
+        );
     }
 }

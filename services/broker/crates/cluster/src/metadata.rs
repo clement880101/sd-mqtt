@@ -93,7 +93,7 @@
 //! there is one.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use storage::{
     MetadataKeyRecord, MetadataRecord, MetadataValueRecord, Record, Restored, RetainedRecord,
@@ -101,10 +101,11 @@ use storage::{
 };
 
 use crate::clock::HybridClock;
+use crate::groups::Groups;
 use crate::identity::NodeId;
 use crate::oplog::{Logged, OpLog};
 use crate::register::{Register, Stamp};
-use crate::routes::Routes;
+use crate::routes::{Liveness, Routes};
 
 /// What a replicated register is about.
 ///
@@ -143,6 +144,29 @@ pub enum MetadataKey {
         /// Whose session.
         session: SessionKey,
     },
+    /// That `node` has at least one member of a shared group.
+    ///
+    /// **Not a [`Self::NodeSubscription`], and section 8.3 says why.** A
+    /// group spanning three nodes has a matching subscriber on each, so
+    /// a routing map built from node subscriptions says all three want
+    /// the topic and one copy to each delivers three times where the
+    /// semantics demand one. A group needs its own map, built from this,
+    /// and a choice of **one** node before the forward rather than
+    /// after; see [`crate::groups`].
+    ///
+    /// The two are exclusive: a shared subscription writes this and not
+    /// a node subscription, so that a node whose only interest in a
+    /// topic is a group member is not also on the ordinary route.
+    NodeGroup {
+        /// Whose member.
+        node: NodeId,
+        /// The share name, which is what makes two groups on one filter
+        /// two groups.
+        group: String,
+        /// The inner filter, because that is what a published topic is
+        /// matched against.
+        filter: String,
+    },
 }
 
 impl MetadataKey {
@@ -161,6 +185,15 @@ impl MetadataKey {
             Self::SessionOwner { session } => MetadataKeyRecord::SessionOwner {
                 session: session.clone(),
             },
+            Self::NodeGroup {
+                node,
+                group,
+                filter,
+            } => MetadataKeyRecord::NodeGroup {
+                node: node.to_bytes(),
+                group: group.clone(),
+                filter: filter.clone(),
+            },
         }
     }
 
@@ -175,6 +208,15 @@ impl MetadataKey {
             MetadataKeyRecord::Retained { topic } => Self::Retained { topic },
             MetadataKeyRecord::Rule { id } => Self::Rule { id },
             MetadataKeyRecord::SessionOwner { session } => Self::SessionOwner { session },
+            MetadataKeyRecord::NodeGroup {
+                node,
+                group,
+                filter,
+            } => Self::NodeGroup {
+                node: NodeId::from_bytes(node),
+                group,
+                filter,
+            },
         }
     }
 
@@ -186,6 +228,7 @@ impl MetadataKey {
             Self::Retained { .. } => "a retained message",
             Self::Rule { .. } => "a rule",
             Self::SessionOwner { .. } => "a session owner",
+            Self::NodeGroup { .. } => "a shared group membership",
         }
     }
 }
@@ -217,6 +260,13 @@ pub enum MetadataValue {
         /// The owner.
         node: NodeId,
     },
+    /// Presence, and nothing else.
+    ///
+    /// A unit variant for [`Self::NodeSubscription`]'s reason: the key
+    /// carries the node, the group and the filter, which is the whole
+    /// fact. How many of that node's clients are in the group is the
+    /// part that stays on the node.
+    NodeGroup,
 }
 
 impl MetadataValue {
@@ -230,6 +280,7 @@ impl MetadataValue {
             Self::SessionOwner { node } => MetadataValueRecord::SessionOwner {
                 node: node.to_bytes(),
             },
+            Self::NodeGroup => MetadataValueRecord::NodeGroup,
         }
     }
 
@@ -243,6 +294,7 @@ impl MetadataValue {
             MetadataValueRecord::SessionOwner { node } => Self::SessionOwner {
                 node: NodeId::from_bytes(node),
             },
+            MetadataValueRecord::NodeGroup => Self::NodeGroup,
         }
     }
 
@@ -254,6 +306,7 @@ impl MetadataValue {
             Self::Retained(_) => "a retained message",
             Self::Rule(_) => "a rule",
             Self::SessionOwner { .. } => "a session owner",
+            Self::NodeGroup => "a shared group membership",
         }
     }
 
@@ -265,6 +318,7 @@ impl MetadataValue {
                 | (MetadataKey::Retained { .. }, Self::Retained(_))
                 | (MetadataKey::Rule { .. }, Self::Rule(_))
                 | (MetadataKey::SessionOwner { .. }, Self::SessionOwner { .. })
+                | (MetadataKey::NodeGroup { .. }, Self::NodeGroup)
         )
     }
 }
@@ -434,18 +488,47 @@ fn merge(state: &mut State, write: &MetadataWrite) -> bool {
 /// A kind the map is not about is nothing to tell it, which is most of
 /// them: a retained message, a rule and a session owner are registers
 /// routing does not read.
-fn index(routes: &Routes, key: &MetadataKey, register: Option<&Register<MetadataValue>>) {
-    let MetadataKey::NodeSubscription { node, filter } = key else {
-        return;
-    };
+fn index(
+    routes: &Routes,
+    groups: &Groups,
+    key: &MetadataKey,
+    register: Option<&Register<MetadataValue>>,
+) {
     // An absent register and a tombstone are the same fact: this node
-    // does not believe that node has a subscriber for that filter. A
-    // collected tombstone is the first of the two and arrives here the
-    // same way, which is why the argument is an `Option` rather than a
-    // `Register`.
-    match register {
-        Some(register) if !register.is_tombstone() => routes.added(*node, filter),
-        _ => routes.removed(*node, filter),
+    // does not believe that node has a subscriber there. A collected
+    // tombstone is the first of the two and arrives here the same way,
+    // which is why the argument is an `Option` rather than a `Register`.
+    let held = matches!(register, Some(register) if !register.is_tombstone());
+    match key {
+        MetadataKey::NodeSubscription { node, filter } => {
+            if held {
+                routes.added(*node, filter);
+            } else {
+                routes.removed(*node, filter);
+            }
+        }
+        // **The two go to two maps, and that separation is section
+        // 8.3's whole answer to the shared-subscription trap.** A group
+        // membership indexed into the routing map would put every
+        // member node on the ordinary route, and one copy to each would
+        // be one delivery per node.
+        MetadataKey::NodeGroup {
+            node,
+            group,
+            filter,
+        } => {
+            if held {
+                groups.added(*node, group, filter);
+            } else {
+                groups.removed(*node, group, filter);
+            }
+        }
+        // A kind neither map is about, which is most of them: a
+        // retained message, a rule and a session owner are registers
+        // routing does not read.
+        MetadataKey::Retained { .. }
+        | MetadataKey::Rule { .. }
+        | MetadataKey::SessionOwner { .. } => {}
     }
 }
 
@@ -480,6 +563,20 @@ pub struct Replicated {
     /// one of them. A map the shell maintained would be fed by whichever
     /// of the four the shell happens to see.
     routes: Routes,
+    /// Section 8.3's **other** map: which nodes have a member of each
+    /// shared group.
+    ///
+    /// Separate from the one above because a group cannot use it, which
+    /// is the one thing in this milestone's design that was wrong before
+    /// the routing plan: see [`crate::groups`].
+    groups: Groups,
+    /// Which nodes this one has judged dead, shared by both maps.
+    ///
+    /// Membership is not replicated — section 8.2 — so this is a local
+    /// judgement with no register behind it, and both maps have to
+    /// honour it. One set rather than two, because two would be two
+    /// answers to one question.
+    liveness: Arc<Liveness>,
 }
 
 /// What [`Replicated`] holds.
@@ -490,6 +587,19 @@ struct State {
     /// Ordered, so that what this hands back is comparable with what a
     /// store hands back: see [`storage::Restored::metadata`].
     registers: BTreeMap<MetadataKey, Register<MetadataValue>>,
+    /// How many of *this node's* clients are in each shared group.
+    ///
+    /// The same rule as [`Self::local_filters`] and for the same reason,
+    /// keyed by share name and inner filter together: a register is
+    /// written only when the count leaves or reaches zero, so a second
+    /// local member of a group says nothing new and the last one to
+    /// leave writes a tombstone.
+    ///
+    /// **A separate count from the one below**, because the two are
+    /// separate registers: a client holding both `a/b` and
+    /// `$share/g/a/b` is one ordinary subscriber and one group member,
+    /// and a single count would tombstone neither when one of them went.
+    local_groups: HashMap<(String, String), usize>,
     /// How many of *this node's* subscribers each filter has.
     ///
     /// **Not replicated and not stored.** An entry is removed when it
@@ -540,7 +650,9 @@ impl Replicated {
         clock: HybridClock,
         restored: &Restored,
     ) -> Result<Self, MetadataError> {
-        let routes = Routes::new();
+        let liveness = Arc::new(Liveness::new());
+        let routes = Routes::new(Arc::clone(&liveness));
+        let groups = Groups::new(Arc::clone(&liveness));
         let mut registers = BTreeMap::new();
         for record in &restored.metadata {
             let write = MetadataWrite::from_record(record.clone())?;
@@ -548,7 +660,7 @@ impl Replicated {
             // with the registers and an empty routing map would forward
             // nothing to anybody until every peer happened to write
             // again, which for a quiet cluster is never.
-            index(&routes, &write.key, Some(&write.register));
+            index(&routes, &groups, &write.key, Some(&write.register));
             registers.insert(write.key, write.register);
         }
         let mut logged = Vec::with_capacity(restored.oplog.len());
@@ -565,11 +677,14 @@ impl Replicated {
             clock,
             state: Mutex::new(State {
                 registers,
+                local_groups: HashMap::new(),
                 local_filters: HashMap::new(),
                 oplog: OpLog::resume(logged, restored.oplog_collected_through),
                 seen,
             }),
             routes,
+            groups,
+            liveness,
         })
     }
 
@@ -740,7 +855,12 @@ impl Replicated {
                 // write that won: a copy that lost told this node
                 // nothing, and feeding it to the map would undo the
                 // later write the map already holds.
-                index(&self.routes, write.key(), Some(write.register()));
+                index(
+                    &self.routes,
+                    &self.groups,
+                    write.key(),
+                    Some(write.register()),
+                );
                 taken.records.push(Record::MetadataPut {
                     entry: write.to_record(),
                 });
@@ -905,6 +1025,109 @@ impl Replicated {
         ))
     }
 
+    /// Section 8.3's **group** map, as the publish path reads it.
+    ///
+    /// Which nodes have a member of each shared group, and which one is
+    /// chosen to serve a publication. Separate from [`Self::routes`]
+    /// because a group cannot use that map; see [`crate::groups`].
+    #[must_use]
+    pub const fn groups(&self) -> &Groups {
+        &self.groups
+    }
+
+    /// Which nodes this one has judged dead.
+    ///
+    /// Membership is not replicated, so nothing is written down when a
+    /// node dies and no register covers it. Both of section 8.3's maps
+    /// honour this, and it is one set rather than two.
+    #[must_use]
+    pub const fn liveness(&self) -> &Arc<Liveness> {
+        &self.liveness
+    }
+
+    /// This node has judged `node` dead: stop choosing it.
+    pub fn died(&self, node: NodeId) {
+        self.liveness.died(node);
+    }
+
+    /// And `node` is answering again.
+    pub fn revived(&self, node: NodeId) {
+        self.liveness.revived(node);
+    }
+
+    /// How many of this node's own clients are in `group` on `filter`.
+    ///
+    /// Local, and never replicated, like [`Self::local_subscribers`].
+    #[must_use]
+    pub fn local_members(&self, group: &str, filter: &str) -> usize {
+        self.held()
+            .local_groups
+            .get(&(group.to_owned(), filter.to_owned()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// A local client joined `group` on `filter`.
+    ///
+    /// Returns a write **only when the count left zero**, for
+    /// [`Self::subscriber_arrived`]'s reason: every peer already
+    /// believes this node has a member, and saying it again is a
+    /// register and a frame per client rather than per group.
+    pub fn group_joined(&self, group: &str, filter: &str) -> Option<MetadataWrite> {
+        let mut state = self.held();
+        let count = {
+            let held = state
+                .local_groups
+                .entry((group.to_owned(), filter.to_owned()))
+                .or_insert(0);
+            *held += 1;
+            *held
+        };
+        if count > 1 {
+            return None;
+        }
+        Some(self.write(
+            &mut state,
+            MetadataKey::NodeGroup {
+                node: self.me,
+                group: group.to_owned(),
+                filter: filter.to_owned(),
+            },
+            Some(MetadataValue::NodeGroup),
+        ))
+    }
+
+    /// A local client left `group` on `filter`.
+    ///
+    /// Returns a **tombstone** only when the count reached zero.
+    /// Dropping the register instead would leave every peer choosing
+    /// this node for a group it has nobody in, and a publication chosen
+    /// for it would be delivered to nobody at all — which is worse than
+    /// an ordinary filter going stale, because the group's other members
+    /// were passed over for it.
+    pub fn group_left(&self, group: &str, filter: &str) -> Option<MetadataWrite> {
+        let key = (group.to_owned(), filter.to_owned());
+        let mut state = self.held();
+        let count = {
+            let held = state.local_groups.get_mut(&key)?;
+            *held -= 1;
+            *held
+        };
+        if count > 0 {
+            return None;
+        }
+        state.local_groups.remove(&key);
+        Some(self.write(
+            &mut state,
+            MetadataKey::NodeGroup {
+                node: self.me,
+                group: group.to_owned(),
+                filter: filter.to_owned(),
+            },
+            None,
+        ))
+    }
+
     /// A retained message was set on `topic`.
     pub fn retained(&self, topic: &str, message: RetainedRecord) -> MetadataWrite {
         let mut state = self.held();
@@ -999,7 +1222,7 @@ impl Replicated {
         // to be said anyway: an index left holding a row for a register
         // that no longer exists is a leak, and the row is the only thing
         // that would notice.
-        index(&self.routes, key, None);
+        index(&self.routes, &self.groups, key, None);
         vec![Record::MetadataRemoved {
             key: key.to_record(),
         }]
@@ -1015,7 +1238,12 @@ impl Replicated {
         let mut state = self.held();
         let won = merge(&mut state, &write);
         if won {
-            index(&self.routes, write.key(), Some(write.register()));
+            index(
+                &self.routes,
+                &self.groups,
+                write.key(),
+                Some(write.register()),
+            );
         }
         won
     }
@@ -1043,7 +1271,7 @@ impl Replicated {
         // [`crate::forward`] is what leaves this node out of a forward —
         // see [`Routes::nodes_for`] for why the subtraction is there and
         // not here.
-        index(&self.routes, &key, Some(&register));
+        index(&self.routes, &self.groups, &key, Some(&register));
         let write = MetadataWrite::new(key, register);
         // Numbered here and published later, which is the two-phase write
         // the module documentation is about: the number is spent now so
