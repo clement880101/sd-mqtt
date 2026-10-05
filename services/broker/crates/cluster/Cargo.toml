@@ -29,6 +29,16 @@ storage = { path = "../storage", version = "0.1.0", default-features = false }
 # Nothing new reaches the binary: `broker-core` is already in it, and the
 # direct-dependency budget counts external crates, of which this adds
 # none.
+#
+# **This was a dev-dependency, and the note under it said a normal one
+# "either way" was wrong.** That note gave two reasons and both are
+# about the other direction, where they still hold: a `broker-core` that
+# depended on this crate would carry tokio, aws-lc-rs and postcard into
+# the crate documented as doing no I/O, and a hybrid logical clock into
+# the one that reads no clock. Neither is true of this direction.
+# `broker-core` gains no dependency, the `cargo tree -p broker-core -e
+# normal` check its own manifest documents is untouched, and there is no
+# cycle to make.
 broker-core = { path = "../broker-core", version = "0.1.0" }
 # Section 8.1's identity is a UUID v7. The same features `broker-core`
 # names, and the same crate: a second version 7 generator in one binary
@@ -93,13 +103,10 @@ proptest.workspace = true
 # last entry is a guard that built its type by hand and so never reached
 # the caller that was supposed to use it.
 #
-# **Dev only, and the direction stays the one it is.** `broker-core`
-# depends on nothing of ours but `storage`, and its `Cargo.toml` asserts
-# that with a `cargo tree -e normal` check; a normal dependency either
-# way would put `tokio`, `aws-lc-rs` and `postcard` into the crate
-# documented as doing no I/O, or this crate's clock into the one that
-# reads no clock. A dev-dependency is neither: nothing shipped links it.
-broker-core = { path = "../broker-core", version = "0.1.0" }
+# `broker-core` is a normal dependency now — section 8.3's routing map
+# is the subscription trie in a second instance — so it is not repeated
+# here. The reasoning that used to live in this paragraph, and what of
+# it still holds, is above it.
 mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
 # `rt` and `macros` for `#[tokio::test]`; `io-util` for `duplex`, which
 # is the pair of ends every handshake test runs over; `time` for the

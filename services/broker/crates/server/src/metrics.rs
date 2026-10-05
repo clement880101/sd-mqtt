@@ -1185,14 +1185,44 @@ impl Collector for Live {
         // **only on a node that clusters**, which is what keeps them
         // absent rather than zero on a node that does not.
         let connections = shared.outbox_count();
-        let (sessions, subscriptions, retained, queued) = shared.with_broker(|broker| {
+        let (sessions, subscriptions, retained, queued, matches) = shared.with_broker(|broker| {
             (
                 broker.session_count(),
                 broker.subscription_count(),
                 broker.retained_count(),
                 broker.queue_depth(),
+                broker.router_matches(),
             )
         });
+
+        // Section 11.3's "router matches split local and remote",
+        // **deferred from milestone 3 and not deferred any more.** The
+        // note that stood here said the remote half needed a cluster and
+        // that counting the local half needed the matching layer to
+        // report a number it did not return, which would have put
+        // counting inside the crate that deliberately counts nothing.
+        // Neither is true now: section 8.3's forwarding is what wanted
+        // the remote half, and the local half is a running total the
+        // broker keeps and this reads, which is the same division as
+        // every gauge above.
+        //
+        // One family split by label rather than two names, because the
+        // question an operator asks is what proportion of this node's
+        // matching is costing a network copy. Both series exist on
+        // every node: a node that does not cluster really did forward to
+        // nobody, which is not the same as `cluster_members`, where zero
+        // would be a lie because a node is a member of its own cluster.
+        let mut router = encoder.encode_descriptor(
+            "router_matches",
+            "Publications routed, by whether they were delivered here or forwarded to \
+             another node",
+            None,
+            prometheus_client::metrics::MetricType::Counter,
+        )?;
+        for (scope, value) in [("local", matches.local), ("remote", matches.remote)] {
+            let counter = ConstCounter::new(value);
+            counter.encode(router.encode_family(&[("scope", scope)])?)?;
+        }
 
         for (name, help, value) in [
             (
@@ -1368,6 +1398,107 @@ sdmqtt_packets_received_total{kind=\"unsuback\",version=\"5\"} 0
 sdmqtt_packets_received_total{kind=\"unsubscribe\",version=\"3.1.1\"} 0
 sdmqtt_packets_received_total{kind=\"unsubscribe\",version=\"5\"} 0
 "
+        );
+    }
+
+    /// Section 11.3's router matches, split local and remote.
+    ///
+    /// **Both series exist before a single publication**, which is the
+    /// half a substring search would not catch: a family that only grew
+    /// a series when it was first incremented leaves a hole in a
+    /// dashboard, and a remote half that was registered only on a node
+    /// that clusters would make the split mean different things on
+    /// different nodes.
+    ///
+    /// The exact text, because it is what a scraper parses: the label is
+    /// `scope`, the values are lower case, and a local delivery does not
+    /// land on the remote series.
+    #[tokio::test]
+    async fn the_router_matches_are_split_local_and_remote() {
+        use broker_core::broker::BrokerConfig;
+        use mqtt_codec::packet::{Connect, RetainHandling, Subscribe, SubscriptionOptions};
+        use mqtt_codec::{Packet, Properties, QoS};
+
+        use crate::shared::Shared;
+
+        let shared = std::sync::Arc::new(Shared::new(BrokerConfig::default()));
+        shared.metrics().watch(&shared);
+
+        assert_eq!(
+            block(&shared.metrics().render(), "sdmqtt_router_matches"),
+            "\
+# HELP sdmqtt_router_matches Publications routed, by whether they were delivered here or forwarded to another node
+# TYPE sdmqtt_router_matches counter
+sdmqtt_router_matches_total{scope=\"local\"} 0
+sdmqtt_router_matches_total{scope=\"remote\"} 0
+",
+            "both series must exist before anything is published"
+        );
+
+        let registration = shared.with_broker(|broker| {
+            broker
+                .connect(
+                    "",
+                    &Connect {
+                        version: Version::V5,
+                        client_id: "listener".into(),
+                        clean_start: false,
+                        keep_alive: 0,
+                        username: None,
+                        password: None,
+                        will: None,
+                        properties: Properties {
+                            session_expiry_interval: Some(3600),
+                            ..Properties::default()
+                        },
+                    },
+                    &mut Vec::new(),
+                )
+                .expect("the default decision authenticates")
+        });
+        shared.with_broker(|broker| {
+            broker
+                .handle(
+                    registration.subscriber,
+                    &Packet::Subscribe(Subscribe {
+                        packet_id: 1,
+                        filters: vec![SubscriptionOptions {
+                            filter: "a/+".into(),
+                            qos: QoS::AtMostOnce,
+                            no_local: false,
+                            retain_as_published: false,
+                            retain_handling: RetainHandling::SendAlways,
+                        }],
+                        properties: Properties::default(),
+                    }),
+                    &mut Vec::new(),
+                )
+                .expect("the subscription is accepted");
+        });
+        shared.with_broker(|broker| {
+            let now = broker.clock().now();
+            broker.publish(
+                broker_core::session::Message::new(
+                    "a/b",
+                    bytes::Bytes::from_static(b"here"),
+                    QoS::AtMostOnce,
+                    false,
+                ),
+                None,
+                now,
+                &mut Vec::new(),
+            );
+        });
+
+        assert_eq!(
+            block(&shared.metrics().render(), "sdmqtt_router_matches"),
+            "\
+# HELP sdmqtt_router_matches Publications routed, by whether they were delivered here or forwarded to another node
+# TYPE sdmqtt_router_matches counter
+sdmqtt_router_matches_total{scope=\"local\"} 1
+sdmqtt_router_matches_total{scope=\"remote\"} 0
+",
+            "one local delivery, and nothing forwarded by a node with no cluster"
         );
     }
 

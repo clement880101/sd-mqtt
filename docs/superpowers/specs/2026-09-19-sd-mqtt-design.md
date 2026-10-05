@@ -1163,12 +1163,16 @@ message this broker ever accepted, and counting it would put a number on the
 remote's traffic rather than on this broker's losses. Recorded as a decision
 rather than left as an omission.
 
-**Router matches are deferred to milestone 5.** This section asks for them
-split local and remote. The remote half needs a cluster, and counting the
-local half needs the matching layer to report a number it does not currently
-return, which would put counting inside the crate that deliberately counts
-nothing. Both halves arrive together with clustering. Recorded here so that
-it stays a decision rather than becoming an omission.
+**Router matches arrived in milestone 5, with the routing they are about.**
+This section asks for them split local and remote, and the deferral recorded
+here gave two reasons: the remote half needs a cluster, and counting the
+local half needs the matching layer to report a number it did not return,
+which would have put counting inside the crate that deliberately counts
+nothing. Section 8.3's forwarding is what wanted the remote half, and the
+local half is a running total the broker keeps and the shell reads at the
+moment of a scrape — the same division as every other number it holds. Both
+series exist on every node, because a node that does not cluster really did
+forward to nobody; see `crates/server/src/metrics.rs`.
 
 **Cluster bytes sent, received and dropped are deferred to milestone 5 as
 well,** and this line is here because they were not. The neighbouring cluster

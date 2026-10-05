@@ -32,17 +32,29 @@
 //! earlier of them: the register table already decided which won, and the
 //! local effect has to follow in the same order.
 //!
-//! What is deliberately not applied is a node subscription or a session
-//! owner. The registers are held — every node holds every register — and
-//! what reads them is section 8.3's routing and section 8.4's migration,
-//! which are milestone 6. A register held with nothing acting on it is the
-//! state those will need; a register acted on by a half-written router
-//! would be worse than either.
+//! What is deliberately not applied *here* is a node subscription or a
+//! session owner. A node subscription is section 8.3's routing, and the
+//! thing that reads it is `cluster::Routes` — which `cluster::Replicated`
+//! keeps in step itself, from the four paths that change a register, so
+//! there is nothing for this task to do with one. A session owner is
+//! section 8.4's migration and is still a register with nothing acting on
+//! it.
+//!
+//! # And a publication that a peer forwarded is not a write at all
+//!
+//! Section 8.3's [`Message::Forward`] arrives on the same link, through
+//! the same handler, and goes nowhere near the register table: it is one
+//! publication for this node's own subscribers. It is routed under the
+//! broker's lock and delivered like any other, and it **fires no rule**,
+//! because a rule fires on the node where the message entered the
+//! cluster. See `broker_core::session::Message::forwarded`, which is
+//! what makes both of those true.
 
 use std::sync::Arc;
 
 use cluster::mesh::{Deliver, Mesh, Message};
 use cluster::metadata::{MetadataKey, MetadataValue};
+use cluster::MemberState;
 use cluster::{MetadataWrite, NodeId, Replicator};
 use rules::live::Registry;
 use sdmqtt_server::shared::{Broadcastable, Shared};
@@ -60,12 +72,25 @@ const SWEEP: std::time::Duration = std::time::Duration::from_secs(30);
 ///
 /// Answers the frame where an answer is owed, and queues what it means so
 /// that the link's reader is never held: see the module documentation.
-#[derive(Debug)]
+///
+/// No `Debug`, because `Shared` has none and must not grow one: a
+/// derived rendering of it would be every session and every subscription
+/// in the process, printed under the broker's lock by whatever logged
+/// it.
 pub struct Replication {
     /// What decides what a frame changed.
     replicator: Arc<Replicator>,
     /// Where the writes that won go to be applied, in order.
     applying: mpsc::UnboundedSender<Applying>,
+    /// The broker behind its lock, for section 8.3's forwarded
+    /// publications.
+    ///
+    /// A publication is not a register and does not go through the
+    /// queue above: it is routed and delivered where it arrives, in the
+    /// order it arrived, which is what the link already guarantees. A
+    /// queue in front of it would be a second ordering to reason about
+    /// and a buffer with nothing bounding it but the link.
+    shared: Arc<Shared>,
 }
 
 /// Writes a peer sent that won, and the records that go with them.
@@ -81,12 +106,16 @@ pub struct Applying {
 impl Replication {
     /// A handler over `replicator`, and the queue [`applying`] drains.
     #[must_use]
-    pub fn new(replicator: Arc<Replicator>) -> (Arc<Self>, mpsc::UnboundedReceiver<Applying>) {
+    pub fn new(
+        replicator: Arc<Replicator>,
+        shared: Arc<Shared>,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<Applying>) {
         let (applying, waiting) = mpsc::unbounded_channel();
         (
             Arc::new(Self {
                 replicator,
                 applying,
+                shared,
             }),
             waiting,
         )
@@ -95,10 +124,18 @@ impl Replication {
 
 impl Deliver for Replication {
     fn delivered(&self, from: NodeId, message: Message) -> Vec<Message> {
-        let Message::Replicate(frame) = message else {
+        let frame = match message {
+            Message::Replicate(frame) => frame,
+            // Section 8.3. One publication, for this node's own
+            // subscribers, and nothing is owed back: a publication is
+            // not a question.
+            Message::Forward(forwarded) => {
+                self.forwarded(forwarded);
+                return Vec::new();
+            }
             // A heartbeat. Membership was updated before this was called;
             // there is nothing else it means.
-            return Vec::new();
+            Message::Heartbeat { .. } => return Vec::new(),
         };
         let handled = match self.replicator.received(from, frame) {
             Ok(handled) => handled,
@@ -123,6 +160,62 @@ impl Deliver for Replication {
             });
         }
         handled.reply.map(Message::Replicate).into_iter().collect()
+    }
+
+    fn member_changed(&self, peer: NodeId, state: MemberState) {
+        // Section 8.2: membership is not replicated, so this is the only
+        // thing that can tell the routing map, and nothing is written
+        // down. The register stays: this node's judgement is local and
+        // may be the wrong half of a one-way partition, and the filters
+        // are the truth either way — see `cluster::routes`.
+        let routes = self.replicator.replicated().routes();
+        match state {
+            MemberState::Dead => routes.died(peer),
+            MemberState::Alive => routes.revived(peer),
+            // **Suspect is not dead, and is deliberately nothing here.**
+            // Section 8.1 gives failure detection two windows precisely
+            // so that a peer that missed a beat is not treated as gone;
+            // withholding its forwards at the first missed heartbeat
+            // would make a cluster under load stop routing to a node
+            // that is working.
+            MemberState::Suspect => {}
+        }
+    }
+}
+
+impl Replication {
+    /// Route one publication a peer forwarded, and deliver it.
+    ///
+    /// **Under the broker's lock and then outside it**, which is the
+    /// division every other path into the broker makes: the routing and
+    /// the journal happen under the guard, and the actions are delivered
+    /// once it has been dropped. `Shared::with_broker` is what enforces
+    /// it — the guard is its own local and there is no await in it.
+    ///
+    /// Nothing waits for the store. A forwarded publication promised
+    /// nobody anything: there is no publisher here to acknowledge, and
+    /// the node that did acknowledge one made its own batch durable
+    /// before it answered its client.
+    fn forwarded(&self, forwarded: cluster::Forwarded) {
+        let topic = forwarded.body.topic.clone();
+        let actions = self.shared.with_broker(|broker| {
+            let now = broker.clock().now();
+            let mut out = Vec::new();
+            let reached = broker.accept_forwarded(forwarded.into_message(), now, &mut out);
+            if reached == 0 {
+                // Not an error and not a defect: the routing map a peer
+                // forwarded by is its copy of this node's registers, and
+                // a subscriber that left a moment ago is a copy in
+                // flight. Said at debug because a *standing* stream of
+                // these is a map that has stopped converging.
+                tracing::debug!(
+                    topic,
+                    "a peer forwarded a publication this node has no subscriber for"
+                );
+            }
+            out
+        });
+        self.shared.deliver(actions);
     }
 }
 

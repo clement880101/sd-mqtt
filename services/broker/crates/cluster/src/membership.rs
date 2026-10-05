@@ -174,7 +174,23 @@ impl Membership {
     /// spoken is alive, on the same link, without waiting for
     /// anything: that is what makes a partition that heals a partition
     /// that heals.
-    pub fn heard(&mut self, identity: &NodeIdentity, advertised: &str, now: Instant) {
+    ///
+    /// Returns the state when this call **changed** it, and `None` when
+    /// a peer that was already alive said something else. The
+    /// difference matters to whoever keeps section 8.3's routing map in
+    /// step: this is called once per inbound frame, and a map told
+    /// every time would take a lock on the publish path for a fact it
+    /// already held. [`Membership::age`] reports a change for the same
+    /// reason — a line per second per peer is how a log stops being
+    /// read — and nothing else here reports one, so a peer that was
+    /// dead and spoke again had nobody to tell until this said so.
+    pub fn heard(
+        &mut self,
+        identity: &NodeIdentity,
+        advertised: &str,
+        now: Instant,
+    ) -> Option<MemberState> {
+        let was = self.members.get(&identity.id()).map(|member| member.state);
         let member = self.members.entry(identity.id()).or_insert_with(|| Member {
             identity: identity.clone(),
             advertised: advertised.to_owned(),
@@ -188,6 +204,7 @@ impl Membership {
         member.advertised = advertised.to_owned();
         member.state = MemberState::Alive;
         member.last_heard = now;
+        (was != Some(MemberState::Alive)).then_some(MemberState::Alive)
     }
 
     /// This peer's connection has gone.

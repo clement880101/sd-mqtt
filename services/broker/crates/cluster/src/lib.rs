@@ -104,6 +104,7 @@
 
 pub mod clock;
 pub mod config;
+pub mod forward;
 pub mod frame;
 pub mod handshake;
 pub mod identity;
@@ -120,6 +121,7 @@ pub mod transport;
 
 pub use clock::{ClockError, HybridClock, Reading, DEFAULT_MAX_DRIFT_MILLIS};
 pub use config::{ClusterConfig, ClusterSettings, ConfigError, DEFAULT_CLUSTER_NAME};
+pub use forward::{targets, Forwarded, Forwarding};
 pub use frame::{FrameError, FrameLimits, FRAME_VERSION};
 pub use handshake::{accept, dial, HandshakeError, Peer, Role};
 pub use identity::{IdentityError, NodeId, NodeIdentity, Reconciled};

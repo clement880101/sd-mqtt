@@ -134,6 +134,76 @@ pub struct Looped {
     pub maximum: u32,
 }
 
+/// Where a publication went, split local and remote.
+///
+/// Section 11.3 asks for "router matches split local and remote", and
+/// both halves arrive with clustering. They are a running total rather
+/// than a pair of metric handles because this crate holds no metrics:
+/// section 7.3 makes it say what happened and the shell writes it down,
+/// and these are the same division as [`Broker::take_journal`] applied
+/// to a number.
+///
+/// Monotonic, so a scraper reading them as counters is reading what they
+/// are. Nothing resets them and nothing may: a counter that goes
+/// backwards is read as a process restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RouterMatches {
+    /// Subscriptions on this node a publication was delivered to.
+    ///
+    /// Counted per delivery and not per publication, which is what
+    /// "matches" means: one publication reaching four sessions is four.
+    /// A subscriber holding two matching filters is one, because the
+    /// protocol makes it one delivery.
+    pub local: u64,
+    /// Copies sent to another node.
+    ///
+    /// One per interested node, which is section 8.3's economy: the
+    /// figure grows with how many nodes wanted a topic and not with how
+    /// many subscribers they have between them. Zero for ever on a node
+    /// that does not cluster, which is the truth about it rather than an
+    /// absence — a node with no peers forwarded to nobody.
+    pub remote: u64,
+}
+
+/// What a publication that entered this node is handed to.
+///
+/// Section 8.3's seam: a publish matches locally, enqueues to local
+/// sessions, and **forwards one copy to each remote node that has any
+/// match**. Which nodes those are is a question about replicated
+/// metadata and a mesh, neither of which this crate has or should gain,
+/// so this is the hole the shell fills.
+///
+/// `None` is a node that does not cluster, and the cost of that is one
+/// `Option` test per publish rather than a trait object call.
+///
+/// # Synchronous, and it must not block
+///
+/// It is called with whatever lock the shell holds around the broker
+/// still held, exactly as a [`crate::hooks::Hook`] is, and the
+/// obligations in that module apply here unchanged. Handing a message
+/// to a peer's bounded queue is a channel send that never waits, and
+/// section 8.1 drops and counts rather than letting a wedged peer block
+/// whoever had something to say to it — so there is nothing here that
+/// needs to wait.
+///
+/// # It is not asked about a forwarded message
+///
+/// [`Broker::publish`] tests the mark before it asks. See
+/// [`Message::forwarded`]: the difference between a mesh and an
+/// infinite loop is that test, and it is in the broker rather than in
+/// an implementation of this because an implementation that forgot it
+/// would be a cluster that melted.
+pub trait Forwarder: Send + Sync {
+    /// Send `message` to every node that wants it, and say how many.
+    ///
+    /// The count is what section 11.3's remote half counts, so it is
+    /// the nodes a copy was *sent to* rather than the nodes that wanted
+    /// it: a peer whose queue was full is a drop, counted as a drop by
+    /// section 8.1's own numbers, and counting it here as a match would
+    /// make the two disagree.
+    fn forward(&self, message: &Message) -> usize;
+}
+
 /// What the hooks said to do with an arriving message.
 ///
 /// Three outcomes and not two, because a message a hook refused and a
@@ -203,6 +273,15 @@ pub struct Broker {
     /// it is one event per session and filter rather than one per
     /// packet, and for the three paths that must emit a departure.
     filter_events: Vec<FilterEvent>,
+    /// Where a publication that entered this node goes next, section
+    /// 8.3, and `None` on a node that does not cluster.
+    ///
+    /// Held here rather than in [`BrokerConfig`] for the reason
+    /// [`Self::hooks`] is: it is a live object with a mesh behind it,
+    /// not configuration a shell can clone and pass around.
+    forwarder: Option<Arc<dyn Forwarder>>,
+    /// Section 11.3's router matches, split local and remote.
+    matches: RouterMatches,
 }
 
 impl Broker {
@@ -227,7 +306,43 @@ impl Broker {
             hooks: Hooks::new(),
             journal: Vec::new(),
             filter_events: Vec::new(),
+            forwarder: None,
+            matches: RouterMatches::default(),
         }
+    }
+
+    /// Send publications that entered this node on to the nodes that
+    /// want them, section 8.3.
+    ///
+    /// Installed by the shell once there is a mesh to forward over, and
+    /// never on a node that does not cluster. See [`Forwarder`] for what
+    /// an implementation may and may not do, and [`Message::forwarded`]
+    /// for the one message it is never asked about.
+    ///
+    /// Replacing one is replacing one. Nothing calls this twice, and the
+    /// answer if anything did is that the latest forwarder is the one
+    /// that is asked, which is the only answer that does not leave a
+    /// mesh being written to by something the binary has forgotten.
+    pub fn install_forwarder(&mut self, forwarder: Arc<dyn Forwarder>) {
+        self.forwarder = Some(forwarder);
+    }
+
+    /// Whether anything forwards from this node.
+    #[must_use]
+    pub fn forwards(&self) -> bool {
+        self.forwarder.is_some()
+    }
+
+    /// Section 11.3's router matches, as they stand.
+    ///
+    /// Read at the moment of a scrape, like every other number the shell
+    /// takes out of here. Deferred from milestone 3 with the reason that
+    /// the remote half needs a cluster and the local half needs the
+    /// matching layer to report a number it did not return; both are
+    /// true now.
+    #[must_use]
+    pub const fn router_matches(&self) -> RouterMatches {
+        self.matches
     }
 
     /// The hooks this broker fires, to install one or to read the
@@ -1323,9 +1438,66 @@ impl Broker {
         }
     }
 
+    /// Take a message another node forwarded, and route it here.
+    ///
+    /// Section 8.3: the receiving node matches against **its own local
+    /// subscribers**, and that is the whole of what this does beyond
+    /// setting the mark.
+    ///
+    /// # Three things it deliberately does not do
+    ///
+    /// - **It fires no message hook, so no rule fires.** A rule fires on
+    ///   the node where the message entered the cluster, which is the
+    ///   node that received it unmarked. This is the other node, so the
+    ///   rule has already fired there and firing it again here would be
+    ///   one publication posted to a webhook once per node that happened
+    ///   to have a subscriber.
+    /// - **It does not forward on.** [`Self::publish`] tests the mark,
+    ///   which this sets; see [`Message::forwarded`].
+    /// - **It does not touch the retained store**, even for a message
+    ///   whose retain flag is set. A retained message is replicated as
+    ///   a register by section 8.2 and arrives by that path, stamped by
+    ///   the node that wrote it. Retaining it here as well would stamp
+    ///   the same value again on this node, and two nodes doing that to
+    ///   each other is one retained message bouncing between them for
+    ///   ever — which is the loop `Shared::apply_replicated` already
+    ///   exists to prevent on the other path.
+    ///
+    ///   The flag itself still travels, because a subscription with
+    ///   retain-as-published set is entitled to see it: that is
+    ///   [MQTT-3.3.1-13] and it is about the delivery rather than about
+    ///   the store.
+    ///
+    /// Returns how many of this node's subscribers it reached, which is
+    /// a number nobody is owed — there is no publisher here to
+    /// acknowledge — and which section 11.3 counts.
+    pub fn accept_forwarded(
+        &mut self,
+        mut message: Message,
+        now: u32,
+        out: &mut Vec<Addressed>,
+    ) -> usize {
+        // **The mark, set in the one place it is ever set.** A shell
+        // that had to remember to set it would be a shell one forgotten
+        // line away from a mesh that melts, so it is not the shell's to
+        // set: what arrives over a link arrives through here.
+        message.forwarded = true;
+        // No publisher, so no-local cannot apply: this is nobody on this
+        // node's own message. The node it came from withheld it from its
+        // own publisher already, which is where that subscription is.
+        self.publish(message, None, now, out)
+    }
+
     /// Route a message to every subscriber that wants it, updating the
     /// retained store first when the flag is set. Returns how many
     /// subscribers it reached.
+    ///
+    /// # And forward one copy to each other node that wants it
+    ///
+    /// Section 8.3, unless the message is marked: see
+    /// [`Message::forwarded`] for why that test is the difference
+    /// between a mesh and an infinite loop, and [`Forwarder`] for what
+    /// does the sending.
     pub fn publish(
         &mut self,
         message: Message,
@@ -1333,7 +1505,10 @@ impl Broker {
         now: u32,
         out: &mut Vec<Addressed>,
     ) -> usize {
-        if message.retain {
+        // A forwarded message is not retained here; see
+        // [`Self::accept_forwarded`] for the stamp that would bounce
+        // between two nodes for ever if it were.
+        if message.retain && !message.forwarded {
             // An empty payload clears the topic rather than storing one,
             // which the store itself knows. The record says the same
             // thing the store was just told, because the two must not
@@ -1416,6 +1591,23 @@ impl Broker {
             }
             self.emit(target.subscriber, actions, out);
             self.drain_session(target.subscriber);
+        }
+
+        self.matches.local += reached as u64;
+        // **The mark is the whole of the loop prevention.** A message
+        // that arrived from a peer is not sent on: three nodes with a
+        // subscriber each would otherwise forward to one another for
+        // ever at the speed of the links between them.
+        //
+        // Read out of the field before the counter is touched, because
+        // the forwarder is borrowed from `self` and the counter is part
+        // of it.
+        if !message.forwarded {
+            let sent = self
+                .forwarder
+                .as_ref()
+                .map_or(0, |forwarder| forwarder.forward(&message));
+            self.matches.remote += sent as u64;
         }
 
         reached

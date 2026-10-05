@@ -854,11 +854,12 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     );
 
     // Section 8.1's mesh, after the store has been read and after the
-    // listener clients use is up. A peer that connects before the MQTT
-    // listener is bound is no trouble — nothing is forwarded over a
-    // link in this milestone — and binding this one last means a
-    // cluster port already in use is not discovered after the broker
-    // has started answering clients.
+    // listener clients use is up. Binding this one last means a cluster
+    // port already in use is not discovered after the broker has
+    // started answering clients — and a peer that connects before the
+    // MQTT listener is bound is no trouble either way, because a
+    // publication it forwards is routed against this node's own
+    // subscribers and a node with no listener has none.
     // Section 8.2's replication, which needs the mesh and is needed by it:
     // the mesh hands a peer's frames to this, and the tasks below hand this
     // node's writes to the mesh. Built before the mesh and given to it, so
@@ -868,7 +869,8 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             Arc::clone(&rebuilt.replicated),
             ReplicationSettings::default(),
         ));
-        let (handler, applying) = replication::Replication::new(Arc::clone(&replicator));
+        let (handler, applying) =
+            replication::Replication::new(Arc::clone(&replicator), Arc::clone(&rebuilt.shared));
         (replicator, handler, applying)
     });
     let deliveries = replication
@@ -876,6 +878,29 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         .map(|(_, handler, _)| Arc::clone(handler) as Arc<dyn cluster::mesh::Deliver>);
 
     let mesh = start_cluster(&config, rebuilt.as_ref(), deliveries).await?;
+    // Section 8.3, and **before any of the tasks below**: this is the
+    // only thing that makes `Broker::publish` forward anything, so the
+    // window between the mesh accepting links and this being installed
+    // is a window in which this node's own clients publish and nothing
+    // leaves. It is closed by putting it here rather than by ordering
+    // the tasks, because nothing about those tasks implies it.
+    //
+    // Installed only on a node that clusters. A node without a mesh
+    // leaves the hole empty, which costs `Broker::publish` one `Option`
+    // test and not a call.
+    if let (Some(mesh), Some(rebuilt)) = (&mesh, rebuilt.as_ref()) {
+        let forwarding = Arc::new(cluster::Forwarding::new(
+            Arc::clone(&rebuilt.replicated),
+            Arc::clone(mesh),
+        ));
+        rebuilt.shared.with_broker(|broker| {
+            broker.install_forwarder(forwarding as Arc<dyn broker_core::broker::Forwarder>);
+        });
+        tracing::info!(
+            node = %rebuilt.identity,
+            "this node forwards publications to the nodes that want them"
+        );
+    }
     // The four tasks of section 8.2, started once there is a mesh for them
     // to talk over. A node that does not cluster starts none of them: its
     // writes are stored and stamped and go nowhere, which is what a cluster

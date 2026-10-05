@@ -111,9 +111,9 @@ pub const DEFAULT_REFUSED_BACKOFF: Duration = Duration::from_secs(300);
 
 /// What a cluster link carries.
 ///
-/// Section 8.3's routing is a later plan and arrives as a variant here
-/// rather than as a second transport, which is what section 8.1 asks
-/// for: one framing, one authentication step and one failure model.
+/// Section 8.3's routing arrived as a variant here rather than as a
+/// second transport, which is what section 8.1 asked for: one framing,
+/// one authentication step and one failure model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
     /// Section 8.1's heartbeat.
@@ -134,6 +134,22 @@ pub enum Message {
     /// has already proved who is on the other end of it, so that is
     /// where the answer comes from.
     Replicate(crate::replicate::Replication),
+    /// Section 8.3's routing: one publication, for this peer's own
+    /// subscribers.
+    ///
+    /// Sent to a peer because the routing map says that peer has a
+    /// matching subscriber, and to no other peer. This is not a
+    /// broadcast, and the whole economy of section 8.3 is that it is
+    /// not: fan-out costs one frame per interested node rather than one
+    /// per node, and a node with nothing matching is not written to at
+    /// all. See [`crate::forward`].
+    ///
+    /// **A frame is never answered with another frame.** A publication
+    /// is not a question and nothing on the far end owes the sender
+    /// anything: a subscriber's acknowledgement belongs to the session
+    /// it was delivered to, which is held by the node that received
+    /// this.
+    Forward(crate::forward::Forwarded),
 }
 
 /// What something on top of the mesh does with a peer's message.
@@ -154,6 +170,28 @@ pub trait Deliver: Send + Sync {
     /// keeps this from needing the mesh: a handler that could send to
     /// anybody would have to hold the thing that holds it.
     fn delivered(&self, from: NodeId, message: Message) -> Vec<Message>;
+
+    /// This node now judges `peer` to be in `state`.
+    ///
+    /// Section 8.2: **membership is deliberately not replicated.**
+    /// Liveness is each node's own judgement about its own links, so
+    /// nothing is written down when a node dies and no register covers
+    /// the case — and section 8.3's routing map still has to stop
+    /// forwarding to it. This is how it is told.
+    ///
+    /// **Said rather than reported as a change**, so that a listener
+    /// does not have to track transitions to be correct. It is called
+    /// when a window ages a peer, when a link's reader ends, and when a
+    /// link comes up; every call is "it is this now" and the same call
+    /// twice means the same thing once.
+    ///
+    /// Synchronous and non-blocking, like [`Self::delivered`], and
+    /// called from the three tasks named above rather than from one.
+    ///
+    /// The default does nothing, which is what section 8.1's own tests
+    /// want: a mesh that reads frames and throws them away has no map to
+    /// keep in step.
+    fn member_changed(&self, _peer: NodeId, _state: MemberState) {}
 }
 
 /// Which end of a link between two nodes is the one to keep.
@@ -786,8 +824,9 @@ async fn beating(state: Arc<State>) {
                 Err(why) => tracing::error!(%why, "a heartbeat could not be framed"),
             }
         }
-        for (identity, state) in locked(&state.members).age(Instant::now()) {
-            match state {
+        let aged = locked(&state.members).age(Instant::now());
+        for (identity, verdict) in aged {
+            match verdict {
                 MemberState::Suspect => tracing::warn!(
                     peer = %identity,
                     "a cluster peer has missed its heartbeats and is suspect"
@@ -797,6 +836,12 @@ async fn beating(state: Arc<State>) {
                     "a cluster peer has been silent past the window and is dead"
                 ),
                 MemberState::Alive => tracing::info!(peer = %identity, "a cluster peer is back"),
+            }
+            // Section 8.3's routing map is what wants this: a node that
+            // is dead must stop receiving forwards, and nothing is
+            // written down when one dies.
+            if let Some(deliveries) = &state.deliveries {
+                deliveries.member_changed(identity.id(), verdict);
             }
         }
     }
@@ -907,7 +952,13 @@ fn install(state: &Arc<State>, stream: BoxStream, peer: handshake::Peer, role: R
     }
     drop(links);
 
-    locked(&state.members).heard(&peer.identity, &peer.advertised, Instant::now());
+    let now_alive = locked(&state.members).heard(&peer.identity, &peer.advertised, Instant::now());
+    // A peer this node had judged dead is alive again, and its filters
+    // are to be routed to again. `Routes` never threw them away, so
+    // there is nothing to replay; see that module.
+    if let (Some(deliveries), Some(verdict)) = (&state.deliveries, now_alive) {
+        deliveries.member_changed(peer.identity.id(), verdict);
+    }
     tracing::info!(peer = %peer.identity, advertised = %peer.advertised, ?role, "a cluster link is up");
     Installed::Kept
 }
@@ -929,7 +980,17 @@ async fn reading_from(
                 // **Anything, not only a beat.** A link carrying
                 // traffic is a link whose peer is answering; the
                 // heartbeat is what covers the links that are not.
-                locked(&state.members).heard(&identity, &advertised, Instant::now());
+                let now_alive =
+                    locked(&state.members).heard(&identity, &advertised, Instant::now());
+                // **Only when it changed.** A peer that was dead on a
+                // link that never closed is alive again the moment it
+                // speaks, and nothing else reports that: `age` sees a
+                // row that is already alive. Told on the edge rather
+                // than on every frame, because this is the inbound
+                // publish path and the map is behind a lock.
+                if let (Some(deliveries), Some(verdict)) = (&state.deliveries, now_alive) {
+                    deliveries.member_changed(identity.id(), verdict);
+                }
                 // Counted as a sign of life first and handled second, so
                 // that a handler which refuses a frame has not also made
                 // the peer look dead.
@@ -996,6 +1057,14 @@ async fn reading_from(
         // losing half of a simultaneous dial, and its peer is very
         // much there.
         locked(&state.members).gone(id);
+        // And the second of the two signals section 8.1 keeps apart: a
+        // closed socket, which is dead at once rather than after a
+        // window. Said here as well as in `beating` because the aging
+        // loop never sees this one — the row is already dead by the
+        // time it looks.
+        if let Some(deliveries) = &state.deliveries {
+            deliveries.member_changed(id, MemberState::Dead);
+        }
     }
 }
 
