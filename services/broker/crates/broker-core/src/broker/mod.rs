@@ -1527,8 +1527,7 @@ impl Broker {
     }
 
     /// Route a message to every subscriber that wants it, updating the
-    /// retained store first when the flag is set. Returns how many
-    /// subscribers it reached.
+    /// retained store first when the flag is set.
     ///
     /// # And forward one copy to each other node that wants it
     ///
@@ -1536,6 +1535,29 @@ impl Broker {
     /// [`Message::forwarded`] for why that test is the difference
     /// between a mesh and an infinite loop, and [`Forwarder`] for what
     /// does the sending.
+    ///
+    /// # What the count means, and why a forward is in it
+    ///
+    /// Returns how many subscribers on this node it reached **plus how
+    /// many other nodes it was forwarded to**. The two are added
+    /// because of the one thing the count decides: whether a publisher
+    /// is told "no matching subscribers".
+    ///
+    /// A client on one node publishing to a topic another node's client
+    /// subscribes to reaches a subscriber. Counting only the local ones
+    /// would answer [`ReasonCode::NoMatchingSubscribers`] — which tells
+    /// that publisher nobody is listening, on a cluster where somebody
+    /// is — and would make the answer depend on which node the
+    /// publisher happened to connect to. That is precisely what section
+    /// 8's clustering exists to stop being visible.
+    ///
+    /// It is a sum of two different things and says so rather than
+    /// pretending otherwise: a node forwarded to has at least one
+    /// matching subscriber, by the routing map's construction, so
+    /// "nonzero" means the same thing for both halves even though
+    /// "seven" does not. Section 11.3's metric keeps them apart, which
+    /// is where the distinction is worth having; see
+    /// [`Self::router_matches`].
     pub fn publish(
         &mut self,
         message: Message,
@@ -1652,6 +1674,7 @@ impl Broker {
         }
 
         self.matches.local += reached as u64;
+        let mut forwarded = 0;
         // **The mark is the whole of the loop prevention.** A message
         // that arrived from a peer is not sent on: three nodes with a
         // subscriber each would otherwise forward to one another for
@@ -1666,9 +1689,10 @@ impl Broker {
                 .as_ref()
                 .map_or(0, |forwarder| forwarder.forward(&message));
             self.matches.remote += sent as u64;
+            forwarded = sent;
         }
 
-        reached
+        reached + forwarded
     }
 
     /// A packet was too large to send and has been discarded.

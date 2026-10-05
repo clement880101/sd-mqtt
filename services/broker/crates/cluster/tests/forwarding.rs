@@ -295,6 +295,22 @@ impl Node {
         self.record(out);
     }
 
+    /// Publish, and say how many subscribers and nodes it reached.
+    ///
+    /// What becomes the acknowledgement's reason code: zero is
+    /// [MQTT-3.3.5]'s "no matching subscribers".
+    fn reached(&self, who: SubscriberId, topic: &str, payload: &'static [u8]) -> usize {
+        let message = Publication::new(topic, Bytes::from_static(payload), QoS::AtMostOnce, false);
+        let mut out = Vec::new();
+        let reached = {
+            let mut broker = locked(&self.broker);
+            let now = broker.clock().now();
+            broker.publish(message, Some(who), now, &mut out)
+        };
+        self.record(out);
+        reached
+    }
+
     /// Write down what the broker addressed to each session.
     fn record(&self, actions: Vec<Addressed>) {
         let mut delivered = locked(&self.delivered);
@@ -949,4 +965,37 @@ async fn a_group_another_node_was_chosen_for_is_not_served_here_as_well() {
         1,
         "beta delivered to its ordinary subscriber and to nobody else"
     );
+}
+
+/// A publisher is not told nobody is listening when another node is.
+///
+/// **The one thing the delivery count decides.** `publish` answers how
+/// many subscribers it reached, and an answer of zero becomes
+/// [MQTT-3.3.5] "no matching subscribers" in the acknowledgement. On a
+/// cluster the local count alone is the wrong answer: a client would be
+/// told nobody is listening while another node's client received the
+/// message, and the answer would depend on which node the publisher
+/// happened to connect to — which is exactly what section 8 exists to
+/// stop being visible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_forwarded_to_another_node_reached_somebody() {
+    let it = Cluster::start(["alpha", "beta", "gamma"]).await;
+    let (listener, writes) = it.nodes[2].subscribe("listener", "counted/+");
+    it.announce(2, &writes);
+
+    let publisher = it.nodes[0].connect("publisher");
+    assert_eq!(
+        it.nodes[0].reached(publisher, "counted/one", b"somebody wants this"),
+        1,
+        "a publication forwarded to a node that wants it reached somebody"
+    );
+    assert_eq!(
+        it.nodes[0].reached(publisher, "wanted/by/nobody", b"and this one does not"),
+        0,
+        "and one nobody wants still reaches nobody"
+    );
+    until("the forwarded one arrives", || {
+        !it.nodes[2].topics(listener).is_empty()
+    })
+    .await;
 }

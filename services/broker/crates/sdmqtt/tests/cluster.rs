@@ -44,8 +44,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use bytes::{Bytes, BytesMut};
 use cluster::testing::gate::Gate;
 use cluster::testing::Direction;
+use mqtt_codec::packet::{Ack, Connect, Publish, RetainHandling, Subscribe, SubscriptionOptions};
+use mqtt_codec::{decode, encode, Limits, Packet, Properties, QoS, ReasonCode, Version};
 
 /// How long to wait for a freshly started broker to accept.
 ///
@@ -95,6 +98,8 @@ const NODES: usize = 3;
 struct Node {
     child: Child,
     admin: SocketAddr,
+    /// Where its clients connect, which section 8.3's routing is about.
+    mqtt: SocketAddr,
     log: PathBuf,
     label: &'static str,
 }
@@ -194,6 +199,24 @@ impl Node {
             "{} would not publish to {topic}: {answered}",
             self.label
         );
+    }
+
+    /// Publish through the admin API and say how many it reached.
+    ///
+    /// Section 8.3's count: subscribers on that node plus nodes it was
+    /// forwarded to. Nonzero is "somebody in this cluster wants it",
+    /// which is what a test waiting for a subscription register to
+    /// arrive is waiting for — and asking the broker beats sleeping,
+    /// because a broadcast is milliseconds and a sleep long enough to
+    /// cover a loaded machine is seconds.
+    fn publish_reaching(&self, topic: &str, payload: &str) -> u64 {
+        let body = format!("{{\"topic\":\"{topic}\",\"payload\":\"{payload}\",\"qos\":1}}");
+        let answered = self.post("/api/v1/publish", &body);
+        let document: serde_json::Value = serde_json::from_str(&answered)
+            .unwrap_or_else(|why| panic!("{answered:?} is not JSON: {why}"));
+        document["delivered"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no delivered count in {document}"))
     }
 
     /// What this node holds retained, as topic and text.
@@ -354,6 +377,223 @@ fn free_port() -> u16 {
     );
 }
 
+// ---- a client over the socket --------------------------------------
+//
+// Section 8.3 is about what a *client* sees, so these tests have to be
+// clients: the admin API can publish and can say what a node holds
+// retained, and it cannot subscribe. The same shape as the client in
+// `tests/restart.rs`, which is deliberate — what differs is that these
+// connect to three different brokers.
+
+/// One MQTT 5 client on a blocking socket.
+struct Client {
+    stream: TcpStream,
+    buf: BytesMut,
+    packets: u16,
+    /// Deliveries that arrived while something else was being waited
+    /// for.
+    ///
+    /// **A retained message overtakes its own SUBACK**, legitimately: a
+    /// subscribe that matches a retained message produces the delivery
+    /// and the acknowledgement in one batch, and nothing in the
+    /// protocol orders the two. A client that insisted on the SUBACK
+    /// first would be asserting an order the broker never promised, so
+    /// this holds whatever arrives early until something asks for it.
+    pending: Vec<(String, String)>,
+}
+
+impl Client {
+    /// Connect to `address` with a session that outlives its connection.
+    fn connect(address: SocketAddr, client_id: &str) -> Self {
+        let stream = TcpStream::connect_timeout(&address, REPLY).expect("the broker accepts");
+        stream.set_nodelay(true).expect("nodelay");
+        stream
+            .set_read_timeout(Some(REPLY))
+            .expect("a read deadline");
+        let mut client = Self {
+            stream,
+            buf: BytesMut::new(),
+            packets: 0,
+            pending: Vec::new(),
+        };
+        client.send(&Packet::Connect(Box::new(Connect {
+            version: Version::V5,
+            client_id: client_id.to_owned(),
+            clean_start: true,
+            keep_alive: 0,
+            username: None,
+            password: None,
+            will: None,
+            properties: Properties {
+                session_expiry_interval: Some(0),
+                ..Properties::default()
+            },
+        })));
+        match client.next() {
+            Some(Packet::ConnAck(ack)) => {
+                assert_eq!(ack.reason, ReasonCode::Success, "{client_id} was refused");
+            }
+            other => panic!("expected a connect acknowledgement, got {other:?}"),
+        }
+        client
+    }
+
+    /// Subscribe at least once, and wait for the grant.
+    fn subscribe(&mut self, filter: &str) {
+        let packet_id = self.next_packet_id();
+        self.send(&Packet::Subscribe(Subscribe {
+            packet_id,
+            filters: vec![SubscriptionOptions {
+                filter: filter.to_owned(),
+                qos: QoS::AtLeastOnce,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: RetainHandling::SendAlways,
+            }],
+            properties: Properties::default(),
+        }));
+        loop {
+            match self.next() {
+                Some(Packet::SubAck(ack)) => {
+                    assert_eq!(
+                        ack.reasons,
+                        vec![ReasonCode::GrantedQos1],
+                        "the subscribe to {filter} was refused"
+                    );
+                    return;
+                }
+                // A retained message this subscribe asked for, arriving
+                // before the acknowledgement. Held rather than
+                // discarded: it is the delivery a later assertion is
+                // about.
+                Some(packet) => {
+                    if let Some(delivery) = self.take(packet) {
+                        self.pending.push(delivery);
+                    }
+                }
+                None => panic!("the broker closed before acknowledging {filter}"),
+            }
+        }
+    }
+
+    /// Publish at least once and wait to be told what it reached.
+    ///
+    /// The reason code is returned rather than asserted, because it
+    /// answers the question a test about routing has to ask: whether
+    /// anybody in the cluster wants the topic yet.
+    fn publish(&mut self, topic: &str, payload: &str) -> ReasonCode {
+        let packet_id = self.next_packet_id();
+        self.send(&Packet::Publish(Publish {
+            dup: false,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            topic: topic.to_owned(),
+            packet_id: Some(packet_id),
+            payload: Bytes::from(payload.to_owned()),
+            properties: Properties::default(),
+        }));
+        loop {
+            match self.next() {
+                Some(Packet::PubAck(ack)) => {
+                    assert_eq!(ack.packet_id, packet_id);
+                    return ack.reason;
+                }
+                // A delivery to this same client, which is ordinary:
+                // these clients subscribe and publish on one connection.
+                Some(packet) => {
+                    if let Some(delivery) = self.take(packet) {
+                        self.pending.push(delivery);
+                    }
+                }
+                None => panic!("the broker closed before acknowledging a publication"),
+            }
+        }
+    }
+
+    /// A publication as a delivery, acknowledged, or `None` for
+    /// anything else.
+    fn take(&mut self, packet: Packet) -> Option<(String, String)> {
+        let Packet::Publish(publish) = packet else {
+            return None;
+        };
+        if let Some(packet_id) = publish.packet_id {
+            self.send(&Packet::PubAck(Ack {
+                packet_id,
+                reason: ReasonCode::Success,
+                properties: Properties::default(),
+            }));
+        }
+        Some((
+            publish.topic,
+            String::from_utf8_lossy(&publish.payload).into_owned(),
+        ))
+    }
+
+    /// Wait up to `patience` for a delivery, and acknowledge it.
+    ///
+    /// Returns the topic and the payload as text. `None` is nothing
+    /// arriving in time, which several of these tests assert.
+    fn delivered_within(&mut self, patience: Duration) -> Option<(String, String)> {
+        if !self.pending.is_empty() {
+            return Some(self.pending.remove(0));
+        }
+        self.stream
+            .set_read_timeout(Some(patience))
+            .expect("a read deadline");
+        let deadline = Instant::now() + patience;
+        while Instant::now() < deadline {
+            // Anything that is not a publication is not what is being
+            // waited for; a closed socket ends the wait.
+            let packet = self.next()?;
+            if let Some(delivery) = self.take(packet) {
+                return Some(delivery);
+            }
+        }
+        None
+    }
+
+    /// Every delivery already waiting, without waiting for more.
+    fn drain(&mut self) -> Vec<(String, String)> {
+        let mut seen = Vec::new();
+        while let Some(delivery) = self.delivered_within(Duration::from_millis(100)) {
+            seen.push(delivery);
+        }
+        seen
+    }
+
+    /// A packet identifier nothing else of this client's is using.
+    ///
+    /// Counted up rather than reused, because these clients have
+    /// deliveries outstanding at the same time as their own
+    /// publications and a fixed identifier would collide with one.
+    fn next_packet_id(&mut self) -> u16 {
+        self.packets = self.packets.wrapping_add(1).max(1);
+        self.packets
+    }
+
+    fn send(&mut self, packet: &Packet) {
+        let mut out = BytesMut::new();
+        encode(packet, Version::V5, &mut out).expect("the packet encodes");
+        self.stream.write_all(&out).expect("the write succeeds");
+    }
+
+    /// Read until one packet is whole, or the read deadline passes.
+    fn next(&mut self) -> Option<Packet> {
+        loop {
+            if let Some(packet) = decode(&mut self.buf, Version::V5, &Limits::default())
+                .expect("the broker sends valid packets")
+            {
+                return Some(packet);
+            }
+            let mut chunk = [0u8; 4096];
+            match self.stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return None,
+                Ok(read) => self.buf.extend_from_slice(&chunk[..read]),
+            }
+        }
+    }
+}
+
 fn loopback(port: u16) -> SocketAddr {
     format!("127.0.0.1:{port}").parse().expect("an address")
 }
@@ -485,6 +725,7 @@ impl Cluster {
             let config = directory.join(format!("{label}.toml"));
             let store = directory.join(format!("{label}-store"));
             let admin = loopback(free_port());
+            let mqtt = loopback(free_port());
             let seeds: Vec<SocketAddr> = (0..NODES)
                 .filter(|to| *to != at)
                 .map(|to| gates[&(at, to)].address())
@@ -493,7 +734,7 @@ impl Cluster {
                 &config,
                 &store,
                 label,
-                loopback(free_port()),
+                mqtt,
                 admin,
                 ports[at],
                 advertised[at],
@@ -525,6 +766,7 @@ impl Cluster {
             let mut node = Node {
                 child,
                 admin,
+                mqtt,
                 log,
                 label,
             };
@@ -993,6 +1235,232 @@ async fn three_nodes_converge_after_a_partition_heals() {
             LABELS.iter().map(|label| (*label).to_owned()).collect(),
             "{} does not see three distinctly named nodes",
             node.label
+        );
+    }
+}
+
+/// Append whichever workers have `payload` waiting for them.
+///
+/// One short pass over all of them rather than a long wait on each:
+/// every publication to a shared group is received by exactly one
+/// member, so most of these find nothing and must find it quickly.
+fn collect(workers: &mut [Client], payload: &str, got: &mut Vec<usize>) {
+    for (which, worker) in workers.iter_mut().enumerate() {
+        while let Some((topic, body)) = worker.delivered_within(Duration::from_millis(50)) {
+            assert_eq!(topic, "jobs/one");
+            assert_eq!(body, payload, "a member received a job out of order");
+            got.push(which);
+        }
+    }
+}
+
+/// Three processes route a publication across the cluster.
+///
+/// Section 8.3 against the real binary, over real sockets, through the
+/// gate. Four criteria in one test rather than four, because what each
+/// of them costs is three operating system processes, three stores and
+/// three handshakes, and the thing being asserted is a property of the
+/// same three:
+///
+/// 1. a subscriber on the third node receives what a publisher on the
+///    first one sends;
+/// 2. a retained message published on one is delivered to a subscriber
+///    that connects to another afterwards;
+/// 3. a shared group with a member on each node receives **one** copy
+///    per publication, and over enough of them every member is chosen;
+/// 4. through the gate: two nodes severed from each other, and the two
+///    that can still reach each other still deliver.
+///
+/// # How a test waits for a subscription to reach another node
+///
+/// Not by sleeping. A subscription becomes a register, the register is
+/// broadcast, and the node that receives it puts it in its routing map
+/// — milliseconds, but milliseconds nobody can bound on a loaded
+/// machine. What *can* be asked is the publisher's own
+/// acknowledgement: section 8.3 counts a node forwarded to as a
+/// subscriber reached, so [MQTT-3.3.5]'s "no matching subscribers"
+/// stops being the answer exactly when the register has arrived.
+///
+/// So these publish until the acknowledgement changes, drain whatever
+/// those probes delivered, and only then assert about a publication of
+/// their own. A test that slept would be slower and would still be a
+/// race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_nodes_deliver_across_the_cluster() {
+    /// How long one delivery may take once the cluster has converged.
+    ///
+    /// A forward is one frame over loopback. Generous because this runs
+    /// on shared hardware, and a flaky cluster test is worse than none.
+    const DELIVERY: Duration = Duration::from_secs(10);
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cluster = Cluster::start(directory.path()).await;
+    let established = cluster.settle();
+    let nodes = &cluster.nodes;
+
+    // ---- 1. a publication crosses the cluster ----------------------
+    let mut listener = Client::connect(nodes[2].mqtt, "the-listener");
+    listener.subscribe("site/+/temp");
+
+    until("alpha learns that gamma wants site/+/temp", || {
+        nodes[0].publish_reaching("site/0/temp", "probe") > 0
+    });
+    // The probes above were delivered too, legitimately: they are
+    // publications to a topic the subscriber asked for.
+    listener.drain();
+
+    let mut publisher = Client::connect(nodes[0].mqtt, "the-publisher");
+    assert_eq!(
+        publisher.publish("site/1/temp", "21.5"),
+        ReasonCode::Success,
+        "a publication a node in this cluster wants must not be answered \
+         with no matching subscribers"
+    );
+    assert_eq!(
+        listener.delivered_within(DELIVERY),
+        Some(("site/1/temp".to_owned(), "21.5".to_owned())),
+        "a publication on alpha did not reach a subscriber on gamma: {}",
+        nodes[2].logged()
+    );
+
+    // ---- 2. a retained message is waiting on another node ----------
+    //
+    // Published on beta, read by a client that connects to gamma
+    // *afterwards*: the register travels by section 8.2's replication
+    // and the delivery is section 3.3.1.3's retained handling, so this
+    // is the one case where the message reaches a client that was not
+    // there when it was published.
+    nodes[1].retain("site/9/state", "warm");
+    until("gamma holds the retained message", || {
+        nodes[2].retained().get("site/9/state").map(String::as_str) == Some("warm")
+    });
+    let mut late = Client::connect(nodes[2].mqtt, "the-latecomer");
+    late.subscribe("site/9/state");
+    assert_eq!(
+        late.delivered_within(DELIVERY),
+        Some(("site/9/state".to_owned(), "warm".to_owned())),
+        "a retained message published on beta was not delivered on gamma"
+    );
+
+    // ---- 3. a shared group is delivered once -----------------------
+    //
+    // A member on each node, which is the arrangement that delivers
+    // three times to a cluster that routes a group through the ordinary
+    // map. Each publication goes through a different node's admin API,
+    // so that section 6's local preference is what spreads the work —
+    // a node with a member of its own serves the group itself, which is
+    // the clause that is implementable before queue replication.
+    const ROUNDS: usize = 3;
+    let mut workers: Vec<Client> = (0..NODES)
+        .map(|at| {
+            let mut worker = Client::connect(nodes[at].mqtt, &format!("worker-{at}"));
+            worker.subscribe("$share/workers/jobs/+");
+            worker
+        })
+        .collect();
+    until("every node knows the group has a member somewhere", || {
+        (0..NODES).all(|at| nodes[at].publish_reaching("jobs/probe", "probe") > 0)
+    });
+    for worker in &mut workers {
+        worker.drain();
+    }
+
+    let mut served = vec![0usize; NODES];
+    for round in 0..ROUNDS {
+        for (at, node) in nodes.iter().enumerate() {
+            let payload = format!("job-{round}-{at}");
+            assert!(
+                node.publish_reaching("jobs/one", &payload) > 0,
+                "{} would not publish to the group",
+                node.label
+            );
+            // Exactly one member receives it, and which one is not what
+            // is asserted: the whole point of a shared subscription is
+            // that the cluster chooses.
+            //
+            // **Polled in short passes rather than waited for member by
+            // member.** Two of the three are going to receive nothing,
+            // and a long deadline each would be two long waits per
+            // publication — the shape that turned this section into
+            // forty seconds of a test that asserts twelve things.
+            let mut got = Vec::new();
+            let deadline = Instant::now() + DELIVERY;
+            while got.is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{payload} reached no member of the group at all: {}",
+                    node.logged()
+                );
+                collect(&mut workers, &payload, &mut got);
+            }
+            // And then one more pass, because a second delivery is the
+            // defect this whole section exists for and it would arrive
+            // a moment after the first.
+            std::thread::sleep(Duration::from_millis(250));
+            collect(&mut workers, &payload, &mut got);
+            assert_eq!(
+                got.len(),
+                1,
+                "{payload} was delivered to {} members of one group, not one: {}",
+                got.len(),
+                node.logged()
+            );
+            served[got[0]] += 1;
+        }
+    }
+    assert_eq!(
+        served.iter().sum::<usize>(),
+        ROUNDS * NODES,
+        "one delivery per publication, and no more: {served:?}"
+    );
+    assert!(
+        served.iter().all(|count| *count > 0),
+        "a member node was never chosen over {} publications: {served:?}",
+        ROUNDS * NODES
+    );
+
+    // ---- 4. through the gate ---------------------------------------
+    //
+    // Alpha and beta are severed from each other in both directions,
+    // and gamma reaches both. What is asserted is that the two nodes
+    // that can still reach each other still deliver: a partition must
+    // not stop the cluster routing where it can, which is section 8.5's
+    // availability default.
+    cluster.gates[&(0, 1)].cut(Direction::Forward);
+    cluster.gates[&(0, 1)].cut(Direction::Backward);
+    cluster.gates[&(1, 0)].cut(Direction::Forward);
+    cluster.gates[&(1, 0)].cut(Direction::Backward);
+    until("alpha and beta declare each other dead", || {
+        nodes[0].how(&nodes[1].identity()).as_deref() == Some("down")
+            && nodes[1].how(&nodes[0].identity()).as_deref() == Some("down")
+    });
+
+    let mut across = Client::connect(nodes[2].mqtt, "across-the-partition");
+    across.subscribe("partitioned/+");
+    until("alpha learns that gamma wants partitioned/+", || {
+        nodes[0].publish_reaching("partitioned/probe", "probe") > 0
+    });
+    across.drain();
+    assert_eq!(
+        publisher.publish("partitioned/one", "still here"),
+        ReasonCode::Success,
+        "alpha should still reach gamma while it cannot reach beta"
+    );
+    assert_eq!(
+        across.delivered_within(DELIVERY),
+        Some(("partitioned/one".to_owned(), "still here".to_owned())),
+        "the two reachable nodes stopped delivering to each other: {}",
+        nodes[0].logged()
+    );
+
+    // And nothing reconnected: the partition was imposed on the
+    // connections the cluster already had, which is what a gate can do
+    // and a closed socket cannot.
+    for (pair, gate) in &cluster.gates {
+        assert_eq!(
+            gate.connections(),
+            established[pair],
+            "the gate {pair:?} reconnected during the test"
         );
     }
 }
