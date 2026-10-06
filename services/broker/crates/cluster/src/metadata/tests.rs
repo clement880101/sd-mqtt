@@ -105,7 +105,10 @@ fn every_kind(me: NodeId) -> Vec<(MetadataKey, MetadataValue)> {
             MetadataKey::SessionOwner {
                 session: session("gauge"),
             },
-            MetadataValue::SessionOwner { node: node(9) },
+            MetadataValue::SessionOwner {
+                node: node(9),
+                epoch: 3,
+            },
         ),
         (
             MetadataKey::NodeGroup {
@@ -217,11 +220,11 @@ fn every_kind_survives_a_restart() {
                 .expect("the first subscriber writes a register"),
             MetadataValue::Retained(held) => before.retained("sensor/1/temp", held),
             MetadataValue::Rule(held) => before.rule(*held),
-            MetadataValue::SessionOwner { node: owner } => {
+            MetadataValue::SessionOwner { node: owner, epoch } => {
                 let MetadataKey::SessionOwner { session } = key else {
                     unreachable!("the pair came from one list")
                 };
-                before.session_owned(session, owner)
+                before.session_owned(session, owner, epoch)
             }
             MetadataValue::NodeGroup => before
                 .group_joined("workers", "jobs/+")
@@ -319,7 +322,7 @@ fn every_kind_is_stamped_by_one_clock_and_one_identity() {
             .expect("the first subscriber"),
         held.retained("a/b", message("warm")),
         held.rule(rule("telemetry")),
-        held.session_owned(session("gauge"), me),
+        held.session_owned(session("gauge"), me, 1),
         held.retained_cleared("a/b"),
         held.rule_removed("telemetry"),
         held.session_released(session("gauge")),
@@ -354,7 +357,7 @@ fn clearing_anything_writes_a_tombstone_and_keeps_it() {
     let held = fresh(me);
     held.retained("a/b", message("warm"));
     held.rule(rule("telemetry"));
-    held.session_owned(session("gauge"), me);
+    held.session_owned(session("gauge"), me, 1);
     held.subscriber_arrived("a/b");
 
     let cleared = vec![
@@ -1115,5 +1118,240 @@ fn a_restart_rebuilds_the_group_map_from_the_registers() {
     assert!(
         after.nodes_for("jobs/one").is_empty(),
         "and it did not come back as an ordinary route"
+    );
+}
+
+// ---- who owns a session, section 8.4 ----------------------------------
+
+/// A connect to the node that already owns the session writes nothing.
+///
+/// Section 8.4 is about a connect to a node that does **not** own the
+/// session; a connect to the one that does is the within-one-node
+/// takeover `broker_core::registry` has always done, and that takeover
+/// is not a cluster event. A claim that wrote a register anyway would
+/// be a frame per reconnect from every client on every node, and — the
+/// part that is not merely waste — a fresh stamp on the losing side of
+/// a partition every time the client retried, which is a node voting
+/// repeatedly in an election it has already lost.
+///
+/// The register is compared whole, stamp included, because a rewrite
+/// carrying the same owner and the same epoch is exactly the write
+/// this is about and nothing else would see it.
+#[test]
+fn a_claim_by_the_node_that_already_owns_it_writes_nothing() {
+    let me = node(1);
+    let held = fresh(me);
+    let key = session("gauge");
+
+    let first = held.session_claimed(&key);
+    assert_eq!(first.epoch, 1, "nothing held means nobody has claimed it");
+    assert_eq!(first.previous, None);
+    let write = first.write.expect("the first claim writes the register");
+    let before = held
+        .register(&MetadataKey::SessionOwner {
+            session: key.clone(),
+        })
+        .expect("the claim is held");
+
+    let again = held.session_claimed(&key);
+    assert!(
+        again.write.is_none(),
+        "a claim by the owner wrote {:?}",
+        again.write
+    );
+    assert_eq!(
+        again.epoch, 1,
+        "and it did not move the epoch it already holds"
+    );
+    assert_eq!(
+        again.previous,
+        Some(Ownership { node: me, epoch: 1 }),
+        "the owner it found was itself"
+    );
+    assert_eq!(
+        write.stamp(),
+        before.stamp(),
+        "the stamp the first claim reported is the one it holds"
+    );
+    assert_eq!(
+        held.register(&MetadataKey::SessionOwner { session: key }),
+        Some(before),
+        "and the register is still that one, stamp and all"
+    );
+}
+
+/// A connect to another node claims it, with a higher epoch.
+///
+/// The epoch is read from the register and incremented, so it is one
+/// number for the session rather than one per node: the previous
+/// owner's epoch is what the new owner's is one more than.
+#[test]
+fn a_claim_by_another_node_takes_it_at_a_higher_epoch() {
+    let me = node(1);
+    let peer = node(2);
+    let held = fresh(me);
+    let key = session("gauge");
+
+    // The peer owns it at epoch 4, replicated to this node.
+    held.observed(MetadataWrite::new(
+        MetadataKey::SessionOwner {
+            session: key.clone(),
+        },
+        Register::written(
+            MetadataValue::SessionOwner {
+                node: peer,
+                epoch: 4,
+            },
+            Stamp::new(Reading::new(100, 0), peer),
+        ),
+    ));
+    assert_eq!(
+        held.session_owner(&key),
+        Some(Ownership {
+            node: peer,
+            epoch: 4
+        })
+    );
+
+    let claim = held.session_claimed(&key);
+    assert_eq!(
+        claim.previous,
+        Some(Ownership {
+            node: peer,
+            epoch: 4
+        }),
+        "the claim reports who it took it from, which is who to ask for the queue"
+    );
+    assert_eq!(claim.epoch, 5, "the epoch is the one it read plus one");
+    let write = claim.write.expect("a claim from another node is a write");
+    assert_eq!(
+        write.register().value(),
+        Some(&MetadataValue::SessionOwner { node: me, epoch: 5 }),
+        "the register names this node as owner and carries the epoch"
+    );
+    assert_eq!(
+        write.stamp().node(),
+        me,
+        "stamped by whoever claimed it, like every other register"
+    );
+    assert_eq!(
+        held.session_owner(&key),
+        Some(Ownership { node: me, epoch: 5 }),
+        "and this node holds it immediately, before the broadcast"
+    );
+}
+
+/// Two nodes claiming at the same epoch resolve the same way on both.
+///
+/// **This is the expected outcome of a partition, not the rare one**,
+/// and section 8.5 says so: two nodes on opposite sides both read the
+/// same epoch and both increment to the same number. A test of a
+/// single claim cannot see it, because a single claim has nothing to
+/// tie with.
+///
+/// What resolves it is the register's own comparison — the clock
+/// reading, then the counter, then the node's UUID — which is why the
+/// epoch is *carried* in the register rather than compared on its own.
+/// Both nodes are told both writes, in opposite orders, and what this
+/// asserts is that they agree: not which one wins, which is arbitrary,
+/// but that there is one answer and both hold it. A comparison on the
+/// epoch alone leaves each side holding itself, and no later exchange
+/// repairs it.
+#[test]
+fn two_nodes_claiming_at_the_same_epoch_agree_on_which_one_won() {
+    let one = node(1);
+    let two = node(2);
+    let first = fresh(one);
+    let second = fresh(two);
+    let key = session("gauge");
+
+    // Each side of the partition reads nothing held and claims it.
+    let mine = first
+        .session_claimed(&key)
+        .write
+        .expect("the first side claims it");
+    let theirs = second
+        .session_claimed(&key)
+        .write
+        .expect("the second side claims it, knowing nothing of the first");
+    // The equal epoch this test is about: both sides read nothing held
+    // and both wrote one. Spelled out as two values rather than as a
+    // comparison, so that a build where neither side incremented would
+    // not satisfy it by being equally wrong.
+    assert_eq!(
+        mine.register().value(),
+        Some(&MetadataValue::SessionOwner {
+            node: one,
+            epoch: 1
+        })
+    );
+    assert_eq!(
+        theirs.register().value(),
+        Some(&MetadataValue::SessionOwner {
+            node: two,
+            epoch: 1
+        })
+    );
+
+    // The partition heals and each is told the other, in the order it
+    // would hear it.
+    first.observed(theirs.clone());
+    second.observed(mine.clone());
+
+    let agreed = first.session_owner(&key);
+    assert_eq!(
+        agreed,
+        second.session_owner(&key),
+        "the two sides of a healed partition hold different owners for one session"
+    );
+    let agreed = agreed.expect("somebody owns it");
+    assert_eq!(agreed.epoch, 1, "the epoch both sides claimed at");
+    let expected = if mine.stamp() > theirs.stamp() {
+        one
+    } else {
+        two
+    };
+    assert_eq!(
+        agreed.node, expected,
+        "the winner is the later stamp, which is what every other register does"
+    );
+
+    // And it stays resolved: hearing the loser again changes nothing,
+    // which is what makes the exchange safe to repeat.
+    assert!(
+        !first.observed(if expected == one {
+            theirs.clone()
+        } else {
+            mine.clone()
+        }),
+        "the losing write won on a second hearing"
+    );
+    assert_eq!(first.session_owner(&key), Some(agreed));
+    assert_eq!(second.session_owner(&key), Some(agreed));
+}
+
+/// A released session is nobody's, and the next claim starts again.
+///
+/// A tombstone is an absent owner rather than an owner of nothing, so
+/// [`Replicated::session_owner`] answers `None` for it, which is the
+/// same answer a register nobody ever wrote gives. What a claim does
+/// after one is what it does from nothing: epoch one.
+#[test]
+fn a_released_session_has_no_owner_and_no_epoch() {
+    let me = node(1);
+    let held = fresh(me);
+    let key = session("gauge");
+
+    held.session_claimed(&key);
+    held.session_released(key.clone());
+    assert_eq!(
+        held.session_owner(&key),
+        None,
+        "a tombstone is an absent owner"
+    );
+    assert_eq!(
+        held.session_claimed(&key).epoch,
+        1,
+        "and the epoch starts again rather than carrying on from a deletion"
     );
 }

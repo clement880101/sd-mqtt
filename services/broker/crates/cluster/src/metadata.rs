@@ -255,10 +255,16 @@ pub enum MetadataValue {
     /// three hundred bytes and the smallest variant here is sixteen, and
     /// a `Box<T>` is written to a store exactly as a `T` is.
     Rule(Box<RuleRecord>),
-    /// Which node owns the session the key names.
+    /// Which node owns the session the key names, and at what epoch.
     SessionOwner {
         /// The owner.
         node: NodeId,
+        /// How many times the session has been claimed, section 8.4.
+        ///
+        /// **Carried here, and not compared.** See [`Ownership`] for
+        /// why the resolution is the register's own and what the epoch
+        /// is for instead.
+        epoch: u64,
     },
     /// Presence, and nothing else.
     ///
@@ -277,8 +283,9 @@ impl MetadataValue {
             Self::NodeSubscription => MetadataValueRecord::NodeSubscription,
             Self::Retained(message) => MetadataValueRecord::Retained(message.clone()),
             Self::Rule(rule) => MetadataValueRecord::Rule(rule.clone()),
-            Self::SessionOwner { node } => MetadataValueRecord::SessionOwner {
+            Self::SessionOwner { node, epoch } => MetadataValueRecord::SessionOwner {
                 node: node.to_bytes(),
+                epoch: *epoch,
             },
             Self::NodeGroup => MetadataValueRecord::NodeGroup,
         }
@@ -291,8 +298,9 @@ impl MetadataValue {
             MetadataValueRecord::NodeSubscription => Self::NodeSubscription,
             MetadataValueRecord::Retained(message) => Self::Retained(message),
             MetadataValueRecord::Rule(rule) => Self::Rule(rule),
-            MetadataValueRecord::SessionOwner { node } => Self::SessionOwner {
+            MetadataValueRecord::SessionOwner { node, epoch } => Self::SessionOwner {
                 node: NodeId::from_bytes(node),
+                epoch,
             },
             MetadataValueRecord::NodeGroup => Self::NodeGroup,
         }
@@ -417,6 +425,69 @@ impl MetadataWrite {
     }
 }
 
+/// Who owns a session, and at what epoch. Section 8.4.
+///
+/// # The epoch is carried, not compared
+///
+/// Section 8.5 reverses the obvious implementation here, and says so
+/// outright: **equal epochs are the expected outcome of a partition,
+/// not the rare one.** Two nodes on opposite sides both read the same
+/// epoch and both increment to the same number, so an ownership
+/// decided by "the higher epoch wins" is a decision that is not taken
+/// in precisely the case it exists for — each side keeps itself, and no
+/// later exchange repairs it, for the reason [`crate::register`] gives
+/// about a tie.
+///
+/// So what resolves two claims is the register's own comparison, which
+/// is the clock reading, then its counter, then the writing node's
+/// UUID. That is why the epoch lives in a [`Register`] rather than
+/// being compared on its own, and it is why there is no ordering on
+/// this type: there is nothing here to compare, and a derived `Ord`
+/// would be an invitation to.
+///
+/// What the epoch is *for* is the next claim. A node that takes a
+/// session over writes the epoch it read plus one, so the number counts
+/// how many times the session has been claimed anywhere, and
+/// `broker_core::registry` lifts its own session's epoch to it: one
+/// number for the session, wherever the session is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Ownership {
+    /// Which node owns it.
+    pub node: NodeId,
+    /// How many times it has been claimed.
+    pub epoch: u64,
+}
+
+/// What claiming a session produced.
+///
+/// Three answers from one call, for [`Taken`]'s reason: a caller needs
+/// all three, and a second read to derive any of them would be a second
+/// read of a register another node may have overwritten in between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    /// Who held it a moment ago, if anybody.
+    ///
+    /// **Who to ask for the queue**, which is what section 8.4's drain
+    /// is addressed to. `None` is a session no node has claimed, or one
+    /// whose register is a tombstone, and there is nobody to ask.
+    pub previous: Option<Ownership>,
+    /// The epoch this node now holds it at.
+    pub epoch: u64,
+    /// The register to store and broadcast, or `None` when this node
+    /// already owned it.
+    ///
+    /// **A claim by the owner writes nothing**, and that is not an
+    /// optimisation. A connect to the node that already owns the
+    /// session is the within-one-node takeover `broker_core::registry`
+    /// has always done, which is not a cluster event; writing a
+    /// register for it would be a frame per reconnect from every client
+    /// on every node, and — the part that is not merely waste — a fresh
+    /// stamp on the losing side of a partition every time a client
+    /// retried, which is a node voting again in an election it has
+    /// already lost.
+    pub write: Option<MetadataWrite>,
+}
+
 /// Why a stored register was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MetadataError {
@@ -457,6 +528,30 @@ pub struct Taken {
     pub records: Vec<Record>,
     /// How far this node has now read the log, contiguously.
     pub through: u64,
+}
+
+/// Who `state` says owns `session`, if anybody.
+///
+/// A free function rather than a method, because
+/// [`Replicated::session_claimed`] reads it with the lock already held
+/// and a second method taking the lock would deadlock on the recursion
+/// the first one did not know it was making.
+fn owner_of(state: &State, session: &SessionKey) -> Option<Ownership> {
+    let register = state.registers.get(&MetadataKey::SessionOwner {
+        session: session.clone(),
+    })?;
+    match register.value()? {
+        MetadataValue::SessionOwner { node, epoch } => Some(Ownership {
+            node: *node,
+            epoch: *epoch,
+        }),
+        // A register filed under a session-owner key holding something
+        // else is refused when it is read back from a store, so this is
+        // unreachable rather than a case. `None` rather than a panic
+        // because the one thing worse than a node that cannot say who
+        // owns a session is a node that stops.
+        _ => None,
+    }
 }
 
 /// Take `write` into `state`'s registers, and say whether it won.
@@ -1171,13 +1266,73 @@ impl Replicated {
         self.write(&mut state, MetadataKey::Rule { id: id.to_owned() }, None)
     }
 
-    /// A session is owned by `owner`, section 8.4.
-    pub fn session_owned(&self, session: SessionKey, owner: NodeId) -> MetadataWrite {
+    /// Who owns `session`, and at what epoch. Section 8.4.
+    ///
+    /// `None` for a session no node has claimed and for one whose
+    /// register is a tombstone: a released session is nobody's, which is
+    /// the same answer as never having been claimed, and a caller that
+    /// had to tell the two apart would be a caller that cared when a
+    /// deletion gets collected.
+    #[must_use]
+    pub fn session_owner(&self, session: &SessionKey) -> Option<Ownership> {
+        owner_of(&self.held(), session)
+    }
+
+    /// Claim `session` for this node, section 8.4.
+    ///
+    /// Reads the register, increments the epoch and writes this node as
+    /// the owner — **under one acquisition of the lock**, because the
+    /// epoch written is derived from the epoch read and two claims that
+    /// read before either wrote would write one number twice. Two
+    /// writes sharing a stamp is the condition [`crate::register`] says
+    /// convergence depends on; two writes sharing an *epoch* is merely
+    /// an election with no decision in it, and this node is the one
+    /// place both halves are available at once.
+    ///
+    /// A claim by the node that already owns it writes nothing: see
+    /// [`Claim::write`].
+    pub fn session_claimed(&self, session: &SessionKey) -> Claim {
+        let mut state = self.held();
+        let previous = owner_of(&state, session);
+        if let Some(held) = previous {
+            if held.node == self.me {
+                return Claim {
+                    previous,
+                    epoch: held.epoch,
+                    write: None,
+                };
+            }
+        }
+        let epoch = previous.map_or(0, |held| held.epoch) + 1;
+        let write = self.write(
+            &mut state,
+            MetadataKey::SessionOwner {
+                session: session.clone(),
+            },
+            Some(MetadataValue::SessionOwner {
+                node: self.me,
+                epoch,
+            }),
+        );
+        Claim {
+            previous,
+            epoch,
+            write: Some(write),
+        }
+    }
+
+    /// A session is owned by `owner` at `epoch`, section 8.4.
+    ///
+    /// The unconditional form, for a caller that already knows both —
+    /// a restore, or a test. [`Replicated::session_claimed`] is what a
+    /// connect goes through, because only it can read the epoch and
+    /// write the next one without letting go of the lock in between.
+    pub fn session_owned(&self, session: SessionKey, owner: NodeId, epoch: u64) -> MetadataWrite {
         let mut state = self.held();
         self.write(
             &mut state,
             MetadataKey::SessionOwner { session },
-            Some(MetadataValue::SessionOwner { node: owner }),
+            Some(MetadataValue::SessionOwner { node: owner, epoch }),
         )
     }
 

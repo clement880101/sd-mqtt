@@ -463,13 +463,14 @@ mod tests {
         // An operator who reads "corrupt" reaches for a backup. The file
         // is not damaged; the build is wrong. Collapsing these is the
         // failure the error type exists to prevent.
+        let later = FORMAT_VERSION + 1;
         let error = StorageError::from(FormatError::UnknownVersion {
-            found: 7,
+            found: later,
             expected: FORMAT_VERSION,
         });
         match error {
             StorageError::UnsupportedVersion { found, expected } => {
-                assert_eq!(found, 7);
+                assert_eq!(found, later);
                 assert_eq!(expected, FORMAT_VERSION);
             }
             other => panic!("a version mismatch became {other:?}"),
@@ -478,13 +479,14 @@ mod tests {
 
     #[test]
     fn a_version_refusal_names_both_versions() {
+        let later = FORMAT_VERSION + 1;
         let message = StorageError::from(FormatError::UnknownVersion {
-            found: 7,
+            found: later,
             expected: FORMAT_VERSION,
         })
         .to_string();
         assert!(
-            message.contains('7') && message.contains(&FORMAT_VERSION.to_string()),
+            message.contains(&later.to_string()) && message.contains(&FORMAT_VERSION.to_string()),
             "said: {message}"
         );
     }

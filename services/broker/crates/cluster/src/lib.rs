@@ -130,7 +130,9 @@ pub use identity::{IdentityError, NodeId, NodeIdentity, Reconciled};
 pub use link::{outgoing, pump, FrameReader, LinkConfig, LinkError, Outgoing, Sent};
 pub use membership::{Member, MemberState, Membership};
 pub use mesh::{keeper, Deliver, Fanout, Mesh, MeshSettings, MeshStats};
-pub use metadata::{MetadataError, MetadataKey, MetadataValue, MetadataWrite, Replicated};
+pub use metadata::{
+    Claim, MetadataError, MetadataKey, MetadataValue, MetadataWrite, Ownership, Replicated,
+};
 pub use oplog::{Logged, OpLog, FIRST_SEQUENCE};
 pub use register::{Register, Stamp};
 pub use replicate::{

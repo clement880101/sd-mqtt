@@ -1850,12 +1850,18 @@ mod contract {
             register(
                 MetadataKeyRecord::SessionOwner { session: key("a") },
                 16,
-                Some(MetadataValueRecord::SessionOwner { node: [9; 16] }),
+                Some(MetadataValueRecord::SessionOwner {
+                    node: [9; 16],
+                    epoch: 3,
+                }),
             ),
             register(
                 MetadataKeyRecord::SessionOwner { session: key("ab") },
                 17,
-                Some(MetadataValueRecord::SessionOwner { node: [9; 16] }),
+                Some(MetadataValueRecord::SessionOwner {
+                    node: [9; 16],
+                    epoch: 3,
+                }),
             ),
         ];
 
@@ -1964,7 +1970,10 @@ mod contract {
                     entry: register(
                         MetadataKeyRecord::SessionOwner { session: key("a") },
                         10,
-                        Some(MetadataValueRecord::SessionOwner { node: [9; 16] }),
+                        Some(MetadataValueRecord::SessionOwner {
+                            node: [9; 16],
+                            epoch: 3,
+                        }),
                     ),
                 },
                 Record::MetadataPut {

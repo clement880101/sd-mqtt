@@ -106,7 +106,18 @@ use serde::{Deserialize, Serialize};
 /// then re-create what it had locally under fresh stamps, which beat
 /// the tombstones every other node still holds: a restart that
 /// resurrects everything this node ever deleted.
-pub const FORMAT_VERSION: u16 = 7;
+///
+/// Version 8 added the session epoch to
+/// [`MetadataValueRecord::SessionOwner`], section 8.4. **This is the
+/// first version that changes the shape of something already stored**
+/// rather than adding a variant at the end, and that is exactly why it
+/// moves the version: a version 7 session-owner register is sixteen
+/// bytes where this build expects sixteen and a varint, so a reader
+/// would run off the end of one record and into the next. The epoch has
+/// to be in the value because section 8.4 makes the claiming node write
+/// "the epoch it read plus one", and an epoch the register does not
+/// carry is one no node can read.
+pub const FORMAT_VERSION: u16 = 8;
 
 /// What every sd-mqtt store begins with, so a file that is not one is
 /// refused as such rather than as a corrupt store.
@@ -1009,10 +1020,20 @@ pub enum MetadataValueRecord {
     /// smallest is sixteen. The same reason `rules::rule::Action` boxes
     /// its bridge.
     Rule(Box<RuleRecord>),
-    /// Which node owns the session the key names.
+    /// Which node owns the session the key names, and at what epoch.
     SessionOwner {
         /// Its sixteen UUID bytes.
         node: [u8; 16],
+        /// How many times the session has been claimed, section 8.4.
+        ///
+        /// **Carried, and not compared.** Section 8.5 is explicit that
+        /// equal epochs are the expected outcome of a partition rather
+        /// than the rare one — two nodes on opposite sides both read
+        /// the same epoch and both increment to the same number — so
+        /// what resolves two claims is the register's own stamp, like
+        /// every other kind. This is here so that the *next* claim has
+        /// something to be one more than.
+        epoch: u64,
     },
     /// Presence, and nothing else.
     ///

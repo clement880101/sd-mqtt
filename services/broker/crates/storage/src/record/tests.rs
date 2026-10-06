@@ -105,7 +105,7 @@ mod golden {
     #[test]
     fn the_format_marker() {
         // A fixed-size array is its elements with no length prefix, and a
-        // u16 is a varint, so version 7 is one byte. The version moved
+        // u16 is a varint, so version 8 is one byte. The version moved
         // from 1 when the reference count of a body left the body's own
         // row, from 2 when rules were added, from 3 when each rule
         // gained an outbox — a version 3 store has no outbox table at
@@ -119,10 +119,16 @@ mod golden {
         // used, and from 6 when the replicated registers themselves were
         // stored, because a store from before it holds none and the node
         // reading it would come up routing to nobody and then resurrect
-        // everything it had ever deleted under fresh stamps.
+        // everything it had ever deleted under fresh stamps, and from 7
+        // when the session epoch joined the owner in a session-owner
+        // register — the first version that changed the shape of
+        // something already stored rather than adding a variant at the
+        // end, so a version 7 register is sixteen bytes where this
+        // build expects sixteen and a varint and a reader would run off
+        // the end of one record into the next.
         let expected: &[u8] = &[
             b's', b'd', b'm', b'q', b't', b't', b's', b't', // magic "sdmqttst"
-            0x07, // version 7
+            0x08, // version 8
         ];
         assert_eq!(FormatMarker::current().encode(), expected);
         assert_eq!(
@@ -930,6 +936,63 @@ mod golden {
         );
     }
 
+    /// A session owner register, whose value carries the epoch.
+    ///
+    /// **Pinned because the epoch is the one field in a stored register
+    /// that another node's behaviour depends on arithmetically.**
+    /// Section 8.4 has the claiming node write the epoch it read plus
+    /// one, so a build that wrote the epoch where another read the
+    /// node's bytes would have every node claiming at an epoch derived
+    /// from sixteen bytes of UUID. A round trip cannot see that, which
+    /// is convention 5's first entry: read from and written to the same
+    /// wrong place, it round trips perfectly.
+    ///
+    /// Two sixteen-byte arrays again — the owner in the value and the
+    /// writer in the stamp — carrying different bytes, because they are
+    /// different nodes whenever a claim was relayed and a transposition
+    /// would otherwise attribute the ownership to whoever gossiped it.
+    ///
+    /// The epoch is 300, which is two varint bytes: a one-byte epoch
+    /// would be indistinguishable from a format that wrote it as a
+    /// single octet.
+    #[test]
+    fn metadata_put_for_a_session_owner() {
+        let expected: &[u8] = &[
+            0x15, // Record::MetadataPut is variant 21
+            0x03, // MetadataKeyRecord::SessionOwner is variant 3
+            0x01, b't', // the key's mountpoint "t"
+            0x05, b'g', b'a', b'u', b'g', b'e', // the key's client "gauge"
+            0x05, // stamp millis 5
+            0x00, // stamp counter 0
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, // the stamp's node
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, //
+            0x01, // the value is present
+            0x03, // MetadataValueRecord::SessionOwner is variant 3
+            0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, // the owning node
+            0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, //
+            0xac, 0x02, // epoch 300
+        ];
+        pins(
+            &Record::MetadataPut {
+                entry: MetadataRecord {
+                    key: MetadataKeyRecord::SessionOwner {
+                        session: SessionKey::new("t", "gauge"),
+                    },
+                    stamp: StampRecord {
+                        millis: 5,
+                        counter: 0,
+                        node: [0x22; 16],
+                    },
+                    value: Some(MetadataValueRecord::SessionOwner {
+                        node: [0x33; 16],
+                        epoch: 300,
+                    }),
+                },
+            },
+            expected,
+        );
+    }
+
     /// Boxing the rule inside a register costs no bytes.
     ///
     /// [`MetadataValueRecord::Rule`] holds a `Box<RuleRecord>` so that
@@ -1710,7 +1773,13 @@ mod roundtrip {
             Just(MetadataValueRecord::NodeSubscription),
             retained().prop_map(MetadataValueRecord::Retained),
             rule().prop_map(|held| MetadataValueRecord::Rule(Box::new(held))),
-            any::<[u8; 16]>().prop_map(|node| MetadataValueRecord::SessionOwner { node }),
+            (any::<[u8; 16]>(), any::<u64>())
+                .prop_map(|(node, epoch)| MetadataValueRecord::SessionOwner { node, epoch }),
+            // The last variant, which this list did not produce: a
+            // generator that cannot make a case is convention 5's
+            // second entry, and the case it could not make here is the
+            // one section 8.3 separates from a node subscription.
+            Just(MetadataValueRecord::NodeGroup),
         ]
     }
 
