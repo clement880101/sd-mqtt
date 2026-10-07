@@ -465,6 +465,65 @@ configured with a production secret still cannot join production.
 `GET /api/v1/nodes` lists what this node can see, and
 `GET /health/cluster` says whether that view is complete.
 
+### A partition: keep serving, or refuse on purpose
+
+A node cut off from the rest of the cluster keeps serving the clients
+that can still reach it. That is the default and there is nothing to
+set for it: a broker that refused them would turn one node's network
+fault into every client's outage.
+
+If you would rather lose availability than accept a write the other
+side cannot see, say which operations to refuse:
+
+```toml
+[cluster]
+expected_size = 3                 # how many nodes this cluster has
+
+[cluster.strict]
+connects = true                   # refuse new clients while short
+publishes = false
+subscribes = false
+```
+
+Each flag refuses the one operation it names. A refused connect is
+answered with reason code 0x88 — "server unavailable", and return code
+3 to a 3.1.1 client — so the client knows to try another node. A
+refused subscribe is answered with 0x83 per filter, and the connection
+stays open. A refused publish is answered with 0x83 in its PUBACK or
+PUBREC where the protocol has one to put a code in; at at-most-once,
+and for a 3.1.1 publisher at any level, there is no acknowledgement
+that can carry a reason — a 3.1.1 PUBACK means *accepted* — so the
+connection is closed instead, with a DISCONNECT 0x83 for an MQTT 5
+client. Those closes are counted as
+`sdmqtt_sockets_closed_total{outcome="not_whole"}`.
+
+**`expected_size` is the only thing that can say what "whole" means,
+so a flag set without it is refused at startup.** Membership is
+learnt from seeds, so the nodes a node has met cannot answer the
+question: three nodes that never heard of a fourth look exactly like
+four with one down. A flag on a node with no `cluster.address` is
+refused for the same reason — it is a cluster of one for ever, so the
+flag could never fire.
+
+More nodes answering than expected is not short of anything, so
+growing a cluster before you edit the key is not an outage.
+`GET /health/cluster` reports `expected_size` as its `expected` when
+it is set, and the count of nodes met when it is not, which is what it
+has always reported.
+
+`SDMQTT_CLUSTER_EXPECTED_SIZE`, `SDMQTT_CLUSTER_STRICT_CONNECTS`,
+`SDMQTT_CLUSTER_STRICT_PUBLISHES` and
+`SDMQTT_CLUSTER_STRICT_SUBSCRIBES` set the same values; the three
+flags take `true` or `false` and nothing else.
+
+Messages published on either side of a partition are not exchanged
+afterwards, whatever the flags say, and a node that acknowledged a
+message it never managed to replicate loses it when it rejoins.
+Closing that window needs synchronous replication of the queue, which
+this build does not do yet: a publish would then not be acknowledged
+until a replica held it. Eliminating it entirely would need consensus,
+which this design does not take on.
+
 ### The admin listener answers to an address, not to a name
 
 ```toml

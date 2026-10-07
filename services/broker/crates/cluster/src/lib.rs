@@ -113,6 +113,24 @@
 //! nobody remembers to name it. Nothing above reaches it: the release
 //! binary links none of it, because nothing it links calls it.
 
+//! # And when it cannot see them, it keeps serving
+//!
+//! [`policy`] is section 8.5. The default is availability: a node cut
+//! off from the rest of the cluster goes on accepting connects,
+//! publishes and subscribes from the clients that can still reach it,
+//! because a broker that refuses them has turned one node's network
+//! fault into every client's outage. Per-operation flags are there for
+//! operators who want the other trade, and a refusal under one carries
+//! a reason code rather than a closed socket.
+//!
+//! What "the rest of the cluster" is has to be **a number an operator
+//! wrote down**. Membership is learnt, so a node that never met a
+//! fourth node cannot tell a cluster of three from a cluster of four
+//! with one node down; a flag evaluated against the nodes met would
+//! refuse nothing in exactly the case it exists for. So a flag set
+//! without `cluster.expected_size` is refused at startup, by
+//! [`Policy::new`] rather than by a check in a startup path.
+
 pub mod clock;
 pub mod config;
 pub mod forward;
@@ -126,6 +144,7 @@ pub mod mesh;
 pub mod metadata;
 pub mod migrate;
 pub mod oplog;
+pub mod policy;
 pub mod register;
 pub mod replicate;
 pub mod routes;
@@ -149,6 +168,7 @@ pub use migrate::{
     Awaiting, Claimed, Claiming, Drain, Drained, Migrations, Migrator, DEFAULT_PATIENCE,
 };
 pub use oplog::{Logged, OpLog, FIRST_SEQUENCE};
+pub use policy::{Gate, Live, Operation, Policy, PolicyError, Strict};
 pub use register::{Register, Stamp};
 pub use replicate::{
     choose, jitter, Handled, Replication, ReplicationError, ReplicationSettings, Replicator, Swept,

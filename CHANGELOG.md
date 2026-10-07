@@ -188,9 +188,44 @@ deleted.
   `SDMQTT_CLUSTER_NAME`, `_SECRET`, `_ADDRESS`, `_ADVERTISE` and
   `_SEEDS` beside it. An empty `SDMQTT_CLUSTER_SECRET` is refused for
   being empty, as `SDMQTT_ADMIN_TOKEN` is.
+- **Section 8.5's partition policy. A node cut off from the cluster
+  keeps serving by default**, and there is nothing to set for that: a
+  broker that refused its reachable clients would turn one node's
+  network fault into every client's outage. `cluster.strict.connects`,
+  `.publishes` and `.subscribes` refuse the one operation each names
+  while the cluster is short of `cluster.expected_size`, for operators
+  who want the other trade, with `SDMQTT_CLUSTER_EXPECTED_SIZE` and
+  `SDMQTT_CLUSTER_STRICT_CONNECTS`, `_PUBLISHES` and `_SUBSCRIBES`
+  beside them.
+
+  A refusal carries a reason code rather than a closed socket wherever
+  the protocol has one to put it in: 0x88 in a CONNACK, which a 3.1.1
+  client reads as return code 3, and 0x83 in a SUBACK per filter and
+  in a PUBACK or PUBREC. At at-most-once, and for a 3.1.1 publisher at
+  any level, nothing can carry one — a 3.1.1 PUBACK means *accepted* —
+  so the connection is closed, which is already what this broker does
+  when it cannot acknowledge a publish. Those closes are counted as
+  `sdmqtt_sockets_closed_total{outcome="not_whole"}`, a new value of
+  that label.
+
+  **A strict flag with no `cluster.expected_size` is refused at
+  startup**, and so is one on a node with no `cluster.address`.
+  Membership is learnt from seeds, so the nodes a node has met cannot
+  say whether the cluster is whole — three nodes that never heard of a
+  fourth look exactly like four with one down — and a cluster of one
+  is never short of anything. A flag that can never fire is refused
+  rather than left to mean nothing quietly.
 
 ### Changed
 
+- **`GET /health/cluster` reports the configured expected size.** With
+  `cluster.expected_size` set, `expected` is that number and `status`
+  is `complete` once `members` has reached it. Unset, it reports the
+  count of nodes this one has met, which is what it has always
+  reported and what carries the blind spot above: it says `complete`
+  on a node that came up alone. More nodes answering than expected is
+  `complete` rather than a disagreement, so growing a cluster before
+  editing the key does not page anybody.
 - **Rules stop being node-local**, which is what section 9.1 and
   milestone 4 said would happen here. Installing, editing or removing
   one still writes this node's own copy and now writes the

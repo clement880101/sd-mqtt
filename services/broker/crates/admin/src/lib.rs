@@ -114,6 +114,24 @@ pub trait Cluster: Send + Sync + 'static {
     /// is this node is what [`crate::resources`] reports separately and
     /// a view that included itself would have two answers to it.
     fn peers(&self) -> Vec<ClusterPeer>;
+
+    /// How many nodes this cluster is meant to have, if an operator
+    /// said. Section 8.5.
+    ///
+    /// `None` is an operator who did not say, and then
+    /// [`crate::health`] falls back to the nodes this one has met —
+    /// which is the count it has always served and is the one with the
+    /// blind spot that made this method necessary: three nodes that
+    /// never heard of a fourth cannot tell themselves apart from four
+    /// with one down.
+    ///
+    /// It comes through this trait, rather than from a configuration
+    /// the handler could read for itself, so that the number an
+    /// operator reads off the probe is the same number that decides
+    /// whether a connect is refused. Two readings of "whole" in one
+    /// process is a probe that says `complete` while clients are being
+    /// turned away.
+    fn expected(&self) -> Option<usize>;
 }
 
 /// One peer, as the API reports it.

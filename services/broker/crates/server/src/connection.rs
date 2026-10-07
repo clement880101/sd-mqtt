@@ -35,8 +35,11 @@ use broker_core::registry::SessionId;
 use broker_core::session::Action;
 use broker_core::subscriptions::SubscriberId;
 use bytes::BytesMut;
-use mqtt_codec::packet::{ConnAck, Connect, Disconnect};
-use mqtt_codec::{encode, CodecError, Limits, Packet, PacketKind, Properties, ReasonCode, Version};
+use cluster::Operation;
+use mqtt_codec::packet::{Ack, ConnAck, Connect, Disconnect, SubAck};
+use mqtt_codec::{
+    encode, CodecError, Limits, Packet, PacketKind, Properties, QoS, ReasonCode, Version,
+};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -93,6 +96,26 @@ const OUTBOX_SLACK: usize = 64;
 /// silence nor a success.
 const NOT_DURABLE: ReasonCode = ReasonCode::ImplementationSpecificError;
 
+/// What a connect is refused with while the cluster is short of its
+/// expected size, section 8.5.
+///
+/// 0x88 Server unavailable, and it is **3.1.1's return code 3** as
+/// well, so a client at either level can read it. It says the thing
+/// that is true: the broker is there and is declining to serve, which
+/// tells a client to try another node. A closed socket tells it
+/// nothing and looks exactly like the partition it is about.
+const NOT_WHOLE_CONNECT: ReasonCode = ReasonCode::ServerUnavailable;
+
+/// And what a publish or a subscribe is refused with.
+///
+/// 0x83 Implementation specific error. Not a choice between this and
+/// 0x88: Table 3-4 and Table 3-8 do not permit 0x88 on a PUBACK, a
+/// PUBREC or a SUBACK, and of what they do permit this is the code
+/// [`NOT_DURABLE`] already uses for the same shape of refusal — the
+/// broker declining to take responsibility for a message rather than
+/// objecting to anything about it.
+const NOT_WHOLE: ReasonCode = ReasonCode::ImplementationSpecificError;
+
 /// How deep a session's outbox must be for the queue and window it
 /// drains, or `None` when those bounds are too large for one to be
 /// sized at all.
@@ -118,6 +141,20 @@ pub fn outbox_depth_for(max_queue_messages: usize, max_inflight: u16) -> Option<
     max_queue_messages
         .checked_add(usize::from(max_inflight))?
         .checked_add(OUTBOX_SLACK)
+}
+
+/// What the shell did with a packet section 8.5 refuses.
+///
+/// Two values, both of which mean the broker never saw the packet. The
+/// difference is whether the protocol had an acknowledgement that could
+/// carry [`NOT_WHOLE`]; see [`Attached::refuse_while_short`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// An acknowledgement carried the reason, and the connection is
+    /// still open.
+    Answered,
+    /// Nothing could carry it, so the connection is ending.
+    Closed,
 }
 
 /// How a connection is configured.
@@ -204,6 +241,17 @@ pub enum ConnectionError {
     /// [`NOT_DURABLE`].
     #[error("not made durable: {0}")]
     NotDurable(#[source] storage::NotDurable),
+    /// The cluster was short of its expected size and this node is
+    /// configured to refuse rather than serve through it. Section 8.5.
+    ///
+    /// Its own variant rather than [`ConnectionError::Protocol`],
+    /// because the client did nothing wrong: it is this node that is
+    /// not whole. An operator reading a log of protocol errors is
+    /// looking for a broken client, and a flag they set themselves
+    /// filling that log would send them looking for one that is not
+    /// there.
+    #[error("refused while the cluster is not whole: {0:?}")]
+    NotWhole(ReasonCode),
 }
 
 /// Serve one connection until it ends, whatever ends it.
@@ -374,6 +422,21 @@ where
         // imposed beyond the limitations in the protocol".
         other => other,
     };
+
+    // Section 8.5, and it is **before the claim below**, for one of
+    // the two reasons the authenticate chain is: a claim writes a
+    // replicated register, closes a connection on another node and
+    // moves a queue across a link, and a connect that is going to be
+    // refused must do none of that. A partition is also precisely when
+    // a claim is least likely to find the previous owner, so refusing
+    // first is the cheaper order as well as the safer one.
+    //
+    // This costs a node that asked for nothing one `OnceLock` read.
+    // See `Shared::allows`.
+    if !shared.allows(Operation::Connect) {
+        refuse(&mut write_half, version, NOT_WHOLE_CONNECT, &metrics).await?;
+        return Err(ConnectionError::NotWhole(NOT_WHOLE_CONNECT));
+    }
 
     // Section 8.4's claim, and it is **before** the registration
     // because the epoch the registration takes is the one the claim
@@ -972,6 +1035,25 @@ impl Attached {
                 self.close_with(reason);
                 return Err(ConnectionError::Protocol(reason));
             }
+            // Section 8.5, before the broker sees it, for the reason
+            // the alias table above is before the broker: nothing
+            // below this shell knows that a cluster exists, and
+            // nothing below it should have to. A refused packet is
+            // answered here and never handed down, so the broker does
+            // not retain it, does not queue it for a subscriber and
+            // does not journal it.
+            match self.refuse_while_short(&packet) {
+                // Not this policy's business, which is every packet on
+                // a node whose operator asked for nothing.
+                None => {}
+                // Refused and answered. The next packet is read from a
+                // connection that is still open, and the broker was
+                // never told about this one.
+                Some(Refusal::Answered) => continue,
+                // Refused with nowhere to put a reason but a close.
+                Some(Refusal::Closed) => return Err(ConnectionError::NotWhole(NOT_WHOLE)),
+            }
+
             let said_goodbye = matches!(packet, Packet::Disconnect(_));
 
             // Section 7.3, and the ordering this milestone exists
@@ -1046,6 +1128,101 @@ impl Attached {
             if said_goodbye {
                 return Ok(());
             }
+        }
+    }
+
+    /// Answer a publish or a subscribe that this node is configured to
+    /// refuse while the cluster is short of its expected size, section
+    /// 8.5.
+    ///
+    /// `None` when the packet is none of its business, which is every
+    /// packet on a node that asked for nothing — one `OnceLock` read,
+    /// and it is the first thing checked. [`Refusal`] otherwise, and
+    /// either of its two values means the packet **must not reach the
+    /// broker**.
+    ///
+    /// Three outcomes and not two. Folding "answered" into "not my
+    /// business" is what the first draft did, and it sent the
+    /// acknowledgement and then handed the packet down anyway: a
+    /// client told its publication was refused, and a broker that
+    /// retained it. The test that caught it is
+    /// `a_refused_publish_is_acknowledged_with_a_reason_and_goes_no_further`,
+    /// which counts the retained store rather than waiting for a
+    /// delivery not to arrive.
+    ///
+    /// # Every refusal carries 0x83, and some of them have to carry it
+    /// in a close
+    ///
+    /// A SUBACK answers each filter, which is what Table 3-8 is for,
+    /// and the connection lives: a client told its subscription was
+    /// refused can retry it, and nothing else it had is disturbed.
+    ///
+    /// A publish has no such answer at every level. 3.1.1's PUBACK
+    /// carries no reason code at all, so sending one would tell a
+    /// publisher its message was accepted, and MQTT 5 at
+    /// at-most-once has no acknowledgement to put a code in. In both
+    /// of those the only thing that can carry a reason is a close,
+    /// which is a DISCONNECT 0x83 to a 5 client and a bare close to a
+    /// 3.1.1 one — and that is already what this broker does when it
+    /// cannot acknowledge a publish; see [`NOT_DURABLE`]. The
+    /// alternative was dropping the publication silently, which is
+    /// legal at at-most-once and is exactly what an operator who set
+    /// the flag asked not to happen.
+    fn refuse_while_short(&self, packet: &Packet) -> Option<Refusal> {
+        let answer = match packet {
+            Packet::Publish(publish) if !self.shared.allows(Operation::Publish) => {
+                // The packet identifier is present exactly when the
+                // level is above zero, so the two `None`s below are
+                // the levels that have no acknowledgement rather than
+                // a packet to be suspicious of.
+                match (self.version, publish.qos, publish.packet_id) {
+                    (Version::V5, QoS::AtLeastOnce, Some(packet_id)) => {
+                        Some(Packet::PubAck(self.ack(packet_id)))
+                    }
+                    (Version::V5, QoS::ExactlyOnce, Some(packet_id)) => {
+                        // [MQTT-4.3.3-?]: a PUBREC carrying a code at
+                        // or above 0x80 ends the exchange there, so
+                        // this is the whole of the refusal and no
+                        // PUBREL is owed or expected.
+                        Some(Packet::PubRec(self.ack(packet_id)))
+                    }
+                    _ => None,
+                }
+            }
+            Packet::Subscribe(request) if !self.shared.allows(Operation::Subscribe) => {
+                Some(Packet::SubAck(SubAck {
+                    packet_id: request.packet_id,
+                    // One per filter, which is what [MQTT-3.9.3-1]
+                    // requires of any SUBACK: the client matches them
+                    // up by position, and a short list would be a
+                    // malformed packet rather than a refusal.
+                    reasons: vec![NOT_WHOLE; request.filters.len()],
+                    properties: Properties::default(),
+                }))
+            }
+            _ => return None,
+        };
+        match answer {
+            Some(answer) => {
+                self.shared
+                    .deliver(vec![(self.subscriber, Action::Send(answer))]);
+                // The connection lives. It was told, and what it does
+                // next is its own business.
+                Some(Refusal::Answered)
+            }
+            None => {
+                self.close_with(NOT_WHOLE);
+                Some(Refusal::Closed)
+            }
+        }
+    }
+
+    /// A refusing acknowledgement for `packet_id`.
+    fn ack(&self, packet_id: u16) -> Ack {
+        Ack {
+            packet_id,
+            reason: NOT_WHOLE,
+            properties: Properties::default(),
         }
     }
 
@@ -1388,6 +1565,7 @@ impl OpenSocket {
             Err(ConnectionError::Io(_)) => SocketOutcome::Io,
             Err(ConnectionError::Protocol(_)) => SocketOutcome::Protocol,
             Err(ConnectionError::NotDurable(_)) => SocketOutcome::NotDurable,
+            Err(ConnectionError::NotWhole(_)) => SocketOutcome::NotWhole,
         });
     }
 }
@@ -4089,5 +4267,478 @@ mod tests {
                 1
             );
         }
+    }
+
+    // -----------------------------------------------------------
+    // Section 8.5: what a partition does, and what an operator can
+    // ask for instead.
+    // -----------------------------------------------------------
+
+    /// A cluster of whatever size a test says, section 8.5.
+    struct Nodes(usize);
+
+    impl cluster::Live for Nodes {
+        fn live(&self) -> usize {
+            self.0
+        }
+    }
+
+    /// A broker that can see `live` of `expected` nodes and refuses
+    /// what `strict` names.
+    fn short_by(live: usize, expected: usize, strict: cluster::Strict) -> Arc<Shared> {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        shared.install_gate(cluster::Gate::new(
+            cluster::Policy::new(Some(expected), strict).expect("a size and some flags"),
+            Arc::new(Nodes(live)),
+        ));
+        shared
+    }
+
+    fn refusing_connects() -> cluster::Strict {
+        cluster::Strict {
+            connects: true,
+            ..cluster::Strict::default()
+        }
+    }
+
+    fn refusing_publishes() -> cluster::Strict {
+        cluster::Strict {
+            publishes: true,
+            ..cluster::Strict::default()
+        }
+    }
+
+    fn refusing_subscribes() -> cluster::Strict {
+        cluster::Strict {
+            subscribes: true,
+            ..cluster::Strict::default()
+        }
+    }
+
+    /// One **retained** publish, at the level a test wants.
+    ///
+    /// Retained because that is what makes "the broker never saw it" a
+    /// positive assertion: a publication that reached it is in the
+    /// retained store and can be counted, and one that did not leaves
+    /// a count of zero rather than an absence to wait for.
+    fn retaining(qos: QoS, packet_id: Option<u16>) -> Packet {
+        Packet::Publish(mqtt_codec::packet::Publish {
+            dup: false,
+            qos,
+            retain: true,
+            topic: "site/1/temp".into(),
+            packet_id,
+            payload: bytes::Bytes::from_static(b"21.5"),
+            properties: Properties::default(),
+        })
+    }
+
+    /// Connect, and say what came back.
+    async fn connected(client: &mut tokio::io::DuplexStream, version: Version) -> ConnAck {
+        let mut connect = connect("sensor", 0);
+        connect.version = version;
+        write(client, &Packet::Connect(Box::new(connect)), version).await;
+        match read(client, version).await {
+            Packet::ConnAck(ack) => ack,
+            other => panic!("expected an acknowledgement, got {other:?}"),
+        }
+    }
+
+    /// **The default is availability**, and that is the whole of
+    /// section 8.5's first paragraph.
+    ///
+    /// A gate is installed and the cluster is one node of three — a
+    /// partition, by any reading — and all three operations are
+    /// served, because the operator set no flags. This is the case a
+    /// mutation that inverted the flag test would break and that no
+    /// test of a *refusal* can see.
+    #[tokio::test]
+    async fn a_partitioned_node_serves_everything_by_default() {
+        let shared = short_by(1, 3, cluster::Strict::default());
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected(&mut client, Version::V5).await.reason,
+            ReasonCode::Success
+        );
+
+        write(
+            &mut client,
+            &Packet::Subscribe(mqtt_codec::packet::Subscribe {
+                packet_id: 1,
+                filters: vec![mqtt_codec::packet::SubscriptionOptions {
+                    filter: "site/+/temp".into(),
+                    qos: QoS::AtLeastOnce,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: mqtt_codec::packet::RetainHandling::DoNotSend,
+                }],
+                properties: Properties::default(),
+            }),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::SubAck(ack) => assert_eq!(
+                ack.reasons,
+                vec![ReasonCode::GrantedQos1],
+                "a cut-off node still takes a subscription"
+            ),
+            other => panic!("expected a subscription acknowledgement, got {other:?}"),
+        }
+
+        write(
+            &mut client,
+            &retaining(QoS::AtLeastOnce, Some(2)),
+            Version::V5,
+        )
+        .await;
+        // Two packets come back and the order is not this test's
+        // business: the acknowledgement, and the publication itself,
+        // because the filter above matches the topic. Both are read
+        // from one buffer, because two packets can arrive in one
+        // chunk; see `read_buffered`.
+        let mut buf = BytesMut::new();
+        let mut acknowledged = false;
+        let mut delivered = false;
+        for _ in 0..2 {
+            match read_buffered(&mut client, &mut buf, Version::V5).await {
+                Packet::PubAck(ack) => {
+                    assert_eq!(ack.reason, ReasonCode::Success);
+                    acknowledged = true;
+                }
+                Packet::Publish(publish) => {
+                    assert_eq!(publish.topic, "site/1/temp");
+                    delivered = true;
+                }
+                other => panic!("expected an acknowledgement or a delivery, got {other:?}"),
+            }
+        }
+        assert!(acknowledged, "the publisher was told its message was taken");
+        assert!(delivered, "and the subscriber was sent it");
+        assert_eq!(
+            shared.with_broker(|broker| broker.retained_count()),
+            1,
+            "and it reached the broker, rather than being answered and dropped"
+        );
+    }
+
+    /// A connect refused carries 0x88, which a 3.1.1 client reads as
+    /// return code 3.
+    ///
+    /// Both versions, because the point of the code is that a client
+    /// can act on it and 3.1.1 clients are most of them. The reason is
+    /// read back off the wire rather than asserted about a constant:
+    /// the encoding is what the client sees.
+    #[tokio::test]
+    async fn a_connect_is_refused_with_server_unavailable_while_the_cluster_is_short() {
+        for version in [Version::V5, Version::V311] {
+            let shared = short_by(1, 3, refusing_connects());
+            let mut client = serve_one(Arc::clone(&shared));
+            assert_eq!(
+                connected(&mut client, version).await.reason,
+                ReasonCode::ServerUnavailable,
+                "a refused connect is told why, at {version:?}"
+            );
+            assert_eq!(
+                shared
+                    .metrics()
+                    .reason_sent(PacketKind::ConnAck, ReasonCode::ServerUnavailable)
+                    .get(),
+                1
+            );
+            assert_eq!(
+                shared
+                    .metrics()
+                    .socket_closed(SocketOutcome::NotWhole)
+                    .get(),
+                1,
+                "and the ending is counted as the operator's own flag rather than \
+                 as a protocol error, which is where a broken client would be \
+                 looked for"
+            );
+            assert_eq!(
+                shared
+                    .metrics()
+                    .socket_closed(SocketOutcome::Protocol)
+                    .get(),
+                0,
+                "the client did nothing wrong"
+            );
+        }
+    }
+
+    /// And a connect is served while the cluster is whole, whatever
+    /// the flags say.
+    ///
+    /// **The mutation this exists for is the refusal firing
+    /// unconditionally**, which every test above would pass.
+    #[tokio::test]
+    async fn a_whole_cluster_connects_with_every_flag_set() {
+        let strict = cluster::Strict {
+            connects: true,
+            publishes: true,
+            subscribes: true,
+        };
+        let shared = short_by(3, 3, strict);
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected(&mut client, Version::V5).await.reason,
+            ReasonCode::Success
+        );
+
+        write(
+            &mut client,
+            &retaining(QoS::AtLeastOnce, Some(1)),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            // 0x10 rather than 0x00: nothing is subscribed, and
+            // 3.4.2.1's table says so. It is an acceptance, and it is
+            // a stronger one to assert than success — only a broker
+            // that looked for subscribers can say there were none.
+            Packet::PubAck(ack) => assert_eq!(ack.reason, ReasonCode::NoMatchingSubscribers),
+            other => panic!("expected a publish acknowledgement, got {other:?}"),
+        }
+        assert_eq!(shared.with_broker(|broker| broker.retained_count()), 1);
+    }
+
+    /// A refused publish is answered, and the connection lives.
+    ///
+    /// The acknowledgement carries 0x83 and **the broker never sees
+    /// the publication**, which is asserted positively: a retained
+    /// publish that reached it would be in the retained store, and the
+    /// count there is zero. An absence of a delivery would prove the
+    /// same thing by waiting for nothing to happen, which proves
+    /// nothing at all.
+    ///
+    /// The subscribe in the middle is the other half of the claim.
+    /// `cluster.strict.publishes` was the only flag set, so the
+    /// subscribe must be granted — a flag refusing all three
+    /// operations is the third mutation this task names.
+    #[tokio::test]
+    async fn a_refused_publish_is_acknowledged_with_a_reason_and_goes_no_further() {
+        let shared = short_by(1, 2, refusing_publishes());
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected(&mut client, Version::V5).await.reason,
+            ReasonCode::Success,
+            "connects were not the flag that was set"
+        );
+
+        write(
+            &mut client,
+            &Packet::Subscribe(mqtt_codec::packet::Subscribe {
+                packet_id: 1,
+                filters: vec![mqtt_codec::packet::SubscriptionOptions {
+                    filter: "site/+/temp".into(),
+                    qos: QoS::AtLeastOnce,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: mqtt_codec::packet::RetainHandling::DoNotSend,
+                }],
+                properties: Properties::default(),
+            }),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::SubAck(ack) => assert_eq!(
+                ack.reasons,
+                vec![ReasonCode::GrantedQos1],
+                "and subscribes were not either"
+            ),
+            other => panic!("expected a subscription acknowledgement, got {other:?}"),
+        }
+
+        // At-least-once: a PUBACK can carry a code, so it carries one.
+        write(
+            &mut client,
+            &retaining(QoS::AtLeastOnce, Some(2)),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::PubAck(ack) => {
+                assert_eq!(ack.reason, ReasonCode::ImplementationSpecificError);
+                assert_eq!(ack.packet_id, 2, "and it answers the publish that asked");
+            }
+            other => panic!("expected a publish acknowledgement, got {other:?}"),
+        }
+
+        // Exactly-once: the PUBREC ends the exchange, so there is no
+        // PUBREL to send and none is waited for.
+        write(
+            &mut client,
+            &retaining(QoS::ExactlyOnce, Some(3)),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::PubRec(ack) => {
+                assert_eq!(ack.reason, ReasonCode::ImplementationSpecificError);
+                assert_eq!(ack.packet_id, 3);
+            }
+            other => panic!("expected a receipt, got {other:?}"),
+        }
+
+        assert_eq!(
+            shared.with_broker(|broker| broker.retained_count()),
+            0,
+            "two retained publishes were refused, so the broker holds neither"
+        );
+
+        // And the connection is still there: a refusal a client can act
+        // on is one it is still connected to act on.
+        write(
+            &mut client,
+            &Packet::Subscribe(mqtt_codec::packet::Subscribe {
+                packet_id: 4,
+                filters: vec![mqtt_codec::packet::SubscriptionOptions {
+                    filter: "site/+/humidity".into(),
+                    qos: QoS::AtMostOnce,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: mqtt_codec::packet::RetainHandling::DoNotSend,
+                }],
+                properties: Properties::default(),
+            }),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::SubAck(ack) => assert_eq!(ack.reasons, vec![ReasonCode::Success]),
+            other => panic!("expected a subscription acknowledgement, got {other:?}"),
+        }
+    }
+
+    /// A publish with no acknowledgement to carry a reason is closed
+    /// instead, with the reason where one can go.
+    ///
+    /// Two cases, and they are the two the protocol leaves no room to
+    /// answer: at-most-once, which has no acknowledgement at any
+    /// version, and 3.1.1 above it, whose PUBACK carries no reason
+    /// code and so would say *accepted*. Closing is what this broker
+    /// already does when it cannot acknowledge a publish; see
+    /// `NOT_DURABLE`.
+    #[tokio::test]
+    async fn a_publish_the_protocol_cannot_answer_is_closed_with_the_reason() {
+        // MQTT 5 at at-most-once: the reason goes in a DISCONNECT,
+        // which 5 has and which is the whole point of its having one.
+        let shared = short_by(1, 2, refusing_publishes());
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected(&mut client, Version::V5).await.reason,
+            ReasonCode::Success
+        );
+        write(&mut client, &retaining(QoS::AtMostOnce, None), Version::V5).await;
+        match read(&mut client, Version::V5).await {
+            Packet::Disconnect(said) => assert_eq!(
+                said.reason,
+                ReasonCode::ImplementationSpecificError,
+                "the one place a reason can go at this level"
+            ),
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
+        assert_eq!(shared.with_broker(|broker| broker.retained_count()), 0);
+
+        // 3.1.1 at at-least-once: a PUBACK here has no reason code, so
+        // sending one would tell the publisher its message was taken.
+        // The socket closes with nothing on it, because 3.1.1 gives a
+        // server nothing to say.
+        let shared = short_by(1, 2, refusing_publishes());
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected(&mut client, Version::V311).await.reason,
+            ReasonCode::Success
+        );
+        write(
+            &mut client,
+            &retaining(QoS::AtLeastOnce, Some(1)),
+            Version::V311,
+        )
+        .await;
+        let mut chunk = [0u8; 64];
+        let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut chunk))
+            .await
+            .expect("the socket ends rather than hanging")
+            .expect("a closed socket reads zero rather than failing");
+        assert_eq!(
+            read, 0,
+            "3.1.1 has no packet for this, so the close is the answer; it must not \
+             be a PUBACK, which would mean accepted"
+        );
+    }
+
+    /// A refused subscribe is answered with one code per filter.
+    ///
+    /// [MQTT-3.9.3-1]: the client matches reason codes to filters by
+    /// position, so a SUBACK shorter than the request is a malformed
+    /// packet rather than a refusal. Two filters here, for exactly
+    /// that reason: a refusal built from `vec![code]` passes a
+    /// one-filter test.
+    #[tokio::test]
+    async fn a_refused_subscribe_carries_one_reason_code_per_filter() {
+        let shared = short_by(1, 2, refusing_subscribes());
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected(&mut client, Version::V5).await.reason,
+            ReasonCode::Success
+        );
+
+        let filter = |filter: &str| mqtt_codec::packet::SubscriptionOptions {
+            filter: filter.into(),
+            qos: QoS::AtLeastOnce,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: mqtt_codec::packet::RetainHandling::DoNotSend,
+        };
+        write(
+            &mut client,
+            &Packet::Subscribe(mqtt_codec::packet::Subscribe {
+                packet_id: 1,
+                filters: vec![filter("site/+/temp"), filter("site/+/humidity")],
+                properties: Properties::default(),
+            }),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::SubAck(ack) => {
+                assert_eq!(
+                    ack.reasons,
+                    vec![
+                        ReasonCode::ImplementationSpecificError,
+                        ReasonCode::ImplementationSpecificError
+                    ],
+                    "one per filter, and both refused"
+                );
+                assert_eq!(ack.packet_id, 1);
+            }
+            other => panic!("expected a subscription acknowledgement, got {other:?}"),
+        }
+
+        // And a publish goes through, because publishes were not the
+        // flag that was set.
+        write(
+            &mut client,
+            &retaining(QoS::AtLeastOnce, Some(2)),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            // 0x10, and here it is also the proof that the refusal
+            // above went no further than the acknowledgement: a
+            // subscribe that reached the broker would have installed
+            // `site/+/temp`, and this publication would have matched
+            // it.
+            Packet::PubAck(ack) => assert_eq!(ack.reason, ReasonCode::NoMatchingSubscribers),
+            other => panic!("expected a publish acknowledgement, got {other:?}"),
+        }
+        assert_eq!(
+            shared.with_broker(|broker| broker.retained_count()),
+            1,
+            "and it reached the broker"
+        );
     }
 }

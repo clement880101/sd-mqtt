@@ -169,9 +169,24 @@ async fn ready(State(state): State<AdminState>) -> (StatusCode, Json<ReadinessVi
 
 /// Whether this node's view of cluster membership is complete.
 ///
-/// `expected` counts this node and every peer it has met; `members`
-/// counts the ones answering. They are equal when nothing is missing,
-/// and the status says `complete` exactly then.
+/// `members` counts the peers answering, and this node. `expected` is
+/// **what an operator configured as `cluster.expected_size`**, and the
+/// status says `complete` while `members` has reached it.
+///
+/// Configured, because nothing else can say: membership is learnt, so
+/// a node that never heard of a fourth node cannot tell a cluster of
+/// three from a cluster of four with one down. With the key unset the
+/// count of nodes met is served instead, which is what this endpoint
+/// has always served and carries exactly that blind spot — it reports
+/// `complete` on a node that came up alone. Section 8.5, and
+/// `cluster::policy`.
+///
+/// More nodes answering than expected is `complete` rather than a
+/// disagreement: a fourth node joining a cluster of three is not an
+/// outage, and an operator who has not updated the key yet should not
+/// be paged for it. It is the same comparison `cluster::Policy::whole`
+/// makes, which is the point — the same reading decides this answer
+/// and whether a client is refused.
 ///
 /// **A node that does not cluster answers a cluster of one**, and that
 /// is the truth rather than a placeholder: it is the only node, and
@@ -193,10 +208,10 @@ async fn cluster(State(state): State<AdminState>) -> Json<ClusterView> {
         });
     };
     let peers = cluster.peers();
-    let expected = peers.len() + 1;
     let members = peers.iter().filter(|peer| peer.state == "up").count() + 1;
+    let expected = cluster.expected().unwrap_or(peers.len() + 1);
     Json(ClusterView {
-        status: if members == expected {
+        status: if members >= expected {
             "complete"
         } else {
             "incomplete"
@@ -340,10 +355,13 @@ mod tests {
     #[tokio::test]
     async fn the_cluster_endpoint_reports_what_this_node_can_see() {
         #[derive(Debug)]
-        struct Peers(Vec<crate::ClusterPeer>);
+        struct Peers(Vec<crate::ClusterPeer>, Option<usize>);
         impl crate::Cluster for Peers {
             fn peers(&self) -> Vec<crate::ClusterPeer> {
                 self.0.clone()
+            }
+            fn expected(&self) -> Option<usize> {
+                self.1
             }
         }
         fn peer(state: &'static str) -> crate::ClusterPeer {
@@ -355,6 +373,12 @@ mod tests {
             }
         }
         async fn serve_with(peers: Vec<crate::ClusterPeer>) -> crate::AdminRunning {
+            configured(peers, None).await
+        }
+        async fn configured(
+            peers: Vec<crate::ClusterPeer>,
+            expected: Option<usize>,
+        ) -> crate::AdminRunning {
             let config = AdminConfig {
                 address: "127.0.0.1:0"
                     .parse::<SocketAddr>()
@@ -362,7 +386,9 @@ mod tests {
                 ..AdminConfig::default()
             };
             let state = AdminState::new(Arc::new(Shared::new(BrokerConfig::default())))
-                .with_cluster(Some(Arc::new(Peers(peers)) as Arc<dyn crate::Cluster>));
+                .with_cluster(Some(
+                    Arc::new(Peers(peers, expected)) as Arc<dyn crate::Cluster>
+                ));
             AdminServer::bind(&config, state)
                 .await
                 .expect("loopback needs no token")
@@ -408,6 +434,41 @@ mod tests {
             response.body
         );
         unsure.shutdown().await;
+
+        // **The case the count of nodes met cannot see.** Three nodes
+        // answering, all three of them each other's whole world, and a
+        // fourth that this one has never heard of because the
+        // partition started before it did. `peers.len() + 1` is three
+        // and would call that complete; the configured four is what
+        // makes it the outage it is. Section 8.5.
+        let unaware = configured(vec![peer("up"), peer("up")], Some(4)).await;
+        let response = testing::get(unaware.address(), "/health/cluster").await;
+        assert!(response.body.contains("\"members\":3"), "{}", response.body);
+        assert!(
+            response.body.contains("\"expected\":4"),
+            "the configured size is what is served, not the nodes met: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("\"status\":\"incomplete\""),
+            "three of four is incomplete, and nothing this node has met could \
+             have told it so: {}",
+            response.body
+        );
+        unaware.shutdown().await;
+
+        // And the other side of the comparison: a node joined that
+        // the key has not caught up with yet. Not an outage, and not
+        // a disagreement to page anybody about.
+        let grown = configured(vec![peer("up"), peer("up")], Some(2)).await;
+        let response = testing::get(grown.address(), "/health/cluster").await;
+        assert!(response.body.contains("\"members\":3"), "{}", response.body);
+        assert!(
+            response.body.contains("\"status\":\"complete\""),
+            "more nodes than expected is not short of anything: {}",
+            response.body
+        );
+        grown.shutdown().await;
     }
 
     /// A broker configured with no store is ready, not forever

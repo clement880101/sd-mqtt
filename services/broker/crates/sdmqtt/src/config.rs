@@ -64,7 +64,7 @@ use std::time::Duration;
 use broker_core::broker::BrokerConfig;
 use cluster::membership::Detection;
 use cluster::mesh::MeshSettings;
-use cluster::{ClusterSettings, DEFAULT_CLUSTER_NAME};
+use cluster::{ClusterSettings, Policy, Strict, DEFAULT_CLUSTER_NAME};
 use mqtt_codec::Limits;
 use sdmqtt_admin::config::{AdminConfig, AdminStartError, Token};
 use sdmqtt_server::connection::{outbox_depth_for, ConnectionConfig};
@@ -166,6 +166,13 @@ pub enum ConfigError {
     /// would be a second copy free to drift from it.
     #[error("{0}")]
     Cluster(#[from] cluster::ConfigError),
+    /// The partition policy cannot mean what it says. Section 8.5.
+    ///
+    /// Carried verbatim for the reason the two above are:
+    /// `cluster::PolicyError` names the flag an operator has to go and
+    /// fix and what the two ways out of it are.
+    #[error("{0}")]
+    Policy(#[from] cluster::PolicyError),
     /// A rule cannot mean what it says.
     ///
     /// Its own variant rather than [`ConfigError::Unusable`] because a
@@ -749,6 +756,26 @@ pub struct ClusterSection {
     /// mismatched secret is a configuration error that will not fix
     /// itself.
     pub refused_backoff_ms: u64,
+    /// How many nodes this cluster is meant to have. Section 8.5.
+    ///
+    /// **The only thing that can say whether the cluster is whole.**
+    /// Membership is learnt, so the nodes a node has met cannot answer
+    /// it: three nodes that never heard of a fourth look exactly like
+    /// four with one down. `None` is an operator who did not say, and
+    /// then nothing is ever short — which is the default, and is
+    /// section 8.5's availability.
+    ///
+    /// Zero is refused rather than read as absent: a cluster contains
+    /// at least the node reading the setting.
+    pub expected_size: Option<usize>,
+    /// Which operations to refuse while the cluster is short of
+    /// [`ClusterSection::expected_size`]. Section 8.5.
+    ///
+    /// All false by default, which keeps a partitioned node serving.
+    /// Any of them set without an expected size is refused at startup,
+    /// because a flag whose condition can never be evaluated is a flag
+    /// that silently means nothing. See `cluster::policy`.
+    pub strict: Strict,
     /// How long a node waits for a session it claimed to be drained to
     /// it, in milliseconds. Section 8.4.
     ///
@@ -780,6 +807,8 @@ impl Default for ClusterSection {
             reconnect_min_ms: 200,
             reconnect_max_ms: 30_000,
             refused_backoff_ms: 300_000,
+            expected_size: None,
+            strict: Strict::default(),
             drain_timeout_ms: 2_000,
         }
     }
@@ -793,6 +822,18 @@ impl ClusterSection {
             name: self.name.clone(),
             secret: self.secret.clone(),
         }
+    }
+
+    /// The partition policy, for `cluster` to check. Section 8.5.
+    ///
+    /// # Errors
+    ///
+    /// `cluster::PolicyError` when a flag is set with no expected size,
+    /// or the expected size is zero. Both are refusals the policy owns
+    /// rather than checks written here, for the reason the secret's
+    /// three are `cluster`'s: one spelling of each message.
+    pub fn policy(&self) -> Result<Policy, cluster::PolicyError> {
+        Policy::new(self.expected_size, self.strict)
     }
 
     /// What this node tells peers to dial.
@@ -1172,7 +1213,39 @@ impl Config {
     /// Nothing here when `cluster.address` is unset, which is a node
     /// that does not cluster and is the default.
     fn validate_cluster(&self) -> Result<(), ConfigError> {
+        // Section 8.5, **before the switch below**, because neither of
+        // these two refusals depends on it: a flag with no expected
+        // size behind it means nothing whether or not this node
+        // clusters, and `cluster::PolicyError` already says which flag
+        // and what to do about it.
+        self.cluster.policy()?;
+
         let Some(address) = self.cluster.address else {
+            // A node with no `cluster.address` is a cluster of one for
+            // ever, so it is never short of anything and a flag on it
+            // can never fire. Refused rather than ignored, for the
+            // reason the policy refuses a flag with no expected size:
+            // an operator who asked for a trade and silently did not
+            // get it finds out during the partition it was for.
+            if let Some(what) = self.cluster.strict.first_set() {
+                return Err(ConfigError::Unusable {
+                    key: what,
+                    value: "true".to_owned(),
+                    why: "this node does not cluster, because cluster.address is unset, so \
+                          it is a cluster of one and is never short of anything. Set \
+                          cluster.address to make it a node of a cluster, or leave the flag \
+                          out",
+                });
+            }
+            if let Some(expected) = self.cluster.expected_size {
+                return Err(ConfigError::Unusable {
+                    key: "cluster.expected_size",
+                    value: expected.to_string(),
+                    why: "this node does not cluster, because cluster.address is unset, so \
+                          there is nothing for an expected size to be compared against. Set \
+                          cluster.address, or leave the key out",
+                });
+            }
             return Ok(());
         };
 
@@ -1371,6 +1444,42 @@ impl Config {
         }
         if let Some(value) = lookup("SDMQTT_CLUSTER_ADVERTISE") {
             self.cluster.advertise = Some(value);
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_EXPECTED_SIZE") {
+            // Section 8.5's number. In the environment as well as the
+            // file because it is the one value here that differs
+            // between a cluster and the same cluster grown by a node,
+            // and growing one is what an operator does from a
+            // deployment rather than by editing three files.
+            self.cluster.expected_size = Some(parse(
+                "SDMQTT_CLUSTER_EXPECTED_SIZE",
+                &value,
+                "a node count",
+            )?);
+        }
+        for (variable, flag) in [
+            (
+                "SDMQTT_CLUSTER_STRICT_CONNECTS",
+                &mut self.cluster.strict.connects,
+            ),
+            (
+                "SDMQTT_CLUSTER_STRICT_PUBLISHES",
+                &mut self.cluster.strict.publishes,
+            ),
+            (
+                "SDMQTT_CLUSTER_STRICT_SUBSCRIBES",
+                &mut self.cluster.strict.subscribes,
+            ),
+        ] {
+            if let Some(value) = lookup(variable) {
+                // `true` or `false` and nothing else. A `1`, a `yes` or
+                // a `TRUE` is refused by name rather than guessed at,
+                // because the guess that goes wrong here is the one
+                // that reads an operator's `yes` as `false` and leaves
+                // them serving through the partition they asked to
+                // refuse.
+                *flag = parse(variable, &value, "true or false")?;
+            }
         }
         if let Some(value) = lookup("SDMQTT_CLUSTER_SEEDS") {
             // Comma separated, for the reason the admin listener's
@@ -3811,5 +3920,231 @@ dead_after_ms = 4000
             !config.admin.enabled,
             "the file said no and the command line said nothing"
         );
+    }
+
+    // -----------------------------------------------------------
+    // The partition policy, section 8.5.
+    // -----------------------------------------------------------
+
+    /// A strict flag with no expected size is refused **at startup**,
+    /// in the policy's own words.
+    ///
+    /// Each of the three, because the message names the flag and a
+    /// list of three literals is how one of them comes to name a key
+    /// that no longer exists.
+    #[test]
+    fn a_strict_flag_with_no_expected_size_is_refused_at_startup() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        for (set, named) in [
+            (
+                cluster::Strict {
+                    connects: true,
+                    ..cluster::Strict::default()
+                },
+                "cluster.strict.connects",
+            ),
+            (
+                cluster::Strict {
+                    publishes: true,
+                    ..cluster::Strict::default()
+                },
+                "cluster.strict.publishes",
+            ),
+            (
+                cluster::Strict {
+                    subscribes: true,
+                    ..cluster::Strict::default()
+                },
+                "cluster.strict.subscribes",
+            ),
+        ] {
+            let mut config = clustering(directory.path());
+            config.cluster.strict = set;
+            let said = config
+                .validate()
+                .expect_err("a flag nothing can evaluate must not start")
+                .to_string();
+            assert_eq!(
+                said,
+                cluster::PolicyError::NoExpectedSize { what: named }.to_string(),
+                "carried verbatim rather than reworded"
+            );
+            assert!(said.contains(named), "{said}");
+            assert!(
+                said.contains("cluster.expected_size"),
+                "and it says what to set: {said}"
+            );
+        }
+    }
+
+    /// With the size set, the same flags are a valid configuration.
+    ///
+    /// The other side of the boundary, and the mutation it is for is a
+    /// refusal that fires whatever the size says — which every test
+    /// above would pass.
+    #[test]
+    fn the_same_flags_with_an_expected_size_are_accepted() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let mut config = clustering(directory.path());
+        config.cluster.expected_size = Some(3);
+        config.cluster.strict = cluster::Strict {
+            connects: true,
+            publishes: true,
+            subscribes: true,
+        };
+        config
+            .validate()
+            .expect("a size and three flags is what section 8.5 offers");
+        let policy = config.cluster.policy().expect("and it builds a policy");
+        assert_eq!(policy.expected(), Some(3));
+        assert!(!policy.allows(cluster::Operation::Connect, 2));
+        assert!(policy.allows(cluster::Operation::Connect, 3));
+    }
+
+    /// An expected size of zero is refused.
+    #[test]
+    fn an_expected_size_of_zero_is_refused_at_startup() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let mut config = clustering(directory.path());
+        config.cluster.expected_size = Some(0);
+        assert_eq!(
+            config
+                .validate()
+                .expect_err("no cluster has no nodes")
+                .to_string(),
+            cluster::PolicyError::NoNodes.to_string()
+        );
+    }
+
+    /// A policy on a node that does not cluster is refused.
+    ///
+    /// Not ignored. A node with no `cluster.address` is a cluster of
+    /// one for ever, so it is never short of anything and a flag on it
+    /// can never fire — an operator who asked for the trade and
+    /// silently did not get it would find out during the partition
+    /// they asked about.
+    #[test]
+    fn a_policy_on_a_node_that_does_not_cluster_is_refused() {
+        let flagged = Config {
+            cluster: ClusterSection {
+                expected_size: Some(3),
+                strict: cluster::Strict {
+                    publishes: true,
+                    ..cluster::Strict::default()
+                },
+                ..ClusterSection::default()
+            },
+            ..Config::default()
+        };
+        let said = flagged
+            .validate()
+            .expect_err("a flag on a cluster of one can never fire")
+            .to_string();
+        assert!(said.contains("cluster.strict.publishes"), "{said}");
+        assert!(said.contains("cluster.address"), "{said}");
+
+        // And the size on its own, which is the same mistake with
+        // nothing reading it.
+        let sized = Config {
+            cluster: ClusterSection {
+                expected_size: Some(3),
+                ..ClusterSection::default()
+            },
+            ..Config::default()
+        };
+        let said = sized
+            .validate()
+            .expect_err("nothing to compare three against")
+            .to_string();
+        assert!(said.contains("cluster.expected_size"), "{said}");
+        assert!(said.contains("cluster.address"), "{said}");
+    }
+
+    /// The default clusters with no policy at all, which is
+    /// availability.
+    #[test]
+    fn a_clustering_node_needs_no_policy() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let config = clustering(directory.path());
+        config.validate().expect("this is the ordinary cluster");
+        assert_eq!(config.cluster.expected_size, None);
+        assert!(!config.cluster.strict.any());
+        let policy = config.cluster.policy().expect("and it builds");
+        assert!(
+            policy.allows(cluster::Operation::Publish, 1),
+            "one node of a cluster that never said how large it is serves"
+        );
+    }
+
+    /// The file spells the section as section 8.5 names it.
+    ///
+    /// A key an operator cannot write is a feature that does not
+    /// exist, and `deny_unknown_fields` means a misspelling here is a
+    /// refusal to start rather than a flag that quietly does nothing.
+    #[test]
+    fn the_policy_is_read_from_a_file() {
+        let config = Config::parse(
+            r#"
+            [cluster]
+            expected_size = 3
+
+            [cluster.strict]
+            publishes = true
+            "#,
+            Path::new("test.toml"),
+        )
+        .expect("the keys are spelled as the section names them");
+        assert_eq!(config.cluster.expected_size, Some(3));
+        assert_eq!(
+            config.cluster.strict,
+            cluster::Strict {
+                publishes: true,
+                ..cluster::Strict::default()
+            },
+            "and one flag set does not set the others"
+        );
+    }
+
+    /// And from the environment, which is how a container is
+    /// configured.
+    #[test]
+    fn the_policy_is_read_from_the_environment() {
+        let mut config = Config::default();
+        config
+            .apply_env(|name| {
+                match name {
+                    "SDMQTT_CLUSTER_EXPECTED_SIZE" => Some("4"),
+                    "SDMQTT_CLUSTER_STRICT_SUBSCRIBES" => Some("true"),
+                    "SDMQTT_CLUSTER_STRICT_PUBLISHES" => Some("false"),
+                    _ => None,
+                }
+                .map(ToOwned::to_owned)
+            })
+            .expect("four nodes and a flag");
+        assert_eq!(config.cluster.expected_size, Some(4));
+        assert_eq!(
+            config.cluster.strict,
+            cluster::Strict {
+                subscribes: true,
+                ..cluster::Strict::default()
+            },
+            "the variable that said false set nothing, and named its own flag"
+        );
+
+        // A boolean this broker will not guess at. `1`, `yes` and
+        // `TRUE` are all refused by name, because the guess that goes
+        // wrong reads an operator's `yes` as `false` and leaves them
+        // serving through the partition they asked to refuse.
+        for written in ["1", "yes", "TRUE", ""] {
+            let mut config = Config::default();
+            let error = config
+                .apply_env(|name| {
+                    (name == "SDMQTT_CLUSTER_STRICT_CONNECTS").then(|| written.to_owned())
+                })
+                .expect_err("a flag that is not true or false is refused");
+            let said = error.to_string();
+            assert!(said.contains("SDMQTT_CLUSTER_STRICT_CONNECTS"), "{said}");
+            assert!(said.contains("true or false"), "{said}");
+        }
     }
 }

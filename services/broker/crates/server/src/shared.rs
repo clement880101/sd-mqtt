@@ -11,7 +11,7 @@ use broker_core::registry::SessionId;
 use broker_core::session::Action;
 use broker_core::subscriptions::{FilterEvent, SubscriberId};
 use cluster::migrate::{Claimed, Migrator};
-use cluster::{MetadataWrite, Replicated};
+use cluster::{Gate, MetadataWrite, Operation, Replicated};
 use foldhash::fast::RandomState;
 use mqtt_codec::Packet;
 use parking_lot::{Mutex, RwLock};
@@ -292,6 +292,19 @@ pub struct Shared {
     /// `None` is a node that does not cluster, and a connect then costs
     /// one `OnceLock` read.
     migrator: OnceLock<Arc<Migrator>>,
+    /// What a partition does to a connect, a publish and a subscribe,
+    /// section 8.5.
+    ///
+    /// Installed after construction for the migrator's reason: it
+    /// counts the mesh's members and the mesh is built later.
+    ///
+    /// **`None` is a node that serves everything**, which is both a
+    /// node that does not cluster and a clustering node whose operator
+    /// set no flags — the default, and section 8.5's availability. So
+    /// the absent case and the permissive case are the same case, and
+    /// the cost of the policy on a node that did not ask for it is one
+    /// `OnceLock` read per operation.
+    gate: OnceLock<Arc<Gate>>,
 }
 
 impl Shared {
@@ -350,6 +363,7 @@ impl Shared {
             rejections_reported: AtomicU64::new(0),
             metrics: Arc::new(Metrics::new()),
             migrator: OnceLock::new(),
+            gate: OnceLock::new(),
         }
     }
 
@@ -366,6 +380,29 @@ impl Shared {
     #[must_use]
     pub fn migrator(&self) -> Option<&Arc<Migrator>> {
         self.migrator.get()
+    }
+
+    /// Refuse operations through `gate` while the cluster is short,
+    /// section 8.5.
+    ///
+    /// Once, for [`Shared::install_migrator`]'s reason: a second
+    /// policy in one process is a second answer to whether a client
+    /// may publish.
+    pub fn install_gate(&self, gate: Arc<Gate>) {
+        let _ = self.gate.set(gate);
+    }
+
+    /// Whether `operation` may proceed, section 8.5.
+    ///
+    /// **True on a node with no gate installed**, which is the default
+    /// and is availability: a node whose operator asked for nothing
+    /// refuses nothing. The gate re-reads the membership on every call
+    /// rather than being told when it changes, because the thing it is
+    /// about is a network fault and nothing sends a notification about
+    /// one.
+    #[must_use]
+    pub fn allows(&self, operation: Operation) -> bool {
+        self.gate.get().is_none_or(|gate| gate.allows(operation))
     }
 
     /// Claim `session` for this node and drain it from whoever held it.

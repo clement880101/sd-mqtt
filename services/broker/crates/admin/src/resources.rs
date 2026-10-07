@@ -1670,6 +1670,12 @@ mod tests {
         fn peers(&self) -> Vec<crate::ClusterPeer> {
             self.0.clone()
         }
+
+        /// Nothing configured, which is what this listing is about: it
+        /// reports the nodes met and never a count of them.
+        fn expected(&self) -> Option<usize> {
+            None
+        }
     }
 
     fn peer(id: &str, name: &str, state: &'static str) -> crate::ClusterPeer {

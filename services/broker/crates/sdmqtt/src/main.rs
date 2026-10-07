@@ -23,8 +23,8 @@ use clap::{Args, Parser, Subcommand};
 use cluster::membership::MemberState;
 use cluster::mesh::Mesh;
 use cluster::{
-    HybridClock, MetadataError, NodeIdentity, Replicated, ReplicationSettings, Replicator,
-    TcpTransport, DEFAULT_MAX_DRIFT_MILLIS,
+    Gate, HybridClock, Live, MetadataError, NodeIdentity, Replicated, ReplicationSettings,
+    Replicator, TcpTransport, DEFAULT_MAX_DRIFT_MILLIS,
 };
 use config::{Config, ConfigError, IngestListener, LogLevel, Overrides};
 use ingest::IngestSocket;
@@ -221,6 +221,12 @@ pub enum StartupError {
     /// three things is wrong and what to do about it.
     #[error("{0}")]
     Cluster(#[from] cluster::ConfigError),
+    /// The partition policy cannot mean what it says. Section 8.5.
+    ///
+    /// Carried verbatim, like the refusal above it: it names the flag
+    /// an operator has to go and fix.
+    #[error("{0}")]
+    Policy(#[from] cluster::PolicyError),
     /// The cluster listener could not be bound.
     ///
     /// Fatal, and for the reason the other listeners' failures are: a
@@ -243,11 +249,22 @@ pub enum StartupError {
 /// set of numbers and a second adapter would be a second place for
 /// them to disagree.
 #[derive(Debug)]
-struct MeshView(Arc<Mesh>);
+struct MeshView {
+    /// Who this node has met, and how each of them is doing.
+    mesh: Arc<Mesh>,
+    /// Section 8.5's policy, for the one number it is asked for.
+    ///
+    /// The gate rather than `config.cluster.expected_size`, so that
+    /// the count the health endpoint serves is read from the same
+    /// place the refusal decision reads it. Two readings of "whole" in
+    /// one process is a probe reporting `complete` while clients are
+    /// being turned away.
+    gate: Arc<Gate>,
+}
 
 impl sdmqtt_admin::Cluster for MeshView {
     fn peers(&self) -> Vec<ClusterPeer> {
-        self.0
+        self.mesh
             .members()
             .into_iter()
             .map(|member| ClusterPeer {
@@ -258,6 +275,10 @@ impl sdmqtt_admin::Cluster for MeshView {
             })
             .collect()
     }
+
+    fn expected(&self) -> Option<usize> {
+        self.gate.expected()
+    }
 }
 
 impl sdmqtt_server::metrics::ClusterMetrics for MeshView {
@@ -265,7 +286,7 @@ impl sdmqtt_server::metrics::ClusterMetrics for MeshView {
         // **Itself included.** A node that has lost every peer is a
         // cluster of one, and reporting none would be wrong rather
         // than empty.
-        self.0
+        self.mesh
             .members()
             .iter()
             .filter(|member| member.state == MemberState::Alive)
@@ -274,15 +295,15 @@ impl sdmqtt_server::metrics::ClusterMetrics for MeshView {
     }
 
     fn bytes_sent(&self) -> u64 {
-        self.0.stats().bytes_sent
+        self.mesh.stats().bytes_sent
     }
 
     fn bytes_received(&self) -> u64 {
-        self.0.stats().bytes_received
+        self.mesh.stats().bytes_received
     }
 
     fn bytes_dropped(&self) -> u64 {
-        self.0.stats().bytes_dropped
+        self.mesh.stats().bytes_dropped
     }
 }
 
@@ -297,6 +318,9 @@ struct Node<'a> {
     identity: Option<&'a NodeIdentity>,
     /// Its mesh, on a node that clusters.
     mesh: Option<&'a Arc<Mesh>>,
+    /// Section 8.5's policy, on the same nodes as the mesh: the two
+    /// are made together and neither is useful without the other.
+    gate: Option<&'a Arc<Gate>>,
 }
 
 /// Start section 8.1's mesh, when this node clusters.
@@ -692,12 +716,13 @@ async fn start_admin(
             .with_node_id(identity.id().to_string())
             .with_node_name(identity.name());
     }
-    if let Some(mesh) = node.mesh {
+    if let (Some(mesh), Some(gate)) = (node.mesh, node.gate) {
         state = state
             .with_node_address(mesh.advertise())
-            .with_cluster(Some(
-                Arc::new(MeshView(Arc::clone(mesh))) as Arc<dyn sdmqtt_admin::Cluster>
-            ));
+            .with_cluster(Some(Arc::new(MeshView {
+                mesh: Arc::clone(mesh),
+                gate: Arc::clone(gate),
+            }) as Arc<dyn sdmqtt_admin::Cluster>));
     }
 
     // Section 9.2: serving the ingest routes here is permitted and
@@ -887,6 +912,19 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         .map(|(_, handler, _)| Arc::clone(handler) as Arc<dyn cluster::mesh::Deliver>);
 
     let mesh = start_cluster(&config, rebuilt.as_ref(), deliveries).await?;
+    // Section 8.5's policy, made once and read in three places: the
+    // connect path, the publish and subscribe paths, and the health
+    // endpoint's expected count. One of them, so that a probe cannot
+    // report a whole cluster while another is refusing clients.
+    //
+    // Carried rather than unwrapped although `Config::validate` has
+    // already refused both policies that cannot be evaluated. A
+    // startup that stopped validating would then refuse to start, with
+    // the message that says which flag, rather than panic.
+    let policy = config.cluster.policy()?;
+    let gate = mesh
+        .as_ref()
+        .map(|mesh| Gate::new(policy, Arc::clone(mesh) as Arc<dyn Live>));
     // Section 8.3, and **before any of the tasks below**: this is the
     // only thing that makes `Broker::publish` forward anything, so the
     // window between the mesh accepting links and this being installed
@@ -920,6 +958,18 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             Arc::clone(&migrations),
             std::time::Duration::from_millis(config.cluster.drain_timeout_ms),
         ));
+        // Section 8.5, here for the same reason and in the same
+        // window: an operator who asked for connects to be refused
+        // while the cluster is short must not have them accepted for
+        // the moment between the listener opening and this.
+        //
+        // A gate with no flags set refuses nothing, so this is
+        // installed whether or not the operator asked for anything —
+        // what it also carries is the expected size the health
+        // endpoint reports.
+        if let Some(gate) = &gate {
+            rebuilt.shared.install_gate(Arc::clone(gate));
+        }
     }
     // The four tasks of section 8.2, started once there is a mesh for them
     // to talk over. A node that does not cluster starts none of them: its
@@ -965,9 +1015,11 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             );
         }
     }
-    if let Some(mesh) = &mesh {
-        let metrics: Arc<dyn sdmqtt_server::metrics::ClusterMetrics> =
-            Arc::new(MeshView(Arc::clone(mesh)));
+    if let (Some(mesh), Some(gate)) = (&mesh, &gate) {
+        let metrics: Arc<dyn sdmqtt_server::metrics::ClusterMetrics> = Arc::new(MeshView {
+            mesh: Arc::clone(mesh),
+            gate: Arc::clone(gate),
+        });
         // Section 11.3's four cluster numbers, registered **only
         // here**: a node that does not cluster leaves them absent
         // rather than reporting zero, which is a different statement.
@@ -1020,6 +1072,7 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         Node {
             identity: rebuilt.as_ref().map(|rebuilt| &rebuilt.identity),
             mesh: mesh.as_ref(),
+            gate: gate.as_ref(),
         },
     )
     .await?;

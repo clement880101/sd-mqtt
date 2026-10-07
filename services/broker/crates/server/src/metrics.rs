@@ -315,6 +315,17 @@ pub enum SocketOutcome {
     /// A publication could not be made durable, so the client was
     /// closed rather than acknowledged.
     NotDurable,
+    /// The cluster was short of its expected size and this node is
+    /// configured to refuse, section 8.5.
+    ///
+    /// **Its own outcome and not `Protocol`**, because it is the one
+    /// ending in the list that an operator asked for: the flag that
+    /// produces it is one they set. A refusal that an acknowledgement
+    /// could carry does not end a socket at all and is counted by its
+    /// reason code instead, so what this counts is the subset the
+    /// protocol left no room to answer — 3.1.1 publishes, and
+    /// at-most-once ones.
+    NotWhole,
     /// The connection was dropped before it finished: a shutdown, or
     /// a panic. Counted from [`Drop`] rather than from a return, so
     /// that a cancelled connection is an ending like any other rather
@@ -323,7 +334,7 @@ pub enum SocketOutcome {
 }
 
 /// Every socket outcome, in the order the handles are indexed in.
-const SOCKET_OUTCOMES: [SocketOutcome; 9] = [
+const SOCKET_OUTCOMES: [SocketOutcome; 10] = [
     SocketOutcome::Clean,
     SocketOutcome::ConnectTimeout,
     SocketOutcome::NotAConnect,
@@ -333,6 +344,11 @@ const SOCKET_OUTCOMES: [SocketOutcome; 9] = [
     SocketOutcome::Codec,
     SocketOutcome::NotDurable,
     SocketOutcome::Abandoned,
+    // Appended rather than slotted in beside `NotDurable`, which it
+    // reads next to: this array's positions **are** the indices
+    // `outcome_index` returns, so inserting one in the middle
+    // renumbers every outcome after it and relabels their counters.
+    SocketOutcome::NotWhole,
 ];
 
 /// The label value for a socket outcome.
@@ -346,6 +362,7 @@ fn outcome_label(outcome: SocketOutcome) -> &'static str {
         SocketOutcome::Io => "io",
         SocketOutcome::Codec => "codec",
         SocketOutcome::NotDurable => "not_durable",
+        SocketOutcome::NotWhole => "not_whole",
         SocketOutcome::Abandoned => "abandoned",
     }
 }
@@ -362,6 +379,7 @@ fn outcome_index(outcome: SocketOutcome) -> usize {
         SocketOutcome::Codec => 6,
         SocketOutcome::NotDurable => 7,
         SocketOutcome::Abandoned => 8,
+        SocketOutcome::NotWhole => 9,
     }
 }
 
