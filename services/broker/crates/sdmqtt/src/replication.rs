@@ -54,6 +54,7 @@ use std::sync::Arc;
 
 use cluster::mesh::{Deliver, Mesh, Message};
 use cluster::metadata::{MetadataKey, MetadataValue};
+use cluster::migrate::{Drained, Migrations};
 use cluster::MemberState;
 use cluster::{MetadataWrite, NodeId, Replicator};
 use rules::live::Registry;
@@ -91,6 +92,12 @@ pub struct Replication {
     /// queue in front of it would be a second ordering to reason about
     /// and a buffer with nothing bounding it but the link.
     shared: Arc<Shared>,
+    /// Section 8.4's drains this node is waiting for.
+    ///
+    /// Made before the mesh and shared with the `Migrator` the shell
+    /// installs into `Shared`, because a chunk arrives on a link —
+    /// here — and the connection waiting for it is over there.
+    migrations: Arc<Migrations>,
 }
 
 /// Writes a peer sent that won, and the records that go with them.
@@ -109,6 +116,7 @@ impl Replication {
     pub fn new(
         replicator: Arc<Replicator>,
         shared: Arc<Shared>,
+        migrations: Arc<Migrations>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<Applying>) {
         let (applying, waiting) = mpsc::unbounded_channel();
         (
@@ -116,6 +124,7 @@ impl Replication {
                 replicator,
                 applying,
                 shared,
+                migrations,
             }),
             waiting,
         )
@@ -136,6 +145,29 @@ impl Deliver for Replication {
             // A heartbeat. Membership was updated before this was called;
             // there is nothing else it means.
             Message::Heartbeat { .. } => return Vec::new(),
+            // Section 8.4. **The one frame that is a question**, and the
+            // answer is what the session held — in chunks, so that a
+            // drain which stops partway has still moved what it managed
+            // to. The close for the old connection goes out inside
+            // `hand_over_session`, before a single chunk is framed,
+            // which is what stops one session having two live
+            // connections.
+            Message::Claim(claiming) => {
+                let handover = self
+                    .shared
+                    .hand_over_session(&claiming.session, claiming.clean)
+                    .unwrap_or_default();
+                return Drained::chunks(&claiming.session, claiming.epoch, handover)
+                    .into_iter()
+                    .map(Message::Drained)
+                    .collect();
+            }
+            // One instalment of an answer. Routed to the connection
+            // waiting for it, or counted as late and dropped.
+            Message::Drained(chunk) => {
+                self.migrations.arrived(chunk);
+                return Vec::new();
+            }
         };
         let handled = match self.replicator.received(from, frame) {
             Ok(handled) => handled,

@@ -12,6 +12,7 @@ use mqtt_codec::{Limits, Packet, Properties, QoS, ReasonCode, Version};
 use storage::record::Record;
 
 use crate::clock::CoarseClock;
+use crate::handover::{Authenticated, Handover};
 use crate::hooks::{ClientInfo, Credentials, Disposition, Hooks};
 use crate::journal::{self, DurableSession, DurableState};
 use crate::keepalive::{Activity, KeepAliveRing};
@@ -753,17 +754,64 @@ impl Broker {
         connect: &Connect,
         out: &mut Vec<Addressed>,
     ) -> Result<Registration, ReasonCode> {
+        self.connect_claimed(mountpoint, connect, 0, None, out)
+    }
+
+    /// Ask the authenticate chain, before anything has been claimed.
+    ///
+    /// `Some` is a connect the chain will serve, and the token is what
+    /// [`Broker::connect_claimed`] takes so that the chain is asked
+    /// once; `None` is [`ReasonCode::NotAuthorized`] and the caller
+    /// answers the client with it.
+    ///
+    /// A caller that is not clustering never needs this:
+    /// [`Broker::connect`] asks the chain itself, at the moment it
+    /// always has.
+    #[must_use]
+    pub fn authenticates(&self, mountpoint: &str, connect: &Connect) -> Option<Authenticated> {
+        self.hooks
+            .authenticate(&Credentials {
+                mountpoint,
+                client_id: &connect.client_id,
+                username: connect.username.as_deref(),
+                password: connect.password.as_deref(),
+                version: connect.version,
+                clean_start: connect.clean_start,
+            })
+            .then_some(Authenticated(()))
+    }
+
+    /// The same, for a session the cluster has already claimed.
+    ///
+    /// Section 8.4: the node a client connects to claims the session by
+    /// writing the epoch it read plus one, and `claimed` is that epoch.
+    /// [`Registry::register_claimed`] is where it lands and what it is
+    /// for; everything else about this call is [`Broker::connect`].
+    ///
+    /// **It is a separate entry point rather than a parameter on
+    /// `connect`**, because every caller that is not the cluster has no
+    /// epoch to pass and zero is not a neutral value a caller should
+    /// have to know to write. A node that does not cluster goes through
+    /// [`Broker::connect`] and nothing about it changes.
+    ///
+    /// [`Registry::register_claimed`]: crate::registry::Registry::register_claimed
+    pub fn connect_claimed(
+        &mut self,
+        mountpoint: &str,
+        connect: &Connect,
+        claimed: u64,
+        authenticated: Option<Authenticated>,
+        out: &mut Vec<Addressed>,
+    ) -> Result<Registration, ReasonCode> {
         let now = self.clock.now();
         let identity = SessionId::new(mountpoint, &connect.client_id);
 
-        if !self.hooks.authenticate(&Credentials {
-            mountpoint,
-            client_id: &connect.client_id,
-            username: connect.username.as_deref(),
-            password: connect.password.as_deref(),
-            version: connect.version,
-            clean_start: connect.clean_start,
-        }) {
+        // **Asked once.** `authenticated` is the answer a caller already
+        // has, because section 8.4 has it ask before it claims; see
+        // [`Authenticated`]. A chain asked twice counts one connect as
+        // two attempts, and the rate limiter section 12.1 brings would
+        // refuse the second half of every successful connect.
+        if authenticated.is_none() && self.authenticates(mountpoint, connect).is_none() {
             // 3.2.2.2: "Not authorized" is the answer to a connect the
             // server will not serve. [MQTT-3.1.4-6] requires the
             // network connection to be closed after it, which is the
@@ -805,7 +853,9 @@ impl Broker {
                 session: journal::key_of(&identity),
             });
         }
-        let mut registration = self.registry.register(identity, connect.clean_start, now);
+        let mut registration =
+            self.registry
+                .register_claimed(identity, connect.clean_start, now, claimed);
         // The registry judges takeover by whether the session was still
         // connected, and this layer disconnected it a moment ago on
         // purpose, so the registry now says no. The observation above is
@@ -882,6 +932,234 @@ impl Broker {
                 client_id: &id.client_id,
             });
         }
+    }
+
+    /// Give a session up to the node that has claimed it, section 8.4.
+    ///
+    /// The previous owner's half of a migration: **close the old
+    /// connection, take the session apart, and say what it held.** The
+    /// node that claimed the session calls this one over a link; see
+    /// `cluster::migrate`.
+    ///
+    /// `None` is a session this node does not hold, which is not an
+    /// error — the register that named this node as owner may be older
+    /// than a restart, and the claiming node must carry on regardless.
+    ///
+    /// # The connection is closed, and that is the point of asking
+    ///
+    /// A client is connected to exactly one node at a time. The
+    /// incumbent is told "session taken over", exactly as a local
+    /// takeover tells it, because from the client's side the two are
+    /// the same event and a build that left the old socket open is a
+    /// build with **two live connections for one session**, each
+    /// receiving half of what the session is sent.
+    ///
+    /// # The will is taken off rather than published
+    ///
+    /// [MQTT-3.1.3-9] forbids sending the will when "a new Network
+    /// Connection to this Session is made before the Will Delay
+    /// Interval has passed", and the connection that caused this is
+    /// exactly that — it is simply on another node. A node that
+    /// published the will here would announce every migrating client as
+    /// having gone offline, which is the one thing a will is for.
+    ///
+    /// # What leaves this node leaves it completely
+    ///
+    /// The subscriptions come out of the trie, which is what makes
+    /// section 8.3 stop forwarding this node copies for them, and the
+    /// departures are in `out`'s batch so a caller cannot store one
+    /// without the other. The queue is reported as
+    /// [`DropReason::Migrated`] and the session record removed, because
+    /// a node that kept its copy would deliver the same messages again
+    /// the next time that client came back to it.
+    pub fn hand_over(
+        &mut self,
+        identity: &SessionId,
+        clean: bool,
+        now: u32,
+        out: &mut Vec<Addressed>,
+    ) -> Option<Handover> {
+        let subscriber = self.registry.subscriber_of(identity)?;
+        let connected = self
+            .registry
+            .get(subscriber)
+            .is_some_and(Session::is_connected);
+        if connected {
+            out.push((subscriber, Action::Close(ReasonCode::SessionTakenOver)));
+            // Nothing else disarms it: the incumbent never disconnected,
+            // and a keep-alive left in the ring would fire on a handle
+            // that no longer names anything.
+            self.keepalive.remove(subscriber);
+            self.activities.remove(&subscriber);
+        }
+
+        let client_id = identity.clone();
+        let key = journal::key_of(identity);
+        let mut session = self.registry.remove(subscriber)?;
+        // Before the departure, so that the departure finds nothing due.
+        session.set_will(None);
+        if connected {
+            session.on_disconnected(false, now);
+        }
+
+        // Read before anything is cleared. A clean start asked for the
+        // session to be discarded [MQTT-3.1.2-4], so there is nothing
+        // to carry — but the connection is still closed and this node
+        // still lets the session go, which is why the clean case is a
+        // smaller answer rather than a different path.
+        let handover = if clean {
+            Handover::default()
+        } else {
+            let mut inflight: Vec<_> = session.outbound.outstanding().collect();
+            inflight.sort_by_key(|entry| entry.delivery.sequence);
+            Handover {
+                subscriptions: session.subscriptions().to_vec(),
+                inflight: inflight
+                    .into_iter()
+                    .map(|entry| {
+                        (
+                            journal::inflight_record(entry),
+                            journal::body_record(&entry.delivery.message),
+                        )
+                    })
+                    .collect(),
+                queued: session
+                    .outbound
+                    .waiting()
+                    .map(|item| {
+                        (
+                            journal::queue_entry(item),
+                            journal::body_record(&item.message),
+                        )
+                    })
+                    .collect(),
+                inbound: session.inbound.held().collect(),
+                highest_sequence: session.outbound.highest_sequence(),
+            }
+        };
+
+        let client = ClientInfo {
+            subscriber: Some(subscriber),
+            mountpoint: &client_id.mountpoint,
+            client_id: &client_id.client_id,
+        };
+        subscribe::remove_all(
+            &self.subscriptions,
+            &self.shared,
+            &mut session,
+            &mut self.filter_events,
+        );
+        // Not through `emit`: the session is out of the registry, so
+        // there is nothing left there to look its identity up by. The
+        // reports it owes its hooks are owed all the same.
+        let mut actions = Vec::new();
+        session.outbound.clear(DropReason::Migrated, &mut actions);
+        tell_hooks(&self.hooks, &client, &actions);
+        for action in actions {
+            out.push((subscriber, action));
+        }
+        // Taken out of the session before it is dropped, and before the
+        // record that ends it: the removal is what makes every one of
+        // these refer to a session the store no longer holds.
+        session.take_journal(&mut self.journal);
+        self.journal.push(Record::SessionRemoved { session: key });
+        if connected {
+            self.hooks.client_disconnected(&client);
+        }
+        Some(handover)
+    }
+
+    /// Take a session another node handed over, section 8.4.
+    ///
+    /// The claiming node's half, and the mirror of
+    /// [`crate::restore`]'s: a session is rebuilt from the records a
+    /// store would have held, by the same conversions, into the handle
+    /// [`Broker::connect_claimed`] just registered.
+    ///
+    /// Returns how many of the filters could not be put back, which is
+    /// `subscribe::reinstate`'s count and is a disagreement between two
+    /// builds rather than anything a client did.
+    ///
+    /// **Called with the session already connected and before the
+    /// acknowledgement goes out**, which is what makes the messages it
+    /// puts back reach the client in one resume rather than two: the
+    /// window is filled here and `on_resume` sends from it, so a client
+    /// sees its queue arrive behind its CONNACK exactly as a local
+    /// resume delivers it.
+    pub fn take_over(
+        &mut self,
+        subscriber: SubscriberId,
+        handover: Handover,
+        now: u32,
+        out: &mut Vec<Addressed>,
+    ) -> usize {
+        let Some(session) = self.registry.get_mut(subscriber) else {
+            debug_assert!(
+                false,
+                "a session is taken over into a handle just registered"
+            );
+            return handover.subscriptions.len();
+        };
+        let refused = subscribe::reinstate(
+            &self.subscriptions,
+            &self.shared,
+            session,
+            &handover.subscriptions,
+            &self.config.limits,
+            &mut self.filter_events,
+        );
+
+        for packet_id in &handover.inbound {
+            session.inbound.reserve(*packet_id);
+        }
+
+        // Section 7.4 first: the mark is the highest ever assigned, and
+        // every number below comes from the node that assigned it. A
+        // session that began again from one would hand out numbers the
+        // far node has already spent, and the messages being put back
+        // carry exactly those numbers.
+        session
+            .outbound
+            .set_highest_sequence(handover.highest_sequence);
+
+        // The window in the order the messages were sent, which is
+        // sequence order, and the queue newest first because each
+        // requeue goes to the head. The same two walks `crate::restore`
+        // makes, for the same two reasons.
+        for (record, body) in &handover.inflight {
+            let message = journal::live_message(record.delivery.body, body);
+            self.journal.push(Record::BodyPut {
+                id: record.delivery.body,
+                body: body.clone(),
+            });
+            self.journal.push(Record::InflightPut {
+                session: journal::key_of(session.id()),
+                entry: record.clone(),
+            });
+            session
+                .outbound
+                .restore(journal::live_inflight(record, message));
+        }
+        for (entry, body) in handover.queued.iter().rev() {
+            let message = journal::live_message(entry.delivery.body, body);
+            self.journal.push(Record::BodyPut {
+                id: entry.delivery.body,
+                body: body.clone(),
+            });
+            self.journal.push(Record::QueuePushed {
+                session: journal::key_of(session.id()),
+                entry: entry.clone(),
+            });
+            let delivery =
+                journal::live_delivery(&entry.delivery, message, entry.sequence, entry.packet_id);
+            session.outbound.requeue(delivery);
+        }
+
+        let mut actions = Vec::new();
+        session.outbound.on_resume(now, &mut actions);
+        self.emit(subscriber, actions, out);
+        self.drain_session(subscriber);
+        refused
     }
 
     /// End a live connection that a newcomer is taking over from, and

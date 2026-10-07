@@ -3,15 +3,19 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use broker_core::broker::{Addressed, Broker, BrokerConfig};
+use broker_core::handover::Handover;
+use broker_core::registry::SessionId;
 use broker_core::session::Action;
 use broker_core::subscriptions::{FilterEvent, SubscriberId};
+use cluster::migrate::{Claimed, Migrator};
 use cluster::{MetadataWrite, Replicated};
 use foldhash::fast::RandomState;
 use mqtt_codec::Packet;
 use parking_lot::{Mutex, RwLock};
+use storage::SessionKey;
 use storage::{Applied, Durable, NotDurable, Record, Writer};
 use tokio::sync::mpsc;
 
@@ -278,6 +282,16 @@ pub struct Shared {
     /// inside it are owned and lock-free; see [`crate::metrics`] for
     /// why that is not an optimisation to consider.
     metrics: Arc<Metrics>,
+    /// What claims a session from another node, section 8.4.
+    ///
+    /// Installed after construction rather than passed to it, like the
+    /// broker's forwarder and for the same reason: it holds the mesh,
+    /// the mesh holds a handler, and the handler holds this. One of the
+    /// three has to be joined up afterwards.
+    ///
+    /// `None` is a node that does not cluster, and a connect then costs
+    /// one `OnceLock` read.
+    migrator: OnceLock<Arc<Migrator>>,
 }
 
 impl Shared {
@@ -335,7 +349,106 @@ impl Shared {
             pacing_reported: AtomicU64::new(0),
             rejections_reported: AtomicU64::new(0),
             metrics: Arc::new(Metrics::new()),
+            migrator: OnceLock::new(),
         }
+    }
+
+    /// Claim sessions through `migrator`, section 8.4.
+    ///
+    /// Once. A second call is ignored rather than refused: the binary
+    /// installs one at startup and a second would be a second answer to
+    /// which mesh a drain goes over.
+    pub fn install_migrator(&self, migrator: Arc<Migrator>) {
+        let _ = self.migrator.set(migrator);
+    }
+
+    /// What claims a session, for whatever reports on it.
+    #[must_use]
+    pub fn migrator(&self) -> Option<&Arc<Migrator>> {
+        self.migrator.get()
+    }
+
+    /// Claim `session` for this node and drain it from whoever held it.
+    ///
+    /// `None` on a node that does not cluster, which is the whole of
+    /// what a non-clustering connect pays for section 8.4.
+    ///
+    /// **Returns once the drain has finished or the patience has run
+    /// out**, and returns either way: see `cluster::migrate`. The
+    /// register the claim wrote is stored and broadcast here, because
+    /// the claim happens outside the broker's lock and nothing else is
+    /// holding a batch for it to ride in.
+    pub async fn claim_session(&self, session: &SessionKey, clean: bool) -> Option<Claimed> {
+        let migrator = self.migrator.get()?;
+        let claimed = migrator.claim(session, clean).await;
+        if let Some(write) = claimed.write.clone() {
+            self.originate(write);
+        }
+        Some(claimed)
+    }
+
+    /// Store and broadcast one register this node originated, in a batch
+    /// of its own.
+    ///
+    /// For a write made **outside** the broker's lock, which is section
+    /// 8.4's claim and nothing else so far: everything the broker
+    /// originates rides the batch its own journal is in, and a register
+    /// in a batch of its own would be a register the store could take
+    /// while the records that caused it were refused.
+    ///
+    /// Nothing waits for it here. Section 8.2's rule is that a peer is
+    /// not told until the store has taken the batch, and that is kept by
+    /// the broadcast waiting; a connect waiting as well would put a disk
+    /// flush in front of every migrating client's acknowledgement for
+    /// no further guarantee.
+    ///
+    /// **What is deliberately not closed** is the claim that is drained
+    /// and then refused by the store. The far node has already given the
+    /// session up, so a refusal here leaves ownership written nowhere
+    /// until the next claim; the node that it happened on has also just
+    /// failed to write everything else it was doing, which is the
+    /// condition `cluster::metadata` describes at length and the one a
+    /// restart resolves.
+    fn originate(&self, write: MetadataWrite) {
+        let (Some(replicated), Some(writer)) = (&self.replicated, &self.writer) else {
+            return;
+        };
+        let records = replicated.records(&write);
+        match writer.apply_durable(records) {
+            Ok(durable) => self.broadcast_when_durable(durable, vec![write]),
+            Err(_) => {
+                self.metrics
+                    .records_dropped(RecordDrop::WriterStopped)
+                    .inc_by(1);
+                tracing::error!(
+                    "the storage writer has stopped, so a session claim was not written down"
+                );
+            }
+        }
+    }
+
+    /// Give a session up to the node that claimed it, section 8.4.
+    ///
+    /// The previous owner's half: the old connection is closed, the
+    /// subscriptions leave this node's trie — which is what makes
+    /// section 8.3 stop forwarding here — and what the session held
+    /// comes back to be sent to the claiming node.
+    ///
+    /// `None` is a session this node does not hold, which is not an
+    /// error: a register naming this node as owner can be older than a
+    /// restart.
+    pub fn hand_over_session(&self, session: &SessionKey, clean: bool) -> Option<Handover> {
+        let (handover, actions) = self.with_broker(|broker| {
+            let now = broker.clock().now();
+            let mut out = Vec::new();
+            let identity = SessionId::new(&session.mountpoint, &session.client_id);
+            let handover = broker.hand_over(&identity, clean, now, &mut out);
+            (handover, out)
+        });
+        // The close for the displaced connection among them, which is
+        // what stops one session having two live connections.
+        self.deliver(actions);
+        handover
     }
 
     /// What this process counts.

@@ -61,52 +61,29 @@ pub fn subscribe(
             continue;
         }
 
-        let subscription = Subscription {
-            subscriber: session.subscriber(),
-            qos: options.qos,
-            no_local: options.no_local,
-            retain_as_published: options.retain_as_published,
-            id: subscription_id,
-        };
-
-        let existed = match group {
-            Some((name, inner)) => shared.insert(name, inner, subscription),
-            None => trie.insert(&options.filter, subscription),
-        };
-        // Section 8.2: the cluster is told that this node has a
-        // subscriber for the filter, and the filter is the one a
-        // published topic is matched against — the inner filter for a
-        // shared subscription.
-        //
-        // **The group travels with it**, and section 8.3 is why: a
-        // group with a member on each of three nodes reported as three
-        // ordinary subscribers to one filter is delivered to three
-        // times. See [`crate::subscriptions::events`].
-        //
-        // **Only when the trie actually gained an entry.** A second
-        // subscribe to a filter this session already holds changes the
-        // options rather than adding a subscription, and an arrival for
-        // it would be a count incremented twice that never comes back
-        // down: the filter would stay advertised to the cluster after
-        // its last subscriber left.
-        if !existed {
-            events.push(FilterEvent::joined(
-                group.map(|(name, _)| name),
-                &options.filter,
-            ));
-        }
-        // Everything the filter was taken under, not just its name. The
-        // identifier above all: [MQTT-3.8.4-3] has it echoed on every
-        // delivery the subscription causes, and a restart that dropped
-        // it would deliver messages a client could no longer route.
-        session.add_subscription(SubscriptionRecord {
-            filter: options.filter.clone(),
-            qos: journal::stored_qos(options.qos),
-            no_local: options.no_local,
-            retain_as_published: options.retain_as_published,
-            retain_handling: journal::stored_retain_handling(options.retain_handling),
-            subscription_id,
-        });
+        let existed = install(
+            trie,
+            shared,
+            session,
+            &options.filter,
+            group,
+            Subscription {
+                subscriber: session.subscriber(),
+                qos: options.qos,
+                no_local: options.no_local,
+                retain_as_published: options.retain_as_published,
+                id: subscription_id,
+            },
+            SubscriptionRecord {
+                filter: options.filter.clone(),
+                qos: journal::stored_qos(options.qos),
+                no_local: options.no_local,
+                retain_as_published: options.retain_as_published,
+                retain_handling: journal::stored_retain_handling(options.retain_handling),
+                subscription_id,
+            },
+            events,
+        );
 
         // A shared subscription has no single subscriber to hand retained
         // messages to, so it receives none. Section 3.3.1.3 scopes the
@@ -139,6 +116,120 @@ pub fn subscribe(
     }
 
     reasons
+}
+
+/// Put one subscription into the matching structures and the session.
+///
+/// The one place a subscription is inserted, so that a client's
+/// SUBSCRIBE and a session arriving from another node cannot reach two
+/// different answers about what the cluster is told. Returns whether the
+/// handle already held an entry for the filter.
+// Eight parameters, one over clippy's threshold, for the reason
+// `subscribe` above it carries the same allowance: every one is a
+// distinct collaborator the broker owns separately, and a context struct
+// here would exist only to satisfy the count.
+#[allow(clippy::too_many_arguments)]
+fn install(
+    trie: &SubscriptionTrie,
+    shared: &SharedSubscriptions,
+    session: &mut Session,
+    filter: &str,
+    group: Option<(&str, &str)>,
+    subscription: Subscription,
+    record: SubscriptionRecord,
+    events: &mut Vec<FilterEvent>,
+) -> bool {
+    let existed = match group {
+        Some((name, inner)) => shared.insert(name, inner, subscription),
+        None => trie.insert(filter, subscription),
+    };
+    // Section 8.2: the cluster is told that this node has a
+    // subscriber for the filter, and the filter is the one a
+    // published topic is matched against — the inner filter for a
+    // shared subscription.
+    //
+    // **The group travels with it**, and section 8.3 is why: a
+    // group with a member on each of three nodes reported as three
+    // ordinary subscribers to one filter is delivered to three
+    // times. See [`crate::subscriptions::events`].
+    //
+    // **Only when the trie actually gained an entry.** A second
+    // subscribe to a filter this session already holds changes the
+    // options rather than adding a subscription, and an arrival for
+    // it would be a count incremented twice that never comes back
+    // down: the filter would stay advertised to the cluster after
+    // its last subscriber left.
+    if !existed {
+        events.push(FilterEvent::joined(group.map(|(name, _)| name), filter));
+    }
+    // Everything the filter was taken under, not just its name. The
+    // identifier above all: [MQTT-3.8.4-3] has it echoed on every
+    // delivery the subscription causes, and a restart that dropped
+    // it would deliver messages a client could no longer route.
+    session.add_subscription(record);
+    existed
+}
+
+/// Put back the subscriptions a session held on another node.
+///
+/// Section 8.4: **subscriptions follow the session.** The new owner
+/// gains the filters the previous owner had, which is what makes
+/// section 8.3 start forwarding here and stop forwarding there.
+///
+/// Three things this is not, each of which would be wrong:
+///
+/// - **No retained messages go out.** 3.3.1.3 scopes retained delivery
+///   to "a new Non-shared Subscription", and this subscription is not
+///   new — the client made it on the other node and was given the
+///   retained messages there. Replaying them on a migration would hand
+///   a client a second copy of every retained message under every
+///   filter it holds, every time it moved. That is also why this is not
+///   `subscribe` with a packet built by the caller: a packet carries a
+///   retain-handling option, and the only honest value to give it would
+///   be one that contradicts the one being restored.
+/// - **No hook is asked.** The authorize-subscribe chain judged these
+///   filters when the client asked for them. Asking again here would
+///   make a migration able to silently drop a subscription that a
+///   node's configuration happens to read differently, and the client
+///   is not told, because there is no SUBACK to put a reason code in.
+/// - **No reason codes come back.** There is nobody to answer.
+///
+/// Returns how many filters could not be put back, which is a filter
+/// the far node accepted and this build will not parse. Counted rather
+/// than silent: it is a disagreement between two builds and it loses a
+/// subscription.
+pub fn reinstate(
+    trie: &SubscriptionTrie,
+    shared: &SharedSubscriptions,
+    session: &mut Session,
+    held: &[SubscriptionRecord],
+    limits: &Limits,
+    events: &mut Vec<FilterEvent>,
+) -> usize {
+    let mut refused = 0;
+    for record in held {
+        let Ok(group) = mqtt_codec::topic::validate_subscription(&record.filter, limits) else {
+            refused += 1;
+            continue;
+        };
+        install(
+            trie,
+            shared,
+            session,
+            &record.filter,
+            group,
+            Subscription {
+                subscriber: session.subscriber(),
+                qos: journal::live_qos(record.qos),
+                no_local: record.no_local,
+                retain_as_published: record.retain_as_published,
+                id: record.subscription_id,
+            },
+            record.clone(),
+            events,
+        );
+    }
+    refused
 }
 
 fn deliver_retained(

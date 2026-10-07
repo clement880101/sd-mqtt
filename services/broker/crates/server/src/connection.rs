@@ -44,6 +44,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::framing::{FrameError, FrameReader};
 use crate::metrics::{Metrics, ShellDrop, SocketOutcome};
 use crate::shared::{promises_durability, Shared};
+use storage::SessionKey;
 
 /// What a client's receive maximum is when it does not say.
 ///
@@ -374,6 +375,47 @@ where
         other => other,
     };
 
+    // Section 8.4's claim, and it is **before** the registration
+    // because the epoch the registration takes is the one the claim
+    // wrote: one number for the session wherever the session is.
+    //
+    // Two things have to happen in this order and nowhere else.
+    //
+    // The authenticate chain is asked first, because a claim writes a
+    // replicated register, closes a connection on another node and
+    // moves a queue across a link, and a connect that is going to be
+    // refused must do none of that — otherwise anyone who can reach the
+    // listener can tear a stranger's session off the node serving it.
+    // `Broker::connect_claimed` is handed the answer rather than asking
+    // again; see `broker_core::handover::Authenticated`.
+    //
+    // And a client that sent no identifier is not claimed at all. Its
+    // identifier is assigned below, under the lock, from the set nobody
+    // holds — so there is no previous owner anywhere in the cluster,
+    // and asking would be a register and a round trip per anonymous
+    // connect.
+    let claimed = if connect.client_id.is_empty() || shared.migrator().is_none() {
+        None
+    } else {
+        let authenticated =
+            shared.with_broker(|broker| broker.authenticates(&config.mountpoint, &connect));
+        let Some(authenticated) = authenticated else {
+            refuse(
+                &mut write_half,
+                version,
+                ReasonCode::NotAuthorized,
+                &metrics,
+            )
+            .await?;
+            return Err(ConnectionError::Protocol(ReasonCode::NotAuthorized));
+        };
+        let session = SessionKey::new(&config.mountpoint, &connect.client_id);
+        shared
+            .claim_session(&session, connect.clean_start)
+            .await
+            .map(|claimed| (claimed, authenticated))
+    };
+
     // From here the broker knows about this connection and is owed a
     // disconnect.
     //
@@ -423,7 +465,21 @@ where
         };
 
         let mut out = Vec::new();
-        let registration = match broker.connect(&config.mountpoint, &connect, &mut out) {
+        let (epoch, authenticated) = match &claimed {
+            Some((claimed, authenticated)) => (claimed.epoch, Some(*authenticated)),
+            // A node that does not cluster, or a client whose identifier
+            // was assigned. Zero is what `Registry::register` passes and
+            // the epoch is then the session's own count of how many
+            // times it has been claimed here.
+            None => (0, None),
+        };
+        let mut registration = match broker.connect_claimed(
+            &config.mountpoint,
+            &connect,
+            epoch,
+            authenticated,
+            &mut out,
+        ) {
             Ok(registration) => registration,
             // Section 9.3's authenticate chain refused it. Nothing
             // was registered and no incumbent was displaced, so
@@ -432,6 +488,31 @@ where
             // rather than dropped in silence.
             Err(reason) => return Some(Err(reason)),
         };
+        if let Some((claimed, _)) = &claimed {
+            // **Reported present even when the drain brought nothing.**
+            // Section 8.4: the session is present because this node has
+            // taken ownership of it, and a client told otherwise
+            // resubscribes — which is the one thing no queue can make
+            // up for. A clean start asked for none of it, so it is told
+            // nothing was resumed, which is the truth.
+            if !connect.clean_start && claimed.present() {
+                registration.session_present = true;
+            }
+            if let Some(drain) = claimed.drain.clone() {
+                // After the registration and before the acknowledgement,
+                // so the queue reaches the client in one resume. Its
+                // actions land after the close that displaced any local
+                // incumbent, which is the rule `Broker::connect`'s own
+                // documentation states: everything after the close
+                // belongs to the newcomer.
+                broker.take_over(
+                    registration.subscriber,
+                    drain.handover,
+                    broker.clock().now(),
+                    &mut out,
+                );
+            }
+        }
         let configured = usize::from(broker.config().max_inflight);
         if let Some(session) = broker.session_mut(registration.subscriber) {
             // Section 4.9: what the client can receive bounds what we

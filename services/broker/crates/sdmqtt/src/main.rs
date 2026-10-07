@@ -864,13 +864,22 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     // the mesh hands a peer's frames to this, and the tasks below hand this
     // node's writes to the mesh. Built before the mesh and given to it, so
     // that a frame arriving on the first link has somewhere to go.
+    //
+    // Section 8.4's table of drains in flight is made here for the same
+    // reason: a chunk arrives on a link, which is this handler, and the
+    // connection waiting for it holds the `Migrator` installed below.
+    // One table, handed to both.
+    let migrations = Arc::new(cluster::Migrations::default());
     let replication = rebuilt.as_ref().map(|rebuilt| {
         let replicator = Arc::new(Replicator::new(
             Arc::clone(&rebuilt.replicated),
             ReplicationSettings::default(),
         ));
-        let (handler, applying) =
-            replication::Replication::new(Arc::clone(&replicator), Arc::clone(&rebuilt.shared));
+        let (handler, applying) = replication::Replication::new(
+            Arc::clone(&replicator),
+            Arc::clone(&rebuilt.shared),
+            Arc::clone(&migrations),
+        );
         (replicator, handler, applying)
     });
     let deliveries = replication
@@ -900,6 +909,17 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             node = %rebuilt.identity,
             "this node forwards publications to the nodes that want them"
         );
+        // Section 8.4, and before the listener takes a connect for the
+        // same reason the forwarder goes in here: a connect that found
+        // no migrator claims nothing, so the window between the mesh
+        // accepting links and this being installed is a window in which
+        // a client silently loses its session rather than moving it.
+        rebuilt.shared.install_migrator(cluster::Migrator::new(
+            Arc::clone(&rebuilt.replicated),
+            Arc::clone(mesh),
+            Arc::clone(&migrations),
+            std::time::Duration::from_millis(config.cluster.drain_timeout_ms),
+        ));
     }
     // The four tasks of section 8.2, started once there is a mesh for them
     // to talk over. A node that does not cluster starts none of them: its

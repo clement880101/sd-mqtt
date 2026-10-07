@@ -447,6 +447,7 @@ reason_table!(DropReason, ALL_DROP_REASONS, drop_label, drop_index, {
     QosZeroWhileOffline => "qos0_while_offline",
     Expired => "expired",
     SessionEnded => "session_ended",
+    Migrated => "migrated",
     RejectedByPeer => "rejected_by_peer",
     TooLargeForPeer => "too_large_for_peer",
 });

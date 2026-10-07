@@ -749,6 +749,16 @@ pub struct ClusterSection {
     /// mismatched secret is a configuration error that will not fix
     /// itself.
     pub refused_backoff_ms: u64,
+    /// How long a node waits for a session it claimed to be drained to
+    /// it, in milliseconds. Section 8.4.
+    ///
+    /// **The bound, and not a deadline the drain must meet.** When it
+    /// runs out the connection is accepted with whatever arrived, the
+    /// session is reported present and the shortfall is counted; see
+    /// `cluster::migrate`. Raising it trades a slower connect for a
+    /// smaller shortfall and lowering it does the reverse, and neither
+    /// end of that trade refuses a client.
+    pub drain_timeout_ms: u64,
 }
 
 impl Default for ClusterSection {
@@ -770,6 +780,7 @@ impl Default for ClusterSection {
             reconnect_min_ms: 200,
             reconnect_max_ms: 30_000,
             refused_backoff_ms: 300_000,
+            drain_timeout_ms: 2_000,
         }
     }
 }

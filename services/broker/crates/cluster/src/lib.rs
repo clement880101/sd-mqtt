@@ -83,6 +83,17 @@
 //! in milestone 4 would happen: `rules::live::Registry` writes the
 //! register that carries a rule in the same batch as the node's own copy.
 //!
+//! # And a session has an owner, and it can change
+//!
+//! [`migrate`] is section 8.4: a node that a client connects to claims
+//! the session, asks whoever held it to close the old connection and
+//! send what the session holds, and **waits a bounded time before
+//! acknowledging — then acknowledges either way.** A drain that times
+//! out, or a previous owner with no link to ask over, is a connection
+//! accepted with what arrived and a shortfall counted, because refusing
+//! turns an unreachable node into an outage for a client that has done
+//! nothing wrong.
+//!
 //! # And it is opened over something, which is not always a socket
 //!
 //! [`transport`] is the seam. Section 14 committed to three nodes in
@@ -113,6 +124,7 @@ pub mod link;
 pub mod membership;
 pub mod mesh;
 pub mod metadata;
+pub mod migrate;
 pub mod oplog;
 pub mod register;
 pub mod replicate;
@@ -132,6 +144,9 @@ pub use membership::{Member, MemberState, Membership};
 pub use mesh::{keeper, Deliver, Fanout, Mesh, MeshSettings, MeshStats};
 pub use metadata::{
     Claim, MetadataError, MetadataKey, MetadataValue, MetadataWrite, Ownership, Replicated,
+};
+pub use migrate::{
+    Awaiting, Claimed, Claiming, Drain, Drained, Migrations, Migrator, DEFAULT_PATIENCE,
 };
 pub use oplog::{Logged, OpLog, FIRST_SEQUENCE};
 pub use register::{Register, Stamp};

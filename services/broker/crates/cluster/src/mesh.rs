@@ -150,6 +150,21 @@ pub enum Message {
     /// it was delivered to, which is held by the node that received
     /// this.
     Forward(crate::forward::Forwarded),
+    /// Section 8.4's migration: "I have claimed this session; close its
+    /// connection and send me what it holds."
+    ///
+    /// **This one is a question**, which is what makes it unlike
+    /// [`Self::Forward`]: the sender is waiting, with a bound on how
+    /// long. The answer is one or more [`Self::Drained`] frames, and a
+    /// node that sends none is a node the claiming node accepts the
+    /// connection without — see `crate::migrate`.
+    Claim(crate::migrate::Claiming),
+    /// One instalment of what a claimed session held.
+    ///
+    /// Sent back to whoever asked and to nobody else. Several per
+    /// claim, so that a drain which stops partway has still moved what
+    /// it managed to; the last one says so.
+    Drained(crate::migrate::Drained),
 }
 
 /// What something on top of the mesh does with a peer's message.
