@@ -27,6 +27,14 @@
   --good: #2f9e44;
   --bad: #e03131;
   /*
+   * And a third, for the one state in this interface that is neither.
+   * A cluster member goes `up` → `suspect` → `down`, and `suspect` is
+   * where a flapping link sits: painting it as an outage would hide
+   * the difference between a slow peer and a gone one, which is the
+   * distinction the membership view exists to draw.
+   */
+  --warn: #e8590c;
+  /*
    * Chart series. Three, because the widest chart here has two and
    * a third keeps the second chart from repeating the first's
    * colour. Chosen for a legible contrast against both surfaces
@@ -48,6 +56,7 @@
     --edge: var(--gray-8);
     --good: #51cf66;
     --bad: #ff6b6b;
+    --warn: #ffa94d;
     --series-a: #4dabf7;
     --series-b: #ffc078;
     --series-c: #da77f2;
@@ -527,4 +536,56 @@ input[aria-invalid='true'] {
   white-space: pre-wrap;
   word-break: break-word;
   font-size: var(--font-size-0);
+}
+
+/* ------------------------------------------------------------------
+ * The Cluster page: one row per member, and what this node thinks of
+ * each of them.
+ * ---------------------------------------------------------------- */
+
+.cluster-table .row {
+  /* Six columns of its own: the Clients table's seven are sized for
+     counts, and an identity is a thirty-six character string that
+     needs the room. */
+  grid-template-columns: minmax(7rem, 1fr) minmax(12rem, 2fr) minmax(8rem, 1fr) 6rem 5rem 5rem;
+  block-size: var(--size-8);
+}
+
+.cluster-table .row-self {
+  /* The page's own background against the table's raised one, rather
+     than a new token: the two already differ by exactly the amount a
+     "this is you" tint wants. */
+  background: var(--surface);
+}
+
+.badge {
+  margin-inline-start: var(--size-2);
+  padding-inline: var(--size-1);
+  border-radius: var(--radius-1);
+  background: var(--surface);
+  color: var(--ink-quiet);
+  font-size: var(--font-size-00);
+  text-transform: uppercase;
+  letter-spacing: var(--font-letterspacing-1);
+}
+
+/* The three membership states, which are the whole point of the
+   table: a colour an operator reads before the word. `suspect` is
+   deliberately not the same as `down` — it is the state a flapping
+   link sits in, and treating it as an outage would hide the
+   difference between a slow peer and a gone one. */
+.state {
+  font-variant-numeric: normal;
+}
+
+.state-up {
+  color: var(--good);
+}
+
+.state-suspect {
+  color: var(--warn);
+}
+
+.state-down {
+  color: var(--bad);
 }

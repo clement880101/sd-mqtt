@@ -216,6 +216,33 @@ deleted.
   is never short of anything. A flag that can never fire is refused
   rather than left to mean nothing quietly.
 
+- **The Cluster page**, which is section 11.2's sixth and the last
+  piece of milestone 5's scope. It shows how many members are
+  answering against how many are expected, whether that view is
+  complete, and a row per node with its name, identity, advertised
+  address, state and — for this node, which is the only one membership
+  carries them for — its version and uptime.
+
+  It says in words whose view it is showing. Membership is not
+  replicated, so every state on it is **this node's own judgement**,
+  and two nodes' pages disagreeing during a one-way partition is what
+  a partition looks like rather than a fault in one of them. It also
+  says which kind of expected size it is reporting, because
+  `3 of 3, complete` means something quite different when the three is
+  a number an operator wrote down than when it is the number of nodes
+  this one happens to have met.
+
+  It polls, and it is the only page that does: there is no membership
+  event to follow, because a node's opinion about a peer is not news.
+
+- **`GET /health/cluster` says whether its expected count was
+  configured**, as `expected_configured`. Without it the document is
+  reassuring rather than informative: a node that came up alone and
+  never heard of the others reports a complete cluster of one, and
+  nothing in the numbers distinguishes that from a healthy cluster of
+  one that was configured as such. Additive, so an existing reader is
+  unaffected.
+
 - **Section 8.4's migration numbers are in `/metrics`.** Seven
   counters: `sdmqtt_sessions_claimed_total`,
   `sdmqtt_sessions_migrated_total`,

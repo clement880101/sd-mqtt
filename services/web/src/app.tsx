@@ -13,6 +13,7 @@ import { useEffect } from 'preact/hooks';
 
 import { lastEventId, start, status } from './live.js';
 import { Clients } from './pages/clients.js';
+import { Cluster } from './pages/cluster.js';
 import { Overview } from './pages/overview.js';
 import { Rules } from './pages/rules.js';
 import { Topics } from './pages/topics.js';
@@ -23,6 +24,7 @@ const PAGES = [
   { path: '/clients', label: 'Clients' },
   { path: '/topics', label: 'Topics' },
   { path: '/rules', label: 'Rules' },
+  { path: '/cluster', label: 'Cluster' },
 ] as const;
 
 /** What the page at `path` is called, for the tab and the navigation. */
@@ -117,6 +119,7 @@ export function App() {
           <Route path="/clients" component={Clients} />
           <Route path="/topics" component={Topics} />
           <Route path="/rules" component={Rules} />
+          <Route path="/cluster" component={Cluster} />
           <Route default component={() => <Placeholder title="Not found" />} />
         </Router>
       </main>

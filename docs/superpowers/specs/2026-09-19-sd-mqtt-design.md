@@ -1066,6 +1066,23 @@ Rules with a per-action form editor and per-rule statistics and dead letters,
 Cluster with member and link health, and Settings for users, access control,
 API keys and listeners.
 
+**Link health on the Cluster page is the per-peer state**, `up`, `suspect` or
+`down`, which is what this node's failure detector has decided about the link
+to each peer. Bytes sent, received and dropped are *not* on it: the mesh
+counts them per process rather than per link, so there is no per-peer number
+to put in a row, and the three process-wide totals are in the exposition where
+section 11.3 puts them. The page says in words that every state is this
+node's own view, because membership is deliberately not replicated and two
+nodes' pages disagreeing during a one-way partition is the truth rather than
+a fault in one of them.
+
+The page polls rather than following the events stream, and it is the only
+one that does. Membership is not on the stream because there is no
+cluster-wide fact to broadcast: a node's judgement about a peer is local, and
+an event saying a peer is down would be one node's opinion presented as news.
+The interval is chosen against the failure detector rather than against what
+feels responsive.
+
 Built with Preact and signals, routed by preact-iso, bundled by Vite,
 charted by uPlot with hand-drawn SVG sparklines in table rows, virtualized
 by the vanilla TanStack virtual core, validated by valibot, and styled with

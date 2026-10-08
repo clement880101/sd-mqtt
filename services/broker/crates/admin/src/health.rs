@@ -143,6 +143,17 @@ struct ClusterView {
     status: &'static str,
     members: usize,
     expected: usize,
+    /// Whether `expected` is a number an operator wrote down.
+    ///
+    /// **Without this the document is reassuring rather than
+    /// informative.** `expected` is `cluster.expected_size` when it is
+    /// set and the count of nodes this one has met when it is not, and
+    /// those two carry entirely different weight: the first can say a
+    /// node is missing, and the second says `complete` on a node that
+    /// came up alone and never heard of the others. A reader cannot
+    /// tell them apart from the number, because three nodes that met
+    /// each other and a configured three look identical.
+    expected_configured: bool,
 }
 
 /// Whether this process is running.
@@ -205,11 +216,15 @@ async fn cluster(State(state): State<AdminState>) -> Json<ClusterView> {
             status: "complete",
             members: 1,
             expected: 1,
+            // A node that does not cluster is a cluster of one, and
+            // that is not a number anybody configured.
+            expected_configured: false,
         });
     };
     let peers = cluster.peers();
     let members = peers.iter().filter(|peer| peer.state == "up").count() + 1;
-    let expected = cluster.expected().unwrap_or(peers.len() + 1);
+    let configured = cluster.expected();
+    let expected = configured.unwrap_or(peers.len() + 1);
     Json(ClusterView {
         status: if members >= expected {
             "complete"
@@ -218,6 +233,7 @@ async fn cluster(State(state): State<AdminState>) -> Json<ClusterView> {
         },
         members,
         expected,
+        expected_configured: configured.is_some(),
     })
 }
 
@@ -398,6 +414,11 @@ mod tests {
         let response = testing::get(whole.address(), "/health/cluster").await;
         assert!(response.body.contains("\"members\":3"), "{}", response.body);
         assert!(
+            response.body.contains("\"expected_configured\":false"),
+            "nothing was configured here, so the three is nodes met and says so: {}",
+            response.body
+        );
+        assert!(
             response.body.contains("\"expected\":3"),
             "{}",
             response.body
@@ -443,6 +464,11 @@ mod tests {
         // makes it the outage it is. Section 8.5.
         let unaware = configured(vec![peer("up"), peer("up")], Some(4)).await;
         let response = testing::get(unaware.address(), "/health/cluster").await;
+        assert!(
+            response.body.contains("\"expected_configured\":true"),
+            "a reader has to be able to tell a configured four from four nodes met: {}",
+            response.body
+        );
         assert!(response.body.contains("\"members\":3"), "{}", response.body);
         assert!(
             response.body.contains("\"expected\":4"),
