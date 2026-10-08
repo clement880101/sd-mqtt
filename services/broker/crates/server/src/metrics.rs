@@ -792,7 +792,58 @@ pub trait ClusterMetrics: std::fmt::Debug + Send + Sync + 'static {
     fn bytes_received(&self) -> u64;
     /// Bytes never written, because a peer's queue was full.
     fn bytes_dropped(&self) -> u64;
+    /// Section 8.4's migration numbers, in the order
+    /// [`MIGRATION_NUMBERS`] names them.
+    ///
+    /// An array rather than seven methods, because every one of them
+    /// is the same question asked of the same table and a trait with
+    /// seven one-line methods is seven places for an implementation to
+    /// answer one of them from the wrong field.
+    fn migrations(&self) -> [u64; MIGRATION_NUMBERS.len()];
 }
+
+/// Section 8.4's migration numbers: the metric name, its help text,
+/// and the order [`ClusterMetrics::migrations`] returns them in.
+///
+/// **`sessions_migrated_incomplete` is the one section 8.4 promises.**
+/// "On timeout, or when the previous owner cannot be reached, the
+/// connection is accepted with what arrived, the session is reported
+/// as present, and the shortfall is **counted and surfaced**" — it was
+/// counted from milestone 5's second task and surfaced nowhere, which
+/// is half of a sentence that reads as a whole one. The other six are
+/// here because a shortfall with nothing to compare it against cannot
+/// be read: a hundred incomplete drains is an outage or a quiet
+/// afternoon depending on how many there were altogether.
+pub const MIGRATION_NUMBERS: [(&str, &str); 7] = [
+    (
+        "sessions_claimed",
+        "Sessions this node claimed from another node",
+    ),
+    (
+        "sessions_migrated",
+        "Claims whose drain finished before the wait ran out",
+    ),
+    (
+        "sessions_migrated_incomplete",
+        "Claims accepted without a finished drain, which is the shortfall of section 8.4",
+    ),
+    (
+        "sessions_migrated_unreachable",
+        "Of those, the ones with no link to the previous owner to ask over",
+    ),
+    (
+        "migrated_messages",
+        "Messages that arrived in a drain and were kept",
+    ),
+    (
+        "migrated_messages_missing",
+        "Messages a previous owner said it held and that never arrived",
+    ),
+    (
+        "migrated_messages_late",
+        "Chunks that arrived for a drain nothing was waiting for any more",
+    ),
+];
 
 impl Default for Metrics {
     fn default() -> Self {
@@ -1322,6 +1373,16 @@ impl Collector for ClusterLive {
             let descriptor = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
             counter.encode(descriptor)?;
         }
+
+        // Section 8.4's, zipped against their names rather than
+        // written out again: two lists of seven in one file is how one
+        // of them ends up describing the other one's fifth entry.
+        let migrations = self.0.migrations();
+        for ((name, help), value) in MIGRATION_NUMBERS.iter().zip(migrations) {
+            let counter = ConstCounter::new(value);
+            let descriptor = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
+            counter.encode(descriptor)?;
+        }
         Ok(())
     }
 }
@@ -1825,6 +1886,102 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
                     "{kind:?} at {version:?} shares a handle with something else"
                 );
             }
+        }
+    }
+
+    /// A cluster whose every number differs from every other.
+    ///
+    /// **Distinct values, and that is the point.** Seven counters
+    /// rendered from one array against one list of names is a zip, and
+    /// a zip that has slipped by one renders seven plausible series
+    /// with the wrong numbers under them. Equal values, or zeroes,
+    /// would make that invisible.
+    #[derive(Debug)]
+    struct Counted;
+
+    impl ClusterMetrics for Counted {
+        fn members(&self) -> u64 {
+            3
+        }
+        fn bytes_sent(&self) -> u64 {
+            11
+        }
+        fn bytes_received(&self) -> u64 {
+            22
+        }
+        fn bytes_dropped(&self) -> u64 {
+            33
+        }
+        fn migrations(&self) -> [u64; MIGRATION_NUMBERS.len()] {
+            [41, 42, 43, 44, 45, 46, 47]
+        }
+    }
+
+    #[test]
+    fn a_clustering_node_renders_its_cluster_and_migration_numbers() {
+        let metrics = Metrics::new();
+        metrics.watch_cluster(Arc::new(Counted));
+        let rendered = metrics.render();
+
+        assert_eq!(
+            block(&rendered, "sdmqtt_cluster_members"),
+            // No trailing full stop: the registry appends one to the
+            // families it owns, and a collector's descriptors are
+            // written as given.
+            "# HELP sdmqtt_cluster_members Nodes in this cluster that this node can see, \
+             itself included\n\
+             # TYPE sdmqtt_cluster_members gauge\n\
+             sdmqtt_cluster_members 3\n"
+        );
+        for (name, value) in [
+            ("sdmqtt_cluster_bytes_sent", 11),
+            ("sdmqtt_cluster_bytes_received", 22),
+            ("sdmqtt_cluster_bytes_dropped", 33),
+        ] {
+            assert!(
+                block(&rendered, name).contains(&format!("{name}_total {value}\n")),
+                "{name} should be {value} in:\n{}",
+                block(&rendered, name)
+            );
+        }
+
+        // Section 8.4's seven, each against the name it belongs to and
+        // not merely present somewhere.
+        for ((name, help), value) in MIGRATION_NUMBERS.iter().zip([41, 42, 43, 44, 45, 46, 47]) {
+            let family = format!("sdmqtt_{name}");
+            let shown = block(&rendered, &family);
+            assert!(
+                shown.contains(&format!("{family}_total {value}\n")),
+                "{family} should be {value} in:\n{shown}"
+            );
+            assert!(
+                shown.contains(help),
+                "{family} should carry its own help text, not another's:\n{shown}"
+            );
+        }
+
+        // And the one the spec names, spelled out, because an operator
+        // alerting on a partition is alerting on this series and a
+        // rename would silently stop their rule firing.
+        assert!(
+            rendered.contains("sdmqtt_sessions_migrated_incomplete_total 43\n"),
+            "section 8.4's shortfall is this series:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_node_that_does_not_cluster_renders_none_of_them() {
+        // Absent rather than zero, which is section 11.3's rule and the
+        // reason `watch_cluster` is called only on a node that
+        // clusters: "no links" and "quiet links" are different
+        // statements, and a scraper cannot tell them apart from a zero.
+        let rendered = Metrics::new().render();
+        assert!(!rendered.contains("sdmqtt_cluster_members"), "{rendered}");
+        for (name, _) in MIGRATION_NUMBERS {
+            assert!(
+                !rendered.contains(&format!("sdmqtt_{name}")),
+                "{name} should be absent on a node that does not cluster:\n{rendered}"
+            );
         }
     }
 }

@@ -613,10 +613,19 @@ A session is owned by exactly one node, recorded as a metadata register
 holding the owning node and the session epoch.
 
 When a client connects to a node that does not own its session, that node
-increments the epoch, writes itself as owner, broadcasts the change, asks the
-previous owner to close the old connection and drain the offline queue to it,
-and waits for the drain up to a bounded timeout before sending CONNACK.
-Subscriptions follow the session.
+increments the epoch, writes itself as owner, asks the previous owner to close
+the old connection and drain the offline queue to it, waits for the drain up
+to a bounded timeout, and **then** broadcasts the change, before sending
+CONNACK. Subscriptions follow the session.
+
+**The broadcast is after the drain, and this paragraph used to have it
+before.** The order matters and is load-bearing: a previous owner that saw the
+register before the claim could not tell a migration from a partition that had
+healed, so it would either tear the session down with the drain still coming
+or need a comparison to tell the two apart — and the obvious comparison, the
+register's epoch against the session's own, is unsound, because the two
+numbers are counted differently. With the broadcast last, a register naming
+another node means the claim either already arrived or never will. See 8.5.
 
 **On timeout, or when the previous owner cannot be reached, the connection
 is accepted with what arrived**, the session is reported as present, and the
@@ -626,6 +635,17 @@ wrong, and the partition that made the owner unreachable is exactly when a
 client most needs to connect somewhere. What is lost is bounded by what had
 not yet been delivered, it is counted rather than silent, and queue
 replication in milestone 6 is what shrinks it to nothing.
+
+Surfaced means `sdmqtt_sessions_migrated_incomplete_total`, with
+`sdmqtt_sessions_migrated_unreachable_total` saying how many of those had no
+link to ask over and `sdmqtt_migrated_messages_missing_total` saying how many
+messages a previous owner said it held and never sent. Those sit beside
+`sdmqtt_sessions_claimed_total`, `sdmqtt_sessions_migrated_total`,
+`sdmqtt_migrated_messages_total` and `sdmqtt_migrated_messages_late_total`,
+because a shortfall with nothing to compare it against cannot be read: a
+hundred incomplete drains is an outage or a quiet afternoon depending on how
+many there were altogether. Like the other cluster series they are absent
+rather than zero on a node that does not cluster.
 
 ### 8.5 Partitions
 

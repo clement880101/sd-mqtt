@@ -216,6 +216,19 @@ deleted.
   is never short of anything. A flag that can never fire is refused
   rather than left to mean nothing quietly.
 
+- **Section 8.4's migration numbers are in `/metrics`.** Seven
+  counters: `sdmqtt_sessions_claimed_total`,
+  `sdmqtt_sessions_migrated_total`,
+  `sdmqtt_sessions_migrated_incomplete_total`,
+  `sdmqtt_sessions_migrated_unreachable_total`,
+  `sdmqtt_migrated_messages_total`,
+  `sdmqtt_migrated_messages_missing_total` and
+  `sdmqtt_migrated_messages_late_total`. The third is the one the
+  design has always promised to surface — the shortfall when a drain
+  times out or the previous owner cannot be reached — and it was
+  counted inside the process and exposed nowhere. Absent rather than
+  zero on a node that does not cluster, like the other cluster series.
+
 - **A split-brain client identifier resolves when the partition
   heals.** Two nodes that cannot see each other both accept the same
   client identifier — that is the availability above, working as

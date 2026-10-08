@@ -22,6 +22,7 @@ use broker_core::broker::Broker;
 use clap::{Args, Parser, Subcommand};
 use cluster::membership::MemberState;
 use cluster::mesh::Mesh;
+use cluster::migrate::Migrations;
 use cluster::{
     Gate, HybridClock, Live, MetadataError, NodeIdentity, Replicated, ReplicationSettings,
     Replicator, TcpTransport, DEFAULT_MAX_DRIFT_MILLIS,
@@ -252,6 +253,14 @@ pub enum StartupError {
 struct MeshView {
     /// Who this node has met, and how each of them is doing.
     mesh: Arc<Mesh>,
+    /// Section 8.4's drains, for the seven numbers it is asked for.
+    ///
+    /// The same table the mesh's handler and the migrator hold. Not
+    /// optional, because it is made whether or not this node clusters
+    /// — and on a node that does not, every one of its counters is
+    /// honestly zero rather than absent: nothing claimed a session
+    /// from anywhere, which is a fact and not a gap.
+    migrations: Arc<Migrations>,
     /// Section 8.5's policy, for the one number it is asked for.
     ///
     /// The gate rather than `config.cluster.expected_size`, so that
@@ -305,6 +314,23 @@ impl sdmqtt_server::metrics::ClusterMetrics for MeshView {
     fn bytes_dropped(&self) -> u64 {
         self.mesh.stats().bytes_dropped
     }
+
+    fn migrations(&self) -> [u64; sdmqtt_server::metrics::MIGRATION_NUMBERS.len()] {
+        // Read once, so the seven numbers are one reading of the table
+        // rather than seven: a scrape that caught a migration halfway
+        // through could otherwise report a drain that finished and no
+        // claim that started it.
+        let stats = self.migrations.stats();
+        [
+            stats.claimed(),
+            stats.drained(),
+            stats.incomplete(),
+            stats.unreachable(),
+            stats.messages(),
+            stats.missing(),
+            stats.late(),
+        ]
+    }
 }
 
 /// Who this node is, as the admin API has to report it.
@@ -318,6 +344,8 @@ struct Node<'a> {
     identity: Option<&'a NodeIdentity>,
     /// Its mesh, on a node that clusters.
     mesh: Option<&'a Arc<Mesh>>,
+    /// Section 8.4's table of drains, which every node has.
+    migrations: &'a Arc<Migrations>,
     /// Section 8.5's policy, on the same nodes as the mesh: the two
     /// are made together and neither is useful without the other.
     gate: Option<&'a Arc<Gate>>,
@@ -721,6 +749,7 @@ async fn start_admin(
             .with_node_address(mesh.advertise())
             .with_cluster(Some(Arc::new(MeshView {
                 mesh: Arc::clone(mesh),
+                migrations: Arc::clone(node.migrations),
                 gate: Arc::clone(gate),
             }) as Arc<dyn sdmqtt_admin::Cluster>));
     }
@@ -1018,11 +1047,16 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     if let (Some(mesh), Some(gate)) = (&mesh, &gate) {
         let metrics: Arc<dyn sdmqtt_server::metrics::ClusterMetrics> = Arc::new(MeshView {
             mesh: Arc::clone(mesh),
+            migrations: Arc::clone(&migrations),
             gate: Arc::clone(gate),
         });
-        // Section 11.3's four cluster numbers, registered **only
-        // here**: a node that does not cluster leaves them absent
-        // rather than reporting zero, which is a different statement.
+        // Section 11.3's four cluster numbers and section 8.4's seven,
+        // registered **only here**: a node that does not cluster
+        // leaves them absent rather than reporting zero, which is a
+        // different statement. The migration numbers go with them
+        // rather than being registered unconditionally, for the same
+        // reason — a node with nowhere to migrate a session from has no
+        // shortfall to report, and a zero would say it had looked.
         running.shared().metrics().watch_cluster(metrics);
     }
 
@@ -1072,6 +1106,7 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         Node {
             identity: rebuilt.as_ref().map(|rebuilt| &rebuilt.identity),
             mesh: mesh.as_ref(),
+            migrations: &migrations,
             gate: gate.as_ref(),
         },
     )

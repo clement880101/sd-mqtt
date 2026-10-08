@@ -239,6 +239,20 @@ impl Node {
             .collect()
     }
 
+    /// One counter from this node's exposition.
+    ///
+    /// `None` for a series that is not there, which is a different
+    /// answer from zero and is what section 11.3 relies on: a node
+    /// that does not cluster renders no cluster numbers at all.
+    fn counter(&self, name: &str) -> Option<u64> {
+        let rendered = self.get("/metrics");
+        let prefix = format!("{name} ");
+        rendered
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .and_then(|line| line[prefix.len()..].trim().parse().ok())
+    }
+
     /// Which sessions this node holds, by client identifier.
     ///
     /// Connected or not: what a migration moves is the session, and a
@@ -1656,6 +1670,37 @@ async fn a_session_moves_to_the_node_its_client_returns_to() {
         delivered.1.starts_with("after-the-move-"),
         "the delivery should be one of the publications made after the move, not \
          the one from before it: {delivered:?}"
+    );
+
+    // ---- and the migration is in gamma's exposition --------------
+    //
+    // Section 8.4 asks for the shortfall to be "counted **and
+    // surfaced**", and it was counted from this milestone's second
+    // task and surfaced nowhere until now. Read off the real process,
+    // because the unit test behind these series reads a double and so
+    // cannot see a counter wired to the wrong field.
+    //
+    // The zeroes are asserted beside the ones for the same reason the
+    // double's values are all different: a counter reading a
+    // neighbour's field is invisible while both hold the same number.
+    for (series, expected) in [
+        ("sdmqtt_sessions_claimed_total", 1),
+        ("sdmqtt_sessions_migrated_total", 1),
+        ("sdmqtt_sessions_migrated_incomplete_total", 0),
+        ("sdmqtt_sessions_migrated_unreachable_total", 0),
+        ("sdmqtt_migrated_messages_total", 1),
+        ("sdmqtt_migrated_messages_missing_total", 0),
+    ] {
+        assert_eq!(
+            nodes[2].counter(series),
+            Some(expected),
+            "{series} on gamma, which claimed the session and drained one message"
+        );
+    }
+    assert_eq!(
+        nodes[0].counter("sdmqtt_sessions_claimed_total"),
+        Some(0),
+        "alpha claimed nothing: it was drained from, which is the other half"
     );
 }
 
