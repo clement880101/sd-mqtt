@@ -15,7 +15,7 @@ the milestone you are moving to.** Everything else is description.
 milestone 5. It refuses to start, and says so:**
 
 ```
-store format version 8 is not readable by this build, which reads version 9.
+store format version 8 is not readable by this build, which reads version 10.
 The store is not damaged; it was written by a different build. Nothing is
 released yet, so there is no migration: see CHANGELOG.md for what moved and
 what starting with a fresh store directory throws away.
@@ -32,7 +32,15 @@ already in a cluster the registers come back from the next
 anti-entropy exchange, and on the last node of a cluster they are the
 cluster's metadata and do not.
 
-**Why the version moved to 9.** A node can now hold a copy of a
+**Why the version moved to 10.** Twice, within this one unreleased
+milestone: to 9 when a node could hold a copy of another node's
+session, and to 10 when the owner's own position in that stream was
+stored beside it. The number moved the second time rather than version
+9 being redefined, for the reason the check is exact in the first
+place — redefining a number already written to somebody's disk is how
+a silent misread happens.
+
+A node can now hold a copy of a
 session another node owns. The records that make up such a copy are
 the same records as any other session's — the session, its
 subscriptions, its queue — so the store gained a row saying *this one
@@ -41,10 +49,17 @@ would hand the broker another node's session: its filters would enter
 this node's matching trie, it would be forwarded publications for
 them, and it would deliver them to a client connected somewhere else.
 
-A version 8 store holds no copies, so nothing is lost by its absence
-— but a version 8 *build* reading a version 9 store would meet a
-record variant it has no arm for, and the check is exact in both
-directions on purpose.
+The owner's position is stored rather than counted from zero at
+startup because a follower refuses anything at or below its own mark:
+an owner that restarted its count would have everything it sent
+refused as a duplicate, silently, until the session had produced as
+many operations as it had before. A follower that quietly stops
+following is the failure replication exists to prevent.
+
+A version 8 store holds neither, so nothing is lost by their absence
+— but a version 8 *build* reading a later store would meet record
+variants it has no arm for, and the check is exact in both directions
+on purpose.
 
 ### Added
 

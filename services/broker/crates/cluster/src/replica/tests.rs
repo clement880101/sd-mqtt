@@ -154,3 +154,80 @@ fn an_acknowledgement_and_a_removal_order_by_position_not_by_sequence() {
     );
     assert_eq!(follower.through(), 3);
 }
+
+#[test]
+fn an_owner_numbers_from_one_and_never_repeats() {
+    let mut owner = Owner::new();
+    assert_eq!(owner.at(), 0, "nothing sent is zero");
+    let key = SessionKey::new("", "a-client");
+    for expected in 1..=4 {
+        assert_eq!(owner.next(&key, appended(expected)).at, expected);
+    }
+    assert_eq!(owner.at(), 4);
+}
+
+#[test]
+fn an_owner_resuming_carries_on_rather_than_starting_again() {
+    // **The reason the position is stored.** A follower refuses
+    // anything at or below its mark, so an owner that began again at
+    // one after a restart would have everything it sent refused as a
+    // duplicate — silently, until the session had produced as many
+    // operations as it had before.
+    let mut owner = Owner::resuming(40);
+    let key = SessionKey::new("", "a-client");
+    assert_eq!(owner.next(&key, appended(1)).at, 41);
+
+    // And the follower on the other side takes it, which is the half
+    // that makes the point: it would have refused a 1.
+    let mut follower = Follower::resuming(40);
+    assert_eq!(follower.offer(41, appended(1)), Applied::Take);
+    assert_eq!(follower.offer(1, appended(1)), Applied::Duplicate);
+}
+
+#[test]
+fn a_queue_record_becomes_a_change_and_everything_else_becomes_nothing() {
+    use storage::record::SessionRecord;
+
+    let key = SessionKey::new("", "a-client");
+    let (session, change) = change_for(&storage::Record::QueuePushed {
+        session: key.clone(),
+        entry: entry(7),
+    })
+    .expect("a push is a change");
+    assert_eq!(session, key);
+    assert!(matches!(change, Change::Appended { .. }));
+
+    let (_, change) = change_for(&storage::Record::QueuePopped {
+        session: key.clone(),
+        sequence: 7,
+    })
+    .expect("a pop is a change");
+    assert_eq!(change, Change::Removed { sequence: 7 });
+
+    // Everything a queue is not. A subscription and a retained
+    // message are replicated as registers by section 8.2 and have no
+    // business in this stream; a build that streamed them would send
+    // every retained payload to every follower of every session.
+    assert!(change_for(&storage::Record::SubscriptionRemoved {
+        session: key.clone(),
+        filter: "a/#".to_owned(),
+    })
+    .is_none());
+    assert!(change_for(&storage::Record::RetainedRemoved {
+        topic: "a/b".to_owned(),
+    })
+    .is_none());
+    assert!(change_for(&storage::Record::SessionRemoved {
+        session: key.clone()
+    })
+    .is_none());
+    assert!(change_for(&storage::Record::SessionPut(SessionRecord {
+        key,
+        version: storage::record::ProtocolVersion::V5,
+        expiry_interval: 0,
+        expires_at: None,
+        will: None,
+        will_at: None,
+    }))
+    .is_none());
+}

@@ -224,4 +224,16 @@ pub struct RestoredSession {
     ///
     /// [`Storage::highest_sequence`]: crate::Storage::highest_sequence
     pub highest_sequence: u64,
+    /// How far this node had sent this session's changes to its
+    /// followers, section 8.6.
+    ///
+    /// Zero for a session that has never been streamed, which is the
+    /// same reading as one whose stream has sent nothing: a node
+    /// resuming either starts at one.
+    ///
+    /// On the session rather than in a list of its own, because it is
+    /// a fact about the session and a caller holding one should not
+    /// have to go and look it up — and because the owner's position
+    /// and the queue it counts must not be able to arrive separately.
+    pub stream_at: u64,
 }

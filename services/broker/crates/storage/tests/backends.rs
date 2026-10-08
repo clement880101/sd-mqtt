@@ -2853,6 +2853,62 @@ mod contract {
 
     // ---- flush ------------------------------------------------------------
 
+    /// The owner's own position in the stream comes back with the
+    /// session, and goes when the session goes.
+    ///
+    /// **Why it is stored at all**: a follower refuses anything at or
+    /// below its mark, so an owner that restarted its count from one
+    /// would have everything it sent refused as a duplicate —
+    /// silently, until the session had produced as many operations as
+    /// it had before. A follower that quietly stops following is the
+    /// failure replication exists to prevent.
+    pub fn the_owners_stream_position_survives_and_goes_with_the_session<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = new();
+        apply(&store, &[Record::SessionPut(session("mine"))]);
+        assert_eq!(
+            session_of(&restore(&store), "mine").stream_at,
+            0,
+            "a session that has never been streamed reads as zero, not as absent"
+        );
+
+        apply(
+            &store,
+            &[Record::StreamAt {
+                session: key("mine"),
+                at: 4,
+            }],
+        );
+        apply(
+            &store,
+            &[Record::StreamAt {
+                session: key("mine"),
+                at: 9,
+            }],
+        );
+        assert_eq!(
+            session_of(&restore(&store), "mine").stream_at,
+            9,
+            "one row, overwritten, not a history"
+        );
+
+        // And a client reconnecting under the same identifier inherits
+        // nothing, this included: a position left behind would have
+        // the next stream start part way through a session that has
+        // none of it.
+        apply(
+            &store,
+            &[
+                Record::SessionRemoved {
+                    session: key("mine"),
+                },
+                Record::SessionPut(session("mine")),
+            ],
+        );
+        assert_eq!(session_of(&restore(&store), "mine").stream_at, 0);
+    }
+
     /// A session this node merely holds a copy of comes back as a
     /// copy, and **not in the list the broker is handed**.
     ///
@@ -3065,6 +3121,7 @@ macro_rules! every_contract_test {
             a_flush_keeps_everything_and_leaves_the_store_usable,
             a_followed_session_restores_as_a_copy_and_not_as_a_session,
             a_replica_mark_is_overwritten_and_dropping_it_keeps_the_session,
+            the_owners_stream_position_survives_and_goes_with_the_session,
         }
     };
 }

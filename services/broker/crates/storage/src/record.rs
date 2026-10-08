@@ -131,7 +131,26 @@ use serde::{Deserialize, Serialize};
 /// restore. The version still moves, because a version 8 *build*
 /// reading a version 9 store would meet a variant index it has no arm
 /// for, and the check is exact in both directions on purpose.
-pub const FORMAT_VERSION: u16 = 9;
+///
+/// Version 10 added [`Record::StreamAt`]: the owner's side of the same
+/// stream, which is where it has got to in sending rather than where a
+/// follower has got to in applying. **Version 9 existed for one commit
+/// of this same unreleased milestone**, and the version moved again
+/// rather than being redefined, for exactly the reason the check is
+/// exact: a version 9 store is only harmless to this build because the
+/// number says which one it is. Redefining a number already written to
+/// somebody's disk is how a silent misread happens.
+///
+/// # Why the owner's position is stored at all
+///
+/// A follower refuses anything at or below its mark, which is what
+/// makes a re-send safe. So an owner that restarted and began counting
+/// from one again would have every change it sent refused as a
+/// duplicate, silently, until the session had produced as many
+/// operations as it had before the restart — a follower that quietly
+/// stops following, which is the failure replication exists to
+/// prevent.
+pub const FORMAT_VERSION: u16 = 10;
 
 /// What every sd-mqtt store begins with, so a file that is not one is
 /// refused as such rather than as a corrupt store.
@@ -1480,6 +1499,26 @@ pub enum Record {
         /// Which session.
         session: SessionKey,
     },
+    /// How far this node has sent, for a session it owns. Section 8.6.
+    ///
+    /// The owner's counterpart to [`Record::ReplicaFollows`]: that one
+    /// is where a copy has got to in applying, this one is where the
+    /// original has got to in sending. One row per owned session,
+    /// overwritten, in the same batch as the queue record it covers.
+    ///
+    /// Stored rather than counted from zero at startup, because a
+    /// follower refuses anything at or below its own mark: an owner
+    /// that restarted its count would have everything it sent refused
+    /// as a duplicate, silently, until the session caught up with where
+    /// it had been.
+    ///
+    /// Goes with the session, as the queue does.
+    StreamAt {
+        /// Which session.
+        session: SessionKey,
+        /// The position of the last change sent.
+        at: u64,
+    },
 }
 
 impl Record {
@@ -1523,7 +1562,8 @@ impl Record {
             // The owner's sixteen bytes and the mark are fixed, so the
             // key is the only part a peer can grow.
             | Self::ReplicaFollows { session, .. }
-            | Self::ReplicaDropped { session } => weigh_key(session),
+            | Self::ReplicaDropped { session }
+            | Self::StreamAt { session, .. } => weigh_key(session),
             Self::SubscriptionAdded {
                 session,
                 subscription,

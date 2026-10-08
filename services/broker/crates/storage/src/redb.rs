@@ -174,6 +174,12 @@ const METADATA_SEEN: TableDefinition<&[u8], &[u8]> = TableDefinition::new("metad
 /// overwritten as the mark advances.
 const REPLICAS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("replicas");
 
+/// How far this node has sent, per session it owns, section 8.6.
+///
+/// The owner's counterpart to [`REPLICAS`]. One row per owned
+/// session, overwritten as the stream advances.
+const STREAMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("streams");
+
 /// A [`Storage`] backed by a redb database on a path.
 #[derive(Debug)]
 pub struct RedbStorage {
@@ -349,6 +355,7 @@ impl Storage for RedbStorage {
         let oplog = open_read(&transaction, OPLOG)?;
         let metadata_seen = open_read(&transaction, METADATA_SEEN)?;
         let replicas = open_read(&transaction, REPLICAS)?;
+        let streams = open_read(&transaction, STREAMS)?;
         let meta = transaction.open_table(META).map_err(StorageError::from)?;
 
         let mut restored = Restored::default();
@@ -365,6 +372,12 @@ impl Storage for RedbStorage {
             followed.insert(key.value().to_vec(), decode(value.value())?);
         }
 
+        let mut sent: std::collections::HashMap<Vec<u8>, u64> = std::collections::HashMap::new();
+        for entry in streams.iter().map_err(StorageError::from)? {
+            let (key, value) = entry.map_err(StorageError::from)?;
+            sent.insert(key.value().to_vec(), decode(value.value())?);
+        }
+
         for entry in sessions.iter().map_err(StorageError::from)? {
             let (key, value) = entry.map_err(StorageError::from)?;
             let record: SessionRecord = decode(value.value())?;
@@ -378,6 +391,7 @@ impl Storage for RedbStorage {
                 inflight: Vec::new(),
                 queue: Vec::new(),
                 highest_sequence: state.highest_sequence,
+                stream_at: sent.get(&prefix).copied().unwrap_or(0),
             };
             for entry in range(&subscriptions, &prefix)? {
                 let (_, value) = entry.map_err(StorageError::from)?;
@@ -574,6 +588,7 @@ struct Tables<'txn> {
     oplog: ByteTable<'txn>,
     metadata_seen: ByteTable<'txn>,
     replicas: ByteTable<'txn>,
+    streams: ByteTable<'txn>,
 }
 
 impl<'txn> Tables<'txn> {
@@ -620,6 +635,9 @@ impl<'txn> Tables<'txn> {
                 .map_err(StorageError::from)?,
             replicas: transaction
                 .open_table(REPLICAS)
+                .map_err(StorageError::from)?,
+            streams: transaction
+                .open_table(STREAMS)
                 .map_err(StorageError::from)?,
         })
     }
@@ -714,6 +732,15 @@ impl<'txn> Tables<'txn> {
                     .remove(prefix.as_slice())
                     .map_err(StorageError::from)?;
                 self.queue_state
+                    .remove(prefix.as_slice())
+                    .map_err(StorageError::from)?;
+                // Both stream rows go with it, for the reason the
+                // queue does: a client reconnecting under the same
+                // identifier must inherit nothing.
+                self.replicas
+                    .remove(prefix.as_slice())
+                    .map_err(StorageError::from)?;
+                self.streams
                     .remove(prefix.as_slice())
                     .map_err(StorageError::from)?;
                 remove_prefixed(&mut self.subscriptions, &prefix)?;
@@ -877,6 +904,11 @@ impl<'txn> Tables<'txn> {
                         session_prefix(session).as_slice(),
                         encode(&(*owner, *through)).as_slice(),
                     )
+                    .map_err(StorageError::from)?;
+            }
+            Record::StreamAt { session, at } => {
+                self.streams
+                    .insert(session_prefix(session).as_slice(), encode(at).as_slice())
                     .map_err(StorageError::from)?;
             }
             Record::ReplicaDropped { session } => {

@@ -88,6 +88,9 @@ struct State {
     /// owner is then the removal of a fact rather than a rewrite of
     /// the session.
     replicas: BTreeMap<SessionKey, ([u8; 16], u64)>,
+    /// How far this node has sent, for each session it owns, section
+    /// 8.6. The owner's counterpart to `replicas`.
+    streams: BTreeMap<SessionKey, u64>,
     /// Who this node is, once something has said. Section 8.1.
     ///
     /// One row rather than a table: a store belongs to one node.
@@ -257,6 +260,13 @@ impl State {
                 // reference belongs to whoever took it; see the note on
                 // `Storage::apply`.
                 self.sessions.remove(session);
+                // Both stream rows go with it, for the reason the
+                // queue does: a client reconnecting under the same
+                // identifier must inherit nothing, and a position left
+                // behind would have the next stream start part way
+                // through a session that has none of it.
+                self.replicas.remove(session);
+                self.streams.remove(session);
             }
             Record::SubscriptionAdded {
                 session,
@@ -359,6 +369,9 @@ impl State {
                 // **The session stays.** Becoming its owner keeps every
                 // queue entry and changes only whose it is.
                 self.replicas.remove(session);
+            }
+            Record::StreamAt { session, at } => {
+                self.streams.insert(session.clone(), *at);
             }
             Record::RuleRemoved { id } => {
                 // The outbox goes with the rule, as a session's queue
@@ -520,6 +533,7 @@ impl Storage for MemoryStorage {
             // queue is keyed by it.
             queue: session.queue.values().cloned().collect(),
             highest_sequence: session.highest_sequence,
+            stream_at: state.streams.get(&session.record.key).copied().unwrap_or(0),
         };
         Ok(Restored {
             // **Split by the replica table**, so that a session this

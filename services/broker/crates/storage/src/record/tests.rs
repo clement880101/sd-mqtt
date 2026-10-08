@@ -128,10 +128,15 @@ mod golden {
         // the end of one record into the next, and from 8 when a node
         // began holding copies of other nodes' session queues, because
         // a version 8 build reading one of those would meet a record
-        // variant it has no arm for.
+        // variant it has no arm for, and from 9 when the owner's own
+        // position in that stream was stored beside it — a version
+        // that existed for one commit of the same unreleased
+        // milestone, and that moved again rather than being redefined,
+        // because redefining a number already on somebody's disk is
+        // how a silent misread happens.
         let expected: &[u8] = &[
             b's', b'd', b'm', b'q', b't', b't', b's', b't', // magic "sdmqttst"
-            0x09, // version 9
+            0x0a, // version 10
         ];
         assert_eq!(FormatMarker::current().encode(), expected);
         assert_eq!(
@@ -1153,6 +1158,18 @@ mod golden {
                 through: 300,
             },
             &expected,
+        );
+    }
+
+    #[test]
+    fn stream_at() {
+        // 300 = 2 * 128 + 44, so the varint is 44|0x80 then 2.
+        pins(
+            &Record::StreamAt {
+                session: key(),
+                at: 300,
+            },
+            &keyed(0x1c, &[0xac, 0x02]), // variant 28
         );
     }
 

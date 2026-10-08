@@ -232,5 +232,92 @@ impl Follower {
     }
 }
 
+/// The owner's side: what to send, and where it has got to.
+///
+/// Turns the records a batch wrote into the changes a follower needs,
+/// numbering them. One per owned session, resumed from
+/// [`storage::RestoredSession::stream_at`] across a restart — see
+/// `Record::StreamAt` for why that number is stored rather than
+/// counted from zero.
+///
+/// # The records are the source, not a second account of them
+///
+/// The broker already journals exactly what changed, in order, in one
+/// batch. Deriving the stream from that rather than from a second set
+/// of calls at the publish path is what keeps the copy and the
+/// original from disagreeing: there is one description of what
+/// happened and both the store and the follower get it.
+#[derive(Debug, Default)]
+pub struct Owner {
+    /// The position of the last change sent.
+    at: u64,
+}
+
+impl Owner {
+    /// An owner that has sent nothing.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// An owner resuming from a stored position.
+    #[must_use]
+    pub fn resuming(at: u64) -> Self {
+        Self { at }
+    }
+
+    /// The position of the last change sent.
+    #[must_use]
+    pub fn at(&self) -> u64 {
+        self.at
+    }
+
+    /// Number `change` and hand it back ready to send.
+    pub fn next(&mut self, session: &SessionKey, change: Change) -> Streamed {
+        self.at += 1;
+        Streamed {
+            session: session.clone(),
+            at: self.at,
+            change,
+        }
+    }
+}
+
+/// What one record means to a follower, if anything.
+///
+/// `None` for every record that is not a change to a queue, which is
+/// most of them: a subscription, a retained message and a rule are
+/// replicated by section 8.2's registers and have nothing to do with
+/// this stream.
+///
+/// **A pop is a removal and not an acknowledgement.** The store has one
+/// record for both, because to a queue they are the same event, and
+/// this cannot invent the difference: what it has is the record. The
+/// distinction exists in [`Change`] because section 8.6 names both, and
+/// it is the publish path that knows which — a caller that has that
+/// knowledge uses [`Owner::next`] directly.
+#[must_use]
+pub fn change_for(record: &storage::Record) -> Option<(SessionKey, Change)> {
+    match record {
+        storage::Record::QueuePushed { session, entry } => Some((
+            session.clone(),
+            Change::Appended {
+                entry: Box::new(entry.clone()),
+                // The body travels separately: it is in the same batch
+                // as its own record, and whether this follower already
+                // holds it is the sender's question, not this one's.
+                body: None,
+            },
+        )),
+        storage::Record::QueuePopped { session, sequence } => Some((
+            session.clone(),
+            Change::Removed {
+                sequence: *sequence,
+            },
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests;
