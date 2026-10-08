@@ -646,6 +646,17 @@ During a partition, two nodes can accept the same client identifier. On heal,
 the higher epoch wins and the loser's connection is closed with "session
 taken over".
 
+**The loser acts on the register alone, and does not compare epochs.** It was
+built that way first, to tell a partition from a migration whose drain was
+still in flight, and the comparison was unsound: a session's local epoch is
+`max(held, claimed) + 1` and climbs on every reconnect to the same node, while
+the register's does not, so the two are different currencies. The case it was
+guarding against cannot arise. A claim travels the link and is waited for
+*before* the register recording it is broadcast, so a register naming another
+node means either the claim already arrived and the session has gone, or it
+never arrived at all and no drain is coming. That ordering is therefore
+load-bearing and is written down where it lives, in `Shared::claim_session`.
+
 **Equal epochs are the expected outcome, not the rare one.** Two nodes on
 opposite sides of a partition both read the same epoch and both increment to
 the same number. The tie breaks the way every other register's does, on the

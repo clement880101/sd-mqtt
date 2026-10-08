@@ -4741,4 +4741,116 @@ mod tests {
             "and it reached the broker"
         );
     }
+
+    // -----------------------------------------------------------
+    // Section 8.5's heal: two nodes accepted one client identifier
+    // while they could not see each other.
+    // -----------------------------------------------------------
+
+    /// A session the cluster says another node won is closed with
+    /// "session taken over", and what it held goes with it.
+    ///
+    /// The epoch is the one this node's own session holds, which
+    /// section 8.5 calls the expected outcome of a partition: both
+    /// nodes read the same epoch and both wrote it, and the register
+    /// having been applied is this node having lost the tie.
+    #[tokio::test]
+    async fn a_session_another_node_won_while_partitioned_is_closed_on_heal() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected(&mut client, Version::V5).await.reason,
+            ReasonCode::Success
+        );
+        let session = SessionKey::new("", "sensor");
+
+        assert!(
+            shared.lost_session(&session),
+            "a register naming another node for a session this one is serving is \
+             this node having lost it"
+        );
+        match read(&mut client, Version::V5).await {
+            Packet::Disconnect(said) => assert_eq!(
+                said.reason,
+                ReasonCode::SessionTakenOver,
+                "section 8.5 names this reason code"
+            ),
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
+        assert_eq!(
+            shared
+                .metrics()
+                .reason_sent(PacketKind::Disconnect, ReasonCode::SessionTakenOver)
+                .get(),
+            1
+        );
+        assert_eq!(
+            shared.with_broker(|broker| broker.sessions().count()),
+            0,
+            "the session left this node rather than lingering with no connection: a \
+             node that kept it would go on being forwarded copies for its filters"
+        );
+    }
+
+    /// A session that has already been handed over is not disturbed by
+    /// the register that records it.
+    ///
+    /// This is the ordinary migration, and it is the case that makes
+    /// `lost_session` safe to call from a register alone: the claim
+    /// reaches the previous owner first, because
+    /// `Shared::claim_session` does not broadcast the register until
+    /// the drain has finished. By the time the register arrives the
+    /// session has gone, and a second hand-over must not be attempted
+    /// on the connection that replaced it.
+    #[tokio::test]
+    async fn a_session_already_handed_over_is_not_given_up_twice() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected(&mut client, Version::V5).await.reason,
+            ReasonCode::Success
+        );
+        let session = SessionKey::new("", "sensor");
+
+        // The claim's half, which is what answering a claim does.
+        assert!(
+            shared.hand_over_session(&session, false).is_some(),
+            "the session was here to be handed over"
+        );
+        match read(&mut client, Version::V5).await {
+            Packet::Disconnect(said) => assert_eq!(said.reason, ReasonCode::SessionTakenOver),
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
+
+        // And then the register arrives, saying what has already
+        // happened.
+        assert!(
+            !shared.lost_session(&session),
+            "the session has already gone, so the register that records it has \
+             nothing left to do"
+        );
+    }
+
+    /// A session this node does not hold is nobody's business here.
+    ///
+    /// Most registers in a cluster name another node for a session this
+    /// one has never served, and every one of them reaches this path.
+    #[tokio::test]
+    async fn a_session_this_node_never_held_is_not_given_up() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected(&mut client, Version::V5).await.reason,
+            ReasonCode::Success
+        );
+        assert!(
+            !shared.lost_session(&SessionKey::new("", "somebody-else")),
+            "a register about a stranger's session says nothing about this node"
+        );
+        assert_eq!(
+            shared.with_broker(|broker| broker.sessions().count()),
+            1,
+            "and the client it is serving is untouched"
+        );
+    }
 }

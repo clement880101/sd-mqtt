@@ -32,13 +32,24 @@
 //! earlier of them: the register table already decided which won, and the
 //! local effect has to follow in the same order.
 //!
-//! What is deliberately not applied *here* is a node subscription or a
-//! session owner. A node subscription is section 8.3's routing, and the
-//! thing that reads it is `cluster::Routes` — which `cluster::Replicated`
-//! keeps in step itself, from the four paths that change a register, so
-//! there is nothing for this task to do with one. A session owner is
-//! section 8.4's migration and is still a register with nothing acting on
-//! it.
+//! What is deliberately not applied *here* is a node subscription. That is
+//! section 8.3's routing, and the thing that reads it is `cluster::Routes`
+//! — which `cluster::Replicated` keeps in step itself, from the four paths
+//! that change a register, so there is nothing for this task to do with
+//! one.
+//!
+//! A session owner **is** applied here, and it is the one write in this
+//! task that disconnects somebody. Section 8.5: two nodes that could not
+//! see each other both accepted the same client identifier, and on heal
+//! the one whose register lost the merge closes its connection with
+//! "session taken over". It is applied after the batch rather than inside
+//! it, because the close travels through the losing connection's own
+//! outbox and nothing may be delivered under the broker's lock. The rule
+//! What makes that safe to do from a register alone — rather than
+//! tearing down a session whose drain is still on its way — is an
+//! ordering `Shared::claim_session` keeps and `Shared::lost_session`
+//! depends on: a claim is sent and waited for before the register that
+//! records it is broadcast.
 //!
 //! # And a publication that a peer forwarded is not a write at all
 //!
@@ -266,6 +277,17 @@ pub async fn applying(
     shared: Arc<Shared>,
     rules: Arc<Registry>,
 ) {
+    // Read once rather than per write. A node with no store cannot
+    // cluster and so reaches none of this, but the type does not say
+    // that, and a `None` here would quietly stop section 8.5's heal
+    // instead of stopping the task — so it ends the task, loudly.
+    let Some(me) = shared.replicated().map(|replicated| replicated.me()) else {
+        tracing::error!(
+            "the applying task was started on a node with nothing replicated, so no \
+             peer's write will take effect here"
+        );
+        return;
+    };
     while let Some(Applying { records, writes }) = waiting.recv().await {
         // The rules go to the registry and everything else to the broker.
         // A rule install opens an outbox and may bind a listener, neither
@@ -304,6 +326,57 @@ pub async fn applying(
         // awaited: the records are on their way, and the next exchange
         // repairs whatever a crash before the flush loses.
         drop(committed);
+
+        // Section 8.5's heal, after the registers are stored and
+        // **outside** the lock the batch was applied under: giving a
+        // session up closes a connection, which is an action delivered
+        // through an outbox.
+        //
+        // Not in `apply_to_broker` for that reason, although every
+        // other local effect is: that closure runs under the lock and
+        // has nowhere to put an action.
+        for write in &for_broker {
+            let MetadataKey::SessionOwner { session } = write.key() else {
+                continue;
+            };
+            let Some(MetadataValue::SessionOwner { node, .. }) = write.register().value() else {
+                // A tombstone, which is a session nobody owns: the
+                // owner that wrote it gave it up, and a node that was
+                // not serving it has nothing to do.
+                continue;
+            };
+            if *node == me {
+                // **A peer cannot have originated this.** A log holds
+                // only what its own node wrote — `cluster::oplog`'s
+                // first line — and what reaches here came off a peer's
+                // log, so a register naming this node as the owner is
+                // a peer replicating a write it did not make.
+                //
+                // So this is a broken invariant rather than a case to
+                // handle, and it is said out loud rather than skipped
+                // quietly. It is still not acted on: handing the
+                // session over here would disconnect the client this
+                // node has just accepted, on the word of a peer that
+                // is already behaving in a way nothing explains.
+                tracing::error!(
+                    peer_write = %node,
+                    client = %session.client_id,
+                    "a peer replicated a session owner naming this node, which only its \
+                     own log should carry; the register is held and nothing is done about it"
+                );
+                continue;
+            }
+            if shared.lost_session(session) {
+                tracing::warn!(
+                    client = %session.client_id,
+                    mountpoint = %session.mountpoint,
+                    owner = %node,
+                    "another node accepted this client while the two could not see each \
+                     other, and its claim won on heal; this node's connection is closed \
+                     with session taken over and what its queue held is gone"
+                );
+            }
+        }
 
         for write in &for_rules {
             // The registers are already stored above, so the registry's

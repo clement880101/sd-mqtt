@@ -216,6 +216,25 @@ deleted.
   is never short of anything. A flag that can never fire is refused
   rather than left to mean nothing quietly.
 
+- **A split-brain client identifier resolves when the partition
+  heals.** Two nodes that cannot see each other both accept the same
+  client identifier — that is the availability above, working as
+  intended — and until now both went on serving it afterwards, with
+  the ownership register settled and nothing acting on it. Now the
+  node whose claim lost the merge closes its connection with
+  `0x8E Session taken over`, drops the session's subscriptions so it
+  stops being forwarded copies, and says so in the log.
+
+  **What that session's queue held is lost, and that is the
+  documented behaviour rather than an oversight**: the node that won
+  accepted its client with whatever reached it, which across a
+  partition was nothing, and section 8.5 of the design says messages
+  published on either side are not retroactively exchanged.
+
+  Nothing is needed to turn this on and there is nothing to configure.
+  A client that is disconnected this way has been told why and can
+  reconnect, which is what the reason code is for.
+
 ### Changed
 
 - **`GET /health/cluster` reports the configured expected size.** With

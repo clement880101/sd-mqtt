@@ -415,6 +415,19 @@ impl Shared {
     /// register the claim wrote is stored and broadcast here, because
     /// the claim happens outside the broker's lock and nothing else is
     /// holding a batch for it to ride in.
+    ///
+    /// # The register is broadcast after the drain, and that order is
+    /// load-bearing
+    ///
+    /// Not an artefact of the two statements below being in this order.
+    /// [`Shared::lost_session`] is allowed to treat a register naming
+    /// another node as proof that no drain is coming, and it is allowed
+    /// to do that **only** because the claim reaches the previous owner
+    /// before the register does — which is true exactly while the
+    /// `await` here precedes the `originate`. Swap them and a previous
+    /// owner can be told it has lost a session whose queue is still
+    /// being asked for, and the client arrives at its new node with an
+    /// empty session.
     pub async fn claim_session(&self, session: &SessionKey, clean: bool) -> Option<Claimed> {
         let migrator = self.migrator.get()?;
         let claimed = migrator.claim(session, clean).await;
@@ -486,6 +499,69 @@ impl Shared {
         // what stops one session having two live connections.
         self.deliver(actions);
         handover
+    }
+
+    /// Give a session up because the cluster says another node owns
+    /// it, section 8.5's heal.
+    ///
+    /// Returns whether a session was given up, which the caller logs:
+    /// this is a client being disconnected through no fault of its own
+    /// and an operator is owed the line.
+    ///
+    /// # Why a register naming somebody else is enough, on its own
+    ///
+    /// There is no epoch comparison here and there must not be one. A
+    /// claim is answered by [`Shared::hand_over_session`], and
+    /// [`Shared::claim_session`] does not broadcast the register until
+    /// the drain it asked for has finished or timed out — so by the
+    /// time a register naming another node arrives, exactly one of two
+    /// things is true. Either the claim reached this node, the session
+    /// has already gone, and `broker.subscriber_of` below finds
+    /// nothing; or the claim never arrived, because there was no link
+    /// to carry it or the queue carrying it was full, and then **no
+    /// drain is coming and none ever will** — the node that claimed it
+    /// counted the shortfall and accepted its client anyway.
+    ///
+    /// A stale register cannot reach here either: what arrives has won
+    /// the merge, and an older write loses it.
+    ///
+    /// The first draft compared the arriving epoch against the one this
+    /// node's own session held, to tell a partition from a migration
+    /// whose drain was still in flight. That comparison was unsound —
+    /// the two numbers are different currencies, because a session's
+    /// epoch is `max(held, claimed) + 1` and climbs on every local
+    /// reconnect while the register's does not — and the case it was
+    /// guarding against cannot happen.
+    ///
+    /// # What the session was holding is lost, on purpose
+    ///
+    /// The queue goes with the hand-over and nothing sends it anywhere:
+    /// the node that won accepted its client with whatever reached it,
+    /// which across a partition was nothing. Section 8.5 says this in
+    /// as many words — messages published on either side are not
+    /// retroactively exchanged, and a node that acknowledged messages
+    /// on the losing side loses them when it rejoins. Keeping them
+    /// would mean delivering, long afterwards, messages the other side
+    /// has already answered for.
+    pub fn lost_session(&self, session: &SessionKey) -> bool {
+        let (given_up, actions) = self.with_broker(|broker| {
+            let identity = SessionId::new(&session.mountpoint, &session.client_id);
+            if broker.subscriber_of(&identity).is_none() {
+                // Not held here, which is the ordinary state of almost
+                // every register in a cluster — and is also the
+                // migration that has already happened.
+                return (false, Vec::new());
+            }
+            let now = broker.clock().now();
+            let mut out = Vec::new();
+            // The handover is dropped rather than sent; see above.
+            let _ = broker.hand_over(&identity, false, now, &mut out);
+            (true, out)
+        });
+        // The close for the losing connection is among them, which is
+        // the thing section 8.5 promises.
+        self.deliver(actions);
+        given_up
     }
 
     /// What this process counts.

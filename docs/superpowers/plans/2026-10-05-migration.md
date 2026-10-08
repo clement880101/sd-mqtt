@@ -78,7 +78,7 @@ node claims a session, read when a client connects.
 The within-one-node takeover already increments an epoch and displaces the
 incumbent. This is the same rule with the incumbent on another node.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 A connect to the node that already owns the session is the existing local
 takeover and writes no register it did not already own. A connect to another
@@ -86,7 +86,7 @@ node claims it, with a higher epoch. **Two nodes claiming at the same epoch
 resolve the same way on both**, which is the case section 8.5 is about and
 the one a test of a single claim cannot see.
 
-- [ ] **Step 2: Implement, confirm teeth, commit**
+- [x] **Step 2: Implement, confirm teeth, commit**
 
 Mutations: the epoch not incremented on a claim; the tie broken on the epoch
 alone, which must fail the equal-epoch test; the tie broken on the node name
@@ -113,7 +113,7 @@ Subscriptions follow the session, which the replicated metadata already
 carries at node granularity, so the new owner's node must gain them and the
 old owner's must lose them.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 A client that subscribed on one node, disconnected, had messages published to
 it, and reconnected to another node receives them. That is the whole feature
@@ -129,7 +129,7 @@ Then the two that matter more:
   not just the acceptance.
 - **The drain times out partway.** Same, with what did arrive delivered.
 
-- [ ] **Step 2: Implement, confirm teeth, commit**
+- [x] **Step 2: Implement, confirm teeth, commit**
 
 Mutations: the acknowledgement sent before the drain; the drain unbounded,
 which must fail a test rather than hang it; the shortfall not counted; the
@@ -155,7 +155,7 @@ whole, for operators who prefer that trade.
 The expected size supplies what "whole" means, and the health endpoint's
 expected count finally has something behind it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 By default a node cut off from the others still accepts a connect, a publish
 and a subscribe. With each flag set it refuses that one operation and not the
@@ -163,7 +163,7 @@ others. Unset expected size with a flag set is refused at startup.
 
 The refusal carries a reason a client can act on, not a closed socket.
 
-- [ ] **Step 2: Implement, confirm teeth, commit**
+- [x] **Step 2: Implement, confirm teeth, commit**
 
 Mutations: a flag refusing when the cluster is whole; the expected size
 ignored; one flag refusing all three operations.
@@ -193,9 +193,17 @@ Milestone five's exit criterion, against the real binary through the gate.
 The fourth is the one with the most ways to look right. Assert which side
 won by the rule, not by which node you happened to ask.
 
-- [ ] **Step 1: Write it, run it several times, commit**
+- [x] **Step 1: Write it, run it several times, commit**
 
 Say how many times, and check free space first.
+
+Fifteen runs of the file, no failures, with 84 GiB free before and after.
+
+**The fourth item needed code, not just a test.** `sdmqtt::replication`
+said in as many words that a session owner was "a register with nothing
+acting on it", so two nodes that had both accepted one client identifier
+went on serving it after the heal. The commit below carries that effect,
+which is why its message is not the `test:` one this step suggested.
 
 ```bash
 git commit -m "test: a session migrates and a cluster converges"

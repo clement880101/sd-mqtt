@@ -47,7 +47,9 @@ use std::time::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
 use cluster::testing::gate::Gate;
 use cluster::testing::Direction;
-use mqtt_codec::packet::{Ack, Connect, Publish, RetainHandling, Subscribe, SubscriptionOptions};
+use mqtt_codec::packet::{
+    Ack, ConnAck, Connect, Publish, RetainHandling, Subscribe, SubscriptionOptions,
+};
 use mqtt_codec::{decode, encode, Limits, Packet, Properties, QoS, ReasonCode, Version};
 
 /// How long to wait for a freshly started broker to accept.
@@ -237,6 +239,23 @@ impl Node {
             .collect()
     }
 
+    /// Which sessions this node holds, by client identifier.
+    ///
+    /// Connected or not: what a migration moves is the session, and a
+    /// listing that showed only connected ones could not tell a
+    /// session that left from a client that went away.
+    fn sessions(&self) -> BTreeSet<String> {
+        let body = self.get("/api/v1/sessions?limit=100");
+        let document: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or_else(|why| panic!("{body:?} is not JSON: {why}"));
+        document["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no items in {document}"))
+            .iter()
+            .map(|item| item["client_id"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
     /// Create a rule through the admin API.
     fn create_rule(&self, id: &str) {
         let body = format!(
@@ -402,9 +421,54 @@ struct Client {
     pending: Vec<(String, String)>,
 }
 
+/// How long a session outlives its connection, for the tests that need
+/// it to.
+///
+/// Comfortably longer than any of them takes. A session that expired
+/// mid-test would look exactly like one that failed to migrate.
+const SESSION_EXPIRY: u32 = 300;
+
+/// How a connection ended, as the client saw it.
+///
+/// Three outcomes rather than two, because section 8.5 promises a
+/// *reason* and a socket that simply ends is the failure that promise
+/// is about. Collapsing [`Ending::Silent`] into a missing reason would
+/// make a test that cannot tell the two apart.
+#[derive(Debug, PartialEq, Eq)]
+enum Ending {
+    /// The broker said why, which is what MQTT 5's DISCONNECT is for.
+    Said(ReasonCode),
+    /// The socket ended with nothing said.
+    Silent,
+    /// Nothing happened in the time allowed.
+    StillOpen,
+}
+
 impl Client {
-    /// Connect to `address` with a session that outlives its connection.
+    /// Connect to `address` with a session that goes when it does.
     fn connect(address: SocketAddr, client_id: &str) -> Self {
+        Self::opened(address, client_id, true, 0).0
+    }
+
+    /// Connect asking to resume, with a session that survives the
+    /// connection going away.
+    ///
+    /// Returns whether the broker said it already had the session,
+    /// which is the thing a migration is: `true` is a session that was
+    /// found — here or, through section 8.4, on whichever node held it
+    /// — and `false` is one that has just been made.
+    fn resuming(address: SocketAddr, client_id: &str) -> (Self, bool) {
+        let (client, ack) = Self::opened(address, client_id, false, SESSION_EXPIRY);
+        (client, ack.session_present)
+    }
+
+    /// The connect both of the above are, and its acknowledgement.
+    fn opened(
+        address: SocketAddr,
+        client_id: &str,
+        clean_start: bool,
+        expiry: u32,
+    ) -> (Self, ConnAck) {
         let stream = TcpStream::connect_timeout(&address, REPLY).expect("the broker accepts");
         stream.set_nodelay(true).expect("nodelay");
         stream
@@ -419,23 +483,46 @@ impl Client {
         client.send(&Packet::Connect(Box::new(Connect {
             version: Version::V5,
             client_id: client_id.to_owned(),
-            clean_start: true,
+            clean_start,
             keep_alive: 0,
             username: None,
             password: None,
             will: None,
             properties: Properties {
-                session_expiry_interval: Some(0),
+                session_expiry_interval: Some(expiry),
                 ..Properties::default()
             },
         })));
         match client.next() {
             Some(Packet::ConnAck(ack)) => {
                 assert_eq!(ack.reason, ReasonCode::Success, "{client_id} was refused");
+                (client, ack)
             }
             other => panic!("expected a connect acknowledgement, got {other:?}"),
         }
-        client
+    }
+
+    /// Wait up to `patience` for the broker to end this connection, and
+    /// say how it ended.
+    ///
+    /// Whatever arrives before the ending is acknowledged and dropped:
+    /// a queued delivery is not what is being waited for, and leaving
+    /// it unread would stall the connection being closed.
+    fn closed_within(&mut self, patience: Duration) -> Ending {
+        self.stream
+            .set_read_timeout(Some(patience))
+            .expect("a read deadline");
+        let deadline = Instant::now() + patience;
+        while Instant::now() < deadline {
+            match self.next() {
+                Some(Packet::Disconnect(said)) => return Ending::Said(said.reason),
+                Some(packet) => {
+                    let _ = self.take(packet);
+                }
+                None => return Ending::Silent,
+            }
+        }
+        Ending::StillOpen
     }
 
     /// Subscribe at least once, and wait for the grant.
@@ -1463,4 +1550,225 @@ async fn three_nodes_deliver_across_the_cluster() {
             "the gate {pair:?} reconnected during the test"
         );
     }
+}
+
+/// A session moves to the node its client comes back to, and brings
+/// what it was holding.
+///
+/// Section 8.4 end to end, against three processes: the subscription
+/// is taken on one node, the message is published on a second while
+/// the client is away, and the client reconnects to a third. Every
+/// piece of that has been proved in isolation — the claim, the drain,
+/// the chunking, the forwarding — and this is the one that proves they
+/// were wired to each other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_moves_to_the_node_its_client_returns_to() {
+    /// What the roaming client subscribes to.
+    const FILTER: &str = "fleet/+/telemetry";
+    /// And the topic published under it.
+    const TOPIC: &str = "fleet/0007/telemetry";
+    /// The message published while nobody is connected.
+    const WHILE_AWAY: &str = "queued-while-away";
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cluster = Cluster::start(directory.path()).await;
+    cluster.settle();
+    let nodes = &cluster.nodes;
+
+    // ---- the session is made on alpha, and left there --------------
+    let (mut rover, present) = Client::resuming(nodes[0].mqtt, "rover");
+    assert!(
+        !present,
+        "a session nothing has ever held is not resumed, and a broker that said \
+         otherwise would make every assertion below meaningless"
+    );
+    rover.subscribe(FILTER);
+    assert!(
+        nodes[0].sessions().contains("rover"),
+        "alpha holds the session it just made"
+    );
+    // The socket goes and the session stays: `SESSION_EXPIRY` is what
+    // makes this a session that outlives its connection rather than a
+    // client that has finished.
+    drop(rover);
+
+    // ---- beta publishes to it while it is nowhere --------------
+    //
+    // Waited for rather than slept on: the register that says alpha has
+    // a subscriber for the filter is a broadcast, and a publication made
+    // before it lands reaches nobody. `publish_reaching` is what asks.
+    // Every attempt before the last reached no node and so queued
+    // nothing, which is what makes the single delivery below the one
+    // this published.
+    until(
+        "beta learns that somebody in the cluster wants the filter",
+        || nodes[1].publish_reaching(TOPIC, WHILE_AWAY) > 0,
+    );
+
+    // ---- and the client comes back to gamma --------------
+    let (mut rover, present) = Client::resuming(nodes[2].mqtt, "rover");
+    assert!(
+        present,
+        "the session was found, which is section 8.4: gamma claimed it and drained \
+         it from alpha rather than making a new one"
+    );
+    assert_eq!(
+        rover.delivered_within(PATIENCE),
+        Some((TOPIC.to_owned(), WHILE_AWAY.to_owned())),
+        "what was queued on alpha was delivered on gamma"
+    );
+
+    // The session is on gamma and **not on alpha**, which is the half
+    // of a handover that a drain alone does not prove: a node that kept
+    // its copy would go on being forwarded messages for those filters
+    // and would deliver them all again next time the client came back.
+    until("alpha has let the session go", || {
+        !nodes[0].sessions().contains("rover")
+    });
+    assert!(
+        nodes[2].sessions().contains("rover"),
+        "and gamma has it: {:?}",
+        nodes[2].sessions()
+    );
+
+    // ---- and the subscription moved with it --------------
+    //
+    // Published until one arrives, because a migration moves two
+    // registers independently — gamma gains a subscriber for the filter
+    // and alpha loses one — and a publication made between the two is
+    // forwarded only to the node that no longer holds the session.
+    // Numbered, so the delivery says which attempt reached it rather
+    // than being anonymous.
+    let mut attempt = 0;
+    let delivered = loop {
+        attempt += 1;
+        assert!(
+            attempt <= 50,
+            "no publication made after the move ever reached the session"
+        );
+        nodes[1].publish_reaching(TOPIC, &format!("after-the-move-{attempt}"));
+        if let Some(delivery) = rover.delivered_within(Duration::from_millis(200)) {
+            break delivery;
+        }
+    };
+    assert_eq!(delivered.0, TOPIC);
+    assert!(
+        delivered.1.starts_with("after-the-move-"),
+        "the delivery should be one of the publications made after the move, not \
+         the one from before it: {delivered:?}"
+    );
+}
+
+/// Two nodes accept the same client identifier while they cannot see
+/// each other, and the heal resolves it.
+///
+/// Section 8.5. Both connects are accepted, because the default is
+/// availability and a node that refused them would turn one node's
+/// network fault into every client's outage. On heal the registers
+/// merge, one claim wins, and **the loser's connection is closed with
+/// "session taken over"** rather than being left as a second live
+/// connection to one session.
+///
+/// # Which side wins is the rule's answer, not this test's
+///
+/// Both nodes read the same epoch and both wrote the same one, which
+/// section 8.5 calls the expected outcome rather than the rare one. An
+/// equal epoch breaks on the clock reading, so **the later claim wins**
+/// — and that is what is asserted: the connection made first is the one
+/// closed. The two are made [`APART`] so the tie cannot fall through to
+/// the node UUID, which is a different rule and not this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_nodes_that_accepted_one_client_resolve_on_heal() {
+    /// Long enough that two claims cannot share a clock reading.
+    const APART: Duration = Duration::from_millis(250);
+    /// What the surviving client uses to prove it is still serving.
+    const AFTERWARDS: &str = "twin/0009/afterwards";
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cluster = Cluster::start(directory.path()).await;
+    cluster.settle();
+    let nodes = &cluster.nodes;
+
+    // ---- gamma is severed, in both directions --------------
+    //
+    // Both, for the reason the convergence test gives: each half has to
+    // take a claim of its own and neither may see the other's.
+    for other in 0..NODES - 1 {
+        cluster.gates[&(other, NODES - 1)].cut(Direction::Forward);
+        cluster.gates[&(other, NODES - 1)].cut(Direction::Backward);
+        cluster.gates[&(NODES - 1, other)].cut(Direction::Forward);
+        cluster.gates[&(NODES - 1, other)].cut(Direction::Backward);
+    }
+    let gamma = nodes[2].identity();
+    let alpha = nodes[0].identity();
+    until("the other two declare gamma dead", || {
+        nodes[0].how(&gamma).as_deref() == Some("down")
+            && nodes[1].how(&gamma).as_deref() == Some("down")
+    });
+    // **And gamma declares them dead**, which is not the same moment
+    // and is the half that matters here: gamma is about to accept a
+    // claim for a session it must not be able to ask anybody about.
+    until("gamma declares the other two dead", || {
+        nodes[2].how(&alpha).as_deref() == Some("down")
+    });
+
+    // ---- both sides accept the same client --------------
+    let (mut first, _) = Client::resuming(nodes[0].mqtt, "twin");
+    first.subscribe("twin/+/first");
+    std::thread::sleep(APART);
+    let (mut second, _) = Client::resuming(nodes[2].mqtt, "twin");
+    second.subscribe("twin/+/second");
+
+    // The split is real while it lasts, which is what makes the
+    // resolution below something that had to happen rather than
+    // something that was already true.
+    assert!(
+        nodes[0].sessions().contains("twin"),
+        "alpha accepted the client it could serve"
+    );
+    assert!(
+        nodes[2].sessions().contains("twin"),
+        "and so did gamma, which is section 8.5's availability and not a defect"
+    );
+
+    // ---- and it heals --------------
+    for other in 0..NODES - 1 {
+        cluster.gates[&(other, NODES - 1)].heal(Direction::Forward);
+        cluster.gates[&(other, NODES - 1)].heal(Direction::Backward);
+        cluster.gates[&(NODES - 1, other)].heal(Direction::Forward);
+        cluster.gates[&(NODES - 1, other)].heal(Direction::Backward);
+    }
+
+    // The earlier claim loses, and is **told why**. A socket that
+    // simply ended would leave a client to guess, which is the whole
+    // difference section 8.5 is about; `Ending` can tell the two apart.
+    assert_eq!(
+        first.closed_within(PATIENCE),
+        Ending::Said(ReasonCode::SessionTakenOver),
+        "the connection whose claim was earlier is the one closed, and it is closed \
+         with the reason section 8.5 names"
+    );
+    until("alpha has let the session go", || {
+        !nodes[0].sessions().contains("twin")
+    });
+
+    // And the winner is still serving, asserted by using it rather
+    // than by waiting for nothing to happen. Published and subscribed
+    // on gamma, so this is about the connection and the session rather
+    // than about a register reaching another node.
+    second.subscribe(AFTERWARDS);
+    assert_eq!(
+        second.publish(AFTERWARDS, "still-here"),
+        ReasonCode::Success,
+        "the surviving connection still publishes"
+    );
+    assert_eq!(
+        second.delivered_within(PATIENCE),
+        Some((AFTERWARDS.to_owned(), "still-here".to_owned())),
+        "and its session still holds subscriptions"
+    );
+    assert!(
+        nodes[2].sessions().contains("twin"),
+        "gamma kept the session it won"
+    );
 }
