@@ -705,6 +705,32 @@ coordination, and moves only the sessions that must move when membership
 changes. With fewer than R live members the set is as large as membership
 allows, and is repaired when members return.
 
+**Placement is advisory. The register decides who owns a session.** Section
+8.2 makes membership deliberately local judgement, so two nodes on either
+side of a partition compute different live sets and therefore different
+replica sets. If placement decided ownership, that disagreement would be a
+split brain by construction. It does not: rendezvous says who *should* own a
+session and who its followers should be, and section 8.4's epoch-stamped
+register says who *does*. A node streaming to a follower that does not
+believe it is one is harmless — the follower applies the operations — and
+two nodes that both think they should own a session resolve the way section
+8.5 already makes them resolve.
+
+**The weight is a hash this project specifies, not one a dependency
+happens to compute.** Every node must compute the same weights or they
+place replicas differently, and that has to survive a rolling upgrade as
+well as a restart, so it cannot rest on a hash whose value a crate is free
+to change between versions. It is SHA-256, from the crate already linked for
+the handshake, over a defined byte string, truncated to 64 bits and combined
+by a defined mixer — pinned by golden vectors derived from the standard
+rather than captured from this implementation.
+
+The mixer is what makes it affordable. True rendezvous hashes each
+session-and-node pair, which at the design's ceilings is a hundred thousand
+sessions times fifty nodes on every membership change. Each node's digest is
+computed once and each session's digest once, and the weight is a mix of the
+two, so a membership change costs one digest per session rather than fifty.
+
 **Streaming.** The owner sends each queue operation, as an append, an
 acknowledgement or a removal, to its followers over the existing node link,
 tagged with the session sequence number. Followers apply operations in order
@@ -724,6 +750,17 @@ reference counted on the follower exactly as on the owner.
 The code path is the same in both modes. Synchronous mode awaits the
 confirmation that asynchronous mode ignores.
 
+**With no reachable follower, a synchronous publish is acknowledged anyway
+and the unconfirmed acknowledgement is counted.** A single-node cluster, a
+replication factor of one, and every follower down all reach this, and the
+alternative turns the loss of one node into a full outage for durable
+publishes — which is the trade section 8.5 already decided the other way for
+connects, publishes and subscribes. It is counted and surfaced rather than
+silent, so an operator can see that sync mode is not currently giving what
+it promises, and a strict flag is available for a deployment that would
+rather be refused: the same shape as section 8.5's flags, and refused at
+startup in the same way when it cannot be evaluated.
+
 **Failover.** When a session's owner is declared dead, or a client
 reconnects elsewhere, the new owner asks every reachable member of the
 replica set for its high-water mark, pulls from the most advanced one,
@@ -732,10 +769,33 @@ Ownership is recorded in the same epoch-stamped register that governs
 takeover, so a stale owner returning from a partition loses and discards its
 copy.
 
+**This backs section 8.4's drain rather than replacing it.** A client
+reconnecting elsewhere still claims the session and still asks the previous
+owner to drain it, because the previous owner holds the authoritative queue
+and reaching it is both the fastest and the most complete answer. The
+replica pull is what happens when that drain times out or the previous owner
+cannot be reached — the two cases 8.4 accepts the connection on and counts a
+shortfall for. That is the sentence in 8.4 about milestone 6 shrinking the
+loss to nothing, made concrete: the shortfall becomes a pull from the most
+advanced replica, and only what no replica held is lost.
+
 **Re-replication.** When a member leaves permanently, the replica sets that
 included it are short. Repair is rate limited and runs in the background so
 that losing one node does not saturate the cluster, and its progress is
 visible in the UI.
+
+**Permanently means a configured grace, with an operator override**, because
+nothing else could mean it: a node that is down is a node that may be
+restarting, and a cluster that re-replicated the moment a peer missed a
+heartbeat would copy its whole queue estate every time somebody applied a
+patch. So a member down for longer than the grace is treated as gone and its
+sets are repaired, with a generous default. An operator who knows a node is
+never coming back removes it and repair starts at once; an operator doing
+long maintenance raises the grace and it does not start at all. Removal is
+also the first thing in this design that can take a node *out* of
+membership, which until now could only ever grow: a peer that has been met
+is remembered as `down` for ever, which is the same blind spot section 8.5's
+expected size exists to work around.
 
 **Cost.** With the default replication factor, each node holds roughly twice
 the durable queue data it would otherwise, and durable queue writes generate
