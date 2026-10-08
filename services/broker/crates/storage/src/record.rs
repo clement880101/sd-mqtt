@@ -73,7 +73,51 @@ use serde::{Deserialize, Serialize};
 /// opened by this build would come up with every rule's outbox empty,
 /// which is not an empty outbox but an undelivered message nobody will
 /// ever look for again.
-pub const FORMAT_VERSION: u16 = 4;
+///
+/// Version 5 added the node's own identity, section 8.1: one variant at
+/// the end of [`Record`], a [`NodeIdentityRecord`] to go in it, and one
+/// global row in each backend. The same argument again, and the sharpest
+/// instance of it yet — **a version 4 store opened by this build holds
+/// no identity, so this node would mint a new UUID and stop being the
+/// node its peers already know.** Section 8.1 makes that identity the
+/// thing singleton ownership and every conflict tie-break order by, so a
+/// silent re-founding is not a node that lost a name; it is two answers
+/// to "which node" separated by a restart.
+///
+/// Version 6 added the hybrid logical clock's high-water mark, section
+/// 8.2: one variant at the end of [`Record`], a [`ClockRecord`] to go
+/// in it, and one global row in each backend. The same argument again,
+/// and it is the sharpest instance yet for the same reason version 5
+/// was — **a version 5 store opened by this build holds no reading, so
+/// this node's clock would resume from zero and re-issue stamps it has
+/// already used.** Section 8.2 makes convergence conditional on no two
+/// writes ever sharing a stamp, so a clock that restarts behind itself
+/// is not a node that lost some counter; it is two values under one key
+/// that no later exchange can ever separate.
+///
+/// Version 7 added the replicated registers themselves, section 8.2:
+/// one variant at the end of [`Record`], a [`MetadataRecord`] to go in
+/// it with the key, stamp and value types it is made of, and one table
+/// in each backend. The same argument as every version above, and the
+/// failure a version 6 store would produce is the quietest of the lot
+/// — **a node would come up holding no registers at all and looking
+/// perfectly healthy**, routing nothing to any peer, serving no
+/// replicated rule, and claiming no session it owned. Worse, it would
+/// then re-create what it had locally under fresh stamps, which beat
+/// the tombstones every other node still holds: a restart that
+/// resurrects everything this node ever deleted.
+///
+/// Version 8 added the session epoch to
+/// [`MetadataValueRecord::SessionOwner`], section 8.4. **This is the
+/// first version that changes the shape of something already stored**
+/// rather than adding a variant at the end, and that is exactly why it
+/// moves the version: a version 7 session-owner register is sixteen
+/// bytes where this build expects sixteen and a varint, so a reader
+/// would run off the end of one record and into the next. The epoch has
+/// to be in the value because section 8.4 makes the claiming node write
+/// "the epoch it read plus one", and an epoch the register does not
+/// carry is one no node can read.
+pub const FORMAT_VERSION: u16 = 8;
 
 /// What every sd-mqtt store begins with, so a file that is not one is
 /// refused as such rather than as a corrupt store.
@@ -781,6 +825,303 @@ pub struct OutboxRecord {
     pub next_attempt_at: u32,
 }
 
+/// Who this node is, section 8.1.
+///
+/// Minted on first start and read back unchanged for the life of the
+/// store. There is one of these per store, not one per anything else:
+/// it names the process's whole identity in the cluster.
+///
+/// # The UUID is stored as its bytes, and the name beside it
+///
+/// **[`Self::uuid`] is the identity everything orders by** and
+/// [`Self::name`] is for operators and is never compared. Section 8.1
+/// gives the reason in one sentence: two copied configurations share a
+/// name, and a comparison that is not antisymmetric leaves both sides
+/// believing they won.
+///
+/// The sixteen bytes rather than the canonical text, because the text
+/// is a rendering of them and storing a rendering invites a reader that
+/// parses it differently. The bytes are in the order the specification
+/// lays a UUID out, which is what `Uuid::as_bytes` gives and what
+/// `Uuid::from_bytes` takes back, so the ordering the cluster relies on
+/// is the ordering of these bytes.
+///
+/// An operator may rename a node; the UUID does not move when they do.
+/// That is the whole reason the two are separate fields rather than one
+/// string: a rename must not re-found the node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeIdentityRecord {
+    /// The UUID v7 that names this node, as its sixteen bytes.
+    pub uuid: [u8; 16],
+    /// What an operator calls it. Never compared.
+    pub name: String,
+}
+
+/// The highest hybrid logical clock reading this node has ever issued.
+///
+/// Section 8.2: **a node resumes its clock from the highest reading it
+/// has ever written, read back from the store, not from zero.** A clock
+/// that restarts behind itself re-issues a stamp it has already used,
+/// and two writes under one key carrying one stamp is the single thing
+/// convergence cannot repair: each side keeps its own and re-gossiping
+/// changes nothing, because each believes it already holds the winner.
+///
+/// One of these per store, like [`NodeIdentityRecord`] and for the same
+/// reason: it is a fact about this node rather than about anything in
+/// the store.
+///
+/// # The store holds it and does not police it
+///
+/// A put replaces the row with whatever it carries, including a lower
+/// reading. That is the same decision [`Record::NodeIdentityPut`]
+/// records at length: only the caller knows whether a reading is this
+/// node's own next one or a peer's, and a store with an opinion about
+/// it would be a second answer in the layer that cannot see the
+/// question. `cluster::HybridClock` is the one place that decides, and
+/// it only ever moves forwards.
+///
+/// # Both halves, because milliseconds alone are not a reading
+///
+/// The counter is what makes two writes inside one millisecond
+/// distinguishable, so a resume that recovered [`Self::millis`] and
+/// dropped [`Self::counter`] would be a clock resuming behind itself by
+/// up to a millisecond's worth of writes. Section 8.2 again: dropping
+/// the counter makes one node ambiguous with itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClockRecord {
+    /// The physical half: milliseconds since the Unix epoch.
+    pub millis: u64,
+    /// The logical half: how many readings this build has issued inside
+    /// [`Self::millis`] already.
+    pub counter: u32,
+}
+
+/// What orders one replicated write against another, section 8.2.
+///
+/// A clock reading and the node that wrote it. **The comparison is the
+/// milliseconds, then the counter, then the sixteen UUID bytes**, and it
+/// lives in `cluster::register` rather than here: this crate holds the
+/// bytes and does not resolve conflicts. The field order below is that
+/// order all the same, so a hex dump reads in the order a comparison
+/// does.
+///
+/// The node is its sixteen bytes rather than its canonical text, for the
+/// reason [`NodeIdentityRecord::uuid`] gives: the text is a rendering of
+/// the bytes, and storing a rendering invites a reader that parses it
+/// differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StampRecord {
+    /// The reading's physical half.
+    pub millis: u64,
+    /// The reading's logical half.
+    pub counter: u32,
+    /// Who wrote it.
+    pub node: [u8; 16],
+}
+
+/// What a replicated register is about, section 8.2.
+///
+/// # An open vocabulary, deliberately
+///
+/// Section 8.2 lists seven kinds of replicated metadata and three of
+/// them — users, access control rules, API keys — do not exist until
+/// milestone 7 brings authentication. They are a variant here and a
+/// variant of [`MetadataValueRecord`], and nothing else: no table, no
+/// exchange, no merge rule. That is what "written to carry a kind they
+/// do not yet know" means in practice.
+///
+/// **Variant order is the format**, as it is for [`Record`]: a new kind
+/// goes at the end or [`FORMAT_VERSION`] moves. It is also the order a
+/// restore hands these back in, and the redb backend's key encoding
+/// puts the variant index in the leading byte precisely so that the two
+/// backends agree on it.
+///
+/// # A subscription names a node and a filter, and not a client
+///
+/// Section 8.2: **subscriptions are replicated at node granularity.** A
+/// register per client subscription would be fifty nodes holding a
+/// hundred thousand each at the design ceiling, against a thirty
+/// megabyte idle budget. What is replicated is that a node has at least
+/// one subscriber for a filter, which is what routing needs; which of
+/// its clients that is never leaves the node, so there is nothing here
+/// to hold it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum MetadataKeyRecord {
+    /// That a node has at least one subscriber for a filter.
+    NodeSubscription {
+        /// Whose subscriber. Its sixteen UUID bytes.
+        node: [u8; 16],
+        /// Which filter.
+        filter: String,
+    },
+    /// The retained message on a topic.
+    Retained {
+        /// Which topic.
+        topic: String,
+    },
+    /// A rule, section 9.1, which stops being node-local here.
+    Rule {
+        /// Which rule.
+        id: String,
+    },
+    /// Which node owns a session, section 8.4.
+    SessionOwner {
+        /// Whose session.
+        session: SessionKey,
+    },
+    /// That a node has at least one member of a shared group.
+    ///
+    /// **Separate from [`Self::NodeSubscription`], and section 8.3 says
+    /// why.** A group spanning three nodes has a matching subscriber on
+    /// each, so a routing map built from node subscriptions says all
+    /// three want the topic and one copy to each delivers three times
+    /// where the semantics demand one. A group needs its own map and a
+    /// selection *before* forwarding, and a map needs a register of its
+    /// own to be built from: the group's name is what a node subscription
+    /// deliberately does not carry.
+    ///
+    /// **Last of the variants, which is what keeps the format.** The
+    /// variant order is the format, as the type documentation says, and
+    /// a new kind goes at the end or [`FORMAT_VERSION`] moves. This is
+    /// the end.
+    NodeGroup {
+        /// Whose member. Its sixteen UUID bytes.
+        node: [u8; 16],
+        /// The share name, which is what makes two groups on one filter
+        /// two groups.
+        group: String,
+        /// The inner filter, with the `$share/<name>/` prefix stripped,
+        /// because that is what a published topic is matched against.
+        filter: String,
+    },
+}
+
+/// What a replicated register holds, section 8.2.
+///
+/// One variant per [`MetadataKeyRecord`] variant, in the same order. A
+/// stored register whose key and value name different kinds is refused
+/// when it is read back, by the crate that knows what the pairs mean.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataValueRecord {
+    /// Presence, and nothing else.
+    ///
+    /// A unit variant because the key carries the node and the filter,
+    /// which is the whole fact. Anything here would be something about
+    /// that node's own clients, and that is the part which does not fit
+    /// in the budget.
+    NodeSubscription,
+    /// What is retained on the topic the key names.
+    Retained(RetainedRecord),
+    /// The rule the key names, whole.
+    ///
+    /// Boxed, which changes nothing on disk — serde writes a `Box<T>`
+    /// exactly as it writes a `T`, and the golden vectors pin that — and
+    /// keeps this variant from being three hundred bytes while the
+    /// smallest is sixteen. The same reason `rules::rule::Action` boxes
+    /// its bridge.
+    Rule(Box<RuleRecord>),
+    /// Which node owns the session the key names, and at what epoch.
+    SessionOwner {
+        /// Its sixteen UUID bytes.
+        node: [u8; 16],
+        /// How many times the session has been claimed, section 8.4.
+        ///
+        /// **Carried, and not compared.** Section 8.5 is explicit that
+        /// equal epochs are the expected outcome of a partition rather
+        /// than the rare one — two nodes on opposite sides both read
+        /// the same epoch and both increment to the same number — so
+        /// what resolves two claims is the register's own stamp, like
+        /// every other kind. This is here so that the *next* claim has
+        /// something to be one more than.
+        epoch: u64,
+    },
+    /// Presence, and nothing else.
+    ///
+    /// A unit variant for [`MetadataKeyRecord::NodeGroup`]'s reason:
+    /// the key carries the node, the group and the filter, which is the
+    /// whole fact. How many of that node's clients are in the group is
+    /// the part section 8.2 keeps on the node, as it does for a node
+    /// subscription.
+    NodeGroup,
+}
+
+/// One replicated register, as a store holds it.
+///
+/// # An absent value is a tombstone, and that is the whole of deletion
+///
+/// Section 8.2: **a tombstone is a value competing by the same
+/// comparison, not a special case.** So there is no `MetadataRemoved`
+/// record beside this one: a deletion is one of these with
+/// [`Self::value`] absent, and it is stored, because a node that simply
+/// dropped the row would be handed its own older copy by the next peer
+/// it spoke to and would resurrect what it deleted. Collecting
+/// tombstones behind a cluster-wide watermark is a later task, and it is
+/// the only thing that ever removes one of these.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataRecord {
+    /// What the register is about.
+    pub key: MetadataKeyRecord,
+    /// What orders it against another copy.
+    pub stamp: StampRecord,
+    /// What is held, or `None` for a tombstone.
+    pub value: Option<MetadataValueRecord>,
+}
+
+/// One entry in a node's own operation log, section 8.2.
+///
+/// A sequence number and the register the node wrote at it. The log is
+/// **gapless in the sequence**, which is what makes "everything after
+/// sequence N from node X" a question with an answer, and it is the
+/// claim the anti-entropy digest makes: a record's most recent writer
+/// changes whenever another node overwrites it, so the question cannot
+/// be answered by looking at the registers.
+///
+/// # The whole register, not a reference to one
+///
+/// [`Self::entry`] duplicates what a [`MetadataPut`] in the same batch
+/// stored, and the alternative — a log of keys, read back through the
+/// register table — was rejected. A key's register is replaced by
+/// whatever wins later, including by a tombstone another node's
+/// collection has since removed, so a log of keys has entries that
+/// resolve to nothing and a peer asking for them gets silence where the
+/// log promised an answer. Holding the write makes an entry
+/// self-contained, and the duplication is bounded by the truncation the
+/// log's own watermark drives.
+///
+/// [`MetadataPut`]: Record::MetadataPut
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggedRecord {
+    /// Where in this node's log it sits. Counted from one.
+    pub sequence: u64,
+    /// What was written.
+    pub entry: MetadataRecord,
+}
+
+/// How far this node has read one other node's operation log, section
+/// 8.2.
+///
+/// **Durable, and that is not an optimisation.** A node that came back
+/// claiming to have seen nothing would be served every peer's log from
+/// the beginning — and a peer whose log has been truncated behind its
+/// watermark cannot serve that, because the entries are gone. Worse, the
+/// claim drags every peer's watermark to nothing, so no node in the
+/// cluster could truncate a log or collect a tombstone until it caught
+/// up. So what a node has seen is written down beside the registers it
+/// saw, in the same batch, and a restart resumes from it.
+///
+/// [`Self::through`] is the **highest contiguous** sequence, not the
+/// highest seen: a broadcast that was dropped leaves a gap, and a node
+/// that counted past it would never be sent the entry it is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeenRecord {
+    /// Whose log. Its sixteen UUID bytes.
+    pub node: [u8; 16],
+    /// The highest sequence of that node's log this node holds, with
+    /// nothing missing below it. Zero is a node nothing has been read
+    /// from.
+    pub through: u64,
+}
+
 /// A message held for future subscribers to a topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedRecord {
@@ -963,6 +1304,122 @@ pub enum Record {
         /// Which envelope.
         sequence: u64,
     },
+    /// Who this node is, section 8.1.
+    ///
+    /// One record for minting and for renaming, as [`Record::RulePut`]
+    /// is one record for creating and for editing: the identity is
+    /// whatever the last put said it was.
+    ///
+    /// **The store does not decide when one of these is written.** It
+    /// holds what it is given, and the caller is the one place that
+    /// knows an identity already exists and must not be replaced with a
+    /// fresh one; see `cluster::NodeIdentity`. A store that refused a
+    /// put whose UUID differed would be a second opinion about the same
+    /// rule, in the layer that cannot see why the caller is asking.
+    NodeIdentityPut {
+        /// Who this node is.
+        identity: NodeIdentityRecord,
+    },
+    /// The highest clock reading this node has issued, section 8.2.
+    ///
+    /// Written **in the same batch as the write it stamps**, which is
+    /// what makes the resume safe rather than nearly safe: a batch is
+    /// all or nothing, so a stamp that survived a crash has its mark
+    /// beside it, and a stamp that did not was never shown to anybody.
+    /// A mark written in a batch of its own could be lost while the
+    /// write it covers survived, which is a clock resuming behind
+    /// itself with no sign that anything went wrong.
+    ///
+    /// Replaced whole, and the store does not decide whether the
+    /// reading moved forwards; see [`ClockRecord`].
+    ClockHighWaterPut {
+        /// The reading.
+        reading: ClockRecord,
+    },
+    /// One replicated register, section 8.2.
+    ///
+    /// **Replaced whole, and the store does not merge.** Which of two
+    /// copies wins is `cluster::register`'s one comparison, and a store
+    /// with an opinion about it would be a second answer in the layer
+    /// that cannot see the question — the same decision
+    /// [`Record::NodeIdentityPut`] and [`ClockRecord`] record at
+    /// length. A caller stores what it has already decided to keep.
+    ///
+    /// A deletion is one of these carrying no value. There is no
+    /// removal record, for the reason [`MetadataRecord`] gives.
+    MetadataPut {
+        /// The register, and what it is about.
+        entry: MetadataRecord,
+    },
+    /// One replicated register is gone, section 8.2.
+    ///
+    /// **The only thing that ever removes one**, and it is tombstone
+    /// collection rather than a deletion: a deletion is a
+    /// [`Record::MetadataPut`] carrying no value, and it is *stored*,
+    /// because a node that dropped the row would be handed its own older
+    /// copy by the next peer it spoke to and would resurrect what it
+    /// deleted. This is what happens afterwards, once every node has
+    /// seen the tombstone and the grace period has passed, and the
+    /// caller is the only thing that can know both of those.
+    ///
+    /// Removing a key the store does not hold is a no-op rather than a
+    /// refusal. A sweep that ran twice, or on a node that had already
+    /// collected the same tombstone through a restart, is not a
+    /// caller's mistake.
+    MetadataRemoved {
+        /// Which register.
+        key: MetadataKeyRecord,
+    },
+    /// How far this node has read one other node's log, section 8.2.
+    ///
+    /// Written in the **same batch as the registers it covers**, for the
+    /// reason [`Record::ClockHighWaterPut`] is: a batch is all or
+    /// nothing, so a node that survived a crash claiming to have read a
+    /// peer's log through sequence N holds everything up to N, and one
+    /// that claimed it without the registers beside it would never be
+    /// sent them again.
+    ///
+    /// Replaced whole, and the store does not decide whether the number
+    /// moved forwards. See [`SeenRecord`].
+    MetadataSeenPut {
+        /// Whose log, and how far.
+        seen: SeenRecord,
+    },
+    /// One entry in this node's own operation log, section 8.2.
+    ///
+    /// Written in the same batch as the [`Record::MetadataPut`] it
+    /// duplicates, so that a node cannot come back holding a register
+    /// its log does not mention — which is a register no exchange would
+    /// ever repair, because the exchange serves the origin's log and the
+    /// origin would have forgotten.
+    ///
+    /// # Refused when the sequence is spent
+    ///
+    /// Section 7.4's rule, one table across: two entries sharing a
+    /// number, or a number going backwards, is what must never happen,
+    /// and the store holds the highest sequence ever appended precisely
+    /// so it can say no. A log that restarted from one would hand a peer
+    /// one node's second write where the peer was told to expect its
+    /// first, which is the same defect as a clock resuming from zero.
+    OpLogAppended {
+        /// The entry, with the sequence it claims.
+        entry: LoggedRecord,
+    },
+    /// This node's own log is collected up to and including `through`.
+    ///
+    /// Section 8.2's second watermark, the one distinct from the
+    /// tombstone one: a node truncates its own log behind what every
+    /// other node has read of it, because nothing will ever ask for an
+    /// entry every node already holds.
+    ///
+    /// **The highest sequence ever appended is not touched**, so a
+    /// restart after a truncation that emptied the log still knows which
+    /// number comes next. Truncating past the end, or twice, is a no-op
+    /// rather than a refusal.
+    OpLogTruncated {
+        /// The last sequence to remove.
+        through: u64,
+    },
 }
 
 impl Record {
@@ -1089,8 +1546,68 @@ impl Record {
             // carries it and is weighed on its own.
             Self::OutboxAppended { rule, entry } => rule.len() + entry.client_id.len(),
             Self::OutboxAttempted { rule, .. } | Self::OutboxRemoved { rule, .. } => rule.len(),
+            // An operator's string, and the only variable thing here:
+            // the UUID is sixteen bytes counted by the record's own
+            // footprint.
+            Self::NodeIdentityPut { identity } => identity.name.len(),
+            // Two integers, both inside the record's own footprint.
+            Self::ClockHighWaterPut { .. } => 0,
+            // A peer controls the size of a filter and a topic, an
+            // operator the size of a rule, and a client the size of a
+            // session key. The stamp is two integers and sixteen bytes,
+            // all inside the record's own footprint.
+            Self::MetadataPut { entry } => weigh_metadata(entry),
+            // The key alone: a removal carries no value, because what it
+            // removes is a tombstone and a tombstone has none.
+            Self::MetadataRemoved { key } => weigh_metadata_key(key),
+            // Sixteen bytes and an integer, both inside the record's own
+            // footprint.
+            Self::MetadataSeenPut { .. } | Self::OpLogTruncated { .. } => 0,
+            // The same accounting a `MetadataPut` gets, because it holds
+            // the same register: see `LoggedRecord`.
+            Self::OpLogAppended { entry } => weigh_metadata(&entry.entry),
         };
         std::mem::size_of::<Self>() + variable
+    }
+}
+
+/// What a replicated register holds beyond the record's own footprint.
+///
+/// A peer controls the size of a filter and a topic, an operator the size
+/// of a rule, and a client the size of a session key. The stamp is two
+/// integers and sixteen bytes, all inside the record's own footprint.
+fn weigh_metadata(entry: &MetadataRecord) -> usize {
+    let value = match &entry.value {
+        None
+        | Some(
+            MetadataValueRecord::NodeSubscription
+            | MetadataValueRecord::SessionOwner { .. }
+            | MetadataValueRecord::NodeGroup,
+        ) => 0,
+        Some(MetadataValueRecord::Retained(message)) => {
+            message.payload.len() + message.properties.len()
+        }
+        // The same accounting a `RulePut` gets, and the one place this
+        // estimate would otherwise miss a field an operator can grow.
+        Some(MetadataValueRecord::Rule(rule)) => {
+            Record::RulePut {
+                rule: (**rule).clone(),
+            }
+            .weight()
+                - std::mem::size_of::<Record>()
+        }
+    };
+    weigh_metadata_key(&entry.key) + value
+}
+
+/// What a register's key holds beyond the record's own footprint.
+fn weigh_metadata_key(key: &MetadataKeyRecord) -> usize {
+    match key {
+        MetadataKeyRecord::NodeSubscription { filter, .. } => filter.len(),
+        MetadataKeyRecord::Retained { topic } => topic.len(),
+        MetadataKeyRecord::Rule { id } => id.len(),
+        MetadataKeyRecord::SessionOwner { session } => weigh_key(session),
+        MetadataKeyRecord::NodeGroup { group, filter, .. } => group.len() + filter.len(),
     }
 }
 

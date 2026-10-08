@@ -71,6 +71,21 @@ pub enum DropReason {
     Expired,
     /// The session was destroyed.
     SessionEnded,
+    /// The session moved to another node, section 8.4.
+    ///
+    /// **Not a loss, and it is here anyway.** A message reported with
+    /// this reason left this node's queue in the same breath as it was
+    /// handed to the node that now owns the session, so the broker that
+    /// reports it is reporting a move. It is a [`DropReason`] because
+    /// the alternative is a message leaving a queue with no record of
+    /// why, which is the one thing this enum exists to prevent: the
+    /// conservation harness would see a message vanish, and an operator
+    /// looking at a node that shed a thousand queued messages in a
+    /// second could not tell a migration from a bug. What the count
+    /// cannot say is whether the far node received them; that is
+    /// `cluster::migrate`'s shortfall, counted separately and on the
+    /// node that would know.
+    Migrated,
     /// The peer answered with a failure reason, so it will never take
     /// the message. The exchange is over by [MQTT-4.4.0-2] and the
     /// message must not be retransmitted.

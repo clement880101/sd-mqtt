@@ -141,6 +141,42 @@ build. Do both, and say in the runner why.
 And do not run two builds against this repository at once. One rewrites
 the binary the other's tests are spawning.
 
+## 7c. A full disk looks exactly like a race
+
+Four agents and one session spent, between them, many hours chasing
+flaky tests in this repository. Each found something real and each left
+a residue of about one whole-suite run in forty failing, always a
+different test, always something that timed out. The diagnoses got more
+inventive as the list got shorter.
+
+The cause was that the build directory had grown to **eighty
+gigabytes** and the volume was **97% full**. On a nearly-full disk the
+security daemon that evaluates a freshly built binary cannot keep up,
+so every new test binary stalls in the dynamic loader — measured at one
+to two minutes, with zero processor time and a stack consisting
+entirely of the loader's entry point. A test that spawns a broker and
+waits for it then fails for a reason that has nothing to do with what
+it asserts.
+
+Reclaiming it took the full suite from **forty-five minutes to
+sixty-five seconds**, and the flake rate from one in forty to **zero in
+sixty**.
+
+Mutation testing is what fills it. Every mutation is a new binary with
+a new hash and nothing collects the old ones, so the discipline this
+project depends on most is also the one that degrades the machine it
+runs on. So:
+
+- **Check free space before concluding that a test is flaky.** It is
+  one command and it is cheaper than every other hypothesis.
+- **Reclaim the build directory after a mutation campaign**, not when
+  something breaks.
+- A test that times out on a loaded machine and passes alone is
+  evidence about the machine until the machine has been ruled out.
+
+Four code defects were found on the way to this, two of them in the
+server, so the hunt was not wasted. But none of them was the flake.
+
 ## 8. A spec section is not a task list
 
 Six features that section 5.4 of the design listed as in scope for v1 had

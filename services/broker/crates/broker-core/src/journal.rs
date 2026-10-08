@@ -219,6 +219,9 @@ pub fn live_message(id: StoredMessageId, body: &BodyRecord) -> Message {
             body.properties.clone(),
         )),
         expires_at: body.expires_at,
+        // A stored message has already been routed; see
+        // `Message::forwarded` for why the mark is not stored.
+        forwarded: false,
     }
 }
 

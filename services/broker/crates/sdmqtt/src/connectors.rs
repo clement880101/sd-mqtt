@@ -32,16 +32,21 @@
 //! # A singleton is started here, and asks whether it may run
 //!
 //! Section 9.2 makes a poller a singleton owned by the live member with
-//! the lowest node identifier. Milestone 4 has one member, so the
-//! [`Membership`] built below holds one node and that node owns
+//! the lowest node identifier. This node is still the only member, so
+//! the [`Membership`] built below holds one node and that node owns
 //! everything — but it is a membership view and the poller asks it,
 //! rather than a poller written on the assumption that it is alone. The
-//! reasoning is `rules::singleton`'s; what happens here is that
-//! milestone 5 replaces one constructor call and nothing else.
+//! reasoning is `rules::singleton`'s; what remains for the rest of
+//! milestone 5 is to hand that view the peers it learns about, and
+//! nothing else here moves.
+//!
+//! The member it holds is **section 8.1's stored identity**, handed in
+//! by the caller, rather than a constant this file used to carry.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use cluster::Replicated;
 use rules::live::Registry;
 use rules::rule::Rule;
 use rules::singleton::{Membership, NodeId};
@@ -101,14 +106,6 @@ pub fn start_without_rules() -> Connectors {
     }
 }
 
-/// What this node calls itself.
-///
-/// Section 8.1 gives a node a persisted identity and that is milestone
-/// 5's; until then there is one node and this is what it is called.
-/// The same string the admin API reports as the only row in its node
-/// listing, so an operator reading one is reading the other.
-const THIS_NODE: &str = "local";
-
 /// Install the configured rules and start their pumps.
 ///
 /// Called after the store has been read and before any listener binds,
@@ -124,16 +121,26 @@ pub async fn start(
     shared: &Arc<Shared>,
     store: &Arc<dyn Storage>,
     writer: &Arc<Writer>,
+    this_node: NodeId,
+    replicated: &Arc<Replicated>,
 ) -> Result<Connectors, StartupError> {
     // One member, so it owns every singleton. Written as a view
     // because a rule only ever exercised in the one-member case is a
     // rule nobody has tested; see `rules::singleton`.
-    let membership = Arc::new(Membership::alone(NodeId::new(THIS_NODE)));
+    //
+    // **The member is this node's stored identity**, section 8.1's,
+    // read or minted before this is called. It used to be the constant
+    // `"local"`, which was the second answer to "which node" this
+    // milestone existed to remove: a cluster of one whose member was a
+    // literal would have joined a cluster of three under a name it
+    // shared with both of them.
+    let membership = Arc::new(Membership::alone(this_node));
     let registry = Registry::new(
         Arc::clone(shared),
         Arc::clone(store),
         Arc::clone(writer),
         membership,
+        Arc::clone(replicated),
     );
 
     let mut configured = BTreeSet::new();
@@ -181,8 +188,15 @@ pub async fn start(
             "the store holds a rule this configuration does not name; it was created \
              over the API or by an earlier configuration, and it is being installed"
         );
+        // **Installed without being stamped**, section 8.2: the register
+        // that carries this rule is in the store beside it. Stamping it
+        // again would make this node the last writer for every rule it
+        // holds on every restart, so a node that was down while an operator
+        // edited a rule elsewhere would come back and overwrite the edit
+        // with its own stale copy. A rule the *file* names is stamped, just
+        // above, because an edited file is an operator saying so.
         registry
-            .install(rule)
+            .install_held(rule)
             .await
             .map_err(|error| StartupError::Connector(error.to_string()))?;
     }

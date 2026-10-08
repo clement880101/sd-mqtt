@@ -3,15 +3,20 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use broker_core::broker::{Addressed, Broker, BrokerConfig};
+use broker_core::handover::Handover;
+use broker_core::registry::SessionId;
 use broker_core::session::Action;
-use broker_core::subscriptions::SubscriberId;
+use broker_core::subscriptions::{FilterEvent, SubscriberId};
+use cluster::migrate::{Claimed, Migrator};
+use cluster::{Gate, MetadataWrite, Operation, Replicated};
 use foldhash::fast::RandomState;
 use mqtt_codec::Packet;
 use parking_lot::{Mutex, RwLock};
-use storage::{Applied, Durable, NotDurable, Writer};
+use storage::SessionKey;
+use storage::{Applied, Durable, NotDurable, Record, Writer};
 use tokio::sync::mpsc;
 
 use crate::metrics::{Metrics, RecordDrop, ShellDrop};
@@ -50,6 +55,42 @@ pub fn promises_durability(actions: &[Addressed]) -> bool {
             Action::Send(Packet::PubAck(_) | Packet::PubRec(_) | Packet::PubComp(_))
         )
     })
+}
+
+/// Writes waiting for the store before anybody is told about them.
+///
+/// Section 8.2's two-phase write, as it crosses from the broker's lock to
+/// whatever holds the mesh. [`Self::durable`] is the batch that carries
+/// them; [`Self::writes`] is what to broadcast once it has landed and what
+/// to abandon if it has not.
+#[derive(Debug)]
+#[must_use = "a write nobody waits for is a write no peer is ever told about"]
+pub struct Broadcastable {
+    /// The batch the writes rode in.
+    durable: Durable,
+    /// What they were, in the order the broker produced them.
+    writes: Vec<MetadataWrite>,
+}
+
+impl Broadcastable {
+    /// Wait for the batch, and say what to do with the writes.
+    ///
+    /// `Ok` is a batch the store took and a flush covered, so every write
+    /// in it may be published and broadcast. `Err` is a batch that was
+    /// refused or a flush that failed, so every write in it must be
+    /// abandoned: see `cluster::oplog` for why telling a peer about one
+    /// anyway is the single divergence no exchange repairs.
+    ///
+    /// # Errors
+    ///
+    /// [`NotDurable`], unchanged from the writer, so that whoever logs it
+    /// can say which of the two causes it was.
+    pub async fn landed(self) -> Result<Vec<MetadataWrite>, (NotDurable, Vec<MetadataWrite>)> {
+        match self.durable.await {
+            Ok(()) => Ok(self.writes),
+            Err(why) => Err((why, self.writes)),
+        }
+    }
 }
 
 /// A journal already on its way to the store, and what is left to wait
@@ -187,6 +228,41 @@ pub struct Shared {
     /// the journal is left to grow: it is still drained, and then
     /// dropped.
     writer: Option<Arc<Writer>>,
+    /// What stamps a replicated write, and `None` on a node that has no
+    /// store and therefore no identity and no clock.
+    ///
+    /// Section 8.2: the broker says which filters gained or lost a
+    /// subscriber on this node, and this turns the ones that left or
+    /// reached zero into registers. It is held here because **the
+    /// register has to go in the same batch as the subscription that
+    /// caused it** — one batch is all or nothing, so a node cannot end
+    /// up with a subscription the cluster was never told about, or a
+    /// register for a subscription it did not keep.
+    ///
+    /// `None` is milestone one's mode, which is still supported: a node
+    /// with no store cannot cluster, so there is nothing to stamp and
+    /// the events are drained and dropped. Drained, not ignored, for the
+    /// reason [`Self::writer`] gives about the journal.
+    replicated: Option<Arc<Replicated>>,
+    /// Where writes go to wait for the store before they are broadcast.
+    ///
+    /// Section 8.2, and the order is the whole of it: **a peer told about
+    /// a register whose batch the store refused holds a value this node
+    /// will never hold again**, and no exchange repairs it, because an
+    /// exchange serves the origin's own log and the origin's log lost the
+    /// entry in the same batch. So a write is stamped and numbered here
+    /// and shown to nobody until the batch carrying it is durable; what
+    /// does the showing is a task of the binary's, draining
+    /// [`Shared::waiting_to_broadcast`].
+    ///
+    /// Unbounded, and bounded in practice by what the writer will take:
+    /// one entry per batch that carried a replicated write, held only
+    /// until that batch's flush. A bound here would mean choosing between
+    /// blocking the broker's lock and dropping a broadcast, and neither is
+    /// a choice this has to make.
+    broadcasts: Option<mpsc::UnboundedSender<Broadcastable>>,
+    /// The other end of it, handed out once.
+    waiting: Mutex<Option<mpsc::UnboundedReceiver<Broadcastable>>>,
     outboxes: RwLock<HashMap<SubscriberId, mpsc::Sender<Action>, RandomState>>,
     /// How often a caller was told the writer is behind. See
     /// [`Shared::report_pacing`].
@@ -206,12 +282,35 @@ pub struct Shared {
     /// inside it are owned and lock-free; see [`crate::metrics`] for
     /// why that is not an optimisation to consider.
     metrics: Arc<Metrics>,
+    /// What claims a session from another node, section 8.4.
+    ///
+    /// Installed after construction rather than passed to it, like the
+    /// broker's forwarder and for the same reason: it holds the mesh,
+    /// the mesh holds a handler, and the handler holds this. One of the
+    /// three has to be joined up afterwards.
+    ///
+    /// `None` is a node that does not cluster, and a connect then costs
+    /// one `OnceLock` read.
+    migrator: OnceLock<Arc<Migrator>>,
+    /// What a partition does to a connect, a publish and a subscribe,
+    /// section 8.5.
+    ///
+    /// Installed after construction for the migrator's reason: it
+    /// counts the mesh's members and the mesh is built later.
+    ///
+    /// **`None` is a node that serves everything**, which is both a
+    /// node that does not cluster and a clustering node whose operator
+    /// set no flags — the default, and section 8.5's availability. So
+    /// the absent case and the permissive case are the same case, and
+    /// the cost of the policy on a node that did not ask for it is one
+    /// `OnceLock` read per operation.
+    gate: OnceLock<Arc<Gate>>,
 }
 
 impl Shared {
     /// A server with no connections and no store.
     pub fn new(config: BrokerConfig) -> Self {
-        Self::from_parts(Broker::new(config), None)
+        Self::from_parts(Broker::new(config), None, None)
     }
 
     /// A server whose broker is already built, writing to `writer`.
@@ -223,24 +322,391 @@ impl Shared {
     /// before the broker does, so a half-restored broker is not a
     /// state anything can be pointed at.
     pub fn with_store(broker: Broker, writer: Arc<Writer>) -> Self {
-        Self::from_parts(broker, Some(writer))
+        Self::from_parts(broker, Some(writer), None)
     }
 
-    fn from_parts(broker: Broker, writer: Option<Arc<Writer>>) -> Self {
+    /// The same, with section 8.2's replicated state beside it.
+    ///
+    /// What the binary builds. The `Replicated` comes out of the same
+    /// restore as the broker, because the clock inside it resumes from
+    /// the highest reading this node has written and the registers are
+    /// the ones it held; see `Replicated::open`.
+    pub fn with_replication(
+        broker: Broker,
+        writer: Arc<Writer>,
+        replicated: Arc<Replicated>,
+    ) -> Self {
+        Self::from_parts(broker, Some(writer), Some(replicated))
+    }
+
+    fn from_parts(
+        broker: Broker,
+        writer: Option<Arc<Writer>>,
+        replicated: Option<Arc<Replicated>>,
+    ) -> Self {
+        let (broadcasts, waiting) = match replicated {
+            Some(_) => {
+                let (sender, receiver) = mpsc::unbounded_channel();
+                (Some(sender), Some(receiver))
+            }
+            None => (None, None),
+        };
         Self {
             broker: Mutex::new(broker),
             writer,
+            replicated,
+            broadcasts,
+            waiting: Mutex::new(waiting),
             outboxes: RwLock::new(HashMap::with_hasher(RandomState::default())),
             paced: AtomicU64::new(0),
             pacing_reported: AtomicU64::new(0),
             rejections_reported: AtomicU64::new(0),
             metrics: Arc::new(Metrics::new()),
+            migrator: OnceLock::new(),
+            gate: OnceLock::new(),
         }
+    }
+
+    /// Claim sessions through `migrator`, section 8.4.
+    ///
+    /// Once. A second call is ignored rather than refused: the binary
+    /// installs one at startup and a second would be a second answer to
+    /// which mesh a drain goes over.
+    pub fn install_migrator(&self, migrator: Arc<Migrator>) {
+        let _ = self.migrator.set(migrator);
+    }
+
+    /// What claims a session, for whatever reports on it.
+    #[must_use]
+    pub fn migrator(&self) -> Option<&Arc<Migrator>> {
+        self.migrator.get()
+    }
+
+    /// Refuse operations through `gate` while the cluster is short,
+    /// section 8.5.
+    ///
+    /// Once, for [`Shared::install_migrator`]'s reason: a second
+    /// policy in one process is a second answer to whether a client
+    /// may publish.
+    pub fn install_gate(&self, gate: Arc<Gate>) {
+        let _ = self.gate.set(gate);
+    }
+
+    /// Whether `operation` may proceed, section 8.5.
+    ///
+    /// **True on a node with no gate installed**, which is the default
+    /// and is availability: a node whose operator asked for nothing
+    /// refuses nothing. The gate re-reads the membership on every call
+    /// rather than being told when it changes, because the thing it is
+    /// about is a network fault and nothing sends a notification about
+    /// one.
+    #[must_use]
+    pub fn allows(&self, operation: Operation) -> bool {
+        self.gate.get().is_none_or(|gate| gate.allows(operation))
+    }
+
+    /// Claim `session` for this node and drain it from whoever held it.
+    ///
+    /// `None` on a node that does not cluster, which is the whole of
+    /// what a non-clustering connect pays for section 8.4.
+    ///
+    /// **Returns once the drain has finished or the patience has run
+    /// out**, and returns either way: see `cluster::migrate`. The
+    /// register the claim wrote is stored and broadcast here, because
+    /// the claim happens outside the broker's lock and nothing else is
+    /// holding a batch for it to ride in.
+    ///
+    /// # The register is broadcast after the drain, and that order is
+    /// load-bearing
+    ///
+    /// Not an artefact of the two statements below being in this order.
+    /// [`Shared::lost_session`] is allowed to treat a register naming
+    /// another node as proof that no drain is coming, and it is allowed
+    /// to do that **only** because the claim reaches the previous owner
+    /// before the register does — which is true exactly while the
+    /// `await` here precedes the `originate`. Swap them and a previous
+    /// owner can be told it has lost a session whose queue is still
+    /// being asked for, and the client arrives at its new node with an
+    /// empty session.
+    pub async fn claim_session(&self, session: &SessionKey, clean: bool) -> Option<Claimed> {
+        let migrator = self.migrator.get()?;
+        let claimed = migrator.claim(session, clean).await;
+        if let Some(write) = claimed.write.clone() {
+            self.originate(write);
+        }
+        Some(claimed)
+    }
+
+    /// Store and broadcast one register this node originated, in a batch
+    /// of its own.
+    ///
+    /// For a write made **outside** the broker's lock, which is section
+    /// 8.4's claim and nothing else so far: everything the broker
+    /// originates rides the batch its own journal is in, and a register
+    /// in a batch of its own would be a register the store could take
+    /// while the records that caused it were refused.
+    ///
+    /// Nothing waits for it here. Section 8.2's rule is that a peer is
+    /// not told until the store has taken the batch, and that is kept by
+    /// the broadcast waiting; a connect waiting as well would put a disk
+    /// flush in front of every migrating client's acknowledgement for
+    /// no further guarantee.
+    ///
+    /// **What is deliberately not closed** is the claim that is drained
+    /// and then refused by the store. The far node has already given the
+    /// session up, so a refusal here leaves ownership written nowhere
+    /// until the next claim; the node that it happened on has also just
+    /// failed to write everything else it was doing, which is the
+    /// condition `cluster::metadata` describes at length and the one a
+    /// restart resolves.
+    fn originate(&self, write: MetadataWrite) {
+        let (Some(replicated), Some(writer)) = (&self.replicated, &self.writer) else {
+            return;
+        };
+        let records = replicated.records(&write);
+        match writer.apply_durable(records) {
+            Ok(durable) => self.broadcast_when_durable(durable, vec![write]),
+            Err(_) => {
+                self.metrics
+                    .records_dropped(RecordDrop::WriterStopped)
+                    .inc_by(1);
+                tracing::error!(
+                    "the storage writer has stopped, so a session claim was not written down"
+                );
+            }
+        }
+    }
+
+    /// Give a session up to the node that claimed it, section 8.4.
+    ///
+    /// The previous owner's half: the old connection is closed, the
+    /// subscriptions leave this node's trie — which is what makes
+    /// section 8.3 stop forwarding here — and what the session held
+    /// comes back to be sent to the claiming node.
+    ///
+    /// `None` is a session this node does not hold, which is not an
+    /// error: a register naming this node as owner can be older than a
+    /// restart.
+    pub fn hand_over_session(&self, session: &SessionKey, clean: bool) -> Option<Handover> {
+        let (handover, actions) = self.with_broker(|broker| {
+            let now = broker.clock().now();
+            let mut out = Vec::new();
+            let identity = SessionId::new(&session.mountpoint, &session.client_id);
+            let handover = broker.hand_over(&identity, clean, now, &mut out);
+            (handover, out)
+        });
+        // The close for the displaced connection among them, which is
+        // what stops one session having two live connections.
+        self.deliver(actions);
+        handover
+    }
+
+    /// Give a session up because the cluster says another node owns
+    /// it, section 8.5's heal.
+    ///
+    /// Returns whether a session was given up, which the caller logs:
+    /// this is a client being disconnected through no fault of its own
+    /// and an operator is owed the line.
+    ///
+    /// # Why a register naming somebody else is enough, on its own
+    ///
+    /// There is no epoch comparison here and there must not be one. A
+    /// claim is answered by [`Shared::hand_over_session`], and
+    /// [`Shared::claim_session`] does not broadcast the register until
+    /// the drain it asked for has finished or timed out — so by the
+    /// time a register naming another node arrives, exactly one of two
+    /// things is true. Either the claim reached this node, the session
+    /// has already gone, and `broker.subscriber_of` below finds
+    /// nothing; or the claim never arrived, because there was no link
+    /// to carry it or the queue carrying it was full, and then **no
+    /// drain is coming and none ever will** — the node that claimed it
+    /// counted the shortfall and accepted its client anyway.
+    ///
+    /// A stale register cannot reach here either: what arrives has won
+    /// the merge, and an older write loses it.
+    ///
+    /// The first draft compared the arriving epoch against the one this
+    /// node's own session held, to tell a partition from a migration
+    /// whose drain was still in flight. That comparison was unsound —
+    /// the two numbers are different currencies, because a session's
+    /// epoch is `max(held, claimed) + 1` and climbs on every local
+    /// reconnect while the register's does not — and the case it was
+    /// guarding against cannot happen.
+    ///
+    /// # What the session was holding is lost, on purpose
+    ///
+    /// The queue goes with the hand-over and nothing sends it anywhere:
+    /// the node that won accepted its client with whatever reached it,
+    /// which across a partition was nothing. Section 8.5 says this in
+    /// as many words — messages published on either side are not
+    /// retroactively exchanged, and a node that acknowledged messages
+    /// on the losing side loses them when it rejoins. Keeping them
+    /// would mean delivering, long afterwards, messages the other side
+    /// has already answered for.
+    pub fn lost_session(&self, session: &SessionKey) -> bool {
+        let (given_up, actions) = self.with_broker(|broker| {
+            let identity = SessionId::new(&session.mountpoint, &session.client_id);
+            if broker.subscriber_of(&identity).is_none() {
+                // Not held here, which is the ordinary state of almost
+                // every register in a cluster — and is also the
+                // migration that has already happened.
+                return (false, Vec::new());
+            }
+            let now = broker.clock().now();
+            let mut out = Vec::new();
+            // The handover is dropped rather than sent; see above.
+            let _ = broker.hand_over(&identity, false, now, &mut out);
+            (true, out)
+        });
+        // The close for the losing connection is among them, which is
+        // the thing section 8.5 promises.
+        self.deliver(actions);
+        given_up
     }
 
     /// What this process counts.
     pub fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
+    }
+
+    /// What this node replicates, for whatever broadcasts it.
+    ///
+    /// `None` on a node with no store, which is a node that cannot
+    /// cluster.
+    pub fn replicated(&self) -> Option<&Arc<Replicated>> {
+        self.replicated.as_ref()
+    }
+
+    /// The queue of writes waiting for the store, taken once.
+    ///
+    /// `None` on a node that does not replicate, and `None` on the second
+    /// call: two drains on one queue would be two halves of the broadcast,
+    /// each silently missing what the other took.
+    pub fn waiting_to_broadcast(&self) -> Option<mpsc::UnboundedReceiver<Broadcastable>> {
+        self.waiting.lock().take()
+    }
+
+    /// Hand `writes` to whatever broadcasts them, once `durable` lands.
+    ///
+    /// For a producer of replicated writes that is **not** the broker's
+    /// journal, which is the rule registry: a rule is an operator's and
+    /// goes through `rules::live`, not through a packet. Section 8.2's
+    /// ordering is the same either way — nothing is shown to a peer until
+    /// the store has taken the batch — so there is one queue and one task
+    /// draining it rather than two answers to when a write may be sent.
+    ///
+    /// Never blocks and never fails: a queue nothing drains is a node that
+    /// does not cluster, and the write is still stored.
+    pub fn broadcast_when_durable(&self, durable: Durable, writes: Vec<MetadataWrite>) {
+        if let Some(broadcasts) = &self.broadcasts {
+            let _ = broadcasts.send(Broadcastable { durable, writes });
+        }
+    }
+
+    /// Turn the filters that gained or lost a subscriber into registers.
+    ///
+    /// Section 8.2, and **appended to the same batch as the journal**:
+    /// one batch is all or nothing, so a subscription cannot be stored
+    /// without the register that tells the cluster about it, nor the
+    /// register without the subscription. Drained under the same lock
+    /// that filled it, so the order a filter was gained and lost in is
+    /// the order the registers are written in.
+    ///
+    /// A node with no store drains and drops them, for the reason
+    /// [`Self::writer`] gives about the journal: a buffer nobody reads
+    /// is a buffer that grows for the life of the process.
+    ///
+    /// Most events produce nothing. A register is written only when the
+    /// count leaves or reaches zero, which is what makes this a write
+    /// per filter rather than per client subscription; see
+    /// `cluster::metadata`.
+    ///
+    /// Several writes in one batch each carry the clock's mark, so the
+    /// batch can hold the same row several times over. Harmless — the
+    /// last one is the highest and the store simply replaces the row —
+    /// and the alternative is a caller that holds a register without
+    /// the mark that covers its stamp, which is what
+    /// `Replicated::records` exists to make impossible.
+    fn take_filter_events(
+        &self,
+        broker: &mut Broker,
+        records: &mut Vec<Record>,
+        originated: &mut Vec<MetadataWrite>,
+    ) {
+        let mut events = Vec::new();
+        broker.take_filter_events(&mut events);
+        let Some(replicated) = &self.replicated else {
+            return;
+        };
+        for event in events {
+            // **Four events and two counts.** A shared group is its own
+            // register, because a group spanning three nodes reported as
+            // three ordinary subscribers to one filter puts all three on
+            // the ordinary route and is delivered to three times; see
+            // `cluster::groups`. A match with no wildcard, so that an
+            // event added to the vocabulary does not compile until it
+            // has been given a register.
+            let write = match &event {
+                FilterEvent::Arrived(filter) => replicated.subscriber_arrived(filter),
+                FilterEvent::Departed(filter) => replicated.subscriber_departed(filter),
+                FilterEvent::GroupJoined { group, filter } => {
+                    replicated.group_joined(group, filter)
+                }
+                FilterEvent::GroupLeft { group, filter } => replicated.group_left(group, filter),
+            };
+            if let Some(write) = write {
+                records.extend(replicated.records(&write));
+                originated.push(write);
+            }
+        }
+    }
+
+    /// Turn the retained messages the broker just changed into registers.
+    ///
+    /// Section 8.2 replicates retained messages, and **the broker's own
+    /// journal is what says one changed.** A second signal beside it — an
+    /// event buffer of its own, the way filters have one — was rejected
+    /// for section 7.3's reason read the other way round: the journal
+    /// already carries the fact, and a second copy of "a retained message
+    /// was set" would drift from it the first time one of them was
+    /// corrected. Filters need their own buffer because what is
+    /// replicated is a count the journal says nothing about; a retained
+    /// message is replicated whole and the record holds it.
+    ///
+    /// **Appended to the same batch**, so a node cannot end up holding a
+    /// retained message the cluster was never told about, or a register
+    /// for a message it did not keep.
+    ///
+    /// `peer` is the one case this must not run: a retained message that
+    /// arrived *because* a peer replicated it would be stamped again by
+    /// this node, which is a write with a later stamp and the same value
+    /// bouncing between every pair of nodes for ever.
+    fn take_retained(&self, records: &mut Vec<Record>, originated: &mut Vec<MetadataWrite>) {
+        let Some(replicated) = &self.replicated else {
+            return;
+        };
+        // Over what is in the batch now, and the registers are appended
+        // after the loop: reading by index rather than over a copy, because
+        // a fan-out to a thousand offline subscribers is a batch of two
+        // thousand records and cloning it on every publish would be a
+        // clone nobody asked for.
+        let before = records.len();
+        let mut made = Vec::new();
+        for record in &records[..before] {
+            match record {
+                Record::RetainedPut { topic, message } => {
+                    made.push(replicated.retained(topic, message.clone()));
+                }
+                Record::RetainedRemoved { topic } => {
+                    made.push(replicated.retained_cleared(topic));
+                }
+                _ => {}
+            }
+        }
+        for write in made {
+            records.extend(replicated.records(&write));
+            originated.push(write);
+        }
     }
 
     /// Do something with the broker, holding the lock for exactly that,
@@ -348,8 +814,72 @@ impl Shared {
     /// the one task that drives every deadline in the process behind a
     /// disk would be the stall this is trying to avoid.
     fn hand_over(&self, broker: &mut Broker, promised: bool) -> Committed {
+        self.hand_over_originating(broker, promised, true, Vec::new())
+    }
+
+    /// Apply what a peer replicated: the local effect and the registers
+    /// that caused it, in one batch.
+    ///
+    /// `registers` is `cluster::Handled::records` — the registers that won
+    /// and the watermark if it moved — and `f` is what they mean to this
+    /// node: a retained message set or cleared. **One batch**, because a
+    /// watermark stored without the effect it covers is a claim to hold a
+    /// write this node would never be sent again, and an effect stored
+    /// without the register is a retained message no peer can tell this
+    /// node already has.
+    ///
+    /// Nothing is stamped again; see
+    /// [`Shared::hand_over_originating`].
+    ///
+    /// What comes back is waited on by the caller the way every other
+    /// commit is, and it promises nobody anything: a peer is not a
+    /// publisher waiting for an acknowledgement.
+    pub fn apply_replicated(
+        &self,
+        registers: Vec<Record>,
+        f: impl FnOnce(&mut Broker),
+    ) -> Committed {
+        let mut broker = self.broker.lock();
+        f(&mut broker);
+        self.hand_over_originating(&mut broker, false, false, registers)
+    }
+
+    /// The same, saying whether this node is the author of what it is
+    /// handing over.
+    ///
+    /// `originate` is false on exactly one path: applying what a peer
+    /// replicated. The records still go to the store — this node holds a
+    /// copy of every register, so its own retained store and its own
+    /// journal carry the message like any other — but **nothing is stamped
+    /// again**. A retained message that arrived because a peer replicated
+    /// it, re-stamped here, is a later write with the same value, and two
+    /// nodes doing that to each other is one message bouncing between them
+    /// for ever.
+    fn hand_over_originating(
+        &self,
+        broker: &mut Broker,
+        promised: bool,
+        originate: bool,
+        extra: Vec<Record>,
+    ) -> Committed {
         let mut records = Vec::new();
         broker.take_journal(&mut records);
+        let mut originated = Vec::new();
+        // **Always drained**, originating or not: a buffer nobody reads is
+        // a buffer that grows for the life of the process, and a filter
+        // event is this node's own whoever caused the call.
+        self.take_filter_events(broker, &mut records, &mut originated);
+        records.extend(extra);
+        // The broker's own facts first and what the cluster is told about
+        // them after, which is both the order a reader of the batch wants
+        // and the order this has to happen in: the registers are derived
+        // from the records, `extra` included. A peer's write arrives as an
+        // `extra` record, so **this is the one place the rule that a peer's
+        // write is not stamped again is kept** — stamp it and the two nodes
+        // tell each other about the same retained message for ever.
+        if originate {
+            self.take_retained(&mut records, &mut originated);
+        }
 
         let Some(writer) = &self.writer else {
             // No store: nothing is written down and nothing can be
@@ -358,6 +888,39 @@ impl Shared {
             // to grow.
             return Committed::Nothing;
         };
+        if !originated.is_empty() {
+            // Section 8.2's two-phase write. The batch is waited on twice:
+            // once by whoever is about to broadcast, and once by this
+            // caller if it promised a publisher anything. One batch and
+            // one outcome, because whether the store took it is one fact.
+            let Some(broadcasts) = &self.broadcasts else {
+                // Unreachable: writes are only originated by a node that
+                // has a `Replicated`, and the queue is made beside it.
+                // Refusing to broadcast is the safe answer if it ever
+                // happens, rather than broadcasting without the store.
+                return Committed::Nothing;
+            };
+            return match writer.apply_durable_twice(records) {
+                Ok((mine, theirs)) => {
+                    // Never blocks: the queue is unbounded, and a send
+                    // that fails is a binary with nothing draining it,
+                    // which is a node that does not cluster.
+                    let _ = broadcasts.send(Broadcastable {
+                        durable: theirs,
+                        writes: originated,
+                    });
+                    if promised {
+                        Committed::Waiting(mine)
+                    } else {
+                        // Nothing was promised to a publisher, so nobody
+                        // here waits. The broadcast still does.
+                        drop(mine);
+                        Committed::Nothing
+                    }
+                }
+                Err(_) => Committed::Stopped,
+            };
+        }
         if !promised {
             if records.is_empty() {
                 return Committed::Nothing;

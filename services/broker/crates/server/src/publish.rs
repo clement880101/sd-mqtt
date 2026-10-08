@@ -107,9 +107,18 @@ pub struct Publication {
 /// What a publication that was made comes back with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Published {
-    /// How many subscribers it reached. Zero is an ordinary answer: a
-    /// retained publish to a topic nobody holds reaches nobody and is
-    /// still kept.
+    /// How many subscribers on this node it reached, **plus how many
+    /// other nodes it was forwarded to**.
+    ///
+    /// Zero is an ordinary answer: a retained publish to a topic nobody
+    /// holds reaches nobody and is still kept.
+    ///
+    /// The two halves are added for the reason
+    /// [`Broker::publish`] gives: a node forwarded to has a matching
+    /// subscriber, so a caller reading this as "did anybody want it"
+    /// gets the same answer wherever it published, which is what
+    /// section 8's clustering is for. A caller wanting the two apart
+    /// reads section 11.3's `router_matches`, where they are two series.
     pub delivered: usize,
     /// Whether this answer waited for the store.
     ///

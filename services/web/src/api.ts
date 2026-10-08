@@ -87,13 +87,48 @@ export interface SubscriptionView {
   subscription_id: number | null;
 }
 
-/** A node in this cluster; today there is one. */
+/** A node in this cluster. */
 export interface NodeView {
   id: string;
+  name: string;
+  /** What peers dial to reach it; empty on a node that does not cluster. */
+  address: string;
   this_node: boolean;
+  /** `up`, `suspect` or `down`. */
   state: string;
-  version: string;
-  uptime_seconds: number;
+  /** Null for a peer: membership carries no build. */
+  version: string | null;
+  /** Null for a peer, for the same reason. */
+  uptime_seconds: number | null;
+}
+
+/**
+ * What `/health/cluster` answers.
+ *
+ * Not under `/api/v1`, so it does not go through {@link fetchPage}:
+ * it is a health endpoint and answers one document rather than a page
+ * of rows.
+ */
+export interface ClusterHealth {
+  /** `complete` while `members` has reached `expected`. */
+  status: string;
+  /** Peers answering, and this node. */
+  members: number;
+  /** `cluster.expected_size`, or the count of nodes this one has met. */
+  expected: number;
+  /**
+   * Whether `expected` is a number an operator wrote down.
+   *
+   * The difference matters more than the number. Unset, `expected` is
+   * the nodes this one has met, which says `complete` on a node that
+   * came up alone and never heard of the others.
+   */
+  expected_configured: boolean;
+}
+
+/** Ask whether this node's view of the cluster is complete. */
+export function fetchClusterHealth(): Promise<ClusterHealth> {
+  return request<ClusterHealth>('/health/cluster');
 }
 
 /** What the publish endpoint answers when it accepted a message. */

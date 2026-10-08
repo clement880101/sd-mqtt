@@ -62,12 +62,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use broker_core::broker::BrokerConfig;
+use cluster::membership::Detection;
+use cluster::mesh::MeshSettings;
+use cluster::{ClusterSettings, Policy, Strict, DEFAULT_CLUSTER_NAME};
 use mqtt_codec::Limits;
 use sdmqtt_admin::config::{AdminConfig, AdminStartError, Token};
 use sdmqtt_server::connection::{outbox_depth_for, ConnectionConfig};
 use sdmqtt_server::listener::{ServerConfig, DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT};
 use serde::Deserialize;
-use storage::{RedbStorage, Storage, StorageError, WriterConfig};
+use storage::{RedbStorage, Secret, Storage, StorageError, WriterConfig};
 use thiserror::Error;
 
 /// Where the configuration file is looked for when none is named.
@@ -155,6 +158,21 @@ pub enum ConfigError {
     /// nothing goes through this file.
     #[error("{0}")]
     Admin(#[from] AdminStartError),
+    /// The cluster refused the configuration it was given.
+    ///
+    /// Carried verbatim, for the reason the admin refusal above is:
+    /// `cluster::ConfigError` already says which of the three things
+    /// is wrong and what to do about it, and a sentence of our own
+    /// would be a second copy free to drift from it.
+    #[error("{0}")]
+    Cluster(#[from] cluster::ConfigError),
+    /// The partition policy cannot mean what it says. Section 8.5.
+    ///
+    /// Carried verbatim for the reason the two above are:
+    /// `cluster::PolicyError` names the flag an operator has to go and
+    /// fix and what the two ways out of it are.
+    #[error("{0}")]
+    Policy(#[from] cluster::PolicyError),
     /// A rule cannot mean what it says.
     ///
     /// Its own variant rather than [`ConfigError::Unusable`] because a
@@ -602,10 +620,261 @@ pub struct Log {
     pub level: LogLevel,
 }
 
+/// The node section, section 8.1.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Node {
+    /// What an operator calls this node.
+    ///
+    /// **Not what identifies it.** Section 8.1 gives a node a UUID
+    /// minted on first start and persisted, and that is what singleton
+    /// ownership and every conflict tie-break order by; this is the
+    /// name printed beside it. Two nodes may share a name — two copied
+    /// configurations do — and nothing compares one.
+    ///
+    /// Changing it renames the node and does not re-found it: the
+    /// stored UUID does not move. See `cluster::NodeIdentity`.
+    pub name: String,
+}
+
+/// What a node is called when the machine will not say.
+///
+/// The word the admin API reported as the only row in its node listing
+/// before there was more than one node, kept as the fallback so that a
+/// node with no name and no hostname reads the way it always did.
+const DEFAULT_NODE_NAME: &str = "local";
+
+/// Where the machine says what it is called.
+///
+/// `/etc/hostname` and nothing else. In a container it is the container's
+/// name or identifier, in Kubernetes it is the pod's, and on a host
+/// running systemd it is the machine's — which is the three places this
+/// broker is built to run, and in all three it is the word an operator
+/// already uses to mean "that node".
+///
+/// Not read through `libc::gethostname`, which would be a direct
+/// dependency for one call, and not through `$HOSTNAME`, which most
+/// shells set and do not export: a name that depended on how the process
+/// was started would differ between a node run by hand and the same node
+/// run by its unit file.
+const MACHINE_NAME: &str = "/etc/hostname";
+
+/// What this node is called by default, given what the machine says.
+///
+/// **Derived rather than constant**, and the plan asked whether it should
+/// be: a default that is the same word on every node shows an operator
+/// three identically named rows in a cluster of three, which is a column
+/// carrying no information in exactly the case it was added for. The name
+/// is for operators and is never compared — the identity is the stored
+/// UUID — so there is no correctness argument either way, and the one
+/// that decides it is that `local` is useless the moment there is a
+/// second node.
+///
+/// Whitespace is trimmed, because `/etc/hostname` ends in a newline, and
+/// an empty or absent name falls back to [`DEFAULT_NODE_NAME`] rather
+/// than to nothing: `Config::validate` refuses an empty name, and a node
+/// that would not start because its hostname file was empty would be a
+/// default that broke a working deployment.
+///
+/// A node whose hostname changes is **renamed and not re-founded**: the
+/// stored UUID does not move, which is `cluster::NodeIdentity`'s rule and
+/// is what makes this safe for a pod that is rescheduled onto the same
+/// volume.
+fn node_name(machine: Option<String>) -> String {
+    match machine.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => name.to_owned(),
+        _ => DEFAULT_NODE_NAME.to_owned(),
+    }
+}
+
+impl Default for Node {
+    fn default() -> Self {
+        Self {
+            name: node_name(std::fs::read_to_string(MACHINE_NAME).ok()),
+        }
+    }
+}
+
+/// The cluster section, section 8.1.
+///
+/// **`cluster.address` is the switch.** A node clusters when it has
+/// somewhere to listen for peers and does not otherwise, which is the
+/// one key that cannot sensibly be defaulted: every other value here
+/// has a sane default and a bind address does not. Setting it makes
+/// `cluster.secret` compulsory, because section 8.1 has no
+/// unauthenticated mode and no loopback exemption.
+///
+/// The name and the secret are `cluster`'s own vocabulary and are
+/// handed to [`ClusterSettings::check`] rather than checked here, so
+/// that the three refusals an operator can meet are written once.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClusterSection {
+    /// What this cluster is called. Bound into every handshake.
+    pub name: String,
+    /// The secret every node in it shares. Never sent.
+    ///
+    /// `None` is absent and `Some("")` is an operator whose variable
+    /// expanded to nothing. They are different mistakes with different
+    /// messages; see `cluster::ConfigError`.
+    pub secret: Option<Secret>,
+    /// Where to listen for peers.
+    ///
+    /// `None` is a node that does not cluster, which is the default
+    /// and is a supported way to run this broker.
+    pub address: Option<SocketAddr>,
+    /// What to tell peers to dial.
+    ///
+    /// **Not the bind address**, and section 8.1 says why: a node
+    /// bound to every interface, behind a port mapping, or behind a
+    /// test's fault-injection gate has a bind address no peer can use.
+    /// Left out, the bind address is advertised, which is right for
+    /// the ordinary case of binding one reachable address and is
+    /// refused for a wildcard bind — there is no way to guess which
+    /// interface an operator meant.
+    pub advertise: Option<String>,
+    /// Addresses to dial to find the cluster.
+    ///
+    /// A node with none is a cluster of one that others may join. A
+    /// seed naming this node is harmless: the handshake recognises it
+    /// and the mesh stops dialling it.
+    pub seeds: Vec<String>,
+    /// How often to beat, in milliseconds.
+    pub heartbeat_ms: u64,
+    /// How many beats may be missed before a peer is suspect.
+    pub suspect_after: u32,
+    /// How long a peer may be silent before it is dead, in
+    /// milliseconds.
+    pub dead_after_ms: u64,
+    /// How long to wait before retrying an address, at first.
+    pub reconnect_min_ms: u64,
+    /// And at most.
+    pub reconnect_max_ms: u64,
+    /// How long to wait after a peer refused this node's secret.
+    ///
+    /// Section 8.1: harder than a transport failure, because a
+    /// mismatched secret is a configuration error that will not fix
+    /// itself.
+    pub refused_backoff_ms: u64,
+    /// How many nodes this cluster is meant to have. Section 8.5.
+    ///
+    /// **The only thing that can say whether the cluster is whole.**
+    /// Membership is learnt, so the nodes a node has met cannot answer
+    /// it: three nodes that never heard of a fourth look exactly like
+    /// four with one down. `None` is an operator who did not say, and
+    /// then nothing is ever short — which is the default, and is
+    /// section 8.5's availability.
+    ///
+    /// Zero is refused rather than read as absent: a cluster contains
+    /// at least the node reading the setting.
+    pub expected_size: Option<usize>,
+    /// Which operations to refuse while the cluster is short of
+    /// [`ClusterSection::expected_size`]. Section 8.5.
+    ///
+    /// All false by default, which keeps a partitioned node serving.
+    /// Any of them set without an expected size is refused at startup,
+    /// because a flag whose condition can never be evaluated is a flag
+    /// that silently means nothing. See `cluster::policy`.
+    pub strict: Strict,
+    /// How long a node waits for a session it claimed to be drained to
+    /// it, in milliseconds. Section 8.4.
+    ///
+    /// **The bound, and not a deadline the drain must meet.** When it
+    /// runs out the connection is accepted with whatever arrived, the
+    /// session is reported present and the shortfall is counted; see
+    /// `cluster::migrate`. Raising it trades a slower connect for a
+    /// smaller shortfall and lowering it does the reverse, and neither
+    /// end of that trade refuses a client.
+    pub drain_timeout_ms: u64,
+}
+
+impl Default for ClusterSection {
+    /// A node that does not cluster.
+    ///
+    /// Deliberately not a working cluster: see `cluster::config`.
+    /// There is nothing to preserve, because a cluster needs seeds
+    /// written down before it exists.
+    fn default() -> Self {
+        Self {
+            name: DEFAULT_CLUSTER_NAME.to_owned(),
+            secret: None,
+            address: None,
+            advertise: None,
+            seeds: Vec::new(),
+            heartbeat_ms: 1_000,
+            suspect_after: 3,
+            dead_after_ms: 10_000,
+            reconnect_min_ms: 200,
+            reconnect_max_ms: 30_000,
+            refused_backoff_ms: 300_000,
+            expected_size: None,
+            strict: Strict::default(),
+            drain_timeout_ms: 2_000,
+        }
+    }
+}
+
+impl ClusterSection {
+    /// The name and the secret, for `cluster` to check.
+    #[must_use]
+    pub fn settings(&self) -> ClusterSettings {
+        ClusterSettings {
+            name: self.name.clone(),
+            secret: self.secret.clone(),
+        }
+    }
+
+    /// The partition policy, for `cluster` to check. Section 8.5.
+    ///
+    /// # Errors
+    ///
+    /// `cluster::PolicyError` when a flag is set with no expected size,
+    /// or the expected size is zero. Both are refusals the policy owns
+    /// rather than checks written here, for the reason the secret's
+    /// three are `cluster`'s: one spelling of each message.
+    pub fn policy(&self) -> Result<Policy, cluster::PolicyError> {
+        Policy::new(self.expected_size, self.strict)
+    }
+
+    /// What this node tells peers to dial.
+    ///
+    /// The configured address, or the bind address when none was
+    /// configured. `None` when there is nothing to cluster.
+    #[must_use]
+    pub fn advertised(&self) -> Option<String> {
+        match &self.advertise {
+            Some(advertise) => Some(advertise.clone()),
+            None => self.address.map(|address| address.to_string()),
+        }
+    }
+
+    /// How the mesh dials, beats and gives up.
+    #[must_use]
+    pub fn mesh(&self) -> MeshSettings {
+        MeshSettings {
+            advertise: self.advertised().unwrap_or_default(),
+            seeds: self.seeds.clone(),
+            detection: Detection {
+                heartbeat: Duration::from_millis(self.heartbeat_ms),
+                suspect_after: self.suspect_after,
+                dead_after: Duration::from_millis(self.dead_after_ms),
+            },
+            reconnect_min: Duration::from_millis(self.reconnect_min_ms),
+            reconnect_max: Duration::from_millis(self.reconnect_max_ms),
+            refused_backoff: Duration::from_millis(self.refused_backoff_ms),
+            link: cluster::LinkConfig::default(),
+        }
+    }
+}
+
 /// What the three sources add up to.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
+    /// The node section.
+    pub node: Node,
+    /// The cluster section, section 8.1.
+    pub cluster: ClusterSection,
     /// The listener section.
     pub listener: Listener,
     /// The broker section.
@@ -727,6 +996,19 @@ impl Config {
         // documents zero as "no ceiling", and either meaning is arguable
         // here, which is the argument for making the operator say which
         // they meant instead of guessing.
+        // A name an operator can read is the whole point of having a
+        // name beside the identifier, and an empty one is a log line
+        // that says a node is called nothing. Refused rather than
+        // filled in, for the reason the empty admin token is: one
+        // value, one reading, whichever source it came from.
+        if self.node.name.is_empty() {
+            return Err(ConfigError::Unusable {
+                key: "node.name",
+                value: String::new(),
+                why: "a node's name is what an operator reads beside its identifier; \
+                      leave the key out to take the default",
+            });
+        }
         if self.broker.max_inflight == 0 {
             return Err(ConfigError::Unusable {
                 key: "broker.max_inflight",
@@ -849,6 +1131,8 @@ impl Config {
             });
         }
 
+        self.validate_cluster()?;
+
         // Two rules under one identifier is one rule's outbox, one
         // rule's dead-letter topic and two rules' messages. The store
         // would accept it — a put replaces — and the second would
@@ -921,6 +1205,135 @@ impl Config {
             },
             why: error.to_string(),
         })?;
+        Ok(())
+    }
+
+    /// Refuse a cluster this node cannot join, section 8.1.
+    ///
+    /// Nothing here when `cluster.address` is unset, which is a node
+    /// that does not cluster and is the default.
+    fn validate_cluster(&self) -> Result<(), ConfigError> {
+        // Section 8.5, **before the switch below**, because neither of
+        // these two refusals depends on it: a flag with no expected
+        // size behind it means nothing whether or not this node
+        // clusters, and `cluster::PolicyError` already says which flag
+        // and what to do about it.
+        self.cluster.policy()?;
+
+        let Some(address) = self.cluster.address else {
+            // A node with no `cluster.address` is a cluster of one for
+            // ever, so it is never short of anything and a flag on it
+            // can never fire. Refused rather than ignored, for the
+            // reason the policy refuses a flag with no expected size:
+            // an operator who asked for a trade and silently did not
+            // get it finds out during the partition it was for.
+            if let Some(what) = self.cluster.strict.first_set() {
+                return Err(ConfigError::Unusable {
+                    key: what,
+                    value: "true".to_owned(),
+                    why: "this node does not cluster, because cluster.address is unset, so \
+                          it is a cluster of one and is never short of anything. Set \
+                          cluster.address to make it a node of a cluster, or leave the flag \
+                          out",
+                });
+            }
+            if let Some(expected) = self.cluster.expected_size {
+                return Err(ConfigError::Unusable {
+                    key: "cluster.expected_size",
+                    value: expected.to_string(),
+                    why: "this node does not cluster, because cluster.address is unset, so \
+                          there is nothing for an expected size to be compared against. Set \
+                          cluster.address, or leave the key out",
+                });
+            }
+            return Ok(());
+        };
+
+        // **A node with no store has no identity, so it does not
+        // cluster.** Section 8.1 mints the identity once and persists
+        // it, and everything else in section 8 orders by it: a node
+        // that minted a fresh one on every start would be a different
+        // node to its peers after every restart, would own a singleton
+        // it had already given up, and would break the uniqueness
+        // conflict resolution depends on — quietly, and only under a
+        // restart nobody was watching.
+        //
+        // Refused rather than warned about, and for the same reason a
+        // rule with no store is: running with no store at all is a
+        // supported mode, and asking to cluster is an operator saying
+        // they want this node to be one of several.
+        if self.storage.directory.is_none() {
+            return Err(ConfigError::Unusable {
+                key: "storage.directory",
+                value: "unset".to_string(),
+                why: "a node's identity is minted once and written down, so clustering \
+                      needs a store directory; without one this node would be a new \
+                      node to its peers after every restart",
+            });
+        }
+
+        // The three refusals `cluster` owns: no secret, an empty
+        // secret, and an empty cluster name.
+        self.cluster.settings().check()?;
+
+        // A wildcard bind has no address a peer can dial, and nothing
+        // here can guess which interface was meant.
+        if self.cluster.advertise.is_none() && address.ip().is_unspecified() {
+            return Err(ConfigError::Unusable {
+                key: "cluster.advertise",
+                value: address.to_string(),
+                why: "a node bound to every interface has no address a peer can dial, \
+                      so it must say which one to advertise",
+            });
+        }
+        if self.cluster.advertise.as_deref() == Some("") {
+            return Err(ConfigError::Unusable {
+                key: "cluster.advertise",
+                value: String::new(),
+                why: "an empty advertised address is one no peer can dial; leave the \
+                      key out to advertise the bind address",
+            });
+        }
+        if self.cluster.heartbeat_ms == 0 {
+            return Err(ConfigError::Unusable {
+                key: "cluster.heartbeat_ms",
+                value: "0".to_string(),
+                why: "a heartbeat every no time at all is a busy loop on every link",
+            });
+        }
+        // A window shorter than the interval declares every peer dead
+        // between one beat and the next, however healthy it is.
+        if self.cluster.dead_after_ms <= self.cluster.heartbeat_ms {
+            return Err(ConfigError::Unusable {
+                key: "cluster.dead_after_ms",
+                value: self.cluster.dead_after_ms.to_string(),
+                why: "a window no longer than the interval declares a peer dead between \
+                      one beat and the next; make it several beats",
+            });
+        }
+        if self.cluster.suspect_after == 0 {
+            return Err(ConfigError::Unusable {
+                key: "cluster.suspect_after",
+                value: "0".to_string(),
+                why: "a peer that is suspect before it has missed a beat is every peer, \
+                      always",
+            });
+        }
+        if self.cluster.reconnect_min_ms == 0 || self.cluster.reconnect_max_ms == 0 {
+            return Err(ConfigError::Unusable {
+                key: "cluster.reconnect_min_ms",
+                value: "0".to_string(),
+                why: "a backoff of nothing is a dial in a loop against a peer that is \
+                      not there",
+            });
+        }
+        if self.cluster.reconnect_max_ms < self.cluster.reconnect_min_ms {
+            return Err(ConfigError::Unusable {
+                key: "cluster.reconnect_max_ms",
+                value: self.cluster.reconnect_max_ms.to_string(),
+                why: "the longest wait cannot be shorter than the first one",
+            });
+        }
         Ok(())
     }
 
@@ -1007,6 +1420,77 @@ impl Config {
         }
         if let Some(value) = lookup("SDMQTT_LOG") {
             self.log.level = parse("SDMQTT_LOG", &value, "log level")?;
+        }
+        if let Some(value) = lookup("SDMQTT_NODE_NAME") {
+            // Kept whatever it says, empty included, so that
+            // `validate` is the one place that refuses it — the rule
+            // `SDMQTT_ADMIN_TOKEN` above is written out at length for.
+            self.node.name = value;
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_NAME") {
+            self.cluster.name = value;
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_SECRET") {
+            // Kept whatever it says, the empty string included. The
+            // admin token's rule, for the admin token's reason: an
+            // environment that expanded to nothing must be refused for
+            // being empty rather than read as absent, and collapsing
+            // the two here would put that decision somewhere
+            // `cluster::ConfigError` cannot see it.
+            self.cluster.secret = Some(Secret::new(value));
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_ADDRESS") {
+            self.cluster.address = Some(parse("SDMQTT_CLUSTER_ADDRESS", &value, "socket address")?);
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_ADVERTISE") {
+            self.cluster.advertise = Some(value);
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_EXPECTED_SIZE") {
+            // Section 8.5's number. In the environment as well as the
+            // file because it is the one value here that differs
+            // between a cluster and the same cluster grown by a node,
+            // and growing one is what an operator does from a
+            // deployment rather than by editing three files.
+            self.cluster.expected_size = Some(parse(
+                "SDMQTT_CLUSTER_EXPECTED_SIZE",
+                &value,
+                "a node count",
+            )?);
+        }
+        for (variable, flag) in [
+            (
+                "SDMQTT_CLUSTER_STRICT_CONNECTS",
+                &mut self.cluster.strict.connects,
+            ),
+            (
+                "SDMQTT_CLUSTER_STRICT_PUBLISHES",
+                &mut self.cluster.strict.publishes,
+            ),
+            (
+                "SDMQTT_CLUSTER_STRICT_SUBSCRIBES",
+                &mut self.cluster.strict.subscribes,
+            ),
+        ] {
+            if let Some(value) = lookup(variable) {
+                // `true` or `false` and nothing else. A `1`, a `yes` or
+                // a `TRUE` is refused by name rather than guessed at,
+                // because the guess that goes wrong here is the one
+                // that reads an operator's `yes` as `false` and leaves
+                // them serving through the partition they asked to
+                // refuse.
+                *flag = parse(variable, &value, "true or false")?;
+            }
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_SEEDS") {
+            // Comma separated, for the reason the admin listener's
+            // allowed hosts are: an environment holds strings and a
+            // list has to be written as one.
+            self.cluster.seeds = value
+                .split(',')
+                .map(str::trim)
+                .filter(|seed| !seed.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
         }
         Ok(())
     }
@@ -2343,6 +2827,299 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------
+    // The cluster section, section 8.1.
+    // -----------------------------------------------------------
+
+    /// A configuration that clusters, over `directory`.
+    fn clustering(directory: &Path) -> Config {
+        Config {
+            storage: StorageSection {
+                directory: Some(directory.to_path_buf()),
+                ..StorageSection::default()
+            },
+            cluster: ClusterSection {
+                secret: Some(Secret::new("a-shared-secret")),
+                address: Some("127.0.0.1:7700".parse().expect("an address")),
+                seeds: vec!["10.0.0.2:7700".to_owned()],
+                ..ClusterSection::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    /// The default configuration does not cluster, and is valid.
+    ///
+    /// There is no zero-configuration cluster: see `cluster::config`.
+    #[test]
+    fn the_default_configuration_does_not_cluster() {
+        let config = Config::default();
+        assert_eq!(config.cluster.address, None);
+        assert_eq!(config.cluster.secret, None);
+        assert_eq!(config.cluster.advertised(), None);
+        config.validate().expect("and it is a valid configuration");
+    }
+
+    /// **A node with no store does not cluster**, and is refused for
+    /// saying it would.
+    ///
+    /// Section 8.1 mints the identity once and writes it down, and
+    /// everything in section 8 orders by it. A node that minted a
+    /// fresh one every start would be a new node to its peers after
+    /// every restart — it would own a singleton it had already given
+    /// up, and would break the uniqueness conflict resolution depends
+    /// on. Running with no store at all stays a supported mode; asking
+    /// that node to cluster does not.
+    #[test]
+    fn clustering_without_a_store_is_refused() {
+        let config = Config {
+            cluster: ClusterSection {
+                secret: Some(Secret::new("a-shared-secret")),
+                address: Some("127.0.0.1:7700".parse().expect("an address")),
+                ..ClusterSection::default()
+            },
+            ..Config::default()
+        };
+        let error = config
+            .validate()
+            .expect_err("a node with no identity cannot cluster");
+        let said = error.to_string();
+        assert!(said.contains("storage.directory"), "{said}");
+        assert!(
+            said.contains("identity"),
+            "the refusal has to say why, or an operator reads it as a typo: {said}"
+        );
+    }
+
+    /// And with a store and no secret, it is refused in `cluster`'s
+    /// own words.
+    #[test]
+    fn clustering_without_a_secret_is_refused_in_the_clusters_own_words() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let mut config = clustering(directory.path());
+        config.cluster.secret = None;
+        let said = config
+            .validate()
+            .expect_err("no secret, no clustering")
+            .to_string();
+        assert_eq!(
+            said,
+            cluster::ConfigError::NoSecret.to_string(),
+            "the refusal is carried verbatim rather than reworded"
+        );
+
+        config.cluster.secret = Some(Secret::new(""));
+        let said = config
+            .validate()
+            .expect_err("an empty secret protects nothing")
+            .to_string();
+        assert_eq!(
+            said,
+            cluster::ConfigError::EmptySecret.to_string(),
+            "and an empty one is refused for being empty, not as absent"
+        );
+    }
+
+    /// A node bound to every interface must say what to advertise.
+    ///
+    /// Section 8.1: a bind address no peer can use is not an address.
+    /// Nothing here can guess which interface was meant, so it is
+    /// refused rather than filled in.
+    #[test]
+    fn a_wildcard_bind_with_nothing_advertised_is_refused() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let mut config = clustering(directory.path());
+        config.cluster.address = Some("0.0.0.0:7700".parse().expect("an address"));
+        let said = config
+            .validate()
+            .expect_err("nothing can dial 0.0.0.0")
+            .to_string();
+        assert!(said.contains("cluster.advertise"), "{said}");
+
+        config.cluster.advertise = Some("10.0.0.4:7700".to_owned());
+        config
+            .validate()
+            .expect("an address to advertise makes it usable");
+        assert_eq!(
+            config.cluster.advertised().as_deref(),
+            Some("10.0.0.4:7700")
+        );
+    }
+
+    /// With nothing advertised and a real bind address, the bind
+    /// address is what peers are told.
+    #[test]
+    fn the_bind_address_is_advertised_when_nothing_else_is() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let config = clustering(directory.path());
+        config.validate().expect("a usable configuration");
+        assert_eq!(
+            config.cluster.advertised().as_deref(),
+            Some("127.0.0.1:7700")
+        );
+        assert_eq!(config.cluster.mesh().advertise, "127.0.0.1:7700");
+        assert_eq!(config.cluster.mesh().seeds, vec!["10.0.0.2:7700"]);
+    }
+
+    /// An advertised address that is there and empty is refused.
+    #[test]
+    fn an_empty_advertised_address_is_refused() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let mut config = clustering(directory.path());
+        config.cluster.advertise = Some(String::new());
+        let said = config
+            .validate()
+            .expect_err("no peer can dial nothing")
+            .to_string();
+        assert!(said.contains("cluster.advertise"), "{said}");
+    }
+
+    /// Timings that would declare a healthy peer dead are refused.
+    #[test]
+    fn a_detection_window_no_longer_than_the_interval_is_refused() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        for (key, mutate) in [
+            (
+                "cluster.heartbeat_ms",
+                Box::new(|c: &mut Config| c.cluster.heartbeat_ms = 0) as Box<dyn Fn(&mut Config)>,
+            ),
+            (
+                "cluster.dead_after_ms",
+                Box::new(|c: &mut Config| c.cluster.dead_after_ms = c.cluster.heartbeat_ms),
+            ),
+            (
+                "cluster.suspect_after",
+                Box::new(|c: &mut Config| c.cluster.suspect_after = 0),
+            ),
+            (
+                "cluster.reconnect_min_ms",
+                Box::new(|c: &mut Config| c.cluster.reconnect_min_ms = 0),
+            ),
+            (
+                "cluster.reconnect_max_ms",
+                Box::new(|c: &mut Config| c.cluster.reconnect_max_ms = 1),
+            ),
+        ] {
+            let mut config = clustering(directory.path());
+            mutate(&mut config);
+            let said = config.validate().unwrap_err().to_string();
+            assert!(said.contains(key), "expected {key} to be named: {said}");
+        }
+    }
+
+    /// The environment configures the whole cluster section.
+    #[test]
+    fn the_environment_configures_the_cluster() {
+        let mut config = Config::default();
+        config
+            .apply_env(|variable| match variable {
+                "SDMQTT_CLUSTER_NAME" => Some("production".to_owned()),
+                "SDMQTT_CLUSTER_SECRET" => Some("from-the-environment".to_owned()),
+                "SDMQTT_CLUSTER_ADDRESS" => Some("0.0.0.0:7701".to_owned()),
+                "SDMQTT_CLUSTER_ADVERTISE" => Some("10.0.0.4:7701".to_owned()),
+                "SDMQTT_CLUSTER_SEEDS" => Some(" 10.0.0.5:7701 , ,10.0.0.6:7701 ".to_owned()),
+                _ => None,
+            })
+            .expect("every one of them reads");
+
+        assert_eq!(config.cluster.name, "production");
+        assert_eq!(
+            config.cluster.secret.as_ref().map(Secret::expose),
+            Some("from-the-environment")
+        );
+        assert_eq!(
+            config.cluster.address,
+            Some("0.0.0.0:7701".parse().expect("an address"))
+        );
+        assert_eq!(
+            config.cluster.advertised().as_deref(),
+            Some("10.0.0.4:7701")
+        );
+        assert_eq!(
+            config.cluster.seeds,
+            vec!["10.0.0.5:7701".to_owned(), "10.0.0.6:7701".to_owned()],
+            "blank entries are not addresses"
+        );
+    }
+
+    /// An empty `SDMQTT_CLUSTER_SECRET` is kept as empty, so that the
+    /// refusal is about emptiness.
+    ///
+    /// The admin token's rule and the admin token's reason: an
+    /// operator whose variable expanded to nothing must not be sent
+    /// looking for a key they have already written.
+    #[test]
+    fn an_empty_cluster_secret_in_the_environment_is_kept_as_empty() {
+        let mut config = Config::default();
+        config
+            .apply_env(|variable| (variable == "SDMQTT_CLUSTER_SECRET").then(String::new))
+            .expect("it reads");
+        assert_eq!(
+            config.cluster.secret.as_ref().map(Secret::expose),
+            Some(""),
+            "collapsing it to absent would put the decision out of reach of the \
+             one refusal that knows the difference"
+        );
+        assert_eq!(
+            config.cluster.settings().check(),
+            Err(cluster::ConfigError::EmptySecret)
+        );
+    }
+
+    /// An unreadable cluster address is an error, not a silent
+    /// default.
+    #[test]
+    fn an_unreadable_cluster_address_is_an_error() {
+        let said = Config::default()
+            .apply_env(|variable| {
+                (variable == "SDMQTT_CLUSTER_ADDRESS").then(|| "not an address".to_owned())
+            })
+            .expect_err("it cannot be read")
+            .to_string();
+        assert!(said.contains("SDMQTT_CLUSTER_ADDRESS"), "{said}");
+    }
+
+    /// A `[cluster]` table in a file reads the whole section.
+    #[test]
+    fn a_file_configures_the_cluster() {
+        let config: Config = toml::from_str(
+            r#"
+[cluster]
+name = "production"
+secret = "a-shared-secret"
+address = "10.0.0.4:7700"
+advertise = "edge-4.example:7700"
+seeds = ["10.0.0.5:7700"]
+heartbeat_ms = 500
+suspect_after = 4
+dead_after_ms = 4000
+"#,
+        )
+        .expect("the section parses");
+        assert_eq!(config.cluster.name, "production");
+        assert_eq!(
+            config.cluster.advertised().as_deref(),
+            Some("edge-4.example:7700")
+        );
+        let mesh = config.cluster.mesh();
+        assert_eq!(mesh.detection.heartbeat, Duration::from_millis(500));
+        assert_eq!(mesh.detection.suspect_after, 4);
+        assert_eq!(mesh.detection.dead_after, Duration::from_millis(4000));
+    }
+
+    /// The secret does not print itself out of this section either.
+    #[test]
+    fn the_cluster_section_does_not_print_its_secret() {
+        let shown = format!(
+            "{:?}",
+            ClusterSection {
+                secret: Some(Secret::new("a-shared-secret")),
+                ..ClusterSection::default()
+            }
+        );
+        assert!(!shown.contains("a-shared-secret"), "{shown}");
+    }
+
     #[test]
     fn an_environment_variable_overrides_the_file() {
         let mut config = Config::from_toml("[listener]\naddress = \"127.0.0.1:1\"\n").unwrap();
@@ -3067,6 +3844,67 @@ mod tests {
         );
     }
 
+    /// Section 8.1's node name: derived, overridable, and never empty.
+    ///
+    /// The name is not the identity — the stored UUID is — so this is
+    /// about what an operator reads, and the one thing that can go
+    /// wrong with it is an environment variable that expanded to
+    /// nothing. Refused rather than read as absent, which is the rule
+    /// `an_empty_token_is_refused_wherever_it_came_from` records.
+    ///
+    /// **The default is the machine's name**, and this asserts the
+    /// derivation rather than the machine: a test that read
+    /// `/etc/hostname` would assert something about whoever is running
+    /// it. What the default must be on *this* machine is only that it
+    /// is not empty, because an empty one is a node that refuses to
+    /// start.
+    #[test]
+    fn the_node_name_is_the_machines_and_can_be_set_and_may_not_be_empty() {
+        assert_eq!(
+            node_name(Some("edge-7\n".to_owned())),
+            "edge-7",
+            "a hostname file ends in a newline, and a name is not whitespace"
+        );
+        assert_eq!(
+            node_name(Some("  \n".to_owned())),
+            "local",
+            "a hostname of nothing falls back rather than refusing to start"
+        );
+        assert_eq!(
+            node_name(None),
+            "local",
+            "a machine that will not say what it is called reads as it always did"
+        );
+        assert!(
+            !Config::from_toml("")
+                .expect("an empty file is a valid one")
+                .node
+                .name
+                .is_empty(),
+            "a derived default that is empty is a node that will not start"
+        );
+
+        let named = Config::from_toml("[node]\nname = \"edge-1\"\n").expect("it parses");
+        named.validate().expect("a name is usable");
+        assert_eq!(named.node.name, "edge-1");
+
+        let mut from_the_environment = Config::default();
+        from_the_environment
+            .apply_env(|variable| (variable == "SDMQTT_NODE_NAME").then(|| "edge-2".to_owned()))
+            .expect("it is read");
+        assert_eq!(from_the_environment.node.name, "edge-2");
+
+        let mut emptied = Config::default();
+        emptied
+            .apply_env(|variable| (variable == "SDMQTT_NODE_NAME").then(String::new))
+            .expect("reading it is not the error; what it says is");
+        let said = emptied
+            .validate()
+            .expect_err("a node called nothing is not a node")
+            .to_string();
+        assert!(said.contains("node.name"), "{said}");
+    }
+
     /// `--no-admin` absent must not turn a disabled listener back on.
     #[test]
     fn an_absent_flag_does_not_re_enable_the_admin_listener() {
@@ -3082,5 +3920,231 @@ mod tests {
             !config.admin.enabled,
             "the file said no and the command line said nothing"
         );
+    }
+
+    // -----------------------------------------------------------
+    // The partition policy, section 8.5.
+    // -----------------------------------------------------------
+
+    /// A strict flag with no expected size is refused **at startup**,
+    /// in the policy's own words.
+    ///
+    /// Each of the three, because the message names the flag and a
+    /// list of three literals is how one of them comes to name a key
+    /// that no longer exists.
+    #[test]
+    fn a_strict_flag_with_no_expected_size_is_refused_at_startup() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        for (set, named) in [
+            (
+                cluster::Strict {
+                    connects: true,
+                    ..cluster::Strict::default()
+                },
+                "cluster.strict.connects",
+            ),
+            (
+                cluster::Strict {
+                    publishes: true,
+                    ..cluster::Strict::default()
+                },
+                "cluster.strict.publishes",
+            ),
+            (
+                cluster::Strict {
+                    subscribes: true,
+                    ..cluster::Strict::default()
+                },
+                "cluster.strict.subscribes",
+            ),
+        ] {
+            let mut config = clustering(directory.path());
+            config.cluster.strict = set;
+            let said = config
+                .validate()
+                .expect_err("a flag nothing can evaluate must not start")
+                .to_string();
+            assert_eq!(
+                said,
+                cluster::PolicyError::NoExpectedSize { what: named }.to_string(),
+                "carried verbatim rather than reworded"
+            );
+            assert!(said.contains(named), "{said}");
+            assert!(
+                said.contains("cluster.expected_size"),
+                "and it says what to set: {said}"
+            );
+        }
+    }
+
+    /// With the size set, the same flags are a valid configuration.
+    ///
+    /// The other side of the boundary, and the mutation it is for is a
+    /// refusal that fires whatever the size says — which every test
+    /// above would pass.
+    #[test]
+    fn the_same_flags_with_an_expected_size_are_accepted() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let mut config = clustering(directory.path());
+        config.cluster.expected_size = Some(3);
+        config.cluster.strict = cluster::Strict {
+            connects: true,
+            publishes: true,
+            subscribes: true,
+        };
+        config
+            .validate()
+            .expect("a size and three flags is what section 8.5 offers");
+        let policy = config.cluster.policy().expect("and it builds a policy");
+        assert_eq!(policy.expected(), Some(3));
+        assert!(!policy.allows(cluster::Operation::Connect, 2));
+        assert!(policy.allows(cluster::Operation::Connect, 3));
+    }
+
+    /// An expected size of zero is refused.
+    #[test]
+    fn an_expected_size_of_zero_is_refused_at_startup() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let mut config = clustering(directory.path());
+        config.cluster.expected_size = Some(0);
+        assert_eq!(
+            config
+                .validate()
+                .expect_err("no cluster has no nodes")
+                .to_string(),
+            cluster::PolicyError::NoNodes.to_string()
+        );
+    }
+
+    /// A policy on a node that does not cluster is refused.
+    ///
+    /// Not ignored. A node with no `cluster.address` is a cluster of
+    /// one for ever, so it is never short of anything and a flag on it
+    /// can never fire — an operator who asked for the trade and
+    /// silently did not get it would find out during the partition
+    /// they asked about.
+    #[test]
+    fn a_policy_on_a_node_that_does_not_cluster_is_refused() {
+        let flagged = Config {
+            cluster: ClusterSection {
+                expected_size: Some(3),
+                strict: cluster::Strict {
+                    publishes: true,
+                    ..cluster::Strict::default()
+                },
+                ..ClusterSection::default()
+            },
+            ..Config::default()
+        };
+        let said = flagged
+            .validate()
+            .expect_err("a flag on a cluster of one can never fire")
+            .to_string();
+        assert!(said.contains("cluster.strict.publishes"), "{said}");
+        assert!(said.contains("cluster.address"), "{said}");
+
+        // And the size on its own, which is the same mistake with
+        // nothing reading it.
+        let sized = Config {
+            cluster: ClusterSection {
+                expected_size: Some(3),
+                ..ClusterSection::default()
+            },
+            ..Config::default()
+        };
+        let said = sized
+            .validate()
+            .expect_err("nothing to compare three against")
+            .to_string();
+        assert!(said.contains("cluster.expected_size"), "{said}");
+        assert!(said.contains("cluster.address"), "{said}");
+    }
+
+    /// The default clusters with no policy at all, which is
+    /// availability.
+    #[test]
+    fn a_clustering_node_needs_no_policy() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let config = clustering(directory.path());
+        config.validate().expect("this is the ordinary cluster");
+        assert_eq!(config.cluster.expected_size, None);
+        assert!(!config.cluster.strict.any());
+        let policy = config.cluster.policy().expect("and it builds");
+        assert!(
+            policy.allows(cluster::Operation::Publish, 1),
+            "one node of a cluster that never said how large it is serves"
+        );
+    }
+
+    /// The file spells the section as section 8.5 names it.
+    ///
+    /// A key an operator cannot write is a feature that does not
+    /// exist, and `deny_unknown_fields` means a misspelling here is a
+    /// refusal to start rather than a flag that quietly does nothing.
+    #[test]
+    fn the_policy_is_read_from_a_file() {
+        let config = Config::parse(
+            r#"
+            [cluster]
+            expected_size = 3
+
+            [cluster.strict]
+            publishes = true
+            "#,
+            Path::new("test.toml"),
+        )
+        .expect("the keys are spelled as the section names them");
+        assert_eq!(config.cluster.expected_size, Some(3));
+        assert_eq!(
+            config.cluster.strict,
+            cluster::Strict {
+                publishes: true,
+                ..cluster::Strict::default()
+            },
+            "and one flag set does not set the others"
+        );
+    }
+
+    /// And from the environment, which is how a container is
+    /// configured.
+    #[test]
+    fn the_policy_is_read_from_the_environment() {
+        let mut config = Config::default();
+        config
+            .apply_env(|name| {
+                match name {
+                    "SDMQTT_CLUSTER_EXPECTED_SIZE" => Some("4"),
+                    "SDMQTT_CLUSTER_STRICT_SUBSCRIBES" => Some("true"),
+                    "SDMQTT_CLUSTER_STRICT_PUBLISHES" => Some("false"),
+                    _ => None,
+                }
+                .map(ToOwned::to_owned)
+            })
+            .expect("four nodes and a flag");
+        assert_eq!(config.cluster.expected_size, Some(4));
+        assert_eq!(
+            config.cluster.strict,
+            cluster::Strict {
+                subscribes: true,
+                ..cluster::Strict::default()
+            },
+            "the variable that said false set nothing, and named its own flag"
+        );
+
+        // A boolean this broker will not guess at. `1`, `yes` and
+        // `TRUE` are all refused by name, because the guess that goes
+        // wrong reads an operator's `yes` as `false` and leaves them
+        // serving through the partition they asked to refuse.
+        for written in ["1", "yes", "TRUE", ""] {
+            let mut config = Config::default();
+            let error = config
+                .apply_env(|name| {
+                    (name == "SDMQTT_CLUSTER_STRICT_CONNECTS").then(|| written.to_owned())
+                })
+                .expect_err("a flag that is not true or false is refused");
+            let said = error.to_string();
+            assert!(said.contains("SDMQTT_CLUSTER_STRICT_CONNECTS"), "{said}");
+            assert!(said.contains("true or false"), "{said}");
+        }
     }
 }

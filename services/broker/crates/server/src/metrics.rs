@@ -315,6 +315,17 @@ pub enum SocketOutcome {
     /// A publication could not be made durable, so the client was
     /// closed rather than acknowledged.
     NotDurable,
+    /// The cluster was short of its expected size and this node is
+    /// configured to refuse, section 8.5.
+    ///
+    /// **Its own outcome and not `Protocol`**, because it is the one
+    /// ending in the list that an operator asked for: the flag that
+    /// produces it is one they set. A refusal that an acknowledgement
+    /// could carry does not end a socket at all and is counted by its
+    /// reason code instead, so what this counts is the subset the
+    /// protocol left no room to answer — 3.1.1 publishes, and
+    /// at-most-once ones.
+    NotWhole,
     /// The connection was dropped before it finished: a shutdown, or
     /// a panic. Counted from [`Drop`] rather than from a return, so
     /// that a cancelled connection is an ending like any other rather
@@ -323,7 +334,7 @@ pub enum SocketOutcome {
 }
 
 /// Every socket outcome, in the order the handles are indexed in.
-const SOCKET_OUTCOMES: [SocketOutcome; 9] = [
+const SOCKET_OUTCOMES: [SocketOutcome; 10] = [
     SocketOutcome::Clean,
     SocketOutcome::ConnectTimeout,
     SocketOutcome::NotAConnect,
@@ -333,6 +344,11 @@ const SOCKET_OUTCOMES: [SocketOutcome; 9] = [
     SocketOutcome::Codec,
     SocketOutcome::NotDurable,
     SocketOutcome::Abandoned,
+    // Appended rather than slotted in beside `NotDurable`, which it
+    // reads next to: this array's positions **are** the indices
+    // `outcome_index` returns, so inserting one in the middle
+    // renumbers every outcome after it and relabels their counters.
+    SocketOutcome::NotWhole,
 ];
 
 /// The label value for a socket outcome.
@@ -346,6 +362,7 @@ fn outcome_label(outcome: SocketOutcome) -> &'static str {
         SocketOutcome::Io => "io",
         SocketOutcome::Codec => "codec",
         SocketOutcome::NotDurable => "not_durable",
+        SocketOutcome::NotWhole => "not_whole",
         SocketOutcome::Abandoned => "abandoned",
     }
 }
@@ -362,6 +379,7 @@ fn outcome_index(outcome: SocketOutcome) -> usize {
         SocketOutcome::Codec => 6,
         SocketOutcome::NotDurable => 7,
         SocketOutcome::Abandoned => 8,
+        SocketOutcome::NotWhole => 9,
     }
 }
 
@@ -447,6 +465,7 @@ reason_table!(DropReason, ALL_DROP_REASONS, drop_label, drop_index, {
     QosZeroWhileOffline => "qos0_while_offline",
     Expired => "expired",
     SessionEnded => "session_ended",
+    Migrated => "migrated",
     RejectedByPeer => "rejected_by_peer",
     TooLargeForPeer => "too_large_for_peer",
 });
@@ -746,7 +765,85 @@ pub struct Metrics {
     /// two collectors over the same numbers would render every one of
     /// them twice, which a scraper reads as a duplicate series.
     watched: AtomicBool,
+    /// The same, for [`Metrics::watch_cluster`].
+    watching_cluster: AtomicBool,
 }
+
+/// What a running cluster can be asked for, once there is one.
+///
+/// Section 11.3's cluster numbers: **the members gauge, and bytes
+/// sent, received and dropped on the links.** All four were deferred
+/// to milestone 5 and recorded as deferred — a counter that can only
+/// ever read zero says something false rather than something empty,
+/// and a membership of zero is wrong rather than empty because this
+/// node is a member of its own cluster of one.
+///
+/// A trait rather than the mesh itself, for the reason
+/// `sdmqtt_admin::Cluster` is one: what this needs of section 8 is
+/// four numbers, and taking the mesh's type would make this crate
+/// unbuildable without a transport, a handshake and a failure
+/// detector.
+pub trait ClusterMetrics: std::fmt::Debug + Send + Sync + 'static {
+    /// How many nodes this one can see, **itself included**.
+    fn members(&self) -> u64;
+    /// Bytes written to peers.
+    fn bytes_sent(&self) -> u64;
+    /// Bytes read from peers.
+    fn bytes_received(&self) -> u64;
+    /// Bytes never written, because a peer's queue was full.
+    fn bytes_dropped(&self) -> u64;
+    /// Section 8.4's migration numbers, in the order
+    /// [`MIGRATION_NUMBERS`] names them.
+    ///
+    /// An array rather than seven methods, because every one of them
+    /// is the same question asked of the same table and a trait with
+    /// seven one-line methods is seven places for an implementation to
+    /// answer one of them from the wrong field.
+    fn migrations(&self) -> [u64; MIGRATION_NUMBERS.len()];
+}
+
+/// Section 8.4's migration numbers: the metric name, its help text,
+/// and the order [`ClusterMetrics::migrations`] returns them in.
+///
+/// **`sessions_migrated_incomplete` is the one section 8.4 promises.**
+/// "On timeout, or when the previous owner cannot be reached, the
+/// connection is accepted with what arrived, the session is reported
+/// as present, and the shortfall is **counted and surfaced**" — it was
+/// counted from milestone 5's second task and surfaced nowhere, which
+/// is half of a sentence that reads as a whole one. The other six are
+/// here because a shortfall with nothing to compare it against cannot
+/// be read: a hundred incomplete drains is an outage or a quiet
+/// afternoon depending on how many there were altogether.
+pub const MIGRATION_NUMBERS: [(&str, &str); 7] = [
+    (
+        "sessions_claimed",
+        "Sessions this node claimed from another node",
+    ),
+    (
+        "sessions_migrated",
+        "Claims whose drain finished before the wait ran out",
+    ),
+    (
+        "sessions_migrated_incomplete",
+        "Claims accepted without a finished drain, which is the shortfall of section 8.4",
+    ),
+    (
+        "sessions_migrated_unreachable",
+        "Of those, the ones with no link to the previous owner to ask over",
+    ),
+    (
+        "migrated_messages",
+        "Messages that arrived in a drain and were kept",
+    ),
+    (
+        "migrated_messages_missing",
+        "Messages a previous owner said it held and that never arrived",
+    ),
+    (
+        "migrated_messages_late",
+        "Chunks that arrived for a drain nothing was waiting for any more",
+    ),
+];
 
 impl Default for Metrics {
     fn default() -> Self {
@@ -922,6 +1019,7 @@ impl Metrics {
             rule_events,
             rule_waiting,
             watched: AtomicBool::new(false),
+            watching_cluster: AtomicBool::new(false),
         }
     }
 
@@ -943,6 +1041,28 @@ impl Metrics {
         self.registry
             .lock()
             .register_collector(Box::new(Live(Arc::downgrade(shared))));
+    }
+
+    /// Register section 11.3's cluster numbers, read from the mesh
+    /// that holds them.
+    ///
+    /// Called only on a node that clusters, which is what keeps the
+    /// four series absent rather than zero on a node that does not:
+    /// "the links are quiet" and "there are no links" are different
+    /// statements, and a scraper cannot tell them apart from a zero.
+    ///
+    /// A strong reference, unlike [`Metrics::watch`]: the mesh does
+    /// not own this registry, so there is no cycle, and a mesh that
+    /// has been shut down still holds the totals its links reached.
+    ///
+    /// Idempotent, for the reason [`Metrics::watch`] is.
+    pub fn watch_cluster(&self, cluster: Arc<dyn ClusterMetrics>) {
+        if self.watching_cluster.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.registry
+            .lock()
+            .register_collector(Box::new(ClusterLive(cluster)));
     }
 
     /// One rule's owned handles.
@@ -1125,31 +1245,54 @@ impl Collector for Live {
         // Each is guarded against drifting from what it counts by a
         // property that walks.
         //
-        // **Cluster members are milestone 5 and are deliberately not
-        // registered at all.** An authentication outcome that will
-        // always be zero until milestone 7 is still a true statement
-        // about this broker; a membership of zero is not, because
-        // this node is a member of its own cluster of one and
-        // reporting none would be wrong rather than empty.
-        //
-        // The same goes for section 11.3's cluster bytes sent,
-        // received and dropped, which are also milestone 5 and are
-        // also absent. There is no inter-node link to count bytes on
-        // until section 8 exists, so the three counters could only
-        // read zero, and zero here would read as "the links are
-        // quiet" rather than "there are no links". Said out loud
-        // because the other two cluster deferrals were recorded and
-        // these three were not, which is the difference between a
-        // decision and an omission.
+        // Section 11.3's cluster members gauge and its three byte
+        // counters used to be listed here as deferred to milestone 5,
+        // with the reason: a membership of zero would be wrong rather
+        // than empty, and three counters that could only read zero
+        // would say "the links are quiet" rather than "there are no
+        // links". They are not deferred any more. They live in
+        // [`ClusterLive`], registered by [`Metrics::watch_cluster`]
+        // **only on a node that clusters**, which is what keeps them
+        // absent rather than zero on a node that does not.
         let connections = shared.outbox_count();
-        let (sessions, subscriptions, retained, queued) = shared.with_broker(|broker| {
+        let (sessions, subscriptions, retained, queued, matches) = shared.with_broker(|broker| {
             (
                 broker.session_count(),
                 broker.subscription_count(),
                 broker.retained_count(),
                 broker.queue_depth(),
+                broker.router_matches(),
             )
         });
+
+        // Section 11.3's "router matches split local and remote",
+        // **deferred from milestone 3 and not deferred any more.** The
+        // note that stood here said the remote half needed a cluster and
+        // that counting the local half needed the matching layer to
+        // report a number it did not return, which would have put
+        // counting inside the crate that deliberately counts nothing.
+        // Neither is true now: section 8.3's forwarding is what wanted
+        // the remote half, and the local half is a running total the
+        // broker keeps and this reads, which is the same division as
+        // every gauge above.
+        //
+        // One family split by label rather than two names, because the
+        // question an operator asks is what proportion of this node's
+        // matching is costing a network copy. Both series exist on
+        // every node: a node that does not cluster really did forward to
+        // nobody, which is not the same as `cluster_members`, where zero
+        // would be a lie because a node is a member of its own cluster.
+        let mut router = encoder.encode_descriptor(
+            "router_matches",
+            "Publications routed, by whether they were delivered here or forwarded to \
+             another node",
+            None,
+            prometheus_client::metrics::MetricType::Counter,
+        )?;
+        for (scope, value) in [("local", matches.local), ("remote", matches.remote)] {
+            let counter = ConstCounter::new(value);
+            counter.encode(router.encode_family(&[("scope", scope)])?)?;
+        }
 
         for (name, help, value) in [
             (
@@ -1184,6 +1327,62 @@ impl Collector for Live {
             reading.encode(descriptor)?;
         }
 
+        Ok(())
+    }
+}
+
+/// Section 11.3's cluster numbers, read from the mesh at the moment
+/// of the scrape.
+///
+/// Registered only on a node that clusters; see
+/// [`Metrics::watch_cluster`].
+#[derive(Debug)]
+struct ClusterLive(Arc<dyn ClusterMetrics>);
+
+impl Collector for ClusterLive {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        // Itself included, which is what the trait promises: a node
+        // that has lost every peer is a cluster of one, not of none.
+        let members = ConstGauge::new(i64::try_from(self.0.members()).unwrap_or(i64::MAX));
+        let descriptor = encoder.encode_descriptor(
+            "cluster_members",
+            "Nodes in this cluster that this node can see, itself included",
+            None,
+            members.metric_type(),
+        )?;
+        members.encode(descriptor)?;
+
+        for (name, help, value) in [
+            (
+                "cluster_bytes_sent",
+                "Bytes written to cluster peers",
+                self.0.bytes_sent(),
+            ),
+            (
+                "cluster_bytes_received",
+                "Bytes read from cluster peers",
+                self.0.bytes_received(),
+            ),
+            (
+                "cluster_bytes_dropped",
+                "Bytes never written to a cluster peer, because its queue was full",
+                self.0.bytes_dropped(),
+            ),
+        ] {
+            let counter = ConstCounter::new(value);
+            let descriptor = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
+            counter.encode(descriptor)?;
+        }
+
+        // Section 8.4's, zipped against their names rather than
+        // written out again: two lists of seven in one file is how one
+        // of them ends up describing the other one's fifth entry.
+        let migrations = self.0.migrations();
+        for ((name, help), value) in MIGRATION_NUMBERS.iter().zip(migrations) {
+            let counter = ConstCounter::new(value);
+            let descriptor = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
+            counter.encode(descriptor)?;
+        }
         Ok(())
     }
 }
@@ -1279,6 +1478,107 @@ sdmqtt_packets_received_total{kind=\"unsuback\",version=\"5\"} 0
 sdmqtt_packets_received_total{kind=\"unsubscribe\",version=\"3.1.1\"} 0
 sdmqtt_packets_received_total{kind=\"unsubscribe\",version=\"5\"} 0
 "
+        );
+    }
+
+    /// Section 11.3's router matches, split local and remote.
+    ///
+    /// **Both series exist before a single publication**, which is the
+    /// half a substring search would not catch: a family that only grew
+    /// a series when it was first incremented leaves a hole in a
+    /// dashboard, and a remote half that was registered only on a node
+    /// that clusters would make the split mean different things on
+    /// different nodes.
+    ///
+    /// The exact text, because it is what a scraper parses: the label is
+    /// `scope`, the values are lower case, and a local delivery does not
+    /// land on the remote series.
+    #[tokio::test]
+    async fn the_router_matches_are_split_local_and_remote() {
+        use broker_core::broker::BrokerConfig;
+        use mqtt_codec::packet::{Connect, RetainHandling, Subscribe, SubscriptionOptions};
+        use mqtt_codec::{Packet, Properties, QoS};
+
+        use crate::shared::Shared;
+
+        let shared = std::sync::Arc::new(Shared::new(BrokerConfig::default()));
+        shared.metrics().watch(&shared);
+
+        assert_eq!(
+            block(&shared.metrics().render(), "sdmqtt_router_matches"),
+            "\
+# HELP sdmqtt_router_matches Publications routed, by whether they were delivered here or forwarded to another node
+# TYPE sdmqtt_router_matches counter
+sdmqtt_router_matches_total{scope=\"local\"} 0
+sdmqtt_router_matches_total{scope=\"remote\"} 0
+",
+            "both series must exist before anything is published"
+        );
+
+        let registration = shared.with_broker(|broker| {
+            broker
+                .connect(
+                    "",
+                    &Connect {
+                        version: Version::V5,
+                        client_id: "listener".into(),
+                        clean_start: false,
+                        keep_alive: 0,
+                        username: None,
+                        password: None,
+                        will: None,
+                        properties: Properties {
+                            session_expiry_interval: Some(3600),
+                            ..Properties::default()
+                        },
+                    },
+                    &mut Vec::new(),
+                )
+                .expect("the default decision authenticates")
+        });
+        shared.with_broker(|broker| {
+            broker
+                .handle(
+                    registration.subscriber,
+                    &Packet::Subscribe(Subscribe {
+                        packet_id: 1,
+                        filters: vec![SubscriptionOptions {
+                            filter: "a/+".into(),
+                            qos: QoS::AtMostOnce,
+                            no_local: false,
+                            retain_as_published: false,
+                            retain_handling: RetainHandling::SendAlways,
+                        }],
+                        properties: Properties::default(),
+                    }),
+                    &mut Vec::new(),
+                )
+                .expect("the subscription is accepted");
+        });
+        shared.with_broker(|broker| {
+            let now = broker.clock().now();
+            broker.publish(
+                broker_core::session::Message::new(
+                    "a/b",
+                    bytes::Bytes::from_static(b"here"),
+                    QoS::AtMostOnce,
+                    false,
+                ),
+                None,
+                now,
+                &mut Vec::new(),
+            );
+        });
+
+        assert_eq!(
+            block(&shared.metrics().render(), "sdmqtt_router_matches"),
+            "\
+# HELP sdmqtt_router_matches Publications routed, by whether they were delivered here or forwarded to another node
+# TYPE sdmqtt_router_matches counter
+sdmqtt_router_matches_total{scope=\"local\"} 1
+sdmqtt_router_matches_total{scope=\"remote\"} 0
+",
+            "one local delivery, and nothing forwarded by a node with no cluster"
         );
     }
 
@@ -1586,6 +1886,102 @@ sdmqtt_packets_received_total{kind=\"unsubscribe\",version=\"5\"} 0
                     "{kind:?} at {version:?} shares a handle with something else"
                 );
             }
+        }
+    }
+
+    /// A cluster whose every number differs from every other.
+    ///
+    /// **Distinct values, and that is the point.** Seven counters
+    /// rendered from one array against one list of names is a zip, and
+    /// a zip that has slipped by one renders seven plausible series
+    /// with the wrong numbers under them. Equal values, or zeroes,
+    /// would make that invisible.
+    #[derive(Debug)]
+    struct Counted;
+
+    impl ClusterMetrics for Counted {
+        fn members(&self) -> u64 {
+            3
+        }
+        fn bytes_sent(&self) -> u64 {
+            11
+        }
+        fn bytes_received(&self) -> u64 {
+            22
+        }
+        fn bytes_dropped(&self) -> u64 {
+            33
+        }
+        fn migrations(&self) -> [u64; MIGRATION_NUMBERS.len()] {
+            [41, 42, 43, 44, 45, 46, 47]
+        }
+    }
+
+    #[test]
+    fn a_clustering_node_renders_its_cluster_and_migration_numbers() {
+        let metrics = Metrics::new();
+        metrics.watch_cluster(Arc::new(Counted));
+        let rendered = metrics.render();
+
+        assert_eq!(
+            block(&rendered, "sdmqtt_cluster_members"),
+            // No trailing full stop: the registry appends one to the
+            // families it owns, and a collector's descriptors are
+            // written as given.
+            "# HELP sdmqtt_cluster_members Nodes in this cluster that this node can see, \
+             itself included\n\
+             # TYPE sdmqtt_cluster_members gauge\n\
+             sdmqtt_cluster_members 3\n"
+        );
+        for (name, value) in [
+            ("sdmqtt_cluster_bytes_sent", 11),
+            ("sdmqtt_cluster_bytes_received", 22),
+            ("sdmqtt_cluster_bytes_dropped", 33),
+        ] {
+            assert!(
+                block(&rendered, name).contains(&format!("{name}_total {value}\n")),
+                "{name} should be {value} in:\n{}",
+                block(&rendered, name)
+            );
+        }
+
+        // Section 8.4's seven, each against the name it belongs to and
+        // not merely present somewhere.
+        for ((name, help), value) in MIGRATION_NUMBERS.iter().zip([41, 42, 43, 44, 45, 46, 47]) {
+            let family = format!("sdmqtt_{name}");
+            let shown = block(&rendered, &family);
+            assert!(
+                shown.contains(&format!("{family}_total {value}\n")),
+                "{family} should be {value} in:\n{shown}"
+            );
+            assert!(
+                shown.contains(help),
+                "{family} should carry its own help text, not another's:\n{shown}"
+            );
+        }
+
+        // And the one the spec names, spelled out, because an operator
+        // alerting on a partition is alerting on this series and a
+        // rename would silently stop their rule firing.
+        assert!(
+            rendered.contains("sdmqtt_sessions_migrated_incomplete_total 43\n"),
+            "section 8.4's shortfall is this series:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_node_that_does_not_cluster_renders_none_of_them() {
+        // Absent rather than zero, which is section 11.3's rule and the
+        // reason `watch_cluster` is called only on a node that
+        // clusters: "no links" and "quiet links" are different
+        // statements, and a scraper cannot tell them apart from a zero.
+        let rendered = Metrics::new().render();
+        assert!(!rendered.contains("sdmqtt_cluster_members"), "{rendered}");
+        for (name, _) in MIGRATION_NUMBERS {
+            assert!(
+                !rendered.contains(&format!("sdmqtt_{name}")),
+                "{name} should be absent on a node that does not cluster:\n{rendered}"
+            );
         }
     }
 }

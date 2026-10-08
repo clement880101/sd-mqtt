@@ -9,6 +9,11 @@ description = "A distributed MQTT broker"
 
 [dependencies]
 sdmqtt-server = { path = "../server", version = "0.1.0" }
+# Section 8.1's node identity, minted or read back at startup. Already
+# in the binary through `rules`, which orders singleton ownership by
+# it; named here because this crate is the one that decides when it is
+# minted and writes it down.
+cluster = { path = "../cluster", version = "0.1.0" }
 sdmqtt-admin = { path = "../admin", version = "0.1.0" }
 broker-core = { path = "../broker-core", version = "0.1.0" }
 # The rules and the outbound connector. This is where the HTTP client
@@ -37,6 +42,11 @@ tempfile.workspace = true
 # `tests/restart.rs` speaks MQTT to the binary over a real socket, and
 # the codec reads and writes through `BytesMut`.
 bytes.workspace = true
+# `tests/cluster.rs` reads the admin API's node listing, which is a
+# document with an envelope around it: a substring search would pass
+# against a page that named the right node in the wrong field. Already
+# in the binary through the admin crate, so this costs no new crate.
+serde_json = { version = "1", default-features = false, features = ["std"] }
 # `tests/interface.rs` asks the binary for the interface as brotli and
 # has to prove the bytes really are brotli. A decoder says so; a
 # content-encoding header does not. Dev only, so nothing of it ships.

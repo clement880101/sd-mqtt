@@ -434,6 +434,24 @@ counts deleted entries.
 Each node has a stable identity persisted on first start: a UUID v7 and a
 human-readable name. A node joins by being given one or more seed addresses.
 
+**The UUID is the identity everything orders by.** The name is for operators
+and is never compared: two copied configurations share a name, and a
+comparison that is not antisymmetric leaves both sides believing they won.
+This matters in two places that must agree, or the binary holds two answers
+to "which node": the lowest identity owns a singleton, and the highest
+identity breaks a tie between equal clock readings.
+
+**A node also advertises the address peers should dial**, which is not its
+bind address. A node bound to all interfaces, behind a port mapping, or
+behind a test's fault-injection gate has a bind address no peer can use.
+Seeds alone are not enough for a full mesh, because a node learnt through a
+seed must publish somewhere to reach it.
+
+**A node that receives a greeting carrying its own UUID refuses the link and
+says so loudly.** That is a copied data directory or a cloned image, and it
+breaks the uniqueness that conflict resolution depends on, quietly and
+permanently. The handshake detects it for nothing.
+
 Nodes form a full TCP mesh. At the design ceiling of 50 nodes that is 49
 links per node, which is negligible. The same links carry message forwarding,
 metadata replication and heartbeats, so there is one transport, one
@@ -444,7 +462,33 @@ signal. A heartbeat every second covers half-open connections; a peer is
 suspect after three missed beats and dead after ten seconds, both
 configurable. Reconnection uses exponential backoff with jitter.
 
-The link is authenticated by a shared secret and may be wrapped in TLS.
+**The link is authenticated by a mutual challenge, not by sending the
+secret.** Each side sends a nonce, then a keyed hash over a transcript of a
+domain string, a role byte, the cluster name, both node identities and both
+nonces. Each verifies the other's before trusting it, and the listener
+verifies before answering, so an unauthenticated dialler learns nothing.
+
+Every part of that earns its place. Sending the secret would hand it to a
+passive observer, because wrapping the link in TLS is optional. Omitting the
+role byte would make the answer **reflectable**: every node holds the same
+secret, so an attacker who knows nothing opens a connection back to the
+honest node, replays that node's own challenge at it, and feeds the answer
+to the first connection. Binding the cluster name stops a staging node
+configured with a production secret from joining production.
+
+A node with no secret configured **refuses to cluster at all**, and an empty
+secret is refused rather than read as absent. There is no loopback exemption,
+because unlike the admin listener there is no zero-configuration case to
+preserve: a cluster needs seeds written down before it exists. A link grants
+session takeover and unauthenticated writes to every replicated register,
+which is a larger grant than the admin API's.
+
+A mismatched secret is a configuration error that will not fix itself, so it
+backs off harder than a transport failure, is logged once per peer rather
+than once per attempt, and is counted and surfaced separately from a link
+that merely failed to connect.
+
+The link may be wrapped in TLS.
 
 Membership beyond roughly 100 nodes would need gossip rather than a full
 mesh. chitchat is the documented escape hatch. It is not needed now and
@@ -456,12 +500,67 @@ take.
 Replicated metadata comprises subscriptions, retained messages, rules, users,
 access control rules, API keys and session ownership.
 
+**Three of those do not exist until milestone 7.** Users, access control
+rules and API keys arrive with authentication, so milestone 5 replicates
+subscriptions, retained messages, rules and session ownership. The register
+type and the anti-entropy exchange are written to carry a kind they do not
+yet know, so that adding the other three is a new variant rather than a new
+mechanism. Rules stop being node-local here, which is what milestone 4 said
+would happen.
+
 Each record is a last-writer-wins register stamped with a hybrid logical
 clock reading and the writing node's identity, which breaks ties
-deterministically. Writes broadcast immediately to all peers. Every few
+deterministically. The order is the reading's milliseconds, then its counter,
+then the node's UUID bytes, compared in that order.
+
+**All three parts are load-bearing.** Milliseconds alone do not converge: two
+nodes writing in the same millisecond each keep their own and no later
+exchange repairs it. Dropping the counter makes one node ambiguous with
+itself, because two writes inside one millisecond then share a key.
+
+**Convergence is conditional on no two writes ever sharing a stamp**, which
+is a real operational requirement rather than a theoretical one. A clock
+cannot issue a duplicate, but two things can: a duplicated node identity,
+which the handshake refuses, and a clock that restarts behind itself. So a
+node resumes its clock from the highest reading it has ever written, read
+back from the store, not from zero.
+
+**A peer whose reading is further ahead than the configured bound is
+refused, not clamped.** Clamping still advances the local clock, so one node
+with a wrong year would poison every node it reached, permanently, and no
+later write anywhere could win a conflict against it. Refusing confines the
+damage to that node's own frames. A peer far behind needs no defence, but a
+node whose writes never win is worth counting: its operator edits and sees
+nothing happen.
+
+**A tombstone is a value competing by the same comparison, not a special
+case.** "A delete always wins" diverges, because two nodes that saw a delete
+and a later write in different orders keep different things. One merge
+function, and every path through it. Writes broadcast immediately to all peers. Every few
 seconds, with jitter, each node exchanges a digest of per-node version
 counters with a random peer and pulls whatever it is missing, in batches.
 This repairs anything a broadcast lost.
+
+**That digest is a claim about an operation log, not about the records.** A
+record's most recent writer changes every time another node overwrites it,
+so "everything after sequence N from node X" cannot be answered by looking at
+the records. Each node keeps a gapless log of the writes it originated,
+truncated behind a second watermark of its own, distinct from the tombstone
+watermark below.
+
+**Subscriptions are replicated at node granularity, not per client.** A
+register per client subscription would be fifty nodes holding a hundred
+thousand registers each at the design ceiling, against an idle memory budget
+of thirty megabytes. What is replicated is that a node has at least one
+subscriber for a filter, which is exactly what routing needs, and what is
+not replicated is which of its clients that is, which nothing outside that
+node needs to know.
+
+**Membership is deliberately not replicated.** Liveness is each node's own
+judgement about its own links. Two nodes can therefore declare a third dead
+independently and both claim its sessions; the session register resolves
+that, and a replicated member list would need the consensus this design
+declines.
 
 Deletions are tombstones, garbage collected after a grace period long enough
 to exceed any plausible partition, tracked by a cluster-wide low watermark.
@@ -479,8 +578,31 @@ copy to each remote node that has any match. The receiving node matches
 against its own local subscribers. Fan-out cost is therefore proportional to
 the number of interested nodes, not the number of subscribers.
 
-Frames on the link are a 32-bit little-endian length, a one-byte protocol
-version, then a postcard-encoded message. Writes are batched and flushed on
+**A forwarded message is marked as forwarded, and a forwarded message is
+never forwarded again.** Stated as an implication, this is the difference
+between a working mesh and an infinite loop, so it is stated outright. The
+mark also answers section 9's deferred question about a rule firing exactly
+once: a rule fires on the node where a message entered the cluster, which is
+the node that received it unmarked, not on every node that has a subscriber.
+
+**Shared subscriptions need their own map and cannot use this one.** A group
+spanning three nodes has a matching subscriber on each, so forwarding one
+copy to each interested node delivers three times where the semantics demand
+one. A separate map from group to member nodes, and a selection before
+forwarding rather than after, is what makes the count right. Section 6's
+preference for a local member and then the least loaded remote also needs a
+load figure this map does not carry; the local preference is implementable
+now and the remote ordering waits for queue replication to make a depth
+worth reading.
+
+Frames on the link are a 32-bit little-endian length **covering the version
+byte and the body**, a one-byte protocol version, then a postcard-encoded
+message, **bounded by a configured maximum a peer may not exceed**: a
+32-bit length otherwise permits four gigabytes from anyone who has
+authenticated. A version byte a node does not know closes the link with a
+reason rather than skipping the frame, because a frame it cannot parse may
+be one it needed. The authentication handshake precedes framing and is not
+carried in it. Writes are batched and flushed on
 a size or time threshold. The outgoing buffer per peer is bounded; beyond the
 bound, messages to that peer are dropped and counted, and the condition is
 surfaced in the UI rather than hidden.
@@ -491,10 +613,39 @@ A session is owned by exactly one node, recorded as a metadata register
 holding the owning node and the session epoch.
 
 When a client connects to a node that does not own its session, that node
-increments the epoch, writes itself as owner, broadcasts the change, asks the
-previous owner to close the old connection and drain the offline queue to it,
-and waits for the drain up to a bounded timeout before sending CONNACK.
-Subscriptions follow the session.
+increments the epoch, writes itself as owner, asks the previous owner to close
+the old connection and drain the offline queue to it, waits for the drain up
+to a bounded timeout, and **then** broadcasts the change, before sending
+CONNACK. Subscriptions follow the session.
+
+**The broadcast is after the drain, and this paragraph used to have it
+before.** The order matters and is load-bearing: a previous owner that saw the
+register before the claim could not tell a migration from a partition that had
+healed, so it would either tear the session down with the drain still coming
+or need a comparison to tell the two apart — and the obvious comparison, the
+register's epoch against the session's own, is unsound, because the two
+numbers are counted differently. With the broadcast last, a register naming
+another node means the claim either already arrived or never will. See 8.5.
+
+**On timeout, or when the previous owner cannot be reached, the connection
+is accepted with what arrived**, the session is reported as present, and the
+shortfall is counted and surfaced. The alternative, refusing the connection,
+makes an unreachable node into an outage for a client that has done nothing
+wrong, and the partition that made the owner unreachable is exactly when a
+client most needs to connect somewhere. What is lost is bounded by what had
+not yet been delivered, it is counted rather than silent, and queue
+replication in milestone 6 is what shrinks it to nothing.
+
+Surfaced means `sdmqtt_sessions_migrated_incomplete_total`, with
+`sdmqtt_sessions_migrated_unreachable_total` saying how many of those had no
+link to ask over and `sdmqtt_migrated_messages_missing_total` saying how many
+messages a previous owner said it held and never sent. Those sit beside
+`sdmqtt_sessions_claimed_total`, `sdmqtt_sessions_migrated_total`,
+`sdmqtt_migrated_messages_total` and `sdmqtt_migrated_messages_late_total`,
+because a shortfall with nothing to compare it against cannot be read: a
+hundred incomplete drains is an outage or a quiet afternoon depending on how
+many there were altogether. Like the other cluster series they are absent
+rather than zero on a node that does not cluster.
 
 ### 8.5 Partitions
 
@@ -503,9 +654,34 @@ clients. Per-operation flags allow an operator to refuse connects, publishes
 or subscribes while the cluster is not whole, for deployments that prefer
 that trade.
 
+**"Whole" means an operator-configured expected size, because nothing else
+can mean it.** Membership is learnt from seeds, so a node that has never
+heard of a fourth node cannot tell a cluster of three from a cluster of four
+with one down, and a decommissioned node would otherwise be a permanent
+hole. The health endpoint has served an expected count since milestone 3
+with nothing behind it; this is what supplies it. Unset, the strict flags are
+refused rather than silently meaning nothing.
+
 During a partition, two nodes can accept the same client identifier. On heal,
 the higher epoch wins and the loser's connection is closed with "session
-taken over". Retained messages and rules converge by last writer wins.
+taken over".
+
+**The loser acts on the register alone, and does not compare epochs.** It was
+built that way first, to tell a partition from a migration whose drain was
+still in flight, and the comparison was unsound: a session's local epoch is
+`max(held, claimed) + 1` and climbs on every reconnect to the same node, while
+the register's does not, so the two are different currencies. The case it was
+guarding against cannot arise. A claim travels the link and is waited for
+*before* the register recording it is broadcast, so a register naming another
+node means either the claim already arrived and the session has gone, or it
+never arrived at all and no drain is coming. That ordering is therefore
+load-bearing and is written down where it lives, in `Shared::claim_session`.
+
+**Equal epochs are the expected outcome, not the rare one.** Two nodes on
+opposite sides of a partition both read the same epoch and both increment to
+the same number. The tie breaks the way every other register's does, on the
+clock reading and then the node's UUID, which is why the epoch is carried in
+a register rather than compared on its own. Retained messages and rules converge by last writer wins.
 Messages published on either side during the partition are not retroactively
 exchanged.
 
@@ -890,6 +1066,23 @@ Rules with a per-action form editor and per-rule statistics and dead letters,
 Cluster with member and link health, and Settings for users, access control,
 API keys and listeners.
 
+**Link health on the Cluster page is the per-peer state**, `up`, `suspect` or
+`down`, which is what this node's failure detector has decided about the link
+to each peer. Bytes sent, received and dropped are *not* on it: the mesh
+counts them per process rather than per link, so there is no per-peer number
+to put in a row, and the three process-wide totals are in the exposition where
+section 11.3 puts them. The page says in words that every state is this
+node's own view, because membership is deliberately not replicated and two
+nodes' pages disagreeing during a one-way partition is the truth rather than
+a fault in one of them.
+
+The page polls rather than following the events stream, and it is the only
+one that does. Membership is not on the stream because there is no
+cluster-wide fact to broadcast: a node's judgement about a peer is local, and
+an event saying a peer is down would be one node's opinion presented as news.
+The interval is chosen against the failure detector rather than against what
+feels responsive.
+
 Built with Preact and signals, routed by preact-iso, bundled by Vite,
 charted by uPlot with hand-drawn SVG sparklines in table rows, virtualized
 by the vanilla TanStack virtual core, validated by valibot, and styled with
@@ -1018,12 +1211,16 @@ message this broker ever accepted, and counting it would put a number on the
 remote's traffic rather than on this broker's losses. Recorded as a decision
 rather than left as an omission.
 
-**Router matches are deferred to milestone 5.** This section asks for them
-split local and remote. The remote half needs a cluster, and counting the
-local half needs the matching layer to report a number it does not currently
-return, which would put counting inside the crate that deliberately counts
-nothing. Both halves arrive together with clustering. Recorded here so that
-it stays a decision rather than becoming an omission.
+**Router matches arrived in milestone 5, with the routing they are about.**
+This section asks for them split local and remote, and the deferral recorded
+here gave two reasons: the remote half needs a cluster, and counting the
+local half needs the matching layer to report a number it did not return,
+which would have put counting inside the crate that deliberately counts
+nothing. Section 8.3's forwarding is what wanted the remote half, and the
+local half is a running total the broker keeps and the shell reads at the
+moment of a scrape — the same division as every other number it holds. Both
+series exist on every node, because a node that does not cluster really did
+forward to nobody; see `crates/server/src/metrics.rs`.
 
 **Cluster bytes sent, received and dropped are deferred to milestone 5 as
 well,** and this line is here because they were not. The neighbouring cluster

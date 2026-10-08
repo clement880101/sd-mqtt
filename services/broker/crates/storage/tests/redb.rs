@@ -754,6 +754,15 @@ fn every_kind_of_state_survives_a_restart() {
                         properties: bytes::Bytes::from_static(&[0x01, 0x00]),
                     },
                 },
+                // Section 8.2's clock mark. A counter that is not zero,
+                // because zero is what a store that held nothing would
+                // also produce.
+                Record::ClockHighWaterPut {
+                    reading: storage::ClockRecord {
+                        millis: 1_700_000_000_123,
+                        counter: 7,
+                    },
+                },
             ],
         );
         store.flush().expect("a flush must succeed");
@@ -775,6 +784,19 @@ fn every_kind_of_state_survives_a_restart() {
         store.highest_sequence(&key("sensor")).expect("the mark"),
         3,
         "the high-water mark did not survive, so a sequence could be reused"
+    );
+    assert_eq!(
+        store
+            .restore()
+            .expect("restoring must succeed")
+            .clock
+            .expect("the clock mark survived the restart"),
+        storage::ClockRecord {
+            millis: 1_700_000_000_123,
+            counter: 7,
+        },
+        "the clock mark did not survive, so this node's clock would resume \
+         behind itself and re-issue a stamp"
     );
 }
 

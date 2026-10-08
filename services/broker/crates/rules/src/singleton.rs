@@ -29,10 +29,20 @@
 //! "Lowest" is only deterministic if every node sorts the same way.
 //! [`NodeId`] orders by the bytes of the identifier, which is the one
 //! ordering that needs no locale, no normalisation and no agreement
-//! beyond the bytes themselves. Section 8.1 gives a node a UUID v7,
-//! whose canonical text sorts in the same order as its bytes and
-//! therefore in order of creation; that is a convenience and not
-//! something this relies on.
+//! beyond the bytes themselves.
+//!
+//! **Which identity that is has been decided: it is the UUID.** This
+//! module used to carry a [`NodeId`] of its own, holding a string,
+//! with a note saying that section 8.1's milestone would decide
+//! whether the string was the UUID or the operator's name. It is the
+//! UUID, and the type now lives in `cluster` and is used here rather
+//! than copied: one type, one ordering, one answer to "which node".
+//!
+//! The name is not in it at all. Section 8.1 says the name is never
+//! compared, because two copied configurations share a name and an
+//! ordering that is not antisymmetric leaves both sides believing they
+//! won — and the strongest way to say "never compared" is a type with
+//! no name in it, in which the comparison does not compile.
 //!
 //! # What this is not
 //!
@@ -47,35 +57,13 @@ use std::fmt;
 
 use tokio::sync::watch;
 
-/// What names a node, for as long as it runs.
+/// What names a node, for as long as its store exists.
 ///
-/// **Ordered by bytes**, because "the live member with the lowest node
-/// identifier" is only deterministic when every node sorts the same
-/// way. See the module documentation.
-///
-/// Section 8.1 gives a node a UUID v7 and a human-readable name; which
-/// of the two this carries is that milestone's to decide, and nothing
-/// here depends on the answer beyond it being stable and comparable.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeId(String);
-
-impl NodeId {
-    /// A node identifier from the text that names it.
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-
-    /// The identifier as text.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for NodeId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+/// `cluster`'s, not a second one: section 8.1's UUID, ordered by its
+/// sixteen bytes. Re-exported here because this module's rule is
+/// written in terms of it and a reader of "the lowest node identifier"
+/// should be one hop from what an identifier is.
+pub use cluster::NodeId;
 
 /// Who is live, as this node sees it.
 ///
@@ -111,7 +99,7 @@ impl Membership {
     /// This node, and these others.
     pub fn of(this: NodeId, others: impl IntoIterator<Item = NodeId>) -> Self {
         let mut live: BTreeSet<NodeId> = others.into_iter().collect();
-        live.insert(this.clone());
+        live.insert(this);
         Self {
             this,
             live: watch::Sender::new(live),
@@ -170,7 +158,7 @@ impl Membership {
         let live = self.live.subscribe();
         let reported = owner_of(&live.borrow()) == self.this;
         Ownership {
-            this: self.this.clone(),
+            this: self.this,
             live,
             reported,
         }
@@ -278,18 +266,24 @@ impl Ownership {
 /// view it is, so an empty one is this module having been broken rather
 /// than a state a caller can reach.
 fn owner_of(live: &BTreeSet<NodeId>) -> NodeId {
-    live.iter()
+    *live
+        .iter()
         .next()
         .expect("a node is always in its own membership view")
-        .clone()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn node(id: &str) -> NodeId {
-        NodeId::new(id)
+    /// A node identifier whose order is written on its face.
+    ///
+    /// The whole sixteen bytes set from one, so `node(1) < node(2)` is
+    /// true of the bytes rather than of a rendering of them, and a test
+    /// below can say which node owns a singleton without the reader
+    /// having to parse a UUID to check.
+    fn node(rank: u8) -> NodeId {
+        NodeId::from_bytes([rank; 16])
     }
 
     /// How long a handover may take before this calls it a failure.
@@ -311,8 +305,8 @@ mod tests {
 
     #[test]
     fn one_member_owns_everything() {
-        let membership = Membership::alone(node("only"));
-        assert_eq!(membership.owner(), node("only"));
+        let membership = Membership::alone(node(1));
+        assert_eq!(membership.owner(), node(1));
         assert!(membership.owns());
         assert!(membership.ownership().owns());
     }
@@ -329,12 +323,10 @@ mod tests {
     /// three times.
     #[test]
     fn of_three_the_lowest_owns_and_the_others_do_not() {
-        let (a, b, c) = (node("a"), node("b"), node("c"));
+        let (a, b, c) = (node(1), node(2), node(3));
         for this in [&a, &b, &c] {
-            let others = [a.clone(), b.clone(), c.clone()]
-                .into_iter()
-                .filter(|other| other != this);
-            let membership = Membership::of(this.clone(), others);
+            let others = [a, b, c].into_iter().filter(|other| other != this);
+            let membership = Membership::of(*this, others);
             assert_eq!(
                 membership.live().len(),
                 3,
@@ -350,17 +342,48 @@ mod tests {
         }
     }
 
-    /// The order is over bytes, not over length or anything numeric.
+    /// The order is over the identifier's bytes, from the first that
+    /// differs.
     ///
-    /// `"10"` is lower than `"9"`, which is the answer every node has
-    /// to give for the selection to be deterministic. Asserted because
-    /// an implementation that sorted by length, or parsed a number out
-    /// of the identifier, would agree with the test above and disagree
-    /// here.
+    /// Asserted with three identifiers that share a leading byte and
+    /// differ later, because an implementation comparing only the
+    /// first byte, or the length, or the time half of a version 7
+    /// identifier, would agree with the test above and disagree here.
     #[test]
     fn lowest_is_by_bytes() {
-        let membership = Membership::of(node("9"), [node("10"), node("100")]);
-        assert_eq!(membership.owner(), node("10"));
+        let mut lowest = [0x09; 16];
+        lowest[7] = 0x01;
+        let mut middle = [0x09; 16];
+        middle[7] = 0x02;
+        let highest = [0x09; 16];
+
+        let membership = Membership::of(
+            NodeId::from_bytes(highest),
+            [NodeId::from_bytes(lowest), NodeId::from_bytes(middle)],
+        );
+        assert_eq!(membership.owner(), NodeId::from_bytes(lowest));
+        assert!(!membership.owns());
+    }
+
+    /// Ownership is decided by the identifier and cannot reach a name.
+    ///
+    /// Section 8.1: the name is for operators and is **never**
+    /// compared, because two copied configurations share one. The
+    /// guard is not this assertion — it is that [`NodeId`] carries no
+    /// name, so an ordering that reached for one would not compile.
+    /// This is here to say so in a place a reader of the rule will
+    /// look, and to fail if the identity ever grows a name again.
+    #[test]
+    fn the_owner_is_the_lowest_identifier_whatever_the_nodes_are_called() {
+        let low = cluster::NodeIdentity::new(node(1), "zulu");
+        let high = cluster::NodeIdentity::new(node(2), "alpha");
+
+        let membership = Membership::of(high.id(), [low.id()]);
+        assert_eq!(
+            membership.owner(),
+            low.id(),
+            "the lowest identifier owns it, although its name sorts last"
+        );
         assert!(!membership.owns());
     }
 
@@ -375,8 +398,8 @@ mod tests {
     /// after the fact. See that method.
     #[tokio::test]
     async fn ownership_moves_when_the_lowest_member_leaves() {
-        let (a, b, c) = (node("a"), node("b"), node("c"));
-        let membership = Membership::of(b.clone(), [a.clone(), c.clone()]);
+        let (a, b, c) = (node(1), node(2), node(3));
+        let membership = Membership::of(b, [a, c]);
         let mut ownership = membership.ownership();
 
         assert!(!membership.owns(), "a is live, so b owns nothing");
@@ -401,14 +424,14 @@ mod tests {
     /// would be running it twice for as long as both were up.
     #[tokio::test]
     async fn ownership_moves_back_when_the_lowest_member_returns() {
-        let (a, b, c) = (node("a"), node("b"), node("c"));
-        let membership = Membership::of(b.clone(), [c.clone()]);
+        let (a, b, c) = (node(1), node(2), node(3));
+        let membership = Membership::of(b, [c]);
         let mut ownership = membership.ownership();
 
         assert!(membership.owns(), "with only b and c live, b is the lowest");
         assert!(ownership.owns());
 
-        assert!(membership.joined(a.clone()), "a returns");
+        assert!(membership.joined(a), "a returns");
 
         assert!(
             !handover(&mut ownership).await,
@@ -428,8 +451,8 @@ mod tests {
     /// ordering reaches the other.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_waiter_already_waiting_is_woken() {
-        let (a, b) = (node("a"), node("b"));
-        let membership = std::sync::Arc::new(Membership::of(b.clone(), [a.clone()]));
+        let (a, b) = (node(1), node(2));
+        let membership = std::sync::Arc::new(Membership::of(b, [a]));
         let mut ownership = membership.ownership();
         assert!(!ownership.owns());
 
@@ -455,12 +478,12 @@ mod tests {
     /// restart a connector each time any node in the cluster bounced.
     #[tokio::test]
     async fn a_change_that_does_not_move_ownership_wakes_nobody() {
-        let (a, b, c) = (node("a"), node("b"), node("c"));
-        let membership = Membership::of(a.clone(), [b.clone()]);
+        let (a, b, c) = (node(1), node(2), node(3));
+        let membership = Membership::of(a, [b]);
         let mut ownership = membership.ownership();
         assert!(ownership.owns());
 
-        assert!(membership.joined(c.clone()), "c joins, above a");
+        assert!(membership.joined(c), "c joins, above a");
         assert!(membership.left(&b), "and b leaves, also above a");
 
         assert!(
@@ -485,29 +508,26 @@ mod tests {
     /// carry on until something replaces it.
     #[test]
     fn a_node_is_always_in_its_own_view() {
-        let membership = Membership::of(node("b"), [node("a")]);
-        assert!(membership.live().contains(&node("b")));
+        let membership = Membership::of(node(2), [node(1)]);
+        assert!(membership.live().contains(&node(2)));
 
-        assert!(
-            !membership.left(&node("b")),
-            "a node cannot see itself leave"
-        );
-        assert!(membership.live().contains(&node("b")));
+        assert!(!membership.left(&node(2)), "a node cannot see itself leave");
+        assert!(membership.live().contains(&node(2)));
 
         // And with nobody else left, it owns everything again.
-        assert!(membership.left(&node("a")));
+        assert!(membership.left(&node(1)));
         assert!(membership.owns());
     }
 
     #[test]
     fn joining_and_leaving_say_whether_the_view_moved() {
-        let membership = Membership::of(node("a"), []);
-        assert!(membership.joined(node("b")));
+        let membership = Membership::of(node(1), []);
+        assert!(membership.joined(node(2)));
         assert!(
-            !membership.joined(node("b")),
+            !membership.joined(node(2)),
             "a repeated signal is not an event"
         );
-        assert!(membership.left(&node("b")));
-        assert!(!membership.left(&node("b")), "nor is leaving twice");
+        assert!(membership.left(&node(2)));
+        assert!(!membership.left(&node(2)), "nor is leaving twice");
     }
 }

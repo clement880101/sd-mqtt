@@ -199,7 +199,12 @@ struct Batch {
     /// journalled still has to wait for it to reach the device.
     records: Vec<Record>,
     /// Who to wake when it is durable, if anyone is waiting.
-    waiter: Option<oneshot::Sender<Outcome>>,
+    /// Who to tell, which may be nobody and may be more than one.
+    ///
+    /// More than one because section 8.2's replication waits on the same
+    /// batch a publication's acknowledgement does; see
+    /// [`Writer::apply_durable_twice`].
+    waiters: Vec<oneshot::Sender<Outcome>>,
     /// What this batch added to the backlog, to be taken off it again
     /// once the batch has been applied.
     ///
@@ -437,7 +442,7 @@ impl Writer {
         self.send(Batch {
             weight: weigh(&records),
             records,
-            waiter: None,
+            waiters: Vec::new(),
         })?;
         Ok(if self.backlog.over(self.config) {
             Applied::Backlogged
@@ -511,9 +516,42 @@ impl Writer {
         self.send(Batch {
             weight: weigh(&records),
             records,
-            waiter: Some(waiter),
+            waiters: vec![waiter],
         })?;
         Ok(Durable(waited_on))
+    }
+
+    /// The same, for a batch **two** callers must hear about.
+    ///
+    /// Both handles answer with the same outcome, because they are the same
+    /// batch: whether the store took it and whether a flush covered it are
+    /// one fact, and two batches would be two.
+    ///
+    /// Section 8.2 is what this exists for. A batch can carry both a
+    /// publication a client is waiting to have acknowledged and a
+    /// replicated register that must not be broadcast until it is durable,
+    /// and the two waiters are different parts of the broker. An empty
+    /// second batch would not do: a batch the store **refused** reports to
+    /// its own waiters and to nobody else, so a later flush succeeding says
+    /// nothing about it, and a broadcast on the strength of that would tell
+    /// a peer about a register this node will never hold.
+    ///
+    /// # Errors
+    ///
+    /// [`WriterStopped`] if the thread is gone, in which case the records
+    /// were not applied and nothing will ever be durable.
+    pub fn apply_durable_twice(
+        &self,
+        records: Vec<Record>,
+    ) -> Result<(Durable, Durable), WriterStopped> {
+        let (one, waited_on_one) = oneshot::channel();
+        let (other, waited_on_other) = oneshot::channel();
+        self.send(Batch {
+            weight: weigh(&records),
+            records,
+            waiters: vec![one, other],
+        })?;
+        Ok((Durable(waited_on_one), Durable(waited_on_other)))
     }
 
     /// How many batches the store refused with nobody waiting to be told.
@@ -710,7 +748,7 @@ impl Thread {
     ///
     /// A refused batch is not counted and does not make anything
     /// outstanding, because [`Storage::apply`] is atomic and a refusal
-    /// changed nothing. Its waiter is told immediately rather than at the
+    /// changed nothing. Its waiters are told immediately rather than at the
     /// next flush: the answer is already known, and holding it back would
     /// make one caller's mistake wait on another caller's write.
     fn take(&mut self, batch: Batch) -> bool {
@@ -735,12 +773,14 @@ impl Thread {
     fn apply_one(&mut self, batch: Batch) -> bool {
         if !batch.records.is_empty() {
             if let Err(error) = self.store.apply(&batch.records) {
-                match batch.waiter {
-                    Some(waiter) => {
-                        let _ = waiter.send(Err(Arc::new(error)));
-                    }
-                    None => {
-                        self.rejected.fetch_add(1, Ordering::Relaxed);
+                if batch.waiters.is_empty() {
+                    self.rejected.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // One cause, shared: every waiter on a batch is waiting
+                    // on the same fact, and `StorageError` is not cloneable.
+                    let shared = Arc::new(error);
+                    for waiter in batch.waiters {
+                        let _ = waiter.send(Err(Arc::clone(&shared)));
                     }
                 }
                 return false;
@@ -748,13 +788,11 @@ impl Thread {
             self.records_since_flush += batch.records.len() as u64;
             self.unflushed = true;
         }
-        match batch.waiter {
-            Some(waiter) => {
-                self.waiting.push(waiter);
-                true
-            }
-            None => false,
+        if batch.waiters.is_empty() {
+            return false;
         }
+        self.waiting.extend(batch.waiters);
+        true
     }
 
     /// Flush, and tell every waiter queued since the last one what

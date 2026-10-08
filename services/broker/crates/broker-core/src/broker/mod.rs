@@ -12,6 +12,7 @@ use mqtt_codec::{Limits, Packet, Properties, QoS, ReasonCode, Version};
 use storage::record::Record;
 
 use crate::clock::CoarseClock;
+use crate::handover::{Authenticated, Handover};
 use crate::hooks::{ClientInfo, Credentials, Disposition, Hooks};
 use crate::journal::{self, DurableSession, DurableState};
 use crate::keepalive::{Activity, KeepAliveRing};
@@ -21,7 +22,7 @@ use crate::session::message::Message;
 use crate::session::queue::{Delivery, DropReason, QueueLimits};
 use crate::session::state::{will_message, Session, StoredWill};
 use crate::session::Action;
-use crate::subscriptions::{SharedSubscriptions, SubscriberId, SubscriptionTrie};
+use crate::subscriptions::{FilterEvent, SharedSubscriptions, SubscriberId, SubscriptionTrie};
 
 /// The inflight window a session has when nothing narrows it, from
 /// section 6 of the design.
@@ -134,6 +135,76 @@ pub struct Looped {
     pub maximum: u32,
 }
 
+/// Where a publication went, split local and remote.
+///
+/// Section 11.3 asks for "router matches split local and remote", and
+/// both halves arrive with clustering. They are a running total rather
+/// than a pair of metric handles because this crate holds no metrics:
+/// section 7.3 makes it say what happened and the shell writes it down,
+/// and these are the same division as [`Broker::take_journal`] applied
+/// to a number.
+///
+/// Monotonic, so a scraper reading them as counters is reading what they
+/// are. Nothing resets them and nothing may: a counter that goes
+/// backwards is read as a process restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RouterMatches {
+    /// Subscriptions on this node a publication was delivered to.
+    ///
+    /// Counted per delivery and not per publication, which is what
+    /// "matches" means: one publication reaching four sessions is four.
+    /// A subscriber holding two matching filters is one, because the
+    /// protocol makes it one delivery.
+    pub local: u64,
+    /// Copies sent to another node.
+    ///
+    /// One per interested node, which is section 8.3's economy: the
+    /// figure grows with how many nodes wanted a topic and not with how
+    /// many subscribers they have between them. Zero for ever on a node
+    /// that does not cluster, which is the truth about it rather than an
+    /// absence — a node with no peers forwarded to nobody.
+    pub remote: u64,
+}
+
+/// What a publication that entered this node is handed to.
+///
+/// Section 8.3's seam: a publish matches locally, enqueues to local
+/// sessions, and **forwards one copy to each remote node that has any
+/// match**. Which nodes those are is a question about replicated
+/// metadata and a mesh, neither of which this crate has or should gain,
+/// so this is the hole the shell fills.
+///
+/// `None` is a node that does not cluster, and the cost of that is one
+/// `Option` test per publish rather than a trait object call.
+///
+/// # Synchronous, and it must not block
+///
+/// It is called with whatever lock the shell holds around the broker
+/// still held, exactly as a [`crate::hooks::Hook`] is, and the
+/// obligations in that module apply here unchanged. Handing a message
+/// to a peer's bounded queue is a channel send that never waits, and
+/// section 8.1 drops and counts rather than letting a wedged peer block
+/// whoever had something to say to it — so there is nothing here that
+/// needs to wait.
+///
+/// # It is not asked about a forwarded message
+///
+/// [`Broker::publish`] tests the mark before it asks. See
+/// [`Message::forwarded`]: the difference between a mesh and an
+/// infinite loop is that test, and it is in the broker rather than in
+/// an implementation of this because an implementation that forgot it
+/// would be a cluster that melted.
+pub trait Forwarder: Send + Sync {
+    /// Send `message` to every node that wants it, and say how many.
+    ///
+    /// The count is what section 11.3's remote half counts, so it is
+    /// the nodes a copy was *sent to* rather than the nodes that wanted
+    /// it: a peer whose queue was full is a drop, counted as a drop by
+    /// section 8.1's own numbers, and counting it here as a match would
+    /// make the two disagree.
+    fn forward(&self, message: &Message) -> usize;
+}
+
 /// What the hooks said to do with an arriving message.
 ///
 /// Three outcomes and not two, because a message a hook refused and a
@@ -186,6 +257,32 @@ pub struct Broker {
     /// the same lock that filled it, so a record and the actions it
     /// belongs with are always taken together and in order.
     journal: Vec<Record>,
+    /// Which filters gained or lost a subscriber on this node, and has
+    /// not been handed over.
+    ///
+    /// Section 8.2 replicates that a node has at least one subscriber
+    /// for a filter, so the shell has to know when that changed. This
+    /// is beside [`Self::journal`] and not in it, and the reason is the
+    /// stamp: a replicated write is ordered by a hybrid logical clock
+    /// reading and this node's identity, and neither is something this
+    /// crate has or should gain — it reads no clock, and the identity
+    /// belongs to `cluster`, which rests on nothing of ours.
+    ///
+    /// So this says what happened and the shell decides what is
+    /// written, which is exactly the division [`Self::journal`]'s
+    /// comment describes. See [`crate::subscriptions::events`] for why
+    /// it is one event per session and filter rather than one per
+    /// packet, and for the three paths that must emit a departure.
+    filter_events: Vec<FilterEvent>,
+    /// Where a publication that entered this node goes next, section
+    /// 8.3, and `None` on a node that does not cluster.
+    ///
+    /// Held here rather than in [`BrokerConfig`] for the reason
+    /// [`Self::hooks`] is: it is a live object with a mesh behind it,
+    /// not configuration a shell can clone and pass around.
+    forwarder: Option<Arc<dyn Forwarder>>,
+    /// Section 11.3's router matches, split local and remote.
+    matches: RouterMatches,
 }
 
 impl Broker {
@@ -209,7 +306,44 @@ impl Broker {
             config,
             hooks: Hooks::new(),
             journal: Vec::new(),
+            filter_events: Vec::new(),
+            forwarder: None,
+            matches: RouterMatches::default(),
         }
+    }
+
+    /// Send publications that entered this node on to the nodes that
+    /// want them, section 8.3.
+    ///
+    /// Installed by the shell once there is a mesh to forward over, and
+    /// never on a node that does not cluster. See [`Forwarder`] for what
+    /// an implementation may and may not do, and [`Message::forwarded`]
+    /// for the one message it is never asked about.
+    ///
+    /// Replacing one is replacing one. Nothing calls this twice, and the
+    /// answer if anything did is that the latest forwarder is the one
+    /// that is asked, which is the only answer that does not leave a
+    /// mesh being written to by something the binary has forgotten.
+    pub fn install_forwarder(&mut self, forwarder: Arc<dyn Forwarder>) {
+        self.forwarder = Some(forwarder);
+    }
+
+    /// Whether anything forwards from this node.
+    #[must_use]
+    pub fn forwards(&self) -> bool {
+        self.forwarder.is_some()
+    }
+
+    /// Section 11.3's router matches, as they stand.
+    ///
+    /// Read at the moment of a scrape, like every other number the shell
+    /// takes out of here. Deferred from milestone 3 with the reason that
+    /// the remote half needs a cluster and the local half needs the
+    /// matching layer to report a number it did not return; both are
+    /// true now.
+    #[must_use]
+    pub const fn router_matches(&self) -> RouterMatches {
+        self.matches
     }
 
     /// The hooks this broker fires, to install one or to read the
@@ -270,6 +404,66 @@ impl Broker {
         out.append(&mut self.journal);
     }
 
+    /// Move every filter that gained or lost a subscriber onto `out`.
+    ///
+    /// Section 8.2, and [`Self::filter_events`] for why these are not
+    /// records. Drained by the shell under the same lock that filled
+    /// it, so that the order a filter was gained and lost in is the
+    /// order the registers are written in — reversed, the node would
+    /// end up advertising a filter it had just given up.
+    pub fn take_filter_events(&mut self, out: &mut Vec<FilterEvent>) {
+        out.append(&mut self.filter_events);
+    }
+
+    /// How many of this node's sessions hold an **ordinary**
+    /// subscription to `filter`.
+    ///
+    /// Walks the sessions, so it is for a test and for an operator and
+    /// not for a routing path. The count the replication layer keeps is
+    /// its own, fed by [`Self::take_filter_events`]; this is what says
+    /// the two agree.
+    ///
+    /// **A shared subscription is not one of these.** It is counted by
+    /// [`Self::local_members`] instead, because section 8.3 replicates
+    /// the two as separate registers into separate maps: a group with a
+    /// member on each of three nodes counted as three ordinary
+    /// subscribers to one filter is delivered to three times. A figure
+    /// that mixed them would be the cross-check agreeing with a count it
+    /// is not about.
+    #[must_use]
+    pub fn local_subscribers(&self, filter: &str) -> usize {
+        self.held_filters()
+            .filter(|held| {
+                matches!(mqtt_codec::topic::parse_shared(held), Ok(None)) && *held == filter
+            })
+            .count()
+    }
+
+    /// How many of this node's sessions are members of `group` on
+    /// `filter`.
+    ///
+    /// The group's name and the **inner** filter, which is the pair the
+    /// whole cluster agrees about. Beside [`Self::local_subscribers`]
+    /// and for the same purpose.
+    #[must_use]
+    pub fn local_members(&self, group: &str, filter: &str) -> usize {
+        self.held_filters()
+            .filter(|held| {
+                matches!(
+                    mqtt_codec::topic::parse_shared(held),
+                    Ok(Some((name, inner))) if name == group && inner == filter
+                )
+            })
+            .count()
+    }
+
+    /// Every filter every session on this node holds, as written.
+    fn held_filters(&self) -> impl Iterator<Item = &str> {
+        self.registry
+            .iter()
+            .flat_map(|(_, session)| session.filters())
+    }
+
     /// Throw away everything said so far, everywhere it is held.
     ///
     /// For [`crate::restore`] and nothing else. Restore rebuilds a
@@ -283,6 +477,26 @@ impl Broker {
     /// discarded by clearing this one: it would simply be handed over
     /// by whichever call next drained that session, long after the
     /// restore that produced it.
+    ///
+    /// # It does not discard the filter events, and that is the point
+    ///
+    /// [`Self::filter_events`] survives this, although the reasoning
+    /// above would seem to apply to it just as well. It does not,
+    /// because the thing those events feed is **not in the store at
+    /// all**: section 8.2's replication keeps a reference count per
+    /// filter, deliberately unreplicated and deliberately unstored, and
+    /// a restore replaying this node's subscriptions is the only thing
+    /// that rebuilds it. Discarding them would leave the count at zero
+    /// with the trie full, so the first genuine last-unsubscribe would
+    /// find nothing to decrement and would tell the cluster nothing —
+    /// and the node would stay advertised for a filter it no longer
+    /// serves until somebody noticed.
+    ///
+    /// The cost is that a node re-announces its filters as it comes
+    /// back, one register per filter rather than per subscription. That
+    /// is a cost worth paying twice over: a peer may have tombstoned
+    /// this node while it was down, or may never have heard from it at
+    /// all, and a node that came back silently would be routed nothing.
     pub fn discard_journal(&mut self) {
         for (_, session) in self.registry.iter_mut() {
             session.take_journal(&mut self.journal);
@@ -540,17 +754,64 @@ impl Broker {
         connect: &Connect,
         out: &mut Vec<Addressed>,
     ) -> Result<Registration, ReasonCode> {
+        self.connect_claimed(mountpoint, connect, 0, None, out)
+    }
+
+    /// Ask the authenticate chain, before anything has been claimed.
+    ///
+    /// `Some` is a connect the chain will serve, and the token is what
+    /// [`Broker::connect_claimed`] takes so that the chain is asked
+    /// once; `None` is [`ReasonCode::NotAuthorized`] and the caller
+    /// answers the client with it.
+    ///
+    /// A caller that is not clustering never needs this:
+    /// [`Broker::connect`] asks the chain itself, at the moment it
+    /// always has.
+    #[must_use]
+    pub fn authenticates(&self, mountpoint: &str, connect: &Connect) -> Option<Authenticated> {
+        self.hooks
+            .authenticate(&Credentials {
+                mountpoint,
+                client_id: &connect.client_id,
+                username: connect.username.as_deref(),
+                password: connect.password.as_deref(),
+                version: connect.version,
+                clean_start: connect.clean_start,
+            })
+            .then_some(Authenticated(()))
+    }
+
+    /// The same, for a session the cluster has already claimed.
+    ///
+    /// Section 8.4: the node a client connects to claims the session by
+    /// writing the epoch it read plus one, and `claimed` is that epoch.
+    /// [`Registry::register_claimed`] is where it lands and what it is
+    /// for; everything else about this call is [`Broker::connect`].
+    ///
+    /// **It is a separate entry point rather than a parameter on
+    /// `connect`**, because every caller that is not the cluster has no
+    /// epoch to pass and zero is not a neutral value a caller should
+    /// have to know to write. A node that does not cluster goes through
+    /// [`Broker::connect`] and nothing about it changes.
+    ///
+    /// [`Registry::register_claimed`]: crate::registry::Registry::register_claimed
+    pub fn connect_claimed(
+        &mut self,
+        mountpoint: &str,
+        connect: &Connect,
+        claimed: u64,
+        authenticated: Option<Authenticated>,
+        out: &mut Vec<Addressed>,
+    ) -> Result<Registration, ReasonCode> {
         let now = self.clock.now();
         let identity = SessionId::new(mountpoint, &connect.client_id);
 
-        if !self.hooks.authenticate(&Credentials {
-            mountpoint,
-            client_id: &connect.client_id,
-            username: connect.username.as_deref(),
-            password: connect.password.as_deref(),
-            version: connect.version,
-            clean_start: connect.clean_start,
-        }) {
+        // **Asked once.** `authenticated` is the answer a caller already
+        // has, because section 8.4 has it ask before it claims; see
+        // [`Authenticated`]. A chain asked twice counts one connect as
+        // two attempts, and the rate limiter section 12.1 brings would
+        // refuse the second half of every successful connect.
+        if authenticated.is_none() && self.authenticates(mountpoint, connect).is_none() {
             // 3.2.2.2: "Not authorized" is the answer to a connect the
             // server will not serve. [MQTT-3.1.4-6] requires the
             // network connection to be closed after it, which is the
@@ -559,6 +820,16 @@ impl Broker {
         }
 
         let displaced = self.displace_incumbent(&identity, connect.clean_start, now, out);
+        // What the handle was subscribed to before any of this, read
+        // while the session that held it still exists. Section 8.2
+        // needs a departure per filter and the registry is about to
+        // replace the session wholesale; see `subscribe::remove_held`.
+        let held: Vec<String> = self
+            .registry
+            .subscriber_of(&identity)
+            .and_then(|subscriber| self.registry.get(subscriber))
+            .map(|session| session.filters().map(str::to_string).collect())
+            .unwrap_or_default();
         if connect.clean_start {
             // The registry is about to replace this session wholesale,
             // taking its queue and its window with it. What it was
@@ -582,7 +853,9 @@ impl Broker {
                 session: journal::key_of(&identity),
             });
         }
-        let mut registration = self.registry.register(identity, connect.clean_start, now);
+        let mut registration =
+            self.registry
+                .register_claimed(identity, connect.clean_start, now, claimed);
         // The registry judges takeover by whether the session was still
         // connected, and this layer disconnected it a moment ago on
         // purpose, so the registry now says no. The observation above is
@@ -596,7 +869,13 @@ impl Broker {
             // in the trie keyed by that same handle, so only this layer
             // can discard them. A no-op for a handle never seen before.
             if let Some(session) = self.registry.get_mut(registration.subscriber) {
-                subscribe::remove_all(&self.subscriptions, &self.shared, session);
+                subscribe::remove_held(
+                    &self.subscriptions,
+                    &self.shared,
+                    session,
+                    &held,
+                    &mut self.filter_events,
+                );
             }
         }
 
@@ -653,6 +932,234 @@ impl Broker {
                 client_id: &id.client_id,
             });
         }
+    }
+
+    /// Give a session up to the node that has claimed it, section 8.4.
+    ///
+    /// The previous owner's half of a migration: **close the old
+    /// connection, take the session apart, and say what it held.** The
+    /// node that claimed the session calls this one over a link; see
+    /// `cluster::migrate`.
+    ///
+    /// `None` is a session this node does not hold, which is not an
+    /// error — the register that named this node as owner may be older
+    /// than a restart, and the claiming node must carry on regardless.
+    ///
+    /// # The connection is closed, and that is the point of asking
+    ///
+    /// A client is connected to exactly one node at a time. The
+    /// incumbent is told "session taken over", exactly as a local
+    /// takeover tells it, because from the client's side the two are
+    /// the same event and a build that left the old socket open is a
+    /// build with **two live connections for one session**, each
+    /// receiving half of what the session is sent.
+    ///
+    /// # The will is taken off rather than published
+    ///
+    /// [MQTT-3.1.3-9] forbids sending the will when "a new Network
+    /// Connection to this Session is made before the Will Delay
+    /// Interval has passed", and the connection that caused this is
+    /// exactly that — it is simply on another node. A node that
+    /// published the will here would announce every migrating client as
+    /// having gone offline, which is the one thing a will is for.
+    ///
+    /// # What leaves this node leaves it completely
+    ///
+    /// The subscriptions come out of the trie, which is what makes
+    /// section 8.3 stop forwarding this node copies for them, and the
+    /// departures are in `out`'s batch so a caller cannot store one
+    /// without the other. The queue is reported as
+    /// [`DropReason::Migrated`] and the session record removed, because
+    /// a node that kept its copy would deliver the same messages again
+    /// the next time that client came back to it.
+    pub fn hand_over(
+        &mut self,
+        identity: &SessionId,
+        clean: bool,
+        now: u32,
+        out: &mut Vec<Addressed>,
+    ) -> Option<Handover> {
+        let subscriber = self.registry.subscriber_of(identity)?;
+        let connected = self
+            .registry
+            .get(subscriber)
+            .is_some_and(Session::is_connected);
+        if connected {
+            out.push((subscriber, Action::Close(ReasonCode::SessionTakenOver)));
+            // Nothing else disarms it: the incumbent never disconnected,
+            // and a keep-alive left in the ring would fire on a handle
+            // that no longer names anything.
+            self.keepalive.remove(subscriber);
+            self.activities.remove(&subscriber);
+        }
+
+        let client_id = identity.clone();
+        let key = journal::key_of(identity);
+        let mut session = self.registry.remove(subscriber)?;
+        // Before the departure, so that the departure finds nothing due.
+        session.set_will(None);
+        if connected {
+            session.on_disconnected(false, now);
+        }
+
+        // Read before anything is cleared. A clean start asked for the
+        // session to be discarded [MQTT-3.1.2-4], so there is nothing
+        // to carry — but the connection is still closed and this node
+        // still lets the session go, which is why the clean case is a
+        // smaller answer rather than a different path.
+        let handover = if clean {
+            Handover::default()
+        } else {
+            let mut inflight: Vec<_> = session.outbound.outstanding().collect();
+            inflight.sort_by_key(|entry| entry.delivery.sequence);
+            Handover {
+                subscriptions: session.subscriptions().to_vec(),
+                inflight: inflight
+                    .into_iter()
+                    .map(|entry| {
+                        (
+                            journal::inflight_record(entry),
+                            journal::body_record(&entry.delivery.message),
+                        )
+                    })
+                    .collect(),
+                queued: session
+                    .outbound
+                    .waiting()
+                    .map(|item| {
+                        (
+                            journal::queue_entry(item),
+                            journal::body_record(&item.message),
+                        )
+                    })
+                    .collect(),
+                inbound: session.inbound.held().collect(),
+                highest_sequence: session.outbound.highest_sequence(),
+            }
+        };
+
+        let client = ClientInfo {
+            subscriber: Some(subscriber),
+            mountpoint: &client_id.mountpoint,
+            client_id: &client_id.client_id,
+        };
+        subscribe::remove_all(
+            &self.subscriptions,
+            &self.shared,
+            &mut session,
+            &mut self.filter_events,
+        );
+        // Not through `emit`: the session is out of the registry, so
+        // there is nothing left there to look its identity up by. The
+        // reports it owes its hooks are owed all the same.
+        let mut actions = Vec::new();
+        session.outbound.clear(DropReason::Migrated, &mut actions);
+        tell_hooks(&self.hooks, &client, &actions);
+        for action in actions {
+            out.push((subscriber, action));
+        }
+        // Taken out of the session before it is dropped, and before the
+        // record that ends it: the removal is what makes every one of
+        // these refer to a session the store no longer holds.
+        session.take_journal(&mut self.journal);
+        self.journal.push(Record::SessionRemoved { session: key });
+        if connected {
+            self.hooks.client_disconnected(&client);
+        }
+        Some(handover)
+    }
+
+    /// Take a session another node handed over, section 8.4.
+    ///
+    /// The claiming node's half, and the mirror of
+    /// [`crate::restore`]'s: a session is rebuilt from the records a
+    /// store would have held, by the same conversions, into the handle
+    /// [`Broker::connect_claimed`] just registered.
+    ///
+    /// Returns how many of the filters could not be put back, which is
+    /// `subscribe::reinstate`'s count and is a disagreement between two
+    /// builds rather than anything a client did.
+    ///
+    /// **Called with the session already connected and before the
+    /// acknowledgement goes out**, which is what makes the messages it
+    /// puts back reach the client in one resume rather than two: the
+    /// window is filled here and `on_resume` sends from it, so a client
+    /// sees its queue arrive behind its CONNACK exactly as a local
+    /// resume delivers it.
+    pub fn take_over(
+        &mut self,
+        subscriber: SubscriberId,
+        handover: Handover,
+        now: u32,
+        out: &mut Vec<Addressed>,
+    ) -> usize {
+        let Some(session) = self.registry.get_mut(subscriber) else {
+            debug_assert!(
+                false,
+                "a session is taken over into a handle just registered"
+            );
+            return handover.subscriptions.len();
+        };
+        let refused = subscribe::reinstate(
+            &self.subscriptions,
+            &self.shared,
+            session,
+            &handover.subscriptions,
+            &self.config.limits,
+            &mut self.filter_events,
+        );
+
+        for packet_id in &handover.inbound {
+            session.inbound.reserve(*packet_id);
+        }
+
+        // Section 7.4 first: the mark is the highest ever assigned, and
+        // every number below comes from the node that assigned it. A
+        // session that began again from one would hand out numbers the
+        // far node has already spent, and the messages being put back
+        // carry exactly those numbers.
+        session
+            .outbound
+            .set_highest_sequence(handover.highest_sequence);
+
+        // The window in the order the messages were sent, which is
+        // sequence order, and the queue newest first because each
+        // requeue goes to the head. The same two walks `crate::restore`
+        // makes, for the same two reasons.
+        for (record, body) in &handover.inflight {
+            let message = journal::live_message(record.delivery.body, body);
+            self.journal.push(Record::BodyPut {
+                id: record.delivery.body,
+                body: body.clone(),
+            });
+            self.journal.push(Record::InflightPut {
+                session: journal::key_of(session.id()),
+                entry: record.clone(),
+            });
+            session
+                .outbound
+                .restore(journal::live_inflight(record, message));
+        }
+        for (entry, body) in handover.queued.iter().rev() {
+            let message = journal::live_message(entry.delivery.body, body);
+            self.journal.push(Record::BodyPut {
+                id: entry.delivery.body,
+                body: body.clone(),
+            });
+            self.journal.push(Record::QueuePushed {
+                session: journal::key_of(session.id()),
+                entry: entry.clone(),
+            });
+            let delivery =
+                journal::live_delivery(&entry.delivery, message, entry.sequence, entry.packet_id);
+            session.outbound.requeue(delivery);
+        }
+
+        let mut actions = Vec::new();
+        session.outbound.on_resume(now, &mut actions);
+        self.emit(subscriber, actions, out);
+        self.drain_session(subscriber);
+        refused
     }
 
     /// End a live connection that a newcomer is taking over from, and
@@ -909,6 +1416,7 @@ impl Broker {
                     now,
                     &mut |filter: &str, qos| hooks.authorize_subscribe(&client, filter, qos),
                     &mut actions,
+                    &mut self.filter_events,
                 );
                 actions.push(Action::Send(Packet::SubAck(mqtt_codec::packet::SubAck {
                     packet_id: request.packet_id,
@@ -928,6 +1436,7 @@ impl Broker {
                     &self.shared,
                     session,
                     &request.filters,
+                    &mut self.filter_events,
                 );
                 out.push((
                     subscriber,
@@ -1238,9 +1747,95 @@ impl Broker {
         }
     }
 
+    /// Take a message another node forwarded, and route it here.
+    ///
+    /// Section 8.3: the receiving node matches against **its own local
+    /// subscribers**, and that is the whole of what this does beyond
+    /// setting the mark.
+    ///
+    /// # Three things it deliberately does not do
+    ///
+    /// - **It fires no message hook, so no rule fires.** A rule fires on
+    ///   the node where the message entered the cluster, which is the
+    ///   node that received it unmarked. This is the other node, so the
+    ///   rule has already fired there and firing it again here would be
+    ///   one publication posted to a webhook once per node that happened
+    ///   to have a subscriber.
+    /// - **It does not forward on.** [`Self::publish`] tests the mark,
+    ///   which this sets; see [`Message::forwarded`].
+    /// - **It does not touch the retained store**, even for a message
+    ///   whose retain flag is set. A retained message is replicated as
+    ///   a register by section 8.2 and arrives by that path, stamped by
+    ///   the node that wrote it. Retaining it here as well would stamp
+    ///   the same value again on this node, and two nodes doing that to
+    ///   each other is one retained message bouncing between them for
+    ///   ever — which is the loop `Shared::apply_replicated` already
+    ///   exists to prevent on the other path.
+    ///
+    ///   The flag itself still travels, because a subscription with
+    ///   retain-as-published set is entitled to see it: that is
+    ///   [MQTT-3.3.1-13] and it is about the delivery rather than about
+    ///   the store.
+    ///
+    /// Returns how many of this node's subscribers it reached, which is
+    /// a number nobody is owed — there is no publisher here to
+    /// acknowledge — and which section 11.3 counts.
+    pub fn accept_forwarded(
+        &mut self,
+        mut message: Message,
+        groups: &[(String, String)],
+        now: u32,
+        out: &mut Vec<Addressed>,
+    ) -> usize {
+        // **The mark, set in the one place it is ever set.** A shell
+        // that had to remember to set it would be a shell one forgotten
+        // line away from a mesh that melts, so it is not the shell's to
+        // set: what arrives over a link arrives through here.
+        message.forwarded = true;
+        // No publisher, so no-local cannot apply: this is nobody on this
+        // node's own message. The node it came from withheld it from its
+        // own publisher already, which is where that subscription is.
+        //
+        // **And only the groups the sending node chose this one for.**
+        // Section 8.3: the choice between nodes is made before the
+        // forward, so a group this node has a member of and was not
+        // chosen for was served elsewhere. Delivering to it as well is
+        // the triple delivery the separate group map exists to prevent.
+        self.route_publication(message, None, route::Groups::Named(groups), now, out)
+    }
+
     /// Route a message to every subscriber that wants it, updating the
-    /// retained store first when the flag is set. Returns how many
-    /// subscribers it reached.
+    /// retained store first when the flag is set.
+    ///
+    /// # And forward one copy to each other node that wants it
+    ///
+    /// Section 8.3, unless the message is marked: see
+    /// [`Message::forwarded`] for why that test is the difference
+    /// between a mesh and an infinite loop, and [`Forwarder`] for what
+    /// does the sending.
+    ///
+    /// # What the count means, and why a forward is in it
+    ///
+    /// Returns how many subscribers on this node it reached **plus how
+    /// many other nodes it was forwarded to**. The two are added
+    /// because of the one thing the count decides: whether a publisher
+    /// is told "no matching subscribers".
+    ///
+    /// A client on one node publishing to a topic another node's client
+    /// subscribes to reaches a subscriber. Counting only the local ones
+    /// would answer [`ReasonCode::NoMatchingSubscribers`] — which tells
+    /// that publisher nobody is listening, on a cluster where somebody
+    /// is — and would make the answer depend on which node the
+    /// publisher happened to connect to. That is precisely what section
+    /// 8's clustering exists to stop being visible.
+    ///
+    /// It is a sum of two different things and says so rather than
+    /// pretending otherwise: a node forwarded to has at least one
+    /// matching subscriber, by the routing map's construction, so
+    /// "nonzero" means the same thing for both halves even though
+    /// "seven" does not. Section 11.3's metric keeps them apart, which
+    /// is where the distinction is worth having; see
+    /// [`Self::router_matches`].
     pub fn publish(
         &mut self,
         message: Message,
@@ -1248,7 +1843,29 @@ impl Broker {
         now: u32,
         out: &mut Vec<Addressed>,
     ) -> usize {
-        if message.retain {
+        // Every group that matches, because a publication that entered
+        // here is one this node is choosing for: see
+        // [`route::Groups::All`].
+        self.route_publication(message, publisher, route::Groups::All, now, out)
+    }
+
+    /// The one routing path, told which shared groups it is for.
+    ///
+    /// [`Self::publish`] and [`Self::accept_forwarded`] differ in that
+    /// and in nothing else, and they are one function here so that the
+    /// retain rule, the mark and the counters cannot be two answers.
+    fn route_publication(
+        &mut self,
+        message: Message,
+        publisher: Option<SubscriberId>,
+        groups: route::Groups<'_>,
+        now: u32,
+        out: &mut Vec<Addressed>,
+    ) -> usize {
+        // A forwarded message is not retained here; see
+        // [`Self::accept_forwarded`] for the stamp that would bounce
+        // between two nodes for ever if it were.
+        if message.retain && !message.forwarded {
             // An empty payload clears the topic rather than storing one,
             // which the store itself knows. The record says the same
             // thing the store was just told, because the two must not
@@ -1307,6 +1924,7 @@ impl Broker {
             &self.shared,
             &message,
             publisher,
+            groups,
             &mut has_room,
             &mut routed,
         );
@@ -1333,7 +1951,26 @@ impl Broker {
             self.drain_session(target.subscriber);
         }
 
-        reached
+        self.matches.local += reached as u64;
+        let mut forwarded = 0;
+        // **The mark is the whole of the loop prevention.** A message
+        // that arrived from a peer is not sent on: three nodes with a
+        // subscriber each would otherwise forward to one another for
+        // ever at the speed of the links between them.
+        //
+        // Read out of the field before the counter is touched, because
+        // the forwarder is borrowed from `self` and the counter is part
+        // of it.
+        if !message.forwarded {
+            let sent = self
+                .forwarder
+                .as_ref()
+                .map_or(0, |forwarder| forwarder.forward(&message));
+            self.matches.remote += sent as u64;
+            forwarded = sent;
+        }
+
+        reached + forwarded
     }
 
     /// A packet was too large to send and has been discarded.
@@ -1490,7 +2127,12 @@ impl Broker {
                     mountpoint: &identity.mountpoint,
                     client_id: &identity.client_id,
                 };
-                subscribe::remove_all(&self.subscriptions, &self.shared, &mut session);
+                subscribe::remove_all(
+                    &self.subscriptions,
+                    &self.shared,
+                    &mut session,
+                    &mut self.filter_events,
+                );
                 // Not through `emit`: the session is already out of
                 // the registry, so there is nothing left there to
                 // look its identity up by. The drops it owes its
@@ -2254,6 +2896,408 @@ mod tests {
             }],
             properties: Properties::default(),
         })
+    }
+
+    // ---- what is replicated, at node granularity: section 8.2 --------
+
+    /// Unsubscribe from one filter.
+    fn unsubscribe_from(filter: &str) -> Packet {
+        Packet::Unsubscribe(mqtt_codec::packet::Unsubscribe {
+            packet_id: 2,
+            filters: vec![filter.to_string()],
+            properties: Properties::default(),
+        })
+    }
+
+    /// Everything the broker has said about filters, drained.
+    fn filter_events(broker: &mut Broker) -> Vec<FilterEvent> {
+        let mut events = Vec::new();
+        broker.take_filter_events(&mut events);
+        events
+    }
+
+    /// Connect a client that keeps its session for an hour.
+    fn durable(broker: &mut Broker, client: &str, out: &mut Vec<Addressed>) -> SubscriberId {
+        let mut connect = connect_v5(client);
+        connect.properties.session_expiry_interval = Some(3_600);
+        broker
+            .connect("", &connect, out)
+            .expect("the default decision authenticates")
+            .subscriber
+    }
+
+    /// **A filter gaining a second local subscriber says nothing new.**
+    ///
+    /// Section 8.2's first easy-to-miss edge, walked through the broker
+    /// rather than through the counting type: convention 5's last entry
+    /// is a guard that built its type by hand and so never reached the
+    /// caller that was supposed to use it. Two clients subscribe to one
+    /// filter through SUBSCRIBE packets, and the second must produce
+    /// exactly one arrival of its own — which the replication layer
+    /// counts to two and broadcasts nothing for.
+    ///
+    /// The count the broker can see is asserted beside it, because an
+    /// event emitted and a subscription inserted are two different
+    /// claims and a test of one is not a test of the other.
+    #[test]
+    fn a_second_subscriber_to_a_filter_is_one_more_arrival_and_nothing_else() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let first = durable(&mut broker, "first", &mut out);
+        let second = durable(&mut broker, "second", &mut out);
+        assert_eq!(
+            filter_events(&mut broker),
+            Vec::new(),
+            "a connect subscribes to nothing"
+        );
+
+        broker
+            .handle(first, &subscribe_to("sensor/+/temp"), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Arrived("sensor/+/temp".to_owned())]
+        );
+
+        broker
+            .handle(second, &subscribe_to("sensor/+/temp"), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Arrived("sensor/+/temp".to_owned())],
+            "the second subscriber to a filter must be one arrival, no more and no less"
+        );
+        assert_eq!(broker.local_subscribers("sensor/+/temp"), 2);
+    }
+
+    /// A session re-subscribing to a filter it holds says nothing.
+    ///
+    /// The protocol's rule is that a second subscribe to the same filter
+    /// changes the options rather than adding a subscription, and the
+    /// count has to agree: an arrival per packet would be incremented
+    /// twice by this client and would never come back down, so the
+    /// filter would stay advertised after its only subscriber left.
+    #[test]
+    fn re_subscribing_to_a_held_filter_is_not_another_arrival() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let only = durable(&mut broker, "only", &mut out);
+
+        broker
+            .handle(only, &subscribe_to("a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Arrived("a/b".to_owned())]
+        );
+
+        // The same filter at a different quality of service, which is
+        // the options changing and not a new subscription.
+        broker
+            .handle(only, &subscribe_at("a/b", QoS::ExactlyOnce), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            Vec::new(),
+            "changing a held filter's options was reported as a new subscriber"
+        );
+        assert_eq!(broker.local_subscribers("a/b"), 1);
+
+        // And the one departure still arrives, which is what the count
+        // above would have lost.
+        broker
+            .handle(only, &unsubscribe_from("a/b"), &mut out)
+            .expect("the unsubscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Departed("a/b".to_owned())]
+        );
+    }
+
+    /// **A filter losing its last local subscriber departs.**
+    ///
+    /// Section 8.2's second edge. The departure is what the replication
+    /// layer turns into a tombstone; without it every peer goes on
+    /// routing to this node for a filter it has no subscriber for.
+    #[test]
+    fn the_last_unsubscribe_from_a_filter_is_the_departure_that_tombstones_it() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let first = durable(&mut broker, "first", &mut out);
+        let second = durable(&mut broker, "second", &mut out);
+        broker
+            .handle(first, &subscribe_to("a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        broker
+            .handle(second, &subscribe_to("a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        drop(filter_events(&mut broker));
+
+        broker
+            .handle(first, &unsubscribe_from("a/b"), &mut out)
+            .expect("the unsubscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Departed("a/b".to_owned())]
+        );
+        assert_eq!(broker.local_subscribers("a/b"), 1);
+
+        broker
+            .handle(second, &unsubscribe_from("a/b"), &mut out)
+            .expect("the unsubscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Departed("a/b".to_owned())],
+            "the last unsubscribe from a filter must depart"
+        );
+        assert_eq!(broker.local_subscribers("a/b"), 0);
+    }
+
+    /// Unsubscribing from a filter nothing held says nothing.
+    ///
+    /// The protocol answers "no subscription existed" and the count must
+    /// agree: a departure here would take the count below zero, and a
+    /// count that cannot reach zero again never tombstones the filter.
+    #[test]
+    fn unsubscribing_from_a_filter_nothing_held_is_not_a_departure() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let only = durable(&mut broker, "only", &mut out);
+        broker
+            .handle(only, &unsubscribe_from("a/b"), &mut out)
+            .expect("the unsubscribe is accepted");
+        assert_eq!(filter_events(&mut broker), Vec::new());
+    }
+
+    /// A session expiring departs from every filter it held.
+    ///
+    /// One of the two teardown paths nobody thinks of. The session is
+    /// never unsubscribed from anything; it simply stops existing, and
+    /// the trie entries go with it. A departure missed here leaves the
+    /// node advertised for the filter until it restarts — and a restart
+    /// would not fix it either, because the subscription is gone from
+    /// the store too.
+    #[test]
+    fn a_session_expiring_departs_from_every_filter_it_held() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let mut connect = connect_v5("brief");
+        connect.properties.session_expiry_interval = Some(1);
+        let only = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates")
+            .subscriber;
+        broker
+            .handle(only, &subscribe_to("a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        broker
+            .handle(only, &subscribe_to("c/d"), &mut out)
+            .expect("the subscribe is accepted");
+        drop(filter_events(&mut broker));
+
+        broker.disconnect(only, &mut out);
+        run_to(&mut broker, 60, &mut out);
+        assert_eq!(broker.session_count(), 0, "the session must have expired");
+
+        let mut departed: Vec<String> = filter_events(&mut broker)
+            .into_iter()
+            .map(|event| match event {
+                FilterEvent::Departed(filter) => filter,
+                other => panic!("an expiring session reported {other:?} rather than a departure"),
+            })
+            .collect();
+        departed.sort();
+        assert_eq!(departed, vec!["a/b".to_owned(), "c/d".to_owned()]);
+        assert_eq!(broker.local_subscribers("a/b"), 0);
+    }
+
+    /// A clean-start connect departs from everything the old session held.
+    ///
+    /// The other teardown path, and the one that hides: a clean-start
+    /// takeover replaces the session wholesale and keeps the handle, so
+    /// only this layer can clear the trie — which is exactly why only
+    /// this layer can report the departures.
+    #[test]
+    fn a_clean_start_connect_departs_from_what_the_old_session_held() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let first = durable(&mut broker, "same", &mut out);
+        broker
+            .handle(first, &subscribe_to("a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        drop(filter_events(&mut broker));
+
+        let mut again = connect_v5("same");
+        again.clean_start = true;
+        broker
+            .connect("", &again, &mut out)
+            .expect("the default decision authenticates");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::Departed("a/b".to_owned())],
+            "a clean start kept the trie entry or kept it quiet"
+        );
+        assert_eq!(broker.local_subscribers("a/b"), 0);
+    }
+
+    /// A shared subscription is a group event on its inner filter.
+    ///
+    /// **This test asserted the opposite, and the assertion was the
+    /// defect.** It said a shared subscription was an arrival on its
+    /// inner filter, on the argument that `$share/g/` is how this node
+    /// shares a delivery among its own clients and that a peer has
+    /// nothing to do with the group. Section 8.3 is why that was wrong:
+    /// a group with a member on each of three nodes, reported as three
+    /// ordinary subscribers to one filter, puts all three on the
+    /// ordinary route — and one copy to each interested node is
+    /// delivered three times where the semantics demand one.
+    ///
+    /// So the group travels, and two groups on one filter are two
+    /// groups rather than two subscribers to it. The filter is still the
+    /// inner one, because that is what a published topic is matched
+    /// against.
+    #[test]
+    fn a_shared_subscription_is_a_group_event_on_its_inner_filter() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let only = durable(&mut broker, "worker", &mut out);
+
+        broker
+            .handle(only, &subscribe_to("$share/one/a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::GroupJoined {
+                group: "one".to_owned(),
+                filter: "a/b".to_owned()
+            }],
+            "a shared subscription was reported without its group"
+        );
+        broker
+            .handle(only, &subscribe_to("$share/two/a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::GroupJoined {
+                group: "two".to_owned(),
+                filter: "a/b".to_owned()
+            }],
+            "two groups on one filter are two groups"
+        );
+        assert_eq!(
+            broker.local_subscribers("a/b"),
+            0,
+            "a group member is not an ordinary subscriber to the filter"
+        );
+        assert_eq!(broker.local_members("one", "a/b"), 1);
+        assert_eq!(broker.local_members("two", "a/b"), 1);
+
+        broker
+            .handle(only, &unsubscribe_from("$share/one/a/b"), &mut out)
+            .expect("the unsubscribe is accepted");
+        broker
+            .handle(only, &unsubscribe_from("$share/two/a/b"), &mut out)
+            .expect("the unsubscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![
+                FilterEvent::GroupLeft {
+                    group: "one".to_owned(),
+                    filter: "a/b".to_owned()
+                },
+                FilterEvent::GroupLeft {
+                    group: "two".to_owned(),
+                    filter: "a/b".to_owned()
+                }
+            ],
+            "a departure that lost its group would never tombstone the group"
+        );
+        assert_eq!(broker.local_members("one", "a/b"), 0);
+        assert_eq!(broker.local_members("two", "a/b"), 0);
+    }
+
+    /// An ordinary subscription and a shared one are counted apart.
+    ///
+    /// One client holding both is one ordinary subscriber and one group
+    /// member. A single count would tombstone neither when one of them
+    /// went, and the node would stay advertised for whichever is gone.
+    #[test]
+    fn an_ordinary_subscription_and_a_shared_one_are_counted_apart() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let both = durable(&mut broker, "both", &mut out);
+
+        broker
+            .handle(both, &subscribe_to("a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        broker
+            .handle(both, &subscribe_to("$share/g/a/b"), &mut out)
+            .expect("the subscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![
+                FilterEvent::Arrived("a/b".to_owned()),
+                FilterEvent::GroupJoined {
+                    group: "g".to_owned(),
+                    filter: "a/b".to_owned()
+                }
+            ]
+        );
+        assert_eq!(broker.local_subscribers("a/b"), 1);
+        assert_eq!(broker.local_members("g", "a/b"), 1);
+
+        broker
+            .handle(both, &unsubscribe_from("$share/g/a/b"), &mut out)
+            .expect("the unsubscribe is accepted");
+        assert_eq!(
+            filter_events(&mut broker),
+            vec![FilterEvent::GroupLeft {
+                group: "g".to_owned(),
+                filter: "a/b".to_owned()
+            }]
+        );
+        assert_eq!(
+            broker.local_subscribers("a/b"),
+            1,
+            "leaving the group must not take the ordinary subscription with it"
+        );
+        assert_eq!(broker.local_members("g", "a/b"), 0);
+    }
+
+    /// A refused subscribe is not an arrival.
+    ///
+    /// Nothing went into the trie, so nothing may be advertised. A node
+    /// that announced a filter its authorizing chain had refused would
+    /// be asked for traffic it would then throw away.
+    #[test]
+    fn a_refused_subscribe_is_not_an_arrival() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let only = durable(&mut broker, "only", &mut out);
+        broker.hooks_mut().set_defaults(crate::hooks::Defaults {
+            subscribe: false,
+            ..crate::hooks::Defaults::default()
+        });
+        broker
+            .handle(only, &subscribe_to("a/b"), &mut out)
+            .expect("the subscribe is answered, per filter");
+        assert_eq!(
+            filter_events(&mut broker),
+            Vec::new(),
+            "a filter the chain refused was advertised to the cluster"
+        );
+    }
+
+    /// An invalid filter is not an arrival either.
+    #[test]
+    fn an_invalid_filter_is_not_an_arrival() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let only = durable(&mut broker, "only", &mut out);
+        broker
+            .handle(only, &subscribe_to("a/#/b"), &mut out)
+            .expect("the subscribe is answered, per filter");
+        assert_eq!(filter_events(&mut broker), Vec::new());
     }
 
     /// A subscribe to one filter at the given quality of service.

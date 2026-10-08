@@ -1,0 +1,117 @@
+[package]
+name = "cluster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Node identity, the authenticated link and the membership view for sd-mqtt"
+
+[dependencies]
+# The record vocabulary and nothing that touches a disk, for the reason
+# `broker-core` takes it that way: which engine a node's identity is
+# written to is the binary's choice and nothing this crate can see.
+storage = { path = "../storage", version = "0.1.0", default-features = false }
+# Section 8.3's routing map asks the same question the subscription trie
+# answers — which filters does this topic match — about other nodes'
+# filters rather than this node's sessions. So it is the same trie, in a
+# second instance: `broker_core::subscriptions::FilterIndex`.
+#
+# **The direction is the layering and not a cycle.** `broker-core` knows
+# nothing about a cluster and must not: it reads no clock, holds no
+# identity and counts nothing. `rules` already depends on it for the
+# reference matcher and on this crate for the node identity, so this
+# edge puts `cluster` where `rules` already is rather than anywhere new.
+#
+# The alternative was a linear scan over every remote filter on every
+# publish, which at the design's fifty-node ceiling is the cost the trie
+# exists to avoid, with a second matcher to keep in step with the first.
+# Nothing new reaches the binary: `broker-core` is already in it, and the
+# direct-dependency budget counts external crates, of which this adds
+# none.
+#
+# **This was a dev-dependency, and the note under it said a normal one
+# "either way" was wrong.** That note gave two reasons and both are
+# about the other direction, where they still hold: a `broker-core` that
+# depended on this crate would carry tokio, aws-lc-rs and postcard into
+# the crate documented as doing no I/O, and a hybrid logical clock into
+# the one that reads no clock. Neither is true of this direction.
+# `broker-core` gains no dependency, the `cargo tree -p broker-core -e
+# normal` check its own manifest documents is untouched, and there is no
+# cycle to make.
+broker-core = { path = "../broker-core", version = "0.1.0" }
+# Section 8.1's identity is a UUID v7. The same features `broker-core`
+# names, and the same crate: a second version 7 generator in one binary
+# would be two answers to what a fresh identifier looks like.
+uuid = { version = "1", default-features = false, features = ["v7", "std"] }
+# Section 8.1's keyed hash, and the random source its nonces come from.
+#
+# **Already linked, transitively, through the TLS stack**, so naming it
+# here costs one more direct dependency of the thirty-five allowed and
+# no new crates at all: `docs/research/component-selection.md` measured
+# a byte-identical lock file and this build reproduced it, which is the
+# check worth doing rather than the claim worth repeating.
+#
+# Default features off with `aws-lc-sys` named, which is the feature set
+# `tokio-rustls` and `hyper-rustls` already ask for; `hmac` and `rand`
+# are ungated by anything beyond it.
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
+# The streams a handshake and a link run over. A trait rather than a
+# socket: `AsyncRead` and `AsyncWrite` are what let every test here run
+# over an in-memory pair, which is what section 14 committed to.
+# `sync` is the bounded queue to one peer and `time` is the link's flush
+# deadline. `net` and `rt` arrive with the mesh and its harnesses: a node
+# binds a socket and spawns a task per link, and the gate of
+# `testing::gate` is a listener of its own in front of a real one. The
+# runtime itself is still the binary's to choose; `rt` is the handle a
+# spawn needs, not a reactor this crate starts.
+tokio = { version = "1", default-features = false, features = ["io-util", "sync", "time", "net", "rt"] }
+# What a frame's body is, the same encoder the store uses. One format in
+# the binary rather than two, and the one already pinned by golden
+# vectors derived from postcard's rules.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+# The buffer a frame is read into. The same type `crates/server` reads
+# packets into, so "consumes nothing when the frame is incomplete" means
+# the same thing in both places.
+bytes.workspace = true
+thiserror.workspace = true
+# What a mesh says when a peer goes, when a secret is refused and when
+# a link comes up. The same subscriber the binary installs; this crate
+# emits and never configures.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# The redb backend, for the identity tests alone. "Minted once and read
+# back unchanged across a restart" is a claim about a file, and the
+# in-memory backend answers it with a store that cannot be reopened.
+# Dev only: nothing this crate ships gains redb.
+storage = { path = "../storage", version = "0.1.0", features = ["redb"] }
+# The directory those stores live in, thrown away with them.
+tempfile.workspace = true
+# Section 8.2's two properties are properties: a clock that resumes from
+# the store never re-issues a reading, and two nodes handed the same
+# writes in any order agree. Both are over sequences nobody would
+# enumerate, and the second one *found* the condition convergence
+# depends on rather than having it explained.
+proptest.workspace = true
+# Section 8.2 replicates **that a node has a subscriber for a filter**,
+# and the two edges of that rule — a second subscriber broadcasting
+# nothing, the last unsubscribe broadcasting a tombstone — are claims
+# about the broker's subscribe path and this crate's count together.
+# `tests/metadata.rs` drives one into the other, because convention 5's
+# last entry is a guard that built its type by hand and so never reached
+# the caller that was supposed to use it.
+#
+# `broker-core` is a normal dependency now — section 8.3's routing map
+# is the subscription trie in a second instance — so it is not repeated
+# here. The reasoning that used to live in this paragraph, and what of
+# it still holds, is above it.
+mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
+# `rt` and `macros` for `#[tokio::test]`; `io-util` for `duplex`, which
+# is the pair of ends every handshake test runs over; `time` for the
+# bounds that make a stalled handshake fail rather than hang.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "io-util", "time"] }
+
+[lints]
+workspace = true

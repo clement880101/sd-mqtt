@@ -30,8 +30,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, PoisonError};
 
 use crate::record::{
-    BodyRecord, InflightRecord, MessageId, OutboxRecord, QueueEntry, Record, RetainedRecord,
-    RuleRecord, SessionKey, SessionRecord, SubscriptionRecord,
+    BodyRecord, ClockRecord, InflightRecord, LoggedRecord, MessageId, MetadataKeyRecord,
+    MetadataRecord, NodeIdentityRecord, OutboxRecord, QueueEntry, Record, RetainedRecord,
+    RuleRecord, SeenRecord, SessionKey, SessionRecord, SubscriptionRecord,
 };
 use crate::restore::{Restored, RestoredSession};
 use crate::{Rejection, Storage, StorageError};
@@ -78,6 +79,47 @@ struct State {
     retained: BTreeMap<String, RetainedRecord>,
     /// Rules by identifier, ordered so that restore is deterministic.
     rules: BTreeMap<String, RuleRecord>,
+    /// Who this node is, once something has said. Section 8.1.
+    ///
+    /// One row rather than a table: a store belongs to one node.
+    node: Option<NodeIdentityRecord>,
+    /// The highest clock reading this node has issued. Section 8.2.
+    ///
+    /// One row, beside the identity and for the same reason: a store
+    /// belongs to one node, and this is that node's clock.
+    clock: Option<ClockRecord>,
+    /// Every replicated register, by what it is about. Section 8.2.
+    ///
+    /// Ordered by the key, which is what makes a restore from this
+    /// backend comparable with one from redb: redb's key encoding puts
+    /// the variant index in a leading byte and escapes each string
+    /// component so that its byte order is this `BTreeMap`'s order.
+    metadata: BTreeMap<MetadataKeyRecord, MetadataRecord>,
+    /// This node's own operation log, by sequence. Section 8.2.
+    ///
+    /// Ordered, which is the whole point: an exchange asks for
+    /// everything after a sequence, and that is a range over this.
+    oplog: BTreeMap<u64, MetadataRecord>,
+    /// The last sequence collection removed from [`State::oplog`].
+    ///
+    /// **The only number held about the log**, and the one that makes the
+    /// highest sequence ever used derivable rather than stored: the table
+    /// holds every entry from here to the top, so the highest is this or
+    /// the last key, whichever is larger. A second row saying the same
+    /// thing was there first and was deleted, because a mutation that
+    /// ignored it could not be made to fail a test — nothing can tell the
+    /// two answers apart, which is what convention 5 calls a test that
+    /// cannot fail.
+    ///
+    /// It is also what lets a sequence at or below it be refused: once
+    /// every node has read past a number the entry is gone, and nothing
+    /// in the table can tell a reuse of it from a first use.
+    oplog_collected_through: u64,
+    /// How far this node has read each other node's log. Section 8.2.
+    ///
+    /// Ordered by the node's bytes, so that a restore from this backend
+    /// is comparable with one from redb.
+    seen: BTreeMap<[u8; 16], u64>,
     /// Each rule's outbox, by the same identifier.
     ///
     /// Beside the rules rather than inside a rule's own entry, because a
@@ -330,6 +372,67 @@ impl State {
                     entry.next_attempt_at = *next_attempt_at;
                 }
             }
+            Record::NodeIdentityPut { identity } => {
+                // Replaced whole, as a rule is by a `RulePut`: the
+                // identity is whatever the last put said it was. What
+                // must not happen — a fresh UUID minted over one that
+                // already exists — is the caller's to prevent, and
+                // `Record::NodeIdentityPut` says why it is not the
+                // store's.
+                self.node = Some(identity.clone());
+            }
+            Record::ClockHighWaterPut { reading } => {
+                // Replaced whole, and not compared with what is held:
+                // whether a reading moved forwards is the clock's
+                // question and `ClockRecord` says why it is not the
+                // store's.
+                self.clock = Some(*reading);
+            }
+            Record::MetadataPut { entry } => {
+                // Replaced whole, and not compared with what is held:
+                // which of two copies wins is the caller's one
+                // comparison, and `Record::MetadataPut` says why it is
+                // not the store's. A deletion arrives here as an entry
+                // whose value is absent, and is stored like any other.
+                self.metadata.insert(entry.key.clone(), entry.clone());
+            }
+            Record::MetadataRemoved { key } => {
+                // A key the store does not hold is a no-op rather than a
+                // refusal: see `Record::MetadataRemoved` for why a sweep
+                // that ran twice is not a caller's mistake.
+                self.metadata.remove(key);
+            }
+            Record::MetadataSeenPut { seen } => {
+                // Replaced whole, and not compared with what is held:
+                // whether a watermark moved forwards is the caller's
+                // question, as it is for the clock beside it.
+                self.seen.insert(seen.node, seen.through);
+            }
+            Record::OpLogAppended { entry } => {
+                // **Already held, or already collected** — not "below the
+                // high-water mark". Two of this node's own writes can be
+                // numbered under two different locks and reach a store in
+                // either order, so a refusal of anything below the highest
+                // would refuse the earlier of two perfectly good writes.
+                // What must never happen is one number carrying two
+                // writes, and these two conditions are exactly that.
+                if entry.sequence <= self.oplog_collected_through
+                    || self.oplog.contains_key(&entry.sequence)
+                {
+                    return Err(Rejection::OpLogSequenceReused {
+                        sequence: entry.sequence,
+                        highest: self.oplog_highest(),
+                    });
+                }
+                self.oplog.insert(entry.sequence, entry.entry.clone());
+            }
+            Record::OpLogTruncated { through } => {
+                // The watermark moves even where it is past the last
+                // entry: the numbers are spent whether or not anything was
+                // held at them, and this is the only record of that.
+                self.oplog.retain(|sequence, _| *sequence > *through);
+                self.oplog_collected_through = self.oplog_collected_through.max(*through);
+            }
             Record::OutboxRemoved { rule, sequence } => {
                 let held = self.outbox_mut(rule)?;
                 // Only what was actually there is subtracted, for the
@@ -342,6 +445,18 @@ impl State {
             }
         }
         Ok(())
+    }
+}
+
+impl State {
+    /// The highest sequence this node's log has ever used.
+    ///
+    /// Derived rather than held: see [`State::oplog_collected_through`].
+    fn oplog_highest(&self) -> u64 {
+        std::cmp::max(
+            self.oplog_collected_through,
+            self.oplog.keys().next_back().copied().unwrap_or_default(),
+        )
     }
 }
 
@@ -399,6 +514,26 @@ impl Storage for MemoryStorage {
                 .map(|(id, held)| (*id, held.body.clone()))
                 .collect::<HashMap<_, _>>(),
             rules: state.rules.values().cloned().collect(),
+            node: state.node.clone(),
+            clock: state.clock,
+            metadata: state.metadata.values().cloned().collect(),
+            oplog: state
+                .oplog
+                .iter()
+                .map(|(sequence, entry)| LoggedRecord {
+                    sequence: *sequence,
+                    entry: entry.clone(),
+                })
+                .collect(),
+            oplog_collected_through: state.oplog_collected_through,
+            seen: state
+                .seen
+                .iter()
+                .map(|(node, through)| SeenRecord {
+                    node: *node,
+                    through: *through,
+                })
+                .collect(),
         })
     }
 

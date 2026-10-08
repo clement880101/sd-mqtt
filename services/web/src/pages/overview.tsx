@@ -125,7 +125,10 @@ export function Overview() {
           return;
         }
         fetched.value = {
-          node: nodes.items[0] ?? null,
+          // This node, not the first row: a cluster's rows are
+          // ordered by identity, so the first one is whichever node
+          // was founded first and need not be the one answering.
+          node: nodes.items.find((node) => node.this_node) ?? null,
           connections: clients.total,
           sessions: sessions.total,
           subscriptions: subscriptions.total,
@@ -189,8 +192,9 @@ export function Overview() {
 
       {held?.node ? (
         <p class="quiet">
-          Node <strong>{held.node.id}</strong>, version {held.node.version}, up{' '}
-          {uptimeOf(held.node.uptime_seconds)}.
+          Node <strong>{held.node.name}</strong> ({held.node.id})
+          {held.node.version === null ? null : `, version ${held.node.version}`}
+          {held.node.uptime_seconds === null ? null : `, up ${uptimeOf(held.node.uptime_seconds)}`}.
         </p>
       ) : null}
 

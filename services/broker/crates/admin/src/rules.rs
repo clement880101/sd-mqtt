@@ -620,6 +620,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use broker_core::broker::{Broker, BrokerConfig};
+    use rules::live::{HybridClock, Replicated, DEFAULT_MAX_DRIFT_MILLIS};
     use rules::singleton::{Membership, NodeId};
     use sdmqtt_server::publish::Publication;
     use sdmqtt_server::shared::Shared;
@@ -654,11 +655,20 @@ mod tests {
                 Broker::new(BrokerConfig::default()),
                 Arc::clone(&writer),
             ));
+            let me = NodeId::mint();
             let registry = Registry::new(
                 Arc::clone(&shared),
                 Arc::clone(&store),
                 writer,
-                Arc::new(Membership::alone(NodeId::new("local"))),
+                Arc::new(Membership::alone(me)),
+                Arc::new(
+                    Replicated::open(
+                        me,
+                        HybridClock::resume(None, DEFAULT_MAX_DRIFT_MILLIS),
+                        &storage::Restored::default(),
+                    )
+                    .expect("an empty store holds nothing to refuse"),
+                ),
             );
             // The same wiring the binary does, and the reason a rule
             // created below actually fires: without it there is no

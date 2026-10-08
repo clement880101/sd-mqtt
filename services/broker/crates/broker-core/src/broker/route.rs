@@ -6,6 +6,46 @@ use crate::session::message::Message;
 use crate::subscriptions::shared::GroupId;
 use crate::subscriptions::{SharedSubscriptions, SubscriberId, Subscription, SubscriptionTrie};
 
+/// Which of this node's shared groups a publication may be delivered to.
+///
+/// Section 8.3's selection happens **before** a publication is
+/// forwarded, not after: a group spanning three nodes has a matching
+/// subscriber on each, so a copy delivered to every matching group on
+/// every node that received one is three deliveries where the semantics
+/// demand one. So the node that chose says which groups the receiving
+/// node is serving, and this is how it says it.
+#[derive(Debug, Clone, Copy)]
+pub enum Groups<'a> {
+    /// Every group that matches.
+    ///
+    /// What a publication that **entered this node** means: this node is
+    /// the one choosing, and for each matching group it has a member of
+    /// it is the node chosen — section 6's local preference, applied by
+    /// `cluster::groups` deciding not to forward that group anywhere.
+    All,
+    /// Only the groups named, by share name and inner filter.
+    ///
+    /// What a **forwarded** publication means. A group this node has a
+    /// member of and that is not named here was served by another node,
+    /// and delivering to it as well is exactly the triple delivery the
+    /// separate map exists to prevent.
+    ///
+    /// Named by the pair rather than by a [`GroupId`], because an
+    /// identifier is a number one node made up and the pair is what the
+    /// whole cluster agrees about.
+    Named(&'a [(String, String)]),
+}
+
+impl Groups<'_> {
+    /// Whether `group` may be delivered to.
+    fn admits(&self, shared: &SharedSubscriptions, group: GroupId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Named(named) => shared.key_of(group).is_some_and(|key| named.contains(&key)),
+        }
+    }
+}
+
 /// One message addressed to one subscriber.
 #[derive(Debug, Clone)]
 pub struct Routed {
@@ -52,11 +92,19 @@ pub struct Routed {
 ///
 /// An ordinary subscription is not asked. Its subscriber is the only
 /// one there is, so a full queue there is a drop however it is reached.
+///
+/// `groups` says which of this node's shared groups this publication is
+/// for. [`Groups::All`] is a publication that entered here;
+/// [`Groups::Named`] is one another node forwarded, carrying the groups
+/// that node chose this one for. See that type: the choice between
+/// nodes is made before the forward, and a group served by another node
+/// must not be served again here.
 pub fn route(
     trie: &SubscriptionTrie,
     shared: &SharedSubscriptions,
     message: &Message,
     publisher: Option<SubscriberId>,
+    groups: Groups<'_>,
     has_room: &mut dyn FnMut(SubscriberId, QoS) -> bool,
     out: &mut Vec<Routed>,
 ) {
@@ -73,9 +121,14 @@ pub fn route(
     // A shared group contributes one member, and that member is merged
     // like any other: a client holding both an ordinary and a shared
     // subscription to the same topic still receives one message.
-    let mut groups = Vec::new();
-    shared.matching(&message.topic[..], &mut groups);
-    for group in groups {
+    let mut matched_groups = Vec::new();
+    shared.matching(&message.topic[..], &mut matched_groups);
+    for group in matched_groups {
+        // Section 8.3: a group another node was chosen to serve is not
+        // served here as well.
+        if !groups.admits(shared, group) {
+            continue;
+        }
         if let Some(subscription) = choose(shared, group, message, publisher, has_room) {
             merge(out, &subscription, message);
         }
@@ -199,7 +252,15 @@ mod tests {
         publisher: Option<SubscriberId>,
         out: &mut Vec<Routed>,
     ) {
-        route(trie, shared, message, publisher, &mut |_, _| true, out);
+        route(
+            trie,
+            shared,
+            message,
+            publisher,
+            Groups::All,
+            &mut |_, _| true,
+            out,
+        );
     }
 
     fn targets(out: &[Routed]) -> Vec<u64> {
@@ -243,6 +304,7 @@ mod tests {
             &shared,
             &message("a/b", QoS::AtLeastOnce),
             None,
+            Groups::All,
             &mut |subscriber, _qos| subscriber == SubscriberId(2),
             &mut out,
         );
@@ -271,6 +333,7 @@ mod tests {
             &shared,
             &message("a/b", QoS::AtLeastOnce),
             None,
+            Groups::All,
             &mut |subscriber, _qos| {
                 asked.push(subscriber.0);
                 assert!(

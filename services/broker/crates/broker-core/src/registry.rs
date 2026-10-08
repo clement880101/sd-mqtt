@@ -260,7 +260,6 @@ pub struct Registry {
     by_identity: BTreeMap<SessionId, SubscriberId>,
     sessions: HashMap<SubscriberId, Session, RandomState>,
     next_subscriber: u64,
-    next_epoch: u64,
     /// The bounds every session it builds starts with, the
     /// process-wide queue total among them. Held rather than passed
     /// per call because a session is also built by a clean start,
@@ -276,7 +275,6 @@ impl Registry {
             by_identity: BTreeMap::new(),
             sessions: HashMap::default(),
             next_subscriber: 0,
-            next_epoch: 0,
             bounds: SessionBounds {
                 max_inflight,
                 queue,
@@ -336,8 +334,49 @@ impl Registry {
     /// disconnected. The epoch decides who wins if two nodes both accepted
     /// the client during a partition, so it only ever increases.
     pub fn register(&mut self, id: SessionId, clean_start: bool, now: u32) -> Registration {
-        self.next_epoch += 1;
-        let epoch = self.next_epoch;
+        self.register_claimed(id, clean_start, now, 0)
+    }
+
+    /// The same, for a session the cluster has already claimed.
+    ///
+    /// # One epoch for the session, wherever it is
+    ///
+    /// Section 8.4 records a session's owner and its epoch in a
+    /// replicated register, and the node a client connects to claims it
+    /// by writing **the epoch it read plus one**. `claimed` is that
+    /// epoch, which this node may never have seen move: a session
+    /// claimed four times on three other nodes comes back here with a
+    /// register saying four and a local session that remembers one.
+    ///
+    /// So the epoch is one past whichever is higher, and two things
+    /// depend on that being a maximum rather than an assignment. A
+    /// register ahead of this node must carry the epoch forwards, or two
+    /// nodes write the same number for different claims and neither can
+    /// displace the other. A register *behind* this node must not drag
+    /// it back, because the epoch is this process's generation guard as
+    /// well: a connection whose session still shows its own epoch
+    /// believes the session is its own, and a reused number would hand a
+    /// displaced connection the right to tear down its successor's.
+    ///
+    /// A node that does not cluster passes zero, which is
+    /// [`Registry::register`], and the epoch is then the session's own
+    /// count of how many times it has been claimed here.
+    pub fn register_claimed(
+        &mut self,
+        id: SessionId,
+        clean_start: bool,
+        now: u32,
+        claimed: u64,
+    ) -> Registration {
+        // Read before anything replaces the session, because a clean
+        // start is what replaces it and the epoch must still only go
+        // one way across one.
+        let held = self
+            .by_identity
+            .get(&id)
+            .and_then(|subscriber| self.sessions.get(subscriber))
+            .map_or(0, Session::epoch);
+        let epoch = held.max(claimed) + 1;
 
         if let Some(subscriber) = self.by_identity.get(&id).copied() {
             let existing = self
@@ -606,6 +645,70 @@ mod tests {
             assert!(reg.epoch > last);
             last = reg.epoch;
         }
+    }
+
+    /// The epoch belongs to the session, not to the registry.
+    ///
+    /// Section 8.4 records a session's owner and its epoch in a
+    /// replicated register, and the claiming node's epoch is the one
+    /// it read **plus one**. That only means anything if the number
+    /// is about the session: a counter shared by every session on
+    /// this node would make one node's session five hundred and
+    /// another's three, and a node incrementing from a register would
+    /// then be writing a number its own registry disagrees with.
+    /// **One epoch for the session, wherever it is.**
+    ///
+    /// Asserted by registering two sessions and then one of them
+    /// again: the second session's epoch must not have moved. A
+    /// registry-wide counter gives the two different numbers on their
+    /// first connect and moves the untouched one, and
+    /// `the_epoch_never_goes_backwards` cannot see either, because one
+    /// session is all it looks at.
+    #[test]
+    fn the_epoch_belongs_to_the_session_and_not_to_the_registry() {
+        let mut registry = Registry::new(20, QueueLimits::default());
+        let a = registry.register(id("a"), false, 0);
+        let b = registry.register(id("b"), false, 0);
+        assert_eq!(a.epoch, 1, "a first connect is the first claim of it");
+        assert_eq!(b.epoch, 1, "and so is another session's first connect");
+
+        let again = registry.register(id("a"), false, 1);
+        assert_eq!(again.epoch, 2, "the session this one is about moved");
+        assert_eq!(
+            registry.get(b.subscriber).expect("still there").epoch(),
+            1,
+            "and the one it is not about did not"
+        );
+    }
+
+    /// A claim is lifted to the epoch the cluster has already reached.
+    ///
+    /// Section 8.4: the node a client connects to increments the epoch
+    /// the register holds, and that register may have been written by
+    /// another node — this session may have been claimed four times on
+    /// three other nodes while this one never saw it. So the claim
+    /// carries a floor, and the epoch is one past whichever of the two
+    /// is higher.
+    ///
+    /// The last two assertions are the directions that matter: a floor
+    /// below what this node already reached must not drag the epoch
+    /// backwards, because the epoch is also this process's generation
+    /// guard — a connection whose session shows its own epoch believes
+    /// the session is still its own.
+    #[test]
+    fn a_claim_lifts_the_epoch_to_what_the_cluster_reached() {
+        let mut registry = Registry::new(20, QueueLimits::default());
+        let far = registry.register_claimed(id("a"), false, 0, 7);
+        assert_eq!(far.epoch, 8, "one past the epoch the register held");
+
+        let next = registry.register(id("a"), false, 1);
+        assert_eq!(next.epoch, 9, "and it carries on from there");
+
+        let behind = registry.register_claimed(id("a"), false, 2, 3);
+        assert_eq!(
+            behind.epoch, 10,
+            "a register behind this node does not drag the epoch backwards"
+        );
     }
 
     #[test]

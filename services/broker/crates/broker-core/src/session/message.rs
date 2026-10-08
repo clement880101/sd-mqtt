@@ -69,6 +69,45 @@ pub struct Message {
     pub properties: Arc<SharedProperties>,
     /// A coarse deadline in seconds, past which it must not be delivered.
     pub expires_at: Option<u32>,
+    /// Whether this message reached this node from another node.
+    ///
+    /// # The mark is the difference between a mesh and an infinite loop
+    ///
+    /// Section 8.3: **a forwarded message is marked as forwarded, and a
+    /// forwarded message is never forwarded again.** Without it, three
+    /// nodes that each have a subscriber forward to each other for ever
+    /// at the speed of the links between them. The original design
+    /// stated it as an implication; it is stated outright there now, and
+    /// this is it.
+    ///
+    /// It is set in exactly one place,
+    /// [`Broker::accept_forwarded`], and read in exactly one,
+    /// [`Broker::publish`]. Nothing else sets it and nothing outside
+    /// this crate needs to: a publication a client made, a will, a dead
+    /// letter and a message a connector originated are all unmarked,
+    /// because all of them entered the cluster here.
+    ///
+    /// # It answers section 9's question about where a rule fires
+    ///
+    /// A rule fires on the node where a message entered the cluster,
+    /// which is the node that received it unmarked. That falls out of
+    /// this rather than needing a rule of its own: the hooks are fired
+    /// by [`Broker::handle`] and [`Broker::originate`], and a forwarded
+    /// message reaches neither.
+    ///
+    /// # Not stored, deliberately
+    ///
+    /// [`crate::journal::body_record`] does not carry it and
+    /// [`crate::journal::live_message`] reads it back as `false`. A
+    /// message in a store is one that has already been routed, sitting
+    /// in some session's queue; a restart that resumed the mark would be
+    /// resuming an answer to a question nothing is going to ask again.
+    ///
+    /// [`Broker::accept_forwarded`]: crate::broker::Broker::accept_forwarded
+    /// [`Broker::publish`]: crate::broker::Broker::publish
+    /// [`Broker::handle`]: crate::broker::Broker::handle
+    /// [`Broker::originate`]: crate::broker::Broker::originate
+    pub forwarded: bool,
 }
 
 impl Message {
@@ -82,6 +121,9 @@ impl Message {
             retain,
             properties: Arc::new(SharedProperties::default()),
             expires_at: None,
+            // A message built here is one that entered the cluster
+            // here. Only `Broker::accept_forwarded` says otherwise.
+            forwarded: false,
         }
     }
 

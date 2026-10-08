@@ -9,6 +9,7 @@
 mod config;
 mod connectors;
 mod ingest;
+mod replication;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -19,13 +20,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use broker_core::broker::Broker;
 use clap::{Args, Parser, Subcommand};
+use cluster::membership::MemberState;
+use cluster::mesh::Mesh;
+use cluster::migrate::Migrations;
+use cluster::{
+    Gate, HybridClock, Live, MetadataError, NodeIdentity, Replicated, ReplicationSettings,
+    Replicator, TcpTransport, DEFAULT_MAX_DRIFT_MILLIS,
+};
 use config::{Config, ConfigError, IngestListener, LogLevel, Overrides};
 use ingest::IngestSocket;
 use rules::live::IngestListening;
 use rules::Ingest;
 use sdmqtt_admin::{
-    listener_list, AdminRunning, AdminServer, AdminStartError, AdminState, ListenerProtocol,
-    ListenerView, Listeners, Readiness, Router,
+    listener_list, AdminRunning, AdminServer, AdminStartError, AdminState, ClusterPeer,
+    ListenerProtocol, ListenerView, Listeners, Readiness, Router,
 };
 use sdmqtt_server::listener::{Running, Server};
 use sdmqtt_server::shared::Shared;
@@ -190,6 +198,215 @@ pub enum StartupError {
     /// this milestone exists to make trustworthy.
     #[error("cannot start a rule: {0}")]
     Connector(String),
+    /// This node's identity could not be established.
+    ///
+    /// Fatal. Section 8.1 makes the identity the thing singleton
+    /// ownership and every conflict tie-break order by, so a node that
+    /// cannot write down who it is would be a different node after the
+    /// next restart — and would be, without saying so.
+    #[error("{0}")]
+    Identity(#[from] cluster::IdentityError),
+    /// A stored replicated register could not be read back.
+    ///
+    /// Fatal, and for the reason [`Self::Restore`] is. Section 8.2's
+    /// registers are what routes to a peer, what serves a replicated
+    /// rule and what claims a session; coming up holding half of one
+    /// this build does not understand is a node that looks perfectly
+    /// healthy and routes nothing. A store written by this build cannot
+    /// contain one, so this is a store written by something else.
+    #[error("cannot read a replicated register from the store: {0}")]
+    Metadata(#[from] MetadataError),
+    /// The cluster's own configuration will not do.
+    ///
+    /// Carried verbatim: `cluster::ConfigError` names which of the
+    /// three things is wrong and what to do about it.
+    #[error("{0}")]
+    Cluster(#[from] cluster::ConfigError),
+    /// The partition policy cannot mean what it says. Section 8.5.
+    ///
+    /// Carried verbatim, like the refusal above it: it names the flag
+    /// an operator has to go and fix.
+    #[error("{0}")]
+    Policy(#[from] cluster::PolicyError),
+    /// The cluster listener could not be bound.
+    ///
+    /// Fatal, and for the reason the other listeners' failures are: a
+    /// node whose peers cannot reach it is a node that has joined
+    /// nothing, and discovering that from a membership of zero an hour
+    /// later is worse than not starting.
+    #[error("cannot bind the cluster listener on {address}: {source}")]
+    ClusterListener {
+        /// Where it was asked to bind.
+        address: std::net::SocketAddr,
+        /// Why it could not.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// The mesh, as the two things that read it want it.
+///
+/// One adapter for both, because the two traits are two views of one
+/// set of numbers and a second adapter would be a second place for
+/// them to disagree.
+#[derive(Debug)]
+struct MeshView {
+    /// Who this node has met, and how each of them is doing.
+    mesh: Arc<Mesh>,
+    /// Section 8.4's drains, for the seven numbers it is asked for.
+    ///
+    /// The same table the mesh's handler and the migrator hold. Not
+    /// optional, because it is made whether or not this node clusters
+    /// — and on a node that does not, every one of its counters is
+    /// honestly zero rather than absent: nothing claimed a session
+    /// from anywhere, which is a fact and not a gap.
+    migrations: Arc<Migrations>,
+    /// Section 8.5's policy, for the one number it is asked for.
+    ///
+    /// The gate rather than `config.cluster.expected_size`, so that
+    /// the count the health endpoint serves is read from the same
+    /// place the refusal decision reads it. Two readings of "whole" in
+    /// one process is a probe reporting `complete` while clients are
+    /// being turned away.
+    gate: Arc<Gate>,
+}
+
+impl sdmqtt_admin::Cluster for MeshView {
+    fn peers(&self) -> Vec<ClusterPeer> {
+        self.mesh
+            .members()
+            .into_iter()
+            .map(|member| ClusterPeer {
+                id: member.identity.id().to_string(),
+                name: member.identity.name().to_owned(),
+                address: member.advertised,
+                state: member.state.label(),
+            })
+            .collect()
+    }
+
+    fn expected(&self) -> Option<usize> {
+        self.gate.expected()
+    }
+}
+
+impl sdmqtt_server::metrics::ClusterMetrics for MeshView {
+    fn members(&self) -> u64 {
+        // **Itself included.** A node that has lost every peer is a
+        // cluster of one, and reporting none would be wrong rather
+        // than empty.
+        self.mesh
+            .members()
+            .iter()
+            .filter(|member| member.state == MemberState::Alive)
+            .count() as u64
+            + 1
+    }
+
+    fn bytes_sent(&self) -> u64 {
+        self.mesh.stats().bytes_sent
+    }
+
+    fn bytes_received(&self) -> u64 {
+        self.mesh.stats().bytes_received
+    }
+
+    fn bytes_dropped(&self) -> u64 {
+        self.mesh.stats().bytes_dropped
+    }
+
+    fn migrations(&self) -> [u64; sdmqtt_server::metrics::MIGRATION_NUMBERS.len()] {
+        // Read once, so the seven numbers are one reading of the table
+        // rather than seven: a scrape that caught a migration halfway
+        // through could otherwise report a drain that finished and no
+        // claim that started it.
+        let stats = self.migrations.stats();
+        [
+            stats.claimed(),
+            stats.drained(),
+            stats.incomplete(),
+            stats.unreachable(),
+            stats.messages(),
+            stats.missing(),
+            stats.late(),
+        ]
+    }
+}
+
+/// Who this node is, as the admin API has to report it.
+///
+/// One parameter rather than two, because they are one fact: a node
+/// with no store has neither, a node with a store has an identity, and
+/// only a node that clusters has a mesh.
+struct Node<'a> {
+    /// Section 8.1's identity, on a node that has somewhere to keep
+    /// one.
+    identity: Option<&'a NodeIdentity>,
+    /// Its mesh, on a node that clusters.
+    mesh: Option<&'a Arc<Mesh>>,
+    /// Section 8.4's table of drains, which every node has.
+    migrations: &'a Arc<Migrations>,
+    /// Section 8.5's policy, on the same nodes as the mesh: the two
+    /// are made together and neither is useful without the other.
+    gate: Option<&'a Arc<Gate>>,
+}
+
+/// Start section 8.1's mesh, when this node clusters.
+///
+/// `Ok(None)` is a node with no `cluster.address`, which is the
+/// default and a supported way to run this broker.
+///
+/// **After the store has been read**, because the identity a peer is
+/// told is the one the store holds; `Config::validate` has already
+/// refused clustering without a store, so the identity is always
+/// there by the time this is reached.
+async fn start_cluster(
+    config: &Config,
+    rebuilt: Option<&Rebuilt>,
+    deliveries: Option<Arc<dyn cluster::mesh::Deliver>>,
+) -> Result<Option<Arc<Mesh>>, StartupError> {
+    let Some(address) = config.cluster.address else {
+        if config.cluster.secret.is_some() {
+            // Said out loud. An operator who put the secret in the
+            // environment of every node and forgot the address on one
+            // of them has a node that looks configured and clusters
+            // with nobody.
+            tracing::warn!(
+                "cluster.secret is configured and cluster.address is not, so this node \
+                 does not cluster at all"
+            );
+        }
+        return Ok(None);
+    };
+    let Some(rebuilt) = rebuilt else {
+        // `Config::validate` refuses this, so reaching it means
+        // something went round the file. Refusing again is cheaper
+        // than a node whose identity lasts until its next restart.
+        return Err(StartupError::Cluster(cluster::ConfigError::NoSecret));
+    };
+
+    let settings = config.cluster.settings().check()?;
+    let transport = Arc::new(
+        TcpTransport::bind(&address.to_string())
+            .await
+            .map_err(|source| StartupError::ClusterListener { address, source })?,
+    );
+    let mesh = Mesh::start_delivering(
+        rebuilt.identity.clone(),
+        settings,
+        config.cluster.mesh(),
+        transport,
+        deliveries,
+    );
+    tracing::info!(
+        node = %rebuilt.identity,
+        address = %mesh.address(),
+        advertise = mesh.advertise(),
+        seeds = config.cluster.seeds.len(),
+        cluster = config.cluster.name,
+        "this node is clustering"
+    );
+    Ok(Some(mesh))
 }
 
 /// Wait for whichever stop signal comes first, and name it.
@@ -280,6 +497,20 @@ struct Rebuilt {
     store: Arc<dyn Storage>,
     /// What a rule's hook and pump write through.
     writer: Arc<Writer>,
+    /// Who this node is, section 8.1.
+    ///
+    /// Read out of the same restore as everything else and minted here
+    /// if the store has never held one, which is what makes a store
+    /// directory and a node the same thing.
+    identity: NodeIdentity,
+    /// This node's replicated metadata, section 8.2.
+    ///
+    /// Opened out of the same restore as everything else, which is
+    /// what it has to be: the clock inside it resumes from the highest
+    /// reading this node has ever written and the registers are the
+    /// ones it held, and a second restore would be a second answer to
+    /// both.
+    replicated: Arc<Replicated>,
 }
 
 /// The same, against a store somebody else opened.
@@ -300,11 +531,44 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, Sta
     let now = now_seconds();
     let restored = store.restore().map_err(StartupError::Restore)?;
 
+    // Section 8.1, and before anything else is decided: who this node
+    // is. Out of the restore that has just been read rather than out of
+    // a second one, and written back only when there is something to
+    // say — a founding, or an operator's rename.
+    let reconciled =
+        NodeIdentity::adopt(store.as_ref(), restored.node.as_ref(), &config.node.name)?;
+    if reconciled.founded {
+        tracing::info!(
+            node = %reconciled.identity,
+            "this store had no identity, so one was minted; it is this node's \
+             for the life of the store directory"
+        );
+    } else {
+        tracing::info!(node = %reconciled.identity, "this node");
+    }
+
     let mut broker = Broker::new(config.server().broker);
     let report = broker_core::restore::restore(&mut broker, &restored, now);
 
     let writer = Arc::new(
         Writer::spawn(Arc::clone(&store), config.storage.writer()).map_err(StartupError::Writer)?,
+    );
+
+    // Section 8.2, out of the same restore. **The clock resumes from
+    // the stored reading rather than from zero**: a clock that
+    // restarted behind itself would re-issue a stamp it had already
+    // used, and two values under one key carrying one stamp is the
+    // single divergence no later exchange repairs. The registers come
+    // back with it, tombstones included, because a node that dropped a
+    // tombstone would be handed its own older copy by the next peer it
+    // spoke to and would resurrect what it had deleted.
+    let replicated = Arc::new(
+        Replicated::open(
+            reconciled.identity.id(),
+            HybridClock::resume(restored.clock, DEFAULT_MAX_DRIFT_MILLIS),
+            &restored,
+        )
+        .map_err(StartupError::Metadata)?,
     );
 
     // A session the restore skipped is still in the store, and nothing
@@ -413,9 +677,15 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, Sta
     }
 
     Ok(Rebuilt {
-        shared: Arc::new(Shared::with_store(broker, Arc::clone(&writer))),
+        shared: Arc::new(Shared::with_replication(
+            broker,
+            Arc::clone(&writer),
+            Arc::clone(&replicated),
+        )),
         store,
         writer,
+        identity: reconciled.identity,
+        replicated,
     })
 }
 
@@ -435,6 +705,7 @@ async fn start_admin(
     listeners: Listeners,
     ingest: &Arc<Ingest>,
     registry: Option<&Arc<rules::live::Registry>>,
+    node: Node<'_>,
 ) -> Result<Option<AdminRunning>, StartupError> {
     if !config.admin.enabled {
         tracing::warn!(
@@ -457,13 +728,31 @@ async fn start_admin(
         }
         return Ok(None);
     }
-    let state = AdminState::new(Arc::clone(running.shared()))
+    let mut state = AdminState::new(Arc::clone(running.shared()))
         .with_readiness(readiness)
         .with_listeners(listeners)
         // Section 11.1 serves rules, and section 9.1 makes one
         // durable metadata, so a node with no store has none to
         // serve. See `sdmqtt_admin::rules`.
         .with_rules(registry.map(Arc::clone));
+    // **Section 8.1's identity, not the word `local`.** A node with no
+    // store has none — its identity is a thing that is written down —
+    // so it keeps the old answer, which is honest: it is the only node
+    // there will ever be in its cluster, and it cannot be in one.
+    if let Some(identity) = node.identity {
+        state = state
+            .with_node_id(identity.id().to_string())
+            .with_node_name(identity.name());
+    }
+    if let (Some(mesh), Some(gate)) = (node.mesh, node.gate) {
+        state = state
+            .with_node_address(mesh.advertise())
+            .with_cluster(Some(Arc::new(MeshView {
+                mesh: Arc::clone(mesh),
+                migrations: Arc::clone(node.migrations),
+                gate: Arc::clone(gate),
+            }) as Arc<dyn sdmqtt_admin::Cluster>));
+    }
 
     // Section 9.2: serving the ingest routes here is permitted and
     // must be chosen explicitly. `Router::new()` is the ordinary case.
@@ -594,7 +883,15 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     // rule here always has somewhere durable to put an envelope.
     let connectors = match &rebuilt {
         Some(rebuilt) => {
-            connectors::start(&config, &shared, &rebuilt.store, &rebuilt.writer).await?
+            connectors::start(
+                &config,
+                &shared,
+                &rebuilt.store,
+                &rebuilt.writer,
+                rebuilt.identity.id(),
+                &rebuilt.replicated,
+            )
+            .await?
         }
         None => connectors::start_without_rules(),
     };
@@ -610,19 +907,188 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         "sdmqtt is serving MQTT over TCP"
     );
 
+    // Section 8.1's mesh, after the store has been read and after the
+    // listener clients use is up. Binding this one last means a cluster
+    // port already in use is not discovered after the broker has
+    // started answering clients — and a peer that connects before the
+    // MQTT listener is bound is no trouble either way, because a
+    // publication it forwards is routed against this node's own
+    // subscribers and a node with no listener has none.
+    // Section 8.2's replication, which needs the mesh and is needed by it:
+    // the mesh hands a peer's frames to this, and the tasks below hand this
+    // node's writes to the mesh. Built before the mesh and given to it, so
+    // that a frame arriving on the first link has somewhere to go.
+    //
+    // Section 8.4's table of drains in flight is made here for the same
+    // reason: a chunk arrives on a link, which is this handler, and the
+    // connection waiting for it holds the `Migrator` installed below.
+    // One table, handed to both.
+    let migrations = Arc::new(cluster::Migrations::default());
+    let replication = rebuilt.as_ref().map(|rebuilt| {
+        let replicator = Arc::new(Replicator::new(
+            Arc::clone(&rebuilt.replicated),
+            ReplicationSettings::default(),
+        ));
+        let (handler, applying) = replication::Replication::new(
+            Arc::clone(&replicator),
+            Arc::clone(&rebuilt.shared),
+            Arc::clone(&migrations),
+        );
+        (replicator, handler, applying)
+    });
+    let deliveries = replication
+        .as_ref()
+        .map(|(_, handler, _)| Arc::clone(handler) as Arc<dyn cluster::mesh::Deliver>);
+
+    let mesh = start_cluster(&config, rebuilt.as_ref(), deliveries).await?;
+    // Section 8.5's policy, made once and read in three places: the
+    // connect path, the publish and subscribe paths, and the health
+    // endpoint's expected count. One of them, so that a probe cannot
+    // report a whole cluster while another is refusing clients.
+    //
+    // Carried rather than unwrapped although `Config::validate` has
+    // already refused both policies that cannot be evaluated. A
+    // startup that stopped validating would then refuse to start, with
+    // the message that says which flag, rather than panic.
+    let policy = config.cluster.policy()?;
+    let gate = mesh
+        .as_ref()
+        .map(|mesh| Gate::new(policy, Arc::clone(mesh) as Arc<dyn Live>));
+    // Section 8.3, and **before any of the tasks below**: this is the
+    // only thing that makes `Broker::publish` forward anything, so the
+    // window between the mesh accepting links and this being installed
+    // is a window in which this node's own clients publish and nothing
+    // leaves. It is closed by putting it here rather than by ordering
+    // the tasks, because nothing about those tasks implies it.
+    //
+    // Installed only on a node that clusters. A node without a mesh
+    // leaves the hole empty, which costs `Broker::publish` one `Option`
+    // test and not a call.
+    if let (Some(mesh), Some(rebuilt)) = (&mesh, rebuilt.as_ref()) {
+        let forwarding = Arc::new(cluster::Forwarding::new(
+            Arc::clone(&rebuilt.replicated),
+            Arc::clone(mesh),
+        ));
+        rebuilt.shared.with_broker(|broker| {
+            broker.install_forwarder(forwarding as Arc<dyn broker_core::broker::Forwarder>);
+        });
+        tracing::info!(
+            node = %rebuilt.identity,
+            "this node forwards publications to the nodes that want them"
+        );
+        // Section 8.4, and before the listener takes a connect for the
+        // same reason the forwarder goes in here: a connect that found
+        // no migrator claims nothing, so the window between the mesh
+        // accepting links and this being installed is a window in which
+        // a client silently loses its session rather than moving it.
+        rebuilt.shared.install_migrator(cluster::Migrator::new(
+            Arc::clone(&rebuilt.replicated),
+            Arc::clone(mesh),
+            Arc::clone(&migrations),
+            std::time::Duration::from_millis(config.cluster.drain_timeout_ms),
+        ));
+        // Section 8.5, here for the same reason and in the same
+        // window: an operator who asked for connects to be refused
+        // while the cluster is short must not have them accepted for
+        // the moment between the listener opening and this.
+        //
+        // A gate with no flags set refuses nothing, so this is
+        // installed whether or not the operator asked for anything —
+        // what it also carries is the expected size the health
+        // endpoint reports.
+        if let Some(gate) = &gate {
+            rebuilt.shared.install_gate(Arc::clone(gate));
+        }
+    }
+    // The four tasks of section 8.2, started once there is a mesh for them
+    // to talk over. A node that does not cluster starts none of them: its
+    // writes are stored and stamped and go nowhere, which is what a cluster
+    // of one is.
+    let mut replicating: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if let (Some((replicator, _, applying)), Some(rebuilt)) = (replication, rebuilt.as_ref()) {
+        // **Whether or not this node clusters.** A node with a store has
+        // an identity, a clock and a log, so its writes are stamped and
+        // numbered and the queue that holds them until the store has
+        // taken them fills either way — and a queue nothing drains is
+        // every retained payload this node ever wrote, held for the life
+        // of the process.
+        if let Some(waiting) = rebuilt.shared.waiting_to_broadcast() {
+            replicating.push(tokio::spawn(replication::broadcasting(
+                waiting,
+                Arc::clone(&replicator),
+                mesh.clone(),
+            )));
+        }
+        if let Some(mesh) = &mesh {
+            // And these three only where there are peers. Applying needs
+            // the registry, which a node with no rules does not have.
+            if let Some(registry) = connectors.registry() {
+                replicating.push(tokio::spawn(replication::applying(
+                    applying,
+                    Arc::clone(&rebuilt.shared),
+                    Arc::clone(registry),
+                )));
+            }
+            replicating.push(tokio::spawn(replication::exchanging(
+                Arc::clone(&replicator),
+                Arc::clone(mesh),
+            )));
+            replicating.push(tokio::spawn(replication::sweeping(
+                Arc::clone(&replicator),
+                Arc::clone(mesh),
+                Arc::clone(&rebuilt.writer),
+            )));
+            tracing::info!(
+                node = %rebuilt.identity,
+                "this node is replicating its metadata to its peers"
+            );
+        }
+    }
+    if let (Some(mesh), Some(gate)) = (&mesh, &gate) {
+        let metrics: Arc<dyn sdmqtt_server::metrics::ClusterMetrics> = Arc::new(MeshView {
+            mesh: Arc::clone(mesh),
+            migrations: Arc::clone(&migrations),
+            gate: Arc::clone(gate),
+        });
+        // Section 11.3's four cluster numbers and section 8.4's seven,
+        // registered **only here**: a node that does not cluster
+        // leaves them absent rather than reporting zero, which is a
+        // different statement. The migration numbers go with them
+        // rather than being registered unconditionally, for the same
+        // reason — a node with nowhere to migrate a session from has no
+        // shortfall to report, and a zero would say it had looked.
+        running.shared().metrics().watch_cluster(metrics);
+    }
+
     // What this process bound, which nothing can discover: a socket
     // does not know what it is for and the broker does not know a
     // listener exists. The other two listeners add their own rows,
     // the admin one once it knows its port and the ingest one
     // whenever it is bound — which is not only at startup; see
     // `ingest`.
-    let listeners = listener_list(vec![ListenerView {
+    let mut bound = vec![ListenerView {
         name: "mqtt".to_owned(),
         protocol: ListenerProtocol::Mqtt,
         address: running.address(),
         mountpoint: config.listener.mountpoint.clone(),
         max_connections: Some(config.listener.max_connections),
-    }]);
+    }];
+    if let (Some(mesh), Some(address)) = (&mesh, config.cluster.address) {
+        bound.push(ListenerView {
+            name: "cluster".to_owned(),
+            protocol: ListenerProtocol::Cluster,
+            // What was actually bound, port and all, which is not what
+            // was asked for when the port was zero.
+            address: mesh.address().parse().unwrap_or(address),
+            // The advertised address, which is what a peer dials and
+            // is not the bind address. It has nowhere better to go in
+            // this row, and a row that showed only a wildcard bind
+            // would be the one thing an operator cannot use.
+            mountpoint: mesh.advertise().to_owned(),
+            max_connections: None,
+        });
+    }
+    let listeners = listener_list(bound);
 
     // **After the MQTT listener, not before.** An ingest post is a
     // publication, and a publication that reaches subscribers before
@@ -637,6 +1103,12 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         Arc::clone(&listeners),
         connectors.ingest(),
         connectors.registry(),
+        Node {
+            identity: rebuilt.as_ref().map(|rebuilt| &rebuilt.identity),
+            mesh: mesh.as_ref(),
+            migrations: &migrations,
+            gate: gate.as_ref(),
+        },
     )
     .await?;
     // All of them, and only once all are bound. A node that said
@@ -665,6 +1137,14 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         admin.shutdown().await;
         tracing::info!("the admin listener has stopped");
     }
+    // And the cluster links, before the MQTT listener: a peer that is
+    // told this node has gone can move on, and leaving the links up
+    // while sessions are being torn down would have peers heartbeating
+    // at a broker that is closing.
+    if let Some(mesh) = &mesh {
+        mesh.shutdown();
+        tracing::info!("the cluster links have closed");
+    }
     // And the ingest listener beside it, for the same reason: it
     // publishes, so nothing may enter a broker that is being torn
     // down. Before the MQTT listener stops, so that a post already in
@@ -682,6 +1162,14 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         }
     }
     running.shutdown().await;
+    // Section 8.2's tasks, after the listener and before the pumps: a
+    // broadcast of something a client did is worth finishing, and an
+    // exchange with a peer is not worth starting. Aborted rather than
+    // joined — nothing was promised to a peer, and the exchange repairs
+    // whatever a stop loses, which is what it is for.
+    for task in replicating {
+        task.abort();
+    }
     // After the listener, so that nothing can enter an outbox while its
     // pump is being stopped, and before the process ends, so that a
     // pump in the middle of a store write is joined rather than left.

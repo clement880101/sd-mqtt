@@ -30,11 +30,12 @@ pub use self::redb::RedbStorage;
 pub use memory::MemoryStorage;
 
 pub use record::{
-    ActionRecord, BodyRecord, DeliveryRecord, FormatError, FormatMarker, HttpInRecord,
-    HttpOutRecord, InflightRecord, InflightState, MessageId, OutboxRecord, ProtocolVersion, Qos,
-    QueueEntry, Record, RetainHandling, RetainedRecord, RuleRecord, Secret, SessionKey,
-    SessionRecord, SubscriptionRecord, TopicFromRecord, TopicFromRequestRecord, TriggerRecord,
-    WillRecord, FORMAT_MAGIC, FORMAT_VERSION,
+    ActionRecord, BodyRecord, ClockRecord, DeliveryRecord, FormatError, FormatMarker, HttpInRecord,
+    HttpOutRecord, InflightRecord, InflightState, LoggedRecord, MessageId, MetadataKeyRecord,
+    MetadataRecord, MetadataValueRecord, NodeIdentityRecord, OutboxRecord, ProtocolVersion, Qos,
+    QueueEntry, Record, RetainHandling, RetainedRecord, RuleRecord, Secret, SeenRecord, SessionKey,
+    SessionRecord, StampRecord, SubscriptionRecord, TopicFromRecord, TopicFromRequestRecord,
+    TriggerRecord, WillRecord, FORMAT_MAGIC, FORMAT_VERSION,
 };
 pub use restore::{Restored, RestoredSession};
 pub use writer::{Applied, Durable, NotDurable, Writer, WriterConfig, WriterStopped};
@@ -230,6 +231,26 @@ pub enum Rejection {
         /// The number the append asked for.
         sequence: u64,
         /// The highest ever assigned to that rule.
+        highest: u64,
+    },
+    /// An append to this node's own operation log reused a sequence.
+    ///
+    /// Its own variant rather than either of the two above, for the
+    /// reason [`Rejection::OutboxSequenceReused`] gives: a refusal that
+    /// could be any of three is a refusal a test cannot assert on.
+    ///
+    /// Section 8.2: the digest exchange is a claim about this log, so a
+    /// sequence used twice tells one peer "this is my seventh write"
+    /// about two different writes, and whichever it asks for second it
+    /// never receives. The store holds the highest sequence ever
+    /// appended, truncation included, precisely so it can say no.
+    #[error(
+        "operation log sequence {sequence} is not past this node's highest, which is {highest}"
+    )]
+    OpLogSequenceReused {
+        /// The number the append asked for.
+        sequence: u64,
+        /// The highest ever appended by this node.
         highest: u64,
     },
     /// A body was released more often than it was stored.
@@ -442,13 +463,14 @@ mod tests {
         // An operator who reads "corrupt" reaches for a backup. The file
         // is not damaged; the build is wrong. Collapsing these is the
         // failure the error type exists to prevent.
+        let later = FORMAT_VERSION + 1;
         let error = StorageError::from(FormatError::UnknownVersion {
-            found: 7,
+            found: later,
             expected: FORMAT_VERSION,
         });
         match error {
             StorageError::UnsupportedVersion { found, expected } => {
-                assert_eq!(found, 7);
+                assert_eq!(found, later);
                 assert_eq!(expected, FORMAT_VERSION);
             }
             other => panic!("a version mismatch became {other:?}"),
@@ -457,13 +479,14 @@ mod tests {
 
     #[test]
     fn a_version_refusal_names_both_versions() {
+        let later = FORMAT_VERSION + 1;
         let message = StorageError::from(FormatError::UnknownVersion {
-            found: 7,
+            found: later,
             expected: FORMAT_VERSION,
         })
         .to_string();
         assert!(
-            message.contains('7') && message.contains(&FORMAT_VERSION.to_string()),
+            message.contains(&later.to_string()) && message.contains(&FORMAT_VERSION.to_string()),
             "said: {message}"
         );
     }

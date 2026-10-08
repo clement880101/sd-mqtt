@@ -101,6 +101,52 @@ pub fn listener_list(views: Vec<ListenerView>) -> Listeners {
     Arc::new(RwLock::new(views))
 }
 
+/// This node's view of the cluster, for whoever is holding one.
+///
+/// A trait rather than the mesh itself. What this API needs of section
+/// 8 is four strings per peer; taking `cluster::mesh::Mesh` would put
+/// the whole of a transport, a handshake and a failure detector behind
+/// an HTTP handler, and would make this crate unbuildable without it.
+pub trait Cluster: Send + Sync + 'static {
+    /// The peers this node has met, in a stable order.
+    ///
+    /// Peers only: this node is not one of them, because whether a row
+    /// is this node is what [`crate::resources`] reports separately and
+    /// a view that included itself would have two answers to it.
+    fn peers(&self) -> Vec<ClusterPeer>;
+
+    /// How many nodes this cluster is meant to have, if an operator
+    /// said. Section 8.5.
+    ///
+    /// `None` is an operator who did not say, and then
+    /// [`crate::health`] falls back to the nodes this one has met —
+    /// which is the count it has always served and is the one with the
+    /// blind spot that made this method necessary: three nodes that
+    /// never heard of a fourth cannot tell themselves apart from four
+    /// with one down.
+    ///
+    /// It comes through this trait, rather than from a configuration
+    /// the handler could read for itself, so that the number an
+    /// operator reads off the probe is the same number that decides
+    /// whether a connect is refused. Two readings of "whole" in one
+    /// process is a probe that says `complete` while clients are being
+    /// turned away.
+    fn expected(&self) -> Option<usize>;
+}
+
+/// One peer, as the API reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterPeer {
+    /// Its identity, in the canonical text.
+    pub id: String,
+    /// What an operator calls it. Never compared.
+    pub name: String,
+    /// The address it says peers should dial.
+    pub address: String,
+    /// `up`, `suspect` or `down`.
+    pub state: &'static str,
+}
+
 /// Everything a handler can reach.
 ///
 /// Cloned per request by axum, so everything in it is behind an
@@ -111,13 +157,36 @@ pub struct AdminState {
     pub shared: Arc<Shared>,
     /// What startup has managed so far. See [`Readiness`].
     pub readiness: Arc<Readiness>,
-    /// What this node is called.
+    /// What this node is.
     ///
-    /// Membership is milestone 5, so today this names a cluster of
-    /// one. It is configurable rather than derived from a hostname
-    /// because a hostname is not stable across a container restart
-    /// and a node identifier has to be.
+    /// **Section 8.1's UUID**, minted on first start and persisted,
+    /// which is the identity singleton ownership and every conflict
+    /// tie-break order by. It used to be the word `local`, hardcoded,
+    /// which was a second answer to "which node" in a binary that has
+    /// a real one.
+    ///
+    /// Still a string rather than a `NodeId`: what this crate does
+    /// with it is print it, and taking `cluster`'s type would put the
+    /// whole of section 8 behind an HTTP handler that needs sixteen
+    /// bytes of text.
     pub node_id: Arc<str>,
+    /// What an operator calls this node.
+    ///
+    /// Never compared; see `cluster::identity`. It is here because a
+    /// listing of nodes with only identifiers in it cannot be matched
+    /// against the configuration an operator wrote.
+    pub node_name: Arc<str>,
+    /// The address this node tells peers to dial, when it clusters.
+    ///
+    /// Empty on a node that does not. **Not the bind address**:
+    /// section 8.1, and `cluster::mesh` for why.
+    pub node_address: Arc<str>,
+    /// This node's view of the cluster, when it has one.
+    ///
+    /// `None` on a node that does not cluster, which is a different
+    /// thing from a cluster of one that has lost every peer, and the
+    /// two answer differently.
+    pub cluster: Option<Arc<dyn Cluster>>,
     /// What this node has bound.
     ///
     /// Given rather than discovered: a bound socket does not know
@@ -200,6 +269,9 @@ impl AdminState {
             shared,
             readiness: Arc::new(Readiness::starting()),
             node_id: Arc::from("local"),
+            node_name: Arc::from("local"),
+            node_address: Arc::from(""),
+            cluster: None,
             listeners: listener_list(Vec::new()),
             started: Instant::now(),
             token: None,
@@ -241,6 +313,29 @@ impl AdminState {
     #[must_use]
     pub fn with_node_id(mut self, node_id: impl Into<Arc<str>>) -> Self {
         self.node_id = node_id.into();
+        self
+    }
+
+    /// Say what an operator calls this node.
+    #[must_use]
+    pub fn with_node_name(mut self, name: impl Into<Arc<str>>) -> Self {
+        self.node_name = name.into();
+        self
+    }
+
+    /// Say what this node tells peers to dial.
+    #[must_use]
+    pub fn with_node_address(mut self, address: impl Into<Arc<str>>) -> Self {
+        self.node_address = address.into();
+        self
+    }
+
+    /// Report the cluster this node is in.
+    ///
+    /// `None` is a node that does not cluster.
+    #[must_use]
+    pub fn with_cluster(mut self, cluster: Option<Arc<dyn Cluster>>) -> Self {
+        self.cluster = cluster;
         self
     }
 

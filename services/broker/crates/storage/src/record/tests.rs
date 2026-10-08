@@ -105,15 +105,30 @@ mod golden {
     #[test]
     fn the_format_marker() {
         // A fixed-size array is its elements with no length prefix, and a
-        // u16 is a varint, so version 4 is one byte. The version moved
+        // u16 is a varint, so version 8 is one byte. The version moved
         // from 1 when the reference count of a body left the body's own
-        // row, from 2 when rules were added, and from 3 when each rule
-        // gained an outbox: a version 3 store has no outbox table at
+        // row, from 2 when rules were added, from 3 when each rule
+        // gained an outbox — a version 3 store has no outbox table at
         // all and would come up looking healthy with every undelivered
-        // envelope missing.
+        // envelope missing — from 4 when the node's own identity
+        // was stored, because a store from before it holds none and the
+        // node reading it would mint a second UUID for itself, and from
+        // 5 when the clock's high-water mark was stored, because a
+        // store from before it holds none and the node reading it would
+        // resume its clock from zero and re-issue stamps it has already
+        // used, and from 6 when the replicated registers themselves were
+        // stored, because a store from before it holds none and the node
+        // reading it would come up routing to nobody and then resurrect
+        // everything it had ever deleted under fresh stamps, and from 7
+        // when the session epoch joined the owner in a session-owner
+        // register — the first version that changed the shape of
+        // something already stored rather than adding a variant at the
+        // end, so a version 7 register is sixteen bytes where this
+        // build expects sixteen and a varint and a reader would run off
+        // the end of one record into the next.
         let expected: &[u8] = &[
             b's', b'd', b'm', b'q', b't', b't', b's', b't', // magic "sdmqttst"
-            0x04, // version 4
+            0x08, // version 8
         ];
         assert_eq!(FormatMarker::current().encode(), expected);
         assert_eq!(
@@ -715,6 +730,297 @@ mod golden {
         );
     }
 
+    /// Section 8.1's identity.
+    ///
+    /// The UUID is a fixed-size array, so postcard writes its sixteen
+    /// bytes with no length prefix; the name is a varint length and
+    /// then the bytes. The two are distinguishable in this vector —
+    /// sixteen bytes that are not ASCII, then a length that is — so a
+    /// transposition of the fields would not decode at all, let alone
+    /// decode to something else.
+    #[test]
+    fn node_identity_put() {
+        let expected: &[u8] = &[
+            0x13, // Record::NodeIdentityPut is variant 19
+            0x01, 0x93, 0x4e, 0x3a, 0x7c, 0x10, 0x70, 0x00, // uuid, sixteen bytes
+            0x80, 0x00, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, //
+            0x06, b'e', b'd', b'g', b'e', b'-', b'1', // name "edge-1"
+        ];
+        pins(
+            &Record::NodeIdentityPut {
+                identity: NodeIdentityRecord {
+                    uuid: [
+                        0x01, 0x93, 0x4e, 0x3a, 0x7c, 0x10, 0x70, 0x00, 0x80, 0x00, 0x0a, 0x0b,
+                        0x0c, 0x0d, 0x0e, 0x0f,
+                    ],
+                    name: "edge-1".to_owned(),
+                },
+            },
+            expected,
+        );
+    }
+
+    /// Section 8.2's clock mark.
+    ///
+    /// Two varints, and the vector is chosen so that a transposition of
+    /// the fields would not decode: a realistic millisecond reading is
+    /// six bytes of varint and the counter is two, so reading them the
+    /// other way round runs off the end of the record.
+    #[test]
+    fn clock_high_water_put() {
+        let expected: &[u8] = &[
+            0x14, // Record::ClockHighWaterPut is variant 20
+            0xfb, 0xd0, 0x95, 0xff, 0xbc, 0x31, // millis 1_700_000_000_123
+            0xac, 0x02, // counter 300
+        ];
+        pins(
+            &Record::ClockHighWaterPut {
+                reading: ClockRecord {
+                    millis: 1_700_000_000_123,
+                    counter: 300,
+                },
+            },
+            expected,
+        );
+    }
+
+    /// Section 8.2's replicated register, with a value.
+    ///
+    /// Two sixteen-byte arrays in one record — the node in the key and
+    /// the node in the stamp — so they carry **different** bytes here: a
+    /// transposition of the two would otherwise round trip perfectly and
+    /// attribute every write to the wrong node. The filter is three
+    /// bytes between them, which is what makes the transposition
+    /// visible at all.
+    ///
+    /// The value is a unit variant, which is one byte after the
+    /// `Option`'s presence byte. That is the whole of a node
+    /// subscription: section 8.2 replicates that a node has a
+    /// subscriber, and nothing about which of its clients it is.
+    #[test]
+    fn metadata_put_with_a_value() {
+        let expected: &[u8] = &[
+            0x15, // Record::MetadataPut is variant 21
+            0x00, // MetadataKeyRecord::NodeSubscription is variant 0
+            0x01, 0x93, 0x4e, 0x3a, 0x7c, 0x10, 0x70, 0x00, // the key's node
+            0x80, 0x00, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, //
+            0x03, b'a', b'/', b'b', // filter "a/b"
+            0xfb, 0xd0, 0x95, 0xff, 0xbc, 0x31, // stamp millis 1_700_000_000_123
+            0xac, 0x02, // stamp counter 300
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // the stamp's node
+            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, //
+            0x01, // the value is present
+            0x00, // MetadataValueRecord::NodeSubscription is variant 0
+        ];
+        pins(
+            &Record::MetadataPut {
+                entry: MetadataRecord {
+                    key: MetadataKeyRecord::NodeSubscription {
+                        node: [
+                            0x01, 0x93, 0x4e, 0x3a, 0x7c, 0x10, 0x70, 0x00, 0x80, 0x00, 0x0a, 0x0b,
+                            0x0c, 0x0d, 0x0e, 0x0f,
+                        ],
+                        filter: "a/b".to_owned(),
+                    },
+                    stamp: StampRecord {
+                        millis: 1_700_000_000_123,
+                        counter: 300,
+                        node: [
+                            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+                            0x1d, 0x1e, 0x1f, 0x20,
+                        ],
+                    },
+                    value: Some(MetadataValueRecord::NodeSubscription),
+                },
+            },
+            expected,
+        );
+    }
+
+    /// A group membership register, which is the last variant.
+    ///
+    /// **Pinned because the variant index is the format.** A node
+    /// subscription and a group membership differ by their leading
+    /// byte and by one extra string, and section 8.3 depends on the two
+    /// being different registers: a group whose membership were filed
+    /// as a node subscription would put every member node on the
+    /// ordinary route and deliver one publication once per node.
+    ///
+    /// Four, and at the end of the enum, which is what lets this be
+    /// added without moving `FORMAT_VERSION`: every register a previous
+    /// build wrote still decodes to the variant it was written as.
+    ///
+    /// The group and the filter are two separate strings rather than
+    /// one joined by a slash, and a vector is where that is visible: a
+    /// share name containing a slash is refused by the codec, but a
+    /// format that relied on it would be a format whose meaning changed
+    /// if that ever stopped being true.
+    #[test]
+    fn metadata_put_for_a_group_membership() {
+        let expected: &[u8] = &[
+            0x15, // Record::MetadataPut is variant 21
+            0x04, // MetadataKeyRecord::NodeGroup is variant 4
+            0x01, 0x93, 0x4e, 0x3a, 0x7c, 0x10, 0x70, 0x00, // the key's node
+            0x80, 0x00, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, //
+            0x07, b'w', b'o', b'r', b'k', b'e', b'r', b's', // group "workers"
+            0x03, b'a', b'/', b'b', // filter "a/b"
+            0xfb, 0xd0, 0x95, 0xff, 0xbc, 0x31, // stamp millis 1_700_000_000_123
+            0xac, 0x02, // stamp counter 300
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // the stamp's node
+            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, //
+            0x01, // the value is present
+            0x04, // MetadataValueRecord::NodeGroup is variant 4
+        ];
+        pins(
+            &Record::MetadataPut {
+                entry: MetadataRecord {
+                    key: MetadataKeyRecord::NodeGroup {
+                        node: [
+                            0x01, 0x93, 0x4e, 0x3a, 0x7c, 0x10, 0x70, 0x00, 0x80, 0x00, 0x0a, 0x0b,
+                            0x0c, 0x0d, 0x0e, 0x0f,
+                        ],
+                        group: "workers".to_owned(),
+                        filter: "a/b".to_owned(),
+                    },
+                    stamp: StampRecord {
+                        millis: 1_700_000_000_123,
+                        counter: 300,
+                        node: [
+                            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+                            0x1d, 0x1e, 0x1f, 0x20,
+                        ],
+                    },
+                    value: Some(MetadataValueRecord::NodeGroup),
+                },
+            },
+            expected,
+        );
+    }
+
+    /// The same record carrying a tombstone.
+    ///
+    /// **The only thing that distinguishes a deletion is one byte**, the
+    /// `Option`'s absence byte, and that is the design rather than an
+    /// economy: section 8.2 makes a tombstone a value competing by the
+    /// same comparison, so there is no removal record and no flag. A
+    /// vector for it because a single byte is exactly the kind of
+    /// difference an encoding change loses silently, and losing it turns
+    /// every delete in the cluster back into a write.
+    #[test]
+    fn metadata_put_carrying_a_tombstone() {
+        let expected: &[u8] = &[
+            0x15, // Record::MetadataPut is variant 21
+            0x02, // MetadataKeyRecord::Rule is variant 2
+            0x09, b't', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y', // id
+            0x05, // stamp millis 5
+            0x00, // stamp counter 0
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, // the stamp's node
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, //
+            0x00, // the value is absent, which is what a tombstone is
+        ];
+        pins(
+            &Record::MetadataPut {
+                entry: MetadataRecord {
+                    key: MetadataKeyRecord::Rule {
+                        id: "telemetry".to_owned(),
+                    },
+                    stamp: StampRecord {
+                        millis: 5,
+                        counter: 0,
+                        node: [0x22; 16],
+                    },
+                    value: None,
+                },
+            },
+            expected,
+        );
+    }
+
+    /// A session owner register, whose value carries the epoch.
+    ///
+    /// **Pinned because the epoch is the one field in a stored register
+    /// that another node's behaviour depends on arithmetically.**
+    /// Section 8.4 has the claiming node write the epoch it read plus
+    /// one, so a build that wrote the epoch where another read the
+    /// node's bytes would have every node claiming at an epoch derived
+    /// from sixteen bytes of UUID. A round trip cannot see that, which
+    /// is convention 5's first entry: read from and written to the same
+    /// wrong place, it round trips perfectly.
+    ///
+    /// Two sixteen-byte arrays again — the owner in the value and the
+    /// writer in the stamp — carrying different bytes, because they are
+    /// different nodes whenever a claim was relayed and a transposition
+    /// would otherwise attribute the ownership to whoever gossiped it.
+    ///
+    /// The epoch is 300, which is two varint bytes: a one-byte epoch
+    /// would be indistinguishable from a format that wrote it as a
+    /// single octet.
+    #[test]
+    fn metadata_put_for_a_session_owner() {
+        let expected: &[u8] = &[
+            0x15, // Record::MetadataPut is variant 21
+            0x03, // MetadataKeyRecord::SessionOwner is variant 3
+            0x01, b't', // the key's mountpoint "t"
+            0x05, b'g', b'a', b'u', b'g', b'e', // the key's client "gauge"
+            0x05, // stamp millis 5
+            0x00, // stamp counter 0
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, // the stamp's node
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, //
+            0x01, // the value is present
+            0x03, // MetadataValueRecord::SessionOwner is variant 3
+            0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, // the owning node
+            0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, //
+            0xac, 0x02, // epoch 300
+        ];
+        pins(
+            &Record::MetadataPut {
+                entry: MetadataRecord {
+                    key: MetadataKeyRecord::SessionOwner {
+                        session: SessionKey::new("t", "gauge"),
+                    },
+                    stamp: StampRecord {
+                        millis: 5,
+                        counter: 0,
+                        node: [0x22; 16],
+                    },
+                    value: Some(MetadataValueRecord::SessionOwner {
+                        node: [0x33; 16],
+                        epoch: 300,
+                    }),
+                },
+            },
+            expected,
+        );
+    }
+
+    /// Boxing the rule inside a register costs no bytes.
+    ///
+    /// [`MetadataValueRecord::Rule`] holds a `Box<RuleRecord>` so that
+    /// the variant is not three hundred bytes while the smallest is
+    /// sixteen, and the whole of that decision rests on serde writing a
+    /// `Box<T>` exactly as it writes a `T`. **That is a claim about
+    /// somebody else's derive**, and the two vectors above do not pin it,
+    /// because neither of them carries a rule: a release that
+    /// length-prefixed a box would move every stored register and the
+    /// round trip would not notice, because it would read back whatever
+    /// it had written.
+    ///
+    /// So the bytes are compared against the variant index followed by
+    /// the rule's own encoding, which is what the unboxed variant would
+    /// have produced.
+    #[test]
+    fn boxing_the_rule_in_a_register_costs_no_bytes() {
+        let held = rule();
+        let mut expected = vec![0x02]; // MetadataValueRecord::Rule is variant 2
+        expected.extend(postcard::to_allocvec(&held).expect("a rule encodes"));
+        assert_eq!(
+            postcard::to_allocvec(&MetadataValueRecord::Rule(Box::new(held)))
+                .expect("a register's value encodes"),
+            expected,
+            "a boxed rule is not written as the rule it boxes"
+        );
+    }
+
     #[test]
     fn retained_removed() {
         let expected: &[u8] = &[
@@ -727,6 +1033,106 @@ mod golden {
             },
             expected,
         );
+    }
+
+    /// A collection takes a key and carries nothing else.
+    ///
+    /// The one record that removes a register. Its key is `Retained`
+    /// rather than `NodeSubscription` so that the variant index of the key
+    /// (`0x01`) differs from the record's own discriminant and from the
+    /// topic's length, which is what makes a transposition visible.
+    #[test]
+    fn metadata_removed() {
+        let expected: &[u8] = &[
+            0x16, // Record::MetadataRemoved is variant 22
+            0x01, // MetadataKeyRecord::Retained is variant 1
+            0x03, b'a', b'/', b'b', // topic "a/b"
+        ];
+        pins(
+            &Record::MetadataRemoved {
+                key: MetadataKeyRecord::Retained {
+                    topic: "a/b".to_owned(),
+                },
+            },
+            expected,
+        );
+    }
+
+    /// How far a peer's log has been read: sixteen bytes and a number.
+    ///
+    /// The node's bytes are not all the same and none of them is the
+    /// two-byte varint that follows, so neither a transposition nor a
+    /// width mistake can hide.
+    #[test]
+    fn metadata_seen_put() {
+        let expected: &[u8] = &[
+            0x17, // Record::MetadataSeenPut is variant 23
+            0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // the node
+            0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, //
+            0xac, 0x02, // through 300
+        ];
+        pins(
+            &Record::MetadataSeenPut {
+                seen: SeenRecord {
+                    node: [
+                        0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c,
+                        0x3d, 0x3e, 0x3f, 0x40,
+                    ],
+                    through: 300,
+                },
+            },
+            expected,
+        );
+    }
+
+    /// One entry of this node's own log: the sequence, then the register.
+    ///
+    /// **The sequence comes first**, which is what pins the field order of
+    /// `LoggedRecord`: swapped, the register's key variant would be read
+    /// as the sequence and the whole entry would land under a number
+    /// nobody asked for. It is a two-byte varint and nothing else here is,
+    /// so the swap is visible.
+    #[test]
+    fn oplog_appended() {
+        let expected: &[u8] = &[
+            0x18, // Record::OpLogAppended is variant 24
+            0x81, 0x01, // sequence 129
+            0x02, // MetadataKeyRecord::Rule is variant 2
+            0x09, b't', b'e', b'l', b'e', b'm', b'e', b't', b'r', b'y', // id
+            0x05, // stamp millis 5
+            0x00, // stamp counter 0
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, // the stamp's node
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, //
+            0x00, // the value is absent, which is what a tombstone is
+        ];
+        pins(
+            &Record::OpLogAppended {
+                entry: LoggedRecord {
+                    sequence: 129,
+                    entry: MetadataRecord {
+                        key: MetadataKeyRecord::Rule {
+                            id: "telemetry".to_owned(),
+                        },
+                        stamp: StampRecord {
+                            millis: 5,
+                            counter: 0,
+                            node: [0x22; 16],
+                        },
+                        value: None,
+                    },
+                },
+            },
+            expected,
+        );
+    }
+
+    #[test]
+    fn oplog_truncated() {
+        let expected: &[u8] = &[
+            0x19, // Record::OpLogTruncated is variant 25
+            0xac, 0x02, // through 300
+        ];
+        pins(&Record::OpLogTruncated { through: 300 }, expected);
     }
 }
 
@@ -1350,6 +1756,59 @@ mod roundtrip {
         )
     }
 
+    /// Every [`MetadataKeyRecord`] variant.
+    fn metadata_key() -> impl Strategy<Value = MetadataKeyRecord> {
+        prop_oneof![
+            (any::<[u8; 16]>(), text())
+                .prop_map(|(node, filter)| MetadataKeyRecord::NodeSubscription { node, filter }),
+            text().prop_map(|topic| MetadataKeyRecord::Retained { topic }),
+            text().prop_map(|id| MetadataKeyRecord::Rule { id }),
+            session_key().prop_map(|session| MetadataKeyRecord::SessionOwner { session }),
+        ]
+    }
+
+    /// Every [`MetadataValueRecord`] variant.
+    fn metadata_value() -> impl Strategy<Value = MetadataValueRecord> {
+        prop_oneof![
+            Just(MetadataValueRecord::NodeSubscription),
+            retained().prop_map(MetadataValueRecord::Retained),
+            rule().prop_map(|held| MetadataValueRecord::Rule(Box::new(held))),
+            (any::<[u8; 16]>(), any::<u64>())
+                .prop_map(|(node, epoch)| MetadataValueRecord::SessionOwner { node, epoch }),
+            // The last variant, which this list did not produce: a
+            // generator that cannot make a case is convention 5's
+            // second entry, and the case it could not make here is the
+            // one section 8.3 separates from a node subscription.
+            Just(MetadataValueRecord::NodeGroup),
+        ]
+    }
+
+    /// A register, with a tombstone as often as a value.
+    ///
+    /// `proptest::option::of` produces `None` rarely by default, and a
+    /// tombstone is not a rare case here — it is half of what section
+    /// 8.2's deletion vocabulary is. Weighted so that the absence byte
+    /// is exercised rather than stumbled on.
+    fn metadata_entry() -> impl Strategy<Value = MetadataRecord> {
+        (
+            metadata_key(),
+            (any::<u64>(), any::<u32>(), any::<[u8; 16]>()),
+            prop_oneof![
+                1 => Just(None),
+                1 => metadata_value().prop_map(Some),
+            ],
+        )
+            .prop_map(|(key, (millis, counter, node), value)| MetadataRecord {
+                key,
+                stamp: StampRecord {
+                    millis,
+                    counter,
+                    node,
+                },
+                value,
+            })
+    }
+
     fn retained() -> impl Strategy<Value = RetainedRecord> {
         (bytes(), qos(), any::<Option<u32>>(), bytes()).prop_map(
             |(payload, qos, expires_at, properties)| RetainedRecord {
@@ -1406,6 +1865,34 @@ mod roundtrip {
             ),
             (text(), any::<u64>())
                 .prop_map(|(rule, sequence)| Record::OutboxRemoved { rule, sequence }),
+            // Section 8.1's identity and section 8.2's clock mark. Both
+            // were missing from this list, which the comment above says
+            // cannot happen and `prop_oneof!` does not in fact enforce:
+            // it is a list and not a match, so a variant left out is
+            // silently never generated. Convention 5's "a generator that
+            // cannot produce a case", in the generator that exists to
+            // catch everything nobody thought of.
+            (any::<[u8; 16]>(), text()).prop_map(|(uuid, name)| Record::NodeIdentityPut {
+                identity: NodeIdentityRecord { uuid, name },
+            }),
+            (any::<u64>(), any::<u32>()).prop_map(|(millis, counter)| {
+                Record::ClockHighWaterPut {
+                    reading: ClockRecord { millis, counter },
+                }
+            }),
+            metadata_entry().prop_map(|entry| Record::MetadataPut { entry }),
+            metadata_key().prop_map(|key| Record::MetadataRemoved { key }),
+            (any::<[u8; 16]>(), any::<u64>()).prop_map(|(node, through)| {
+                Record::MetadataSeenPut {
+                    seen: SeenRecord { node, through },
+                }
+            }),
+            (any::<u64>(), metadata_entry()).prop_map(|(sequence, entry)| {
+                Record::OpLogAppended {
+                    entry: LoggedRecord { sequence, entry },
+                }
+            }),
+            any::<u64>().prop_map(|through| Record::OpLogTruncated { through }),
         ]
     }
 

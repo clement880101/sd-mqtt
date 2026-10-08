@@ -449,9 +449,13 @@ async fn start(action: &HttpPoll, membership: &Membership) -> (Node, Subscriber)
     )
 }
 
-/// The one member milestone 4 has.
+/// The one member this test is.
+///
+/// A minted identity rather than a fixed one, because nothing here
+/// cares which node it is; what matters is that it is the only one, so
+/// it owns every singleton.
 fn alone() -> Membership {
-    Membership::alone(NodeId::new("local"))
+    Membership::alone(NodeId::mint())
 }
 
 // ---- the tests ----------------------------------------------------------
@@ -700,8 +704,10 @@ async fn a_fetch_slower_than_the_interval_never_overlaps_and_drops_the_ticks_it_
 #[tokio::test(flavor = "multi_thread")]
 async fn a_poller_fetches_nothing_while_another_member_owns_it() {
     let endpoint = Endpoint::start(Behaviour::Counting).await;
-    // This node is `b`, and `a` is live and lower, so `a` owns it.
-    let membership = Membership::of(NodeId::new("b"), [NodeId::new("a")]);
+    // This node is the higher of the two, and the lower one is live,
+    // so the lower one owns the poller.
+    let lower = NodeId::from_bytes([0x01; 16]);
+    let membership = Membership::of(NodeId::from_bytes([0x02; 16]), [lower]);
     let (running, mut subscriber) = start(&action(endpoint.url(), 50), &membership).await;
 
     // Twenty intervals' worth. A poller that ignored ownership would
@@ -721,7 +727,7 @@ async fn a_poller_fetches_nothing_while_another_member_owns_it() {
     );
 
     // The lowest member leaves, so this one takes over.
-    assert!(membership.left(&NodeId::new("a")));
+    assert!(membership.left(&lower));
 
     let delivered = subscriber.delivery().await;
     assert_eq!(delivered.payload.as_ref(), b"reading 1");
