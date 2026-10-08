@@ -516,6 +516,26 @@ has always reported.
 `SDMQTT_CLUSTER_STRICT_SUBSCRIBES` set the same values; the three
 flags take `true` or `false` and nothing else.
 
+### How many nodes hold a session's queue
+
+```toml
+[cluster]
+replication_factor = 2            # the owner, and one follower
+```
+
+Two by default. Which nodes they are is worked out from the session's
+identity and the live members, with no coordination and no table: when
+a member leaves, only the sessions that were on it move.
+
+One keeps no follower and replicates nothing. Three is the most this
+broker takes, because every copy costs a full copy of the durable
+queue data and proportionate traffic between nodes. A cluster smaller
+than the factor is not an error — the set is as large as membership
+allows, and it is repaired when the other nodes arrive.
+
+`SDMQTT_CLUSTER_REPLICATION_FACTOR` sets the same value. A number
+outside one to three is refused at startup rather than clamped.
+
 Messages published on either side of a partition are not exchanged
 afterwards, whatever the flags say, and a node that acknowledged a
 message it never managed to replicate loses it when it rejoins.

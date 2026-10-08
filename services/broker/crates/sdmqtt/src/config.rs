@@ -64,7 +64,7 @@ use std::time::Duration;
 use broker_core::broker::BrokerConfig;
 use cluster::membership::Detection;
 use cluster::mesh::MeshSettings;
-use cluster::{ClusterSettings, Policy, Strict, DEFAULT_CLUSTER_NAME};
+use cluster::{ClusterSettings, Factor, Policy, Strict, DEFAULT_CLUSTER_NAME, DEFAULT_FACTOR};
 use mqtt_codec::Limits;
 use sdmqtt_admin::config::{AdminConfig, AdminStartError, Token};
 use sdmqtt_server::connection::{outbox_depth_for, ConnectionConfig};
@@ -173,6 +173,11 @@ pub enum ConfigError {
     /// fix and what the two ways out of it are.
     #[error("{0}")]
     Policy(#[from] cluster::PolicyError),
+    /// The replication factor cannot mean what it says. Section 8.6.
+    ///
+    /// Carried verbatim, like the three refusals above it.
+    #[error("{0}")]
+    Factor(#[from] cluster::FactorError),
     /// A rule cannot mean what it says.
     ///
     /// Its own variant rather than [`ConfigError::Unusable`] because a
@@ -756,6 +761,18 @@ pub struct ClusterSection {
     /// mismatched secret is a configuration error that will not fix
     /// itself.
     pub refused_backoff_ms: u64,
+    /// How many nodes hold a copy of each session's queue. Section 8.6.
+    ///
+    /// Two by default: the owner and one follower, which is what makes
+    /// losing a single node lose no durable message. One keeps no
+    /// follower and replicates nothing, and three is the most this
+    /// broker takes — each copy costs a full copy of the durable queue
+    /// data and proportionate traffic between nodes, which section 15
+    /// states as a budget.
+    ///
+    /// A cluster smaller than this is not an error: the set is as large
+    /// as membership allows and is repaired when the members arrive.
+    pub replication_factor: usize,
     /// How many nodes this cluster is meant to have. Section 8.5.
     ///
     /// **The only thing that can say whether the cluster is whole.**
@@ -807,6 +824,7 @@ impl Default for ClusterSection {
             reconnect_min_ms: 200,
             reconnect_max_ms: 30_000,
             refused_backoff_ms: 300_000,
+            replication_factor: DEFAULT_FACTOR,
             expected_size: None,
             strict: Strict::default(),
             drain_timeout_ms: 2_000,
@@ -822,6 +840,17 @@ impl ClusterSection {
             name: self.name.clone(),
             secret: self.secret.clone(),
         }
+    }
+
+    /// How many copies of a queue, for `cluster` to check. Section 8.6.
+    ///
+    /// # Errors
+    ///
+    /// `cluster::FactorError` for zero and for more than three, which
+    /// are two mistakes with two messages, written once where the rule
+    /// is rather than here.
+    pub fn factor(&self) -> Result<Factor, cluster::FactorError> {
+        Factor::new(self.replication_factor)
     }
 
     /// The partition policy, for `cluster` to check. Section 8.5.
@@ -1294,6 +1323,12 @@ impl Config {
                       key out to advertise the bind address",
             });
         }
+        // Section 8.6, beside the other parameters of clustering
+        // rather than before the switch above: a factor is not a
+        // behaviour an operator asked for the way a strict flag is,
+        // it is a dial on a thing that is either on or off.
+        self.cluster.factor()?;
+
         if self.cluster.heartbeat_ms == 0 {
             return Err(ConfigError::Unusable {
                 key: "cluster.heartbeat_ms",
@@ -1444,6 +1479,13 @@ impl Config {
         }
         if let Some(value) = lookup("SDMQTT_CLUSTER_ADVERTISE") {
             self.cluster.advertise = Some(value);
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_REPLICATION_FACTOR") {
+            self.cluster.replication_factor = parse(
+                "SDMQTT_CLUSTER_REPLICATION_FACTOR",
+                &value,
+                "a copy count of 1, 2 or 3",
+            )?;
         }
         if let Some(value) = lookup("SDMQTT_CLUSTER_EXPECTED_SIZE") {
             // Section 8.5's number. In the environment as well as the
@@ -4146,5 +4188,72 @@ dead_after_ms = 4000
             assert!(said.contains("SDMQTT_CLUSTER_STRICT_CONNECTS"), "{said}");
             assert!(said.contains("true or false"), "{said}");
         }
+    }
+
+    /// Section 8.6's replication factor, refused outside one to three.
+    #[test]
+    fn a_replication_factor_outside_one_to_three_is_refused() {
+        let clustered = |factor: usize| {
+            let mut config = Config::default();
+            config.node.name = "alpha".to_owned();
+            config.storage.directory = Some(PathBuf::from("/tmp/sd-mqtt-test-store"));
+            config.cluster.secret = Some(Secret::new("a-shared-secret"));
+            config.cluster.address = Some("127.0.0.1:7700".parse().expect("an address"));
+            config.cluster.replication_factor = factor;
+            config
+        };
+
+        // The default is two copies, and it validates.
+        assert_eq!(Config::default().cluster.replication_factor, DEFAULT_FACTOR);
+        clustered(DEFAULT_FACTOR)
+            .validate()
+            .expect("the default is a working configuration");
+        clustered(1)
+            .validate()
+            .expect("one copy replicates nothing");
+        clustered(3).validate().expect("three is the ceiling");
+
+        for (factor, expected) in [
+            (0, cluster::FactorError::None),
+            (4, cluster::FactorError::TooMany { asked: 4 }),
+        ] {
+            let error = clustered(factor)
+                .validate()
+                .expect_err("a factor outside the range is refused");
+            assert!(
+                matches!(&error, ConfigError::Factor(why) if *why == expected),
+                "{factor} should be refused as {expected:?}, got {error}"
+            );
+            // The message names the key, because an operator reading
+            // a refusal has to know which line to go and change.
+            assert!(
+                error.to_string().contains("cluster.replication_factor"),
+                "{error}"
+            );
+        }
+    }
+
+    /// And from the environment, which is how a container is
+    /// configured.
+    #[test]
+    fn the_replication_factor_is_read_from_the_environment() {
+        let mut config = Config::default();
+        config
+            .apply_env(|name| (name == "SDMQTT_CLUSTER_REPLICATION_FACTOR").then(|| "3".to_owned()))
+            .expect("three copies");
+        assert_eq!(config.cluster.replication_factor, 3);
+
+        // **Refused at the variable rather than clamped**, and the
+        // message names the variable: a container whose value came
+        // from a template that expanded wrongly must not quietly run
+        // with a different number of copies than the operator wrote.
+        let mut config = Config::default();
+        let error = config
+            .apply_env(|name| {
+                (name == "SDMQTT_CLUSTER_REPLICATION_FACTOR").then(|| "two".to_owned())
+            })
+            .expect_err("a factor that is not a number is refused");
+        let said = error.to_string();
+        assert!(said.contains("SDMQTT_CLUSTER_REPLICATION_FACTOR"), "{said}");
     }
 }

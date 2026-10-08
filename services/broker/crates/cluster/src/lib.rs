@@ -131,6 +131,20 @@
 //! without `cluster.expected_size` is refused at startup, by
 //! [`Policy::new`] rather than by a check in a startup path.
 
+//! # And where a session's queue is kept
+//!
+//! [`placement`] is section 8.6's rendezvous hashing: which nodes hold
+//! a copy of a session's queue, highest weight first, the owner and
+//! then its followers. It decides nothing — section 8.4's register
+//! still says who owns a session — because two nodes on either side of
+//! a partition see different members and would otherwise place copies
+//! differently *and* disagree about ownership, which is one problem
+//! rather than two.
+//!
+//! The weight is SHA-256 over a defined byte string rather than a
+//! crate's hash, because every node must compute the same number
+//! across a rolling upgrade as well as a restart.
+
 pub mod clock;
 pub mod config;
 pub mod forward;
@@ -144,6 +158,7 @@ pub mod mesh;
 pub mod metadata;
 pub mod migrate;
 pub mod oplog;
+pub mod placement;
 pub mod policy;
 pub mod register;
 pub mod replicate;
@@ -168,6 +183,7 @@ pub use migrate::{
     Awaiting, Claimed, Claiming, Drain, Drained, Migrations, Migrator, DEFAULT_PATIENCE,
 };
 pub use oplog::{Logged, OpLog, FIRST_SEQUENCE};
+pub use placement::{place, Factor, FactorError, Weighted, DEFAULT_FACTOR, MAX_FACTOR};
 pub use policy::{Gate, Live, Operation, Policy, PolicyError, Strict};
 pub use register::{Register, Stamp};
 pub use replicate::{
