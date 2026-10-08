@@ -161,6 +161,7 @@ pub mod oplog;
 pub mod placement;
 pub mod policy;
 pub mod register;
+pub mod replica;
 pub mod replicate;
 pub mod routes;
 pub mod testing;
@@ -186,6 +187,7 @@ pub use oplog::{Logged, OpLog, FIRST_SEQUENCE};
 pub use placement::{place, Factor, FactorError, Weighted, DEFAULT_FACTOR, MAX_FACTOR};
 pub use policy::{Gate, Live, Operation, Policy, PolicyError, Strict};
 pub use register::{Register, Stamp};
+pub use replica::{Applied, Change, Follower, Streamed};
 pub use replicate::{
     choose, jitter, Handled, Replication, ReplicationError, ReplicationSettings, Replicator, Swept,
     DEFAULT_BATCH, DEFAULT_EXCHANGE, DEFAULT_TOMBSTONE_GRACE,

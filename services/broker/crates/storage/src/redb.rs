@@ -48,7 +48,7 @@ use crate::record::{
     MetadataKeyRecord, MetadataRecord, NodeIdentityRecord, OutboxRecord, QueueEntry, Record,
     SeenRecord, SessionKey, SessionRecord,
 };
-use crate::restore::{Restored, RestoredSession};
+use crate::restore::{Restored, RestoredReplica, RestoredSession};
 use crate::{Rejection, Storage, StorageError, SyncMode};
 
 /// Anything global to the database, of which there are two things.
@@ -166,6 +166,13 @@ const OPLOG: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oplog");
 /// width, and which gives the same order the in-memory backend's
 /// `BTreeMap` produces.
 const METADATA_SEEN: TableDefinition<&[u8], &[u8]> = TableDefinition::new("metadata_seen");
+
+/// Sessions this node holds a copy of rather than owns, section 8.6.
+///
+/// Keyed by the session, holding the owning node's sixteen bytes and
+/// the stream position applied through. One row per followed session,
+/// overwritten as the mark advances.
+const REPLICAS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("replicas");
 
 /// A [`Storage`] backed by a redb database on a path.
 #[derive(Debug)]
@@ -341,9 +348,23 @@ impl Storage for RedbStorage {
         let metadata = open_read(&transaction, METADATA)?;
         let oplog = open_read(&transaction, OPLOG)?;
         let metadata_seen = open_read(&transaction, METADATA_SEEN)?;
+        let replicas = open_read(&transaction, REPLICAS)?;
         let meta = transaction.open_table(META).map_err(StorageError::from)?;
 
         let mut restored = Restored::default();
+
+        // **Read before the sessions, because it decides which list
+        // each one goes in.** See `Restored::replicas`: every record a
+        // followed session is made of is the same record an owned one
+        // is made of, so the only thing that can tell them apart is
+        // this table.
+        let mut followed: std::collections::HashMap<Vec<u8>, ([u8; 16], u64)> =
+            std::collections::HashMap::new();
+        for entry in replicas.iter().map_err(StorageError::from)? {
+            let (key, value) = entry.map_err(StorageError::from)?;
+            followed.insert(key.value().to_vec(), decode(value.value())?);
+        }
+
         for entry in sessions.iter().map_err(StorageError::from)? {
             let (key, value) = entry.map_err(StorageError::from)?;
             let record: SessionRecord = decode(value.value())?;
@@ -374,7 +395,14 @@ impl Storage for RedbStorage {
                 let (_, value) = entry.map_err(StorageError::from)?;
                 session.queue.push(decode(value.value())?);
             }
-            restored.sessions.push(session);
+            match followed.get(&prefix) {
+                Some((owner, through)) => restored.replicas.push(RestoredReplica {
+                    session,
+                    owner: *owner,
+                    through: *through,
+                }),
+                None => restored.sessions.push(session),
+            }
         }
 
         for entry in retained.iter().map_err(StorageError::from)? {
@@ -545,6 +573,7 @@ struct Tables<'txn> {
     metadata: ByteTable<'txn>,
     oplog: ByteTable<'txn>,
     metadata_seen: ByteTable<'txn>,
+    replicas: ByteTable<'txn>,
 }
 
 impl<'txn> Tables<'txn> {
@@ -588,6 +617,9 @@ impl<'txn> Tables<'txn> {
             oplog: transaction.open_table(OPLOG).map_err(StorageError::from)?,
             metadata_seen: transaction
                 .open_table(METADATA_SEEN)
+                .map_err(StorageError::from)?,
+            replicas: transaction
+                .open_table(REPLICAS)
                 .map_err(StorageError::from)?,
         })
     }
@@ -830,6 +862,29 @@ impl<'txn> Tables<'txn> {
             Record::RulePut { rule } => {
                 self.rules
                     .insert(rule.id.as_str(), encode(rule).as_slice())
+                    .map_err(StorageError::from)?;
+            }
+            Record::ReplicaFollows {
+                session,
+                owner,
+                through,
+            } => {
+                // Overwritten, not appended to: one row per followed
+                // session holding where its stream has got to, in the
+                // same batch as the queue record it is about.
+                self.replicas
+                    .insert(
+                        session_prefix(session).as_slice(),
+                        encode(&(*owner, *through)).as_slice(),
+                    )
+                    .map_err(StorageError::from)?;
+            }
+            Record::ReplicaDropped { session } => {
+                // **The session stays.** Becoming its owner keeps every
+                // queue entry and changes only whose it is, so this
+                // removes one row and nothing else.
+                self.replicas
+                    .remove(session_prefix(session).as_slice())
                     .map_err(StorageError::from)?;
             }
             Record::RuleRemoved { id } => {

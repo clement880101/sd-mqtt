@@ -71,6 +71,20 @@ pub struct Restored {
     /// after, so the store hands over what it holds and says nothing about
     /// the time.
     pub sessions: Vec<RestoredSession>,
+    /// Sessions this node holds a **copy** of rather than owns, section
+    /// 8.6, each with the node that owns it and how far its stream was
+    /// applied.
+    ///
+    /// **A separate list, and that is the whole safety of it.** Every
+    /// record a followed session is made of is the same record an owned
+    /// one is made of, so a restore that handed these back in
+    /// [`Self::sessions`] would have the broker serve another node's
+    /// session: its filters would enter this node's matching trie, it
+    /// would be forwarded publications for them, and it would deliver
+    /// them to a client that is connected somewhere else. Two lists
+    /// make that mistake something a caller has to write on purpose
+    /// rather than something it gets by not knowing.
+    pub replicas: Vec<RestoredReplica>,
     /// Retained messages, by topic.
     pub retained: Vec<(String, RetainedRecord)>,
     /// The bodies the queue and inflight entries reference.
@@ -168,6 +182,22 @@ pub struct Restored {
     /// logs that have been truncated, and would hold every peer's
     /// watermark down until it caught up.
     pub seen: Vec<SeenRecord>,
+}
+
+/// One session this node holds a copy of, and who owns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredReplica {
+    /// Everything the copy holds, in the same shape an owned session
+    /// comes back in.
+    pub session: RestoredSession,
+    /// The node that owns it, by its sixteen identity bytes.
+    ///
+    /// Opaque here, as a message identifier is: which node that is, is
+    /// `cluster`'s question.
+    pub owner: [u8; 16],
+    /// The highest contiguous stream position applied before the
+    /// restart, which is where the follower resumes.
+    pub through: u64,
 }
 
 /// One session and everything that belongs to it.

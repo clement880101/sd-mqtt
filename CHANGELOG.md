@@ -7,6 +7,66 @@ milestones, which is what this project actually ships in.
 **The one thing to read before upgrading is "Before you upgrade" under
 the milestone you are moving to.** Everything else is description.
 
+## Unreleased — milestone 6: queue replication
+
+### Before you upgrade: a store written before this milestone is refused
+
+**A broker built from this milestone will not open a store written by
+milestone 5. It refuses to start, and says so:**
+
+```
+store format version 8 is not readable by this build, which reads version 9.
+The store is not damaged; it was written by a different build. Nothing is
+released yet, so there is no migration: see CHANGELOG.md for what moved and
+what starting with a fresh store directory throws away.
+```
+
+**What to do.** The same as every other version move: stop the broker,
+move or delete the store directory (`storage.directory`, holding
+`sdmqtt.redb`), and start the new build, which creates a fresh store.
+What that throws away is the list in the milestone 5 section —
+durable sessions, queued messages, retained messages, wills, rules,
+outboxes, this node's identity, its clock and its replicated
+registers. **Throw away one store, not every store:** on a node
+already in a cluster the registers come back from the next
+anti-entropy exchange, and on the last node of a cluster they are the
+cluster's metadata and do not.
+
+**Why the version moved to 9.** A node can now hold a copy of a
+session another node owns. The records that make up such a copy are
+the same records as any other session's — the session, its
+subscriptions, its queue — so the store gained a row saying *this one
+is a copy, owned by that node, applied this far*. Without it a restore
+would hand the broker another node's session: its filters would enter
+this node's matching trie, it would be forwarded publications for
+them, and it would deliver them to a client connected somewhere else.
+
+A version 8 store holds no copies, so nothing is lost by its absence
+— but a version 8 *build* reading a version 9 store would meet a
+record variant it has no arm for, and the check is exact in both
+directions on purpose.
+
+### Added
+
+- **Which nodes hold a session's queue.** Rendezvous hashing over the
+  live members picks a replica set per session:
+  `cluster.replication_factor`, one to three, two by default, also
+  `SDMQTT_CLUSTER_REPLICATION_FACTOR`. Nothing streams anything yet;
+  this is the placement and its configuration.
+
+  It is **advice, not authority**. Membership is local judgement, so
+  two nodes on opposite sides of a partition compute different sets;
+  ownership stays with the epoch-stamped register from milestone 5, so
+  that disagreement costs nothing.
+
+- **A follower's half of the stream**, and what it keeps across a
+  restart. Changes to a session's queue carry a stream position, and a
+  follower applies them in order: a position after a hole is held
+  rather than applied, and the high-water mark it reports is the
+  highest *contiguous* position — a mark that skipped a hole would
+  make failover prefer the copy with a message missing from the
+  middle.
+
 ## Unreleased — milestone 5: the cluster mesh
 
 ### Before you upgrade: a store written before this milestone is refused
