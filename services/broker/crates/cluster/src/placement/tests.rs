@@ -244,3 +244,32 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn a_dead_member_keeps_its_place_until_the_grace_runs_out() {
+    // **Section 8.6's grace, which is the difference between a node
+    // restarting and a node gone.** Read literally, "live members"
+    // would drop a node at its first failed heartbeat, rendezvous
+    // would name a replacement, and the replacement would be sent the
+    // whole queue estate every time anybody applied a patch.
+    use crate::membership::MemberState;
+    let grace = Duration::from_secs(60);
+    assert!(placed(MemberState::Alive, Duration::ZERO, grace));
+    assert!(
+        placed(MemberState::Suspect, Duration::from_secs(5), grace),
+        "suspect is not dead, and is not even half way to gone"
+    );
+    assert!(
+        placed(MemberState::Dead, Duration::from_secs(59), grace),
+        "dead inside the grace is a node that may be restarting"
+    );
+    assert!(
+        !placed(MemberState::Dead, Duration::from_secs(60), grace),
+        "and at the grace it is gone"
+    );
+    assert!(!placed(
+        MemberState::Dead,
+        Duration::from_secs(3_600),
+        grace
+    ));
+}

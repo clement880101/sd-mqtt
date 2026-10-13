@@ -379,6 +379,9 @@ mod tests {
             fn expected(&self) -> Option<usize> {
                 self.1
             }
+            fn forget(&self, _: &str) -> crate::Forgotten {
+                crate::Forgotten::NotMet
+            }
         }
         fn peer(state: &'static str) -> crate::ClusterPeer {
             crate::ClusterPeer {

@@ -556,6 +556,33 @@ impl Mesh {
         locked(&self.state.members).alive()
     }
 
+    /// How long `peer` has been silent. `None` for a peer never met.
+    pub fn silent_for(&self, peer: NodeId) -> Option<Duration> {
+        locked(&self.state.members).silent_for(peer, Instant::now())
+    }
+
+    /// Take `peer` out of membership altogether, and drop its link.
+    ///
+    /// Section 8.6's operator override: a node that is never coming
+    /// back is forgotten at once rather than after the grace, so the
+    /// replica sets that included it are repaired now. The link is
+    /// aborted first, because a member forgotten while its link stayed
+    /// up would be re-admitted by its very next heartbeat.
+    ///
+    /// **A forgotten peer that comes back is re-admitted.** Its
+    /// handshake inserts it like any peer met for the first time, and
+    /// a configured seed is still dialled; forgetting is about this
+    /// node's table, not about the other node's right to exist.
+    ///
+    /// Returns whether there was anything to forget.
+    pub fn forget(&self, peer: NodeId) -> bool {
+        if let Some(link) = locked(&self.state.links).remove(&peer) {
+            link.reader.abort();
+            link.writer.abort();
+        }
+        locked(&self.state.members).forget(peer)
+    }
+
     /// Which end of the link to this peer this node is, if there is
     /// one.
     ///

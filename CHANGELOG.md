@@ -121,6 +121,34 @@ on purpose.
   the race away; the test reconnects without waiting, as a client
   would.
 
+- **A replica set that is short repairs itself**, and a node can be
+  taken out of membership. Section 8.6's re-replication. A node that
+  is down keeps its place in every replica set until
+  `cluster.gone_after_ms` runs out — an hour by default, because a node
+  that is down is usually restarting and copying the whole queue estate
+  on every restart is what the grace prevents — and is then given up
+  on: the sets that included it are repaired onto the nodes that
+  remain, each session's queue sent to its new follower as one
+  snapshot, at most `cluster.repair_sessions_per_second` a second.
+
+  **`DELETE /api/v1/nodes/{id}`** forgets a node at once, on the node
+  asked. It is the first thing in this design that makes membership
+  smaller: until now a peer once met was remembered as `down` for
+  ever, which is the hole repair could not fill, because a set is
+  repaired *away* from a node and a node never forgotten is never
+  repaired away from. A forgotten node that comes back is re-admitted.
+
+  A snapshot does not consume a stream position, and that is the
+  design: a new follower starts at zero while the owner's stream is at
+  some position the other followers have reached, and re-sending the
+  queue as ordinary appends would either put the others behind or
+  leave the newcomer with a hole nothing fills. The snapshot carries
+  the owner's position, the follower takes it whole, and the next live
+  change is the next change for everybody.
+
+  `sdmqtt_replica_repairs_pending` and `sdmqtt_replica_repairs_done_total`
+  are section 8.6's "progress visible".
+
 - **Losing the owner does not lose the queue.** Section 8.6's failover.
   When a drain comes up short — the previous owner cannot be reached,
   or does not finish in time — the claiming node asks every reachable

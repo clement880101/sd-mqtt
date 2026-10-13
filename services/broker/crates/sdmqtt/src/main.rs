@@ -263,6 +263,8 @@ struct MeshView {
     mesh: Arc<Mesh>,
     /// Section 8.6's copies, for the three numbers it is asked for.
     copies: Arc<cluster::Copies>,
+    /// Who this node is, so that it refuses to forget itself.
+    me: cluster::NodeId,
     /// Section 8.4's drains, for the seven numbers it is asked for.
     ///
     /// The same table the mesh's handler and the migrator hold. Not
@@ -297,6 +299,22 @@ impl sdmqtt_admin::Cluster for MeshView {
 
     fn expected(&self) -> Option<usize> {
         self.gate.expected()
+    }
+
+    fn forget(&self, id: &str) -> sdmqtt_admin::Forgotten {
+        // An identifier that is not one names nobody this node has
+        // met, which is the same answer as an identifier it has not.
+        let Ok(id) = cluster::NodeId::parse(id) else {
+            return sdmqtt_admin::Forgotten::NotMet;
+        };
+        if id == self.me {
+            return sdmqtt_admin::Forgotten::Myself;
+        }
+        if self.mesh.forget(id) {
+            sdmqtt_admin::Forgotten::Gone
+        } else {
+            sdmqtt_admin::Forgotten::NotMet
+        }
     }
 }
 
@@ -335,6 +353,10 @@ impl sdmqtt_server::metrics::ClusterMetrics for MeshView {
 
     fn replica_applied(&self) -> u64 {
         self.copies.applied()
+    }
+
+    fn repairs(&self) -> (u64, u64) {
+        (self.copies.repairs_pending(), self.copies.repairs_done())
     }
 
     fn migrations(&self) -> [u64; sdmqtt_server::metrics::MIGRATION_NUMBERS.len()] {
@@ -808,6 +830,10 @@ async fn start_admin(
                 mesh: Arc::clone(mesh),
                 migrations: Arc::clone(node.migrations),
                 copies: Arc::clone(copies),
+                me: node
+                    .identity
+                    .expect("a node with a mesh has an identity")
+                    .id(),
                 gate: Arc::clone(gate),
             }) as Arc<dyn sdmqtt_admin::Cluster>));
     }
@@ -1028,6 +1054,10 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             rebuilt.identity.id(),
             factor,
             Arc::clone(mesh),
+            // Section 8.6's grace: how long a dead node keeps its place
+            // in every replica set before the sets are repaired without
+            // it.
+            std::time::Duration::from_millis(config.cluster.gone_after_ms),
         )),
         _ => None,
     };
@@ -1146,11 +1176,30 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             );
         }
     }
+    // Section 8.6's repair: a sweep that sends a session's queue to a
+    // follower that holds none of it, at the configured rate. Only on a
+    // node that places sessions, because only such a node has anything
+    // to repair.
+    if let (Some(mesh), Some(placement), Some(rebuilt)) = (&mesh, &placement, rebuilt.as_ref()) {
+        replicating.push(tokio::spawn(replication::repairing(
+            Arc::clone(&rebuilt.shared),
+            Arc::clone(mesh),
+            Arc::clone(placement),
+            Arc::clone(&rebuilt.copies),
+            Arc::clone(&rebuilt.store),
+            config.cluster.repair_sessions_per_second,
+        )));
+    }
     if let (Some(mesh), Some(gate), Some(copies)) = (&mesh, &gate, &copies) {
         let metrics: Arc<dyn sdmqtt_server::metrics::ClusterMetrics> = Arc::new(MeshView {
             mesh: Arc::clone(mesh),
             migrations: Arc::clone(&migrations),
             copies: Arc::clone(copies),
+            me: rebuilt
+                .as_ref()
+                .expect("a node with a mesh has a store")
+                .identity
+                .id(),
             gate: Arc::clone(gate),
         });
         // Section 11.3's four cluster numbers and section 8.4's seven,

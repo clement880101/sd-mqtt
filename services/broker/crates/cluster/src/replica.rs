@@ -116,6 +116,28 @@ pub enum Change {
         /// Which queue entry.
         sequence: u64,
     },
+    /// The whole queue, for a follower that holds none of it. Section
+    /// 8.6's repair.
+    ///
+    /// **Does not consume a stream position, and that is the design.**
+    /// A follower rendezvous has just named for a session — because a
+    /// node is gone, or was forgotten — starts with a mark of zero,
+    /// while the owner's stream is at some position `M` that every
+    /// other follower has reached. Re-sending the queue as ordinary
+    /// appends at `M+1..` would make the existing followers' marks fall
+    /// behind, or make them store entries they already hold; sending
+    /// it as appends at `1..` would leave the new follower with a hole
+    /// from there to `M` that no later change ever fills. So the
+    /// snapshot carries the owner's current position, the follower
+    /// takes it whole — replacing whatever copy it had — and sets its
+    /// mark to that position. The next live change, at `M+1`, is then
+    /// the next change for everybody.
+    Snapshot {
+        /// The session itself, because the follower may hold nothing.
+        session: Box<SessionRecord>,
+        /// Every entry in the queue, with its payload.
+        entries: Vec<(QueueEntry, BodyRecord)>,
+    },
 }
 
 /// What a follower decided to do with an operation.
@@ -376,6 +398,11 @@ pub struct Copies {
     /// flat line here on a node that is meant to be following is a
     /// follower that has stopped.
     applied: std::sync::atomic::AtomicU64,
+    /// Sessions this node owns whose replica set is short, as of the
+    /// last sweep. Section 8.6's "progress visible".
+    repairs_pending: std::sync::atomic::AtomicU64,
+    /// Sessions this node has re-streamed to a new follower, ever.
+    repairs_done: std::sync::atomic::AtomicU64,
 }
 
 /// The two halves, under [`Copies`]'s lock.
@@ -452,18 +479,33 @@ impl Copies {
         change: Change,
     ) -> (Vec<(u64, Change)>, u64) {
         let mut tables = locked(&self.inner);
-        let (_, follower) = tables
-            .followed
-            .entry(session.clone())
-            .or_insert_with(|| (owner, Follower::new()));
         let mut taken = Vec::new();
-        if follower.offer(at, change.clone()) == Applied::Take {
+        if matches!(change, Change::Snapshot { .. }) {
+            // A snapshot replaces the copy and sets the mark; see
+            // `Change::Snapshot`. Whatever was held — nothing, or a
+            // stale copy from before this node left the set — goes
+            // with it, and anything waiting behind a hole with it.
+            tables
+                .followed
+                .insert(session.clone(), (owner, Follower::resuming(at)));
             taken.push((at, change));
-            taken.extend(follower.release());
+        } else {
+            let (_, follower) = tables
+                .followed
+                .entry(session.clone())
+                .or_insert_with(|| (owner, Follower::new()));
+            if follower.offer(at, change.clone()) == Applied::Take {
+                taken.push((at, change));
+                taken.extend(follower.release());
+            }
         }
+        let through = tables
+            .followed
+            .get(session)
+            .map_or(0, |(_, follower)| follower.through());
         self.applied
             .fetch_add(taken.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        (taken, follower.through())
+        (taken, through)
     }
 
     /// How far a copy of `session` has got on this node.
@@ -476,6 +518,15 @@ impl Copies {
             .followed
             .get(session)
             .map(|(_, follower)| follower.through())
+    }
+
+    /// Where a session's stream is now, for a snapshot to carry.
+    ///
+    /// Zero for a session this node has not streamed, which is a
+    /// snapshot that says "you are at the beginning", and is right.
+    #[must_use]
+    pub fn position(&self, session: &SessionKey) -> u64 {
+        locked(&self.inner).owned.get(session).map_or(0, Owner::at)
     }
 
     /// Resume a session's stream from the position the store held.
@@ -610,6 +661,50 @@ impl Copies {
             })
             .max()
             .unwrap_or(0)
+    }
+
+    /// Every session this node owns and streams, for a sweep.
+    ///
+    /// A snapshot rather than an iterator over the lock, because what
+    /// a sweep does per session — read a queue, send it — must not
+    /// happen under the table's lock.
+    #[must_use]
+    pub fn owned_sessions(&self) -> Vec<SessionKey> {
+        locked(&self.inner).owned.keys().cloned().collect()
+    }
+
+    /// Whether `follower` has ever reported a mark for `session`.
+    ///
+    /// What section 8.6's repair looks for: a follower rendezvous now
+    /// names for a session, that has never said how far it is, holds
+    /// nothing of it — it was not in the set when the queue was
+    /// streamed, or it was and has since lost it.
+    #[must_use]
+    pub fn has_mark(&self, session: &SessionKey, follower: [u8; 16]) -> bool {
+        locked(&self.inner)
+            .marks
+            .contains_key(&(session.clone(), follower))
+    }
+
+    /// Record the outcome of one sweep: how many sessions still need a
+    /// copy sent somewhere, and how many were sent this time.
+    pub fn swept(&self, pending: u64, done: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.repairs_pending.store(pending, Relaxed);
+        self.repairs_done.fetch_add(done, Relaxed);
+    }
+
+    /// Sessions whose replica set was short at the last sweep.
+    #[must_use]
+    pub fn repairs_pending(&self) -> u64 {
+        self.repairs_pending
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Sessions re-streamed to a new follower, ever.
+    #[must_use]
+    pub fn repairs_done(&self) -> u64 {
+        self.repairs_done.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Changes this node has applied as a follower, ever.

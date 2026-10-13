@@ -55,6 +55,7 @@
 //! node digest breaks.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use aws_lc_rs::digest;
 use storage::SessionKey;
@@ -256,6 +257,8 @@ pub struct Placement {
     me: NodeId,
     factor: Factor,
     mesh: Arc<Mesh>,
+    /// How long a dead member keeps its place. Section 8.6's grace.
+    gone_after: Duration,
     /// The weighed members, and the identities they were built from.
     ///
     /// **A cache, because the digests are the expensive part.** The
@@ -274,11 +277,12 @@ fn locked<T>(what: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Placement {
     /// Place sessions for `me` across `mesh`, keeping `factor` copies.
     #[must_use]
-    pub fn new(me: NodeId, factor: Factor, mesh: Arc<Mesh>) -> Arc<Self> {
+    pub fn new(me: NodeId, factor: Factor, mesh: Arc<Mesh>, gone_after: Duration) -> Arc<Self> {
         Arc::new(Self {
             me,
             factor,
             mesh,
+            gone_after,
             weighed: Mutex::new((Vec::new(), Vec::new())),
         })
     }
@@ -295,25 +299,44 @@ impl Placement {
         self.factor
     }
 
-    /// The live members, weighed, **this node included**.
+    /// The members that keep a place in a replica set, weighed,
+    /// **this node included**.
     ///
     /// Itself included because a session has to be placeable on the
     /// node serving it — rendezvous puts the owner first, and a set
     /// computed without this node would make every session's owner
     /// somebody else.
     ///
-    /// A peer that is suspect or down is left out, which is section
-    /// 8.6's "live members": a copy sent to a node that is not
-    /// answering is a copy nobody holds. That it is this node's own
-    /// judgement, and that another node may judge differently, is why
-    /// placement decides nothing — see the module documentation.
+    /// **A dead member keeps its place until the grace runs out.** The
+    /// obvious rule, section 8.6's "live members" read literally, would
+    /// drop a node the moment its heartbeat failed, and rendezvous
+    /// would then name a replacement, and the replacement would be
+    /// sent the queue — the whole estate, every time anybody restarted
+    /// a node. So a member that is dead but silent for less than
+    /// `gone_after` is still placed: the set is short by one copy
+    /// while it is away, which the lag and the unconfirmed counter
+    /// both show, and is repaired only once the node is given up on.
+    /// A forgotten node is not in the table at all and so is not
+    /// placed, which is the operator's way of not waiting.
+    ///
+    /// That this is this node's own judgement, and that another node
+    /// may judge differently, is why placement decides nothing — see
+    /// the module documentation.
     #[must_use]
     pub fn members(&self) -> Vec<Weighted> {
+        let now = std::time::Instant::now();
+        let gone_after = self.gone_after;
         let mut live: Vec<NodeId> = self
             .mesh
             .members()
             .into_iter()
-            .filter(|member| member.state == MemberState::Alive)
+            .filter(|member| {
+                placed(
+                    member.state,
+                    now.saturating_duration_since(member.last_heard),
+                    gone_after,
+                )
+            })
             .map(|member| member.identity.id())
             .collect();
         live.push(self.me);
@@ -325,6 +348,18 @@ impl Placement {
             weighed.0 = live;
         }
         weighed.1.clone()
+    }
+}
+
+/// Whether a member in `state`, silent for `silence`, keeps its place.
+///
+/// Alive and suspect always; dead only within the grace. Pulled out of
+/// [`Placement::members`] so the rule can be tested without a mesh.
+#[must_use]
+pub fn placed(state: MemberState, silence: Duration, gone_after: Duration) -> bool {
+    match state {
+        MemberState::Alive | MemberState::Suspect => true,
+        MemberState::Dead => silence < gone_after,
     }
 }
 

@@ -132,6 +132,31 @@ pub trait Cluster: Send + Sync + 'static {
     /// process is a probe that says `complete` while clients are being
     /// turned away.
     fn expected(&self) -> Option<usize>;
+
+    /// Take a node out of membership at once, section 8.6's operator
+    /// override of the grace.
+    ///
+    /// `id` is the canonical text of the identity, as `peers` reports
+    /// it. The three answers are three different HTTP replies, and the
+    /// trait says which rather than returning a bool and leaving the
+    /// handler to guess why.
+    fn forget(&self, id: &str) -> Forgotten;
+}
+
+/// What forgetting a node came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forgotten {
+    /// It was in the table and is not now. Repair starts at once.
+    Gone,
+    /// This node has never met it, so there is nothing to forget.
+    NotMet,
+    /// The identifier is this node's own.
+    ///
+    /// Refused: a node cannot take itself out of its own cluster this
+    /// way, and an operator who meant to decommission it stops the
+    /// process. Not silently a no-op, because the request said
+    /// something impossible and should be told so.
+    Myself,
 }
 
 /// One peer, as the API reports it.

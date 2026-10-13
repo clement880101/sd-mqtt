@@ -61,7 +61,9 @@
 //! cluster. See `broker_core::session::Message::forwarded`, which is
 //! what makes both of those true.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cluster::mesh::{Deliver, Mesh, Message};
 use cluster::metadata::{MetadataKey, MetadataValue};
@@ -660,6 +662,145 @@ fn records_for_change(
                 sequence,
             }]
         }
+        // The whole queue, replacing whatever copy was held. **The
+        // removal first**, so that entries a stale copy held and the
+        // owner no longer does are gone, and so that the entries below
+        // are not refused as reused sequences by a copy that already
+        // had them.
+        cluster::Change::Snapshot {
+            session: record,
+            entries,
+        } => {
+            let mut records = Vec::with_capacity(entries.len() * 2 + 2);
+            records.push(storage::Record::SessionRemoved {
+                session: session.clone(),
+            });
+            records.push(storage::Record::SessionPut(*record));
+            for (entry, body) in entries {
+                records.push(storage::Record::BodyPut {
+                    id: entry.delivery.body,
+                    body,
+                });
+                records.push(storage::Record::QueuePushed {
+                    session: session.clone(),
+                    entry,
+                });
+            }
+            records
+        }
+    }
+}
+
+/// Repair the replica sets this node's sessions are short of, section
+/// 8.6, at a bounded rate.
+///
+/// Every second: for each session this node streams, the followers
+/// rendezvous names now; any of them that has never reported a mark
+/// for the session holds no copy of it — it was named after the queue
+/// was streamed, because a node is gone or was forgotten — and is sent
+/// the whole queue as one [`cluster::Change::Snapshot`]. At most
+/// `per_second` sessions a sweep, which is the rate limit: a node that
+/// is gone leaves every session it held a copy of to be sent somewhere
+/// else, and sending them all at once is what the limit prevents.
+///
+/// **The grace is not here.** It is in `cluster::Placement`, which
+/// keeps a dead node in its sets until `cluster.gone_after_ms` runs
+/// out; this task only ever acts on what placement says is short, so a
+/// node that is merely restarting never becomes a repair.
+///
+/// A snapshot that was sent but not yet answered must not be sent
+/// again next second, or a slow follower would be sent its queue once
+/// a second for as long as it took to apply the first one. So each
+/// send is remembered for a bounded time, locally to this task.
+pub async fn repairing(
+    shared: Arc<Shared>,
+    mesh: Arc<Mesh>,
+    placement: Arc<Placement>,
+    copies: Arc<cluster::Copies>,
+    store: Arc<dyn storage::Storage>,
+    per_second: u64,
+) {
+    /// How long a sent snapshot is given before it may be sent again.
+    const SENT_HOLDS_FOR: Duration = Duration::from_secs(30);
+
+    let mut sent: HashMap<(storage::SessionKey, [u8; 16]), Instant> = HashMap::new();
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let now = Instant::now();
+        sent.retain(|_, when| now.duration_since(*when) < SENT_HOLDS_FOR);
+
+        let members = placement.members();
+        let me = placement.me();
+        let mut budget = per_second;
+        let mut pending = 0u64;
+        let mut done = 0u64;
+        for session in copies.owned_sessions() {
+            let followers: Vec<_> = cluster::place(&session, &members, placement.factor())
+                .into_iter()
+                .filter(|node| *node != me)
+                .take(placement.factor().copies().saturating_sub(1))
+                .filter(|node| !copies.has_mark(&session, node.to_bytes()))
+                .collect();
+            if followers.is_empty() {
+                continue;
+            }
+            pending += 1;
+            for follower in followers {
+                let key = (session.clone(), follower.to_bytes());
+                if sent.contains_key(&key) {
+                    continue;
+                }
+                if budget == 0 {
+                    break;
+                }
+                let Some(record) = shared.with_broker(|broker| broker.session_record(&session))
+                else {
+                    // Gone between the sweep's listing and now; the
+                    // next sweep will not list it.
+                    continue;
+                };
+                let handover = match cluster::copy_as_handover(store.as_ref(), &session) {
+                    Ok(handover) => handover,
+                    Err(why) => {
+                        tracing::error!(
+                            client = %session.client_id,
+                            %why,
+                            "a session's queue could not be read to repair a copy of it"
+                        );
+                        continue;
+                    }
+                };
+                let snapshot = cluster::Streamed {
+                    session: session.clone(),
+                    at: copies.position(&session),
+                    change: cluster::Change::Snapshot {
+                        session: Box::new(record),
+                        entries: handover.queued,
+                    },
+                };
+                match mesh.send(follower, &Message::Replicated(snapshot)) {
+                    Some(Ok(cluster::link::Sent::Queued)) => {
+                        sent.insert(key, now);
+                        budget -= 1;
+                        done += 1;
+                        tracing::info!(
+                            client = %session.client_id,
+                            to = %follower,
+                            "a copy of a session's queue was sent to a follower that held none"
+                        );
+                    }
+                    _ => {
+                        tracing::warn!(
+                            client = %session.client_id,
+                            to = %follower,
+                            "a follower named for a session could not be sent its copy; tried \
+                             again next sweep"
+                        );
+                    }
+                }
+            }
+        }
+        copies.swept(pending, done);
     }
 }
 
@@ -755,5 +896,72 @@ pub async fn sweeping(replicator: Arc<Replicator>, mesh: Arc<Mesh>, writer: Arc<
         if writer.apply(swept.records).is_err() {
             tracing::error!("the storage writer stopped before a sweep could be written down");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storage::record::{
+        BodyRecord, DeliveryRecord, MessageId, ProtocolVersion, Qos, QueueEntry, SessionRecord,
+    };
+
+    /// A snapshot wipes the copy before it writes it.
+    ///
+    /// **The removal first, and that is the whole test.** A copy that
+    /// already held entry 1 — stale, from before this node left the
+    /// set — would have the snapshot's entry 1 refused as a reused
+    /// sequence, and the whole batch with it, and the follower's mark
+    /// would say it held a queue the store had thrown away. That is
+    /// the shape of the defect the stream shipped with, one layer up.
+    #[test]
+    fn a_snapshot_removes_the_old_copy_before_writing_the_new_one() {
+        let session = storage::SessionKey::new("", "rover");
+        let body = MessageId([3; 16]);
+        let records = records_for_change(
+            &session,
+            cluster::Change::Snapshot {
+                session: Box::new(SessionRecord {
+                    key: session.clone(),
+                    version: ProtocolVersion::V5,
+                    expiry_interval: 300,
+                    expires_at: None,
+                    will: None,
+                    will_at: None,
+                }),
+                entries: vec![(
+                    QueueEntry {
+                        sequence: 1,
+                        packet_id: None,
+                        delivery: DeliveryRecord {
+                            body,
+                            qos: Qos::AtLeastOnce,
+                            retain: false,
+                            subscription_ids: Vec::new(),
+                            dup: false,
+                        },
+                    },
+                    BodyRecord {
+                        topic: "a/b".to_owned(),
+                        payload: bytes::Bytes::from_static(b"x"),
+                        qos: Qos::AtLeastOnce,
+                        retain: false,
+                        expires_at: None,
+                        properties: bytes::Bytes::new(),
+                    },
+                )],
+            },
+        );
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|record| match record {
+                storage::Record::SessionRemoved { .. } => "removed",
+                storage::Record::SessionPut(_) => "session",
+                storage::Record::BodyPut { .. } => "body",
+                storage::Record::QueuePushed { .. } => "pushed",
+                other => panic!("a snapshot does not write {other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, vec!["removed", "session", "body", "pushed"]);
     }
 }

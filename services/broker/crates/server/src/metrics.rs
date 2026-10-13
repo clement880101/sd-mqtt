@@ -806,6 +806,10 @@ pub trait ClusterMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// Changes this node has applied as a follower, ever. See
     /// [`REPLICA_APPLIED`].
     fn replica_applied(&self) -> u64;
+    /// Sessions whose replica set was short at the last sweep, and
+    /// sessions re-streamed to a new follower ever: a gauge and a
+    /// counter. See [`REPAIRS_PENDING`] and [`REPAIRS_DONE`].
+    fn repairs(&self) -> (u64, u64);
     /// Section 8.4's migration numbers, in the order
     /// [`MIGRATION_NUMBERS`] names them.
     ///
@@ -858,6 +862,23 @@ pub const REPLICATION_NUMBERS: [(&str, &str); 3] = [
 pub const REPLICA_APPLIED: (&str, &str) = (
     "replica_changes_applied",
     "Queue changes this node has applied to copies it holds for other nodes",
+);
+
+/// Sessions this node owns whose replica set is short. Section 8.6.
+///
+/// What section 8.6 means by repair progress being visible: the number
+/// goes up when a node is gone and comes down as the sweep sends each
+/// session's queue to the follower that replaced it, at the configured
+/// rate. A gauge, because it goes both ways.
+pub const REPAIRS_PENDING: (&str, &str) = (
+    "replica_repairs_pending",
+    "Sessions this node owns whose replica set is short of a copy",
+);
+
+/// Sessions re-streamed to a new follower, ever. A counter.
+pub const REPAIRS_DONE: (&str, &str) = (
+    "replica_repairs_done",
+    "Sessions whose queue this node has re-streamed to a follower that held no copy",
 );
 
 /// Durable publishes acknowledged in synchronous mode that no follower
@@ -1500,6 +1521,20 @@ impl Collector for ClusterLive {
             applied.metric_type(),
         )?;
         applied.encode(descriptor)?;
+        // Section 8.6's repair: a level and a total.
+        let (pending, done) = self.0.repairs();
+        let pending = ConstGauge::new(i64::try_from(pending).unwrap_or(i64::MAX));
+        let descriptor = encoder.encode_descriptor(
+            REPAIRS_PENDING.0,
+            REPAIRS_PENDING.1,
+            None,
+            pending.metric_type(),
+        )?;
+        pending.encode(descriptor)?;
+        let done = ConstCounter::new(done);
+        let descriptor =
+            encoder.encode_descriptor(REPAIRS_DONE.0, REPAIRS_DONE.1, None, done.metric_type())?;
+        done.encode(descriptor)?;
         Ok(())
     }
 }
@@ -2038,6 +2073,9 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
         fn replica_applied(&self) -> u64 {
             54
         }
+        fn repairs(&self) -> (u64, u64) {
+            (55, 56)
+        }
     }
 
     #[test]
@@ -2126,6 +2164,18 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
             applied.contains("sdmqtt_replica_changes_applied_total 54\n"),
             "{applied}"
         );
+        let pending = block(&rendered, "sdmqtt_replica_repairs_pending");
+        assert!(
+            pending.contains("# TYPE sdmqtt_replica_repairs_pending gauge\n")
+                && pending.contains("sdmqtt_replica_repairs_pending 55\n"),
+            "repairs pending is a level:\n{pending}"
+        );
+        let done = block(&rendered, "sdmqtt_replica_repairs_done");
+        assert!(
+            done.contains("# TYPE sdmqtt_replica_repairs_done counter\n")
+                && done.contains("sdmqtt_replica_repairs_done_total 56\n"),
+            "repairs done is a total:\n{done}"
+        );
     }
 
     #[test]
@@ -2139,7 +2189,7 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
         for (name, _) in MIGRATION_NUMBERS
             .iter()
             .chain(REPLICATION_NUMBERS.iter())
-            .chain(std::iter::once(&REPLICA_APPLIED))
+            .chain([&REPLICA_APPLIED, &REPAIRS_PENDING, &REPAIRS_DONE])
         {
             assert!(
                 !rendered.contains(&format!("sdmqtt_{name}")),

@@ -325,7 +325,7 @@ membership.** Until now the table could only grow. Removing a node that is
 still alive has to do something defined — it will be met again on the next
 heartbeat — so decide it, write it down, and test it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 - Down past the grace: the sets that included it are repaired onto the
   remaining members, and the new follower ends up holding the same queue.
@@ -337,7 +337,7 @@ heartbeat — so decide it, write it down, and test it.
   copying happened.
 - A set that did not include the departed member is **not** touched.
 
-- [ ] **Step 2: Implement, confirm teeth, commit**
+- [x] **Step 2: Implement, confirm teeth, commit**
 
 Mutations: the grace ignored; the rate limit ignored; every set repaired
 rather than the ones that are short; a removed node that comes back not
@@ -346,6 +346,23 @@ re-admitted.
 ```bash
 git commit -m "feat(cluster): a short replica set repairs itself"
 ```
+
+No `repair.rs`: the sweep lives in `sdmqtt/src/replication.rs` beside
+the handler that applies what it sends, because what it sends is a
+`Change::Snapshot` on the existing stream and the only new thing in the
+`cluster` crate is the grace, which is placement's business. A snapshot
+does **not** take a stream position: it carries the owner's current
+mark and the follower resumes from there, so the owner's `at` for every
+other follower is untouched and an append after a repair is numbered
+the same on every copy.
+
+All four mutations died, with one lesson: the rate-limit test first
+waited for the done counter to be *exactly* one, and the unlimited
+mutant died because it never was — it jumped straight to six. That was
+a kill by accident; the test is about time, not the count, and now
+waits for *at least* one so the timing assertion is what does the
+killing. "Removed node re-admitted" is the membership unit test and the
+three-node test restarting the forgotten node on the same store.
 
 ---
 

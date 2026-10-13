@@ -575,6 +575,41 @@ can never be a follower.
 `SDMQTT_CLUSTER_DURABILITY`, `SDMQTT_CLUSTER_SYNC_TIMEOUT_MS` and
 `SDMQTT_CLUSTER_STRICT_UNCONFIRMED` set the same three.
 
+### When a node is gone for good
+
+```toml
+[cluster]
+gone_after_ms = 3600000           # an hour, by default
+repair_sessions_per_second = 50
+```
+
+A node that is down keeps its place in every replica set until
+`gone_after_ms` runs out — short by one copy while it is away, which
+`sdmqtt_replication_lag` and `sdmqtt_publishes_unconfirmed_total`
+both show — and is then given up on: the sets that included it are
+repaired onto the nodes that remain, each session's queue sent to its
+new follower, at most `repair_sessions_per_second` of them a second.
+An hour, because a node that is down is usually a node restarting, and
+copying the whole queue estate every time somebody applies a patch is
+the thing the grace prevents.
+
+If you know a node is never coming back, do not wait:
+
+```bash
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:1884/api/v1/nodes/<id>
+```
+
+That forgets it on **this node only** — membership is not replicated —
+and repair starts here at once. Tell each surviving node, or let the
+grace handle the ones you did not. A forgotten node that comes back is
+re-admitted. `sdmqtt_replica_repairs_pending` is how many sessions
+still need a copy sent somewhere, and `sdmqtt_replica_repairs_done_total`
+how many have been.
+
+`SDMQTT_CLUSTER_GONE_AFTER_MS` and
+`SDMQTT_CLUSTER_REPAIR_SESSIONS_PER_SECOND` set the same two.
+
 ### What happens when a node dies
 
 A client whose node has gone reconnects to any other node, and gets

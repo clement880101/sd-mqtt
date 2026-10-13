@@ -781,6 +781,30 @@ pub struct ClusterSection {
     /// for ever turns one slow node into every publisher's outage. Set
     /// `cluster.strict.unconfirmed` to be refused instead.
     pub sync_timeout_ms: u64,
+    /// How long a node may be down before it is treated as gone, in
+    /// milliseconds. Section 8.6.
+    ///
+    /// **An hour by default, and that is the point of it.** A node that
+    /// is down may be restarting, and a cluster that repaired its
+    /// replica sets the moment a peer missed a heartbeat would copy its
+    /// whole queue estate every time somebody applied a patch. Until
+    /// this runs out, a dead node keeps its place in every replica set
+    /// — short by one copy, which `sdmqtt_replication_lag` and the
+    /// unconfirmed counter both show — and once it runs out, the sets
+    /// that included it are repaired onto the nodes that remain.
+    ///
+    /// `DELETE /api/v1/nodes/{id}` is the override: an operator who
+    /// knows a node is never coming back starts the repair at once,
+    /// and one doing long maintenance raises this and it does not
+    /// start at all.
+    pub gone_after_ms: u64,
+    /// How many sessions a repair may copy per second. Section 8.6.
+    ///
+    /// The rate limit that keeps losing one node from saturating the
+    /// cluster: a repair after a node is gone has every session it
+    /// held a copy of to send somewhere else, and sending them all at
+    /// once is the failure the limit prevents.
+    pub repair_sessions_per_second: u64,
     /// How many nodes hold a copy of each session's queue. Section 8.6.
     ///
     /// Two by default: the owner and one follower, which is what makes
@@ -847,6 +871,8 @@ impl Default for ClusterSection {
             durability: Durability::default(),
             sync_timeout_ms: 2_000,
             replication_factor: DEFAULT_FACTOR,
+            gone_after_ms: 3_600_000,
+            repair_sessions_per_second: 50,
             expected_size: None,
             strict: Strict::default(),
             drain_timeout_ms: 2_000,
@@ -1375,6 +1401,25 @@ impl Config {
             });
         }
 
+        if self.cluster.gone_after_ms == 0 {
+            return Err(ConfigError::Unusable {
+                key: "cluster.gone_after_ms",
+                value: "0".to_owned(),
+                why: "a grace of zero treats every missed heartbeat as a node gone for good \
+                      and copies the whole queue estate on every restart. Write the \
+                      milliseconds a node may be down before it is given up on, or leave \
+                      the key out for an hour",
+            });
+        }
+        if self.cluster.repair_sessions_per_second == 0 {
+            return Err(ConfigError::Unusable {
+                key: "cluster.repair_sessions_per_second",
+                value: "0".to_owned(),
+                why: "a limit of zero sessions a second is a repair that never runs, and a \
+                      replica set left short for ever. Write how many a second the cluster \
+                      can spare, or leave the key out",
+            });
+        }
         if self.cluster.sync_timeout_ms == 0 {
             return Err(ConfigError::Unusable {
                 key: "cluster.sync_timeout_ms",
@@ -1560,6 +1605,17 @@ impl Config {
         if let Some(value) = lookup("SDMQTT_CLUSTER_STRICT_UNCONFIRMED") {
             self.cluster.strict.unconfirmed =
                 parse("SDMQTT_CLUSTER_STRICT_UNCONFIRMED", &value, "true or false")?;
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_GONE_AFTER_MS") {
+            self.cluster.gone_after_ms =
+                parse("SDMQTT_CLUSTER_GONE_AFTER_MS", &value, "milliseconds")?;
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_REPAIR_SESSIONS_PER_SECOND") {
+            self.cluster.repair_sessions_per_second = parse(
+                "SDMQTT_CLUSTER_REPAIR_SESSIONS_PER_SECOND",
+                &value,
+                "sessions a second",
+            )?;
         }
         if let Some(value) = lookup("SDMQTT_CLUSTER_REPLICATION_FACTOR") {
             self.cluster.replication_factor = parse(

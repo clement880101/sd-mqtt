@@ -481,3 +481,51 @@ async fn a_follower_that_goes_quiet_does_not_hold_the_publisher_for_ever() {
         started.elapsed()
     );
 }
+
+#[test]
+fn a_snapshot_replaces_whatever_copy_was_held_and_sets_the_mark() {
+    // **Does not consume a position, and lands the follower exactly
+    // where the owner is.** The new follower's next change will be at
+    // the owner's position plus one, the same as every other
+    // follower's, so the stream has no hole and nobody else's mark is
+    // touched.
+    use storage::record::{ProtocolVersion, SessionRecord};
+    let copies = Copies::new();
+    let session = key("rover");
+    // A stale copy from before this node left the set: at 2, with a
+    // change held behind a hole.
+    copies.arrived(&session, ALPHA, 1, appended(1));
+    copies.arrived(&session, ALPHA, 2, appended(2));
+    copies.arrived(&session, ALPHA, 4, appended(4));
+    assert_eq!(copies.through(&session), Some(2));
+
+    let snapshot = Change::Snapshot {
+        session: Box::new(SessionRecord {
+            key: session.clone(),
+            version: ProtocolVersion::V5,
+            expiry_interval: 300,
+            expires_at: None,
+            will: None,
+            will_at: None,
+        }),
+        entries: vec![],
+    };
+    let (taken, through) = copies.arrived(&session, ALPHA, 9, snapshot);
+    assert_eq!(taken.len(), 1, "the snapshot itself is what to apply");
+    assert_eq!(
+        through, 9,
+        "the mark is the owner's position, not the next one"
+    );
+    assert_eq!(copies.through(&session), Some(9));
+
+    // What was held behind the hole went with the old copy: position
+    // 4 does not reappear, and position 10 is simply next.
+    assert!(matches!(
+        copies
+            .arrived(&session, ALPHA, 10, appended(10))
+            .0
+            .as_slice(),
+        [(10, _)]
+    ));
+    assert_eq!(copies.through(&session), Some(10));
+}

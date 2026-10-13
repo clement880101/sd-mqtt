@@ -104,8 +104,8 @@ struct Node {
     /// Where its store is. The point of a restart is that this
     /// survives it.
     store: PathBuf,
-    /// How many copies of each session, so a restart keeps it.
-    factor: usize,
+    /// What it was started with beyond the file, so a restart keeps it.
+    knobs: Knobs,
     admin: SocketAddr,
     /// Where its clients connect, which section 8.3's routing is about.
     mqtt: SocketAddr,
@@ -173,7 +173,7 @@ impl Node {
     fn restart(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        self.child = spawn(&self.config, &self.store, &self.log, self.factor);
+        self.child = spawn(&self.config, &self.store, &self.log, self.knobs);
         if let Err(why) = self.wait_until_listening() {
             panic!("{} did not come back: {why}", self.label);
         }
@@ -343,6 +343,40 @@ impl Node {
             .collect()
     }
 
+    /// A `DELETE`, with the token: the status line's code and the body.
+    ///
+    /// The code is returned as well as the body because what this is
+    /// used for is a request that may be refused, and a refusal's body
+    /// is prose nobody should match on.
+    fn delete(&self, path: &str) -> (u16, String) {
+        let mut socket =
+            TcpStream::connect_timeout(&self.admin, REPLY).expect("the listener accepts");
+        socket
+            .set_read_timeout(Some(REPLY))
+            .expect("a read deadline");
+        let head = format!(
+            "DELETE {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {TOKEN}\r\n\
+             Connection: close\r\n\r\n",
+            self.admin
+        );
+        socket
+            .write_all(head.as_bytes())
+            .expect("the head is written");
+        socket.flush().expect("and flushed");
+        let mut raw = Vec::new();
+        socket.read_to_end(&mut raw).expect("the response ends");
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let code = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status in {text:?}"));
+        match text.split_once("\r\n\r\n") {
+            Some((_head, body)) => (code, body.to_owned()),
+            None => panic!("no body in {text:?}"),
+        }
+    }
+
     /// The body of a `POST` of JSON, without its head.
     fn post(&self, path: &str, body: &str) -> String {
         let mut socket =
@@ -383,7 +417,33 @@ impl Drop for Node {
 ///
 /// Factored out because a restart is the same command: a node that
 /// came back differently would not be testing what a restart does.
-fn spawn(config: &Path, store: &Path, log: &Path, factor: usize) -> Child {
+/// What a test can turn on a node that the file does not carry.
+///
+/// Through the environment, so one harness serves every setting a test
+/// wants and a restart starts with the same ones.
+#[derive(Debug, Clone, Copy)]
+struct Knobs {
+    /// Copies of each session. Section 8.6.
+    factor: usize,
+    /// How long a dead node keeps its place in a replica set.
+    gone_after_ms: u64,
+    /// How many sessions a repair may send a second.
+    repair_per_second: u64,
+}
+
+impl Default for Knobs {
+    /// The broker's own defaults, so a test that sets nothing tests
+    /// what an operator who set nothing would run.
+    fn default() -> Self {
+        Self {
+            factor: cluster::DEFAULT_FACTOR,
+            gone_after_ms: 3_600_000,
+            repair_per_second: 50,
+        }
+    }
+}
+
+fn spawn(config: &Path, store: &Path, log: &Path, knobs: Knobs) -> Child {
     Command::new(env!("CARGO_BIN_EXE_sdmqtt"))
         .arg("serve")
         .arg("--config")
@@ -404,7 +464,18 @@ fn spawn(config: &Path, store: &Path, log: &Path, factor: usize) -> Child {
         // Section 8.6's copies per session. In the environment rather
         // than the file so that one harness serves every factor a test
         // wants, and so that a restart starts with the same one.
-        .env("SDMQTT_CLUSTER_REPLICATION_FACTOR", factor.to_string())
+        .env(
+            "SDMQTT_CLUSTER_REPLICATION_FACTOR",
+            knobs.factor.to_string(),
+        )
+        .env(
+            "SDMQTT_CLUSTER_GONE_AFTER_MS",
+            knobs.gone_after_ms.to_string(),
+        )
+        .env(
+            "SDMQTT_CLUSTER_REPAIR_SESSIONS_PER_SECOND",
+            knobs.repair_per_second.to_string(),
+        )
         .stderr(Stdio::from(
             // Appended rather than truncated, so a restart does not
             // throw away the log of what happened before it.
@@ -877,7 +948,7 @@ struct Cluster {
 impl Cluster {
     /// Start three nodes under `directory`, each with a store of its own.
     async fn start(directory: &Path) -> Self {
-        Self::start_with_factor(directory, cluster::DEFAULT_FACTOR).await
+        Self::start_with(directory, Knobs::default()).await
     }
 
     /// The same, keeping `factor` copies of each session.
@@ -886,6 +957,18 @@ impl Cluster {
     /// on every node, which is what a test about choosing *between*
     /// copies needs: two followers, one of them held back.
     async fn start_with_factor(directory: &Path, factor: usize) -> Self {
+        Self::start_with(
+            directory,
+            Knobs {
+                factor,
+                ..Knobs::default()
+            },
+        )
+        .await
+    }
+
+    /// The same, with every knob a test may turn.
+    async fn start_with(directory: &Path, knobs: Knobs) -> Self {
         let labels = LABELS;
 
         // The three cluster ports, chosen before anything starts so that
@@ -936,14 +1019,14 @@ impl Cluster {
             );
             let log = directory.join(format!("{label}.log"));
             let mut node = Node {
-                child: spawn(&config, &store, &log, factor),
+                child: spawn(&config, &store, &log, knobs),
                 admin,
                 mqtt,
                 log,
                 label,
                 config,
                 store,
-                factor,
+                knobs,
             };
             if let Err(why) = node.wait_until_listening() {
                 panic!("{why}");
@@ -2258,5 +2341,226 @@ async fn the_copy_furthest_ahead_is_the_one_pulled() {
     assert_eq!(
         cluster.nodes[2].counter("sdmqtt_migrated_messages_missing_total"),
         Some(0)
+    );
+}
+
+/// Queue `count` sessions on alpha, each with one message, and wait for
+/// every one to have a copy on another node. Returns how many copies
+/// each of beta and gamma holds, in that order.
+///
+/// The split between the two is rendezvous's and varies by run, which
+/// is why it is returned rather than assumed: the tests below assert
+/// against what the hash actually did.
+fn queued_and_copied(cluster: &Cluster, count: usize) -> [u64; 2] {
+    for nth in 0..count {
+        let filter = format!("fleet/{nth}/+");
+        let topic = format!("fleet/{nth}/telemetry");
+        let (mut rover, _) = Client::resuming(cluster.nodes[0].mqtt, &format!("rover-{nth}"));
+        rover.subscribe(&filter);
+        drop(rover);
+        until("beta learns that somebody wants the filter", || {
+            cluster.nodes[1].publish_reaching(&topic, "copy-me") > 0
+        });
+    }
+    let held = |at: usize| {
+        cluster.nodes[at]
+            .counter("sdmqtt_replica_sessions")
+            .unwrap_or(0)
+    };
+    until("every session has a copy on another node", || {
+        held(1) + held(2) == count as u64
+    });
+    [held(1), held(2)]
+}
+
+/// A node gone past the grace is repaired away from.
+///
+/// Section 8.6's re-replication, with the grace short enough to wait
+/// for: the node holding the copies is killed, the grace runs out, and
+/// every session it held a copy of is sent to the node that remains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_gone_past_the_grace_is_repaired_away_from() {
+    const SESSIONS: usize = 4;
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let mut cluster = Cluster::start_with(
+        directory.path(),
+        Knobs {
+            gone_after_ms: 2_000,
+            ..Knobs::default()
+        },
+    )
+    .await;
+    cluster.settle();
+    let [on_beta, on_gamma] = queued_and_copied(&cluster, SESSIONS);
+    // Kill whichever holds more, so there is something to repair.
+    let (victim, survivor, lost) = if on_beta >= on_gamma {
+        (1, 2, on_beta)
+    } else {
+        (2, 1, on_gamma)
+    };
+    let before = cluster.nodes[survivor]
+        .counter("sdmqtt_replica_sessions")
+        .unwrap_or(0);
+    cluster.nodes[victim].kill();
+
+    until("the survivor holds every copy the victim held", || {
+        cluster.nodes[survivor].counter("sdmqtt_replica_sessions") == Some(before + lost)
+    });
+    assert_eq!(
+        cluster.nodes[0].counter("sdmqtt_replica_repairs_done_total"),
+        Some(lost),
+        "exactly the sessions the victim held were repaired, and no others"
+    );
+    until("and nothing is pending any more", || {
+        cluster.nodes[0].counter("sdmqtt_replica_repairs_pending") == Some(0)
+    });
+}
+
+/// Within the grace, nothing is copied.
+///
+/// **The test that matters**, because a build that repairs on a missed
+/// heartbeat passes the one above and copies the whole queue estate
+/// every time an operator restarts a node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn within_the_grace_nothing_is_copied() {
+    const SESSIONS: usize = 4;
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let mut cluster = Cluster::start(directory.path()).await;
+    cluster.settle();
+    let [on_beta, on_gamma] = queued_and_copied(&cluster, SESSIONS);
+    let (victim, survivor) = if on_beta >= on_gamma { (1, 2) } else { (2, 1) };
+    let before = cluster.nodes[survivor]
+        .counter("sdmqtt_replica_sessions")
+        .unwrap_or(0);
+    let gone = cluster.nodes[victim].kill();
+    until("alpha declares the victim dead", || {
+        cluster.nodes[0].how(&gone).as_deref() == Some("down")
+    });
+
+    // Dead, and still placed: the default grace is an hour.
+    keeps(
+        "no copy moves to the survivor",
+        Duration::from_secs(5),
+        || {
+            cluster.nodes[survivor].counter("sdmqtt_replica_sessions") == Some(before)
+                && cluster.nodes[0].counter("sdmqtt_replica_repairs_done_total") == Some(0)
+        },
+    );
+    assert_eq!(
+        cluster.nodes[0].counter("sdmqtt_replica_repairs_pending"),
+        Some(0),
+        "a node inside the grace keeps its place, so nothing is short"
+    );
+}
+
+/// Forgetting a node starts the repair at once, and the two refusals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forgetting_a_node_starts_the_repair_at_once() {
+    const SESSIONS: usize = 4;
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let mut cluster = Cluster::start(directory.path()).await;
+    cluster.settle();
+    let [on_beta, on_gamma] = queued_and_copied(&cluster, SESSIONS);
+    let (victim, survivor, lost) = if on_beta >= on_gamma {
+        (1, 2, on_beta)
+    } else {
+        (2, 1, on_gamma)
+    };
+    let before = cluster.nodes[survivor]
+        .counter("sdmqtt_replica_sessions")
+        .unwrap_or(0);
+    let gone = cluster.nodes[victim].kill();
+    until("alpha declares the victim dead", || {
+        cluster.nodes[0].how(&gone).as_deref() == Some("down")
+    });
+
+    // The two refusals first, because they are cheap and because a
+    // handler that forgot *something* for any identifier would pass
+    // the success below.
+    let (code, _) = cluster.nodes[0].delete("/api/v1/nodes/not-an-identifier");
+    assert_eq!(code, 404, "an identifier this node never met is not found");
+    let me = cluster.nodes[0].identity();
+    let (code, _) = cluster.nodes[0].delete(&format!("/api/v1/nodes/{me}"));
+    assert_eq!(code, 400, "a node cannot forget itself");
+
+    let (code, body) = cluster.nodes[0].delete(&format!("/api/v1/nodes/{gone}"));
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body.contains(&gone),
+        "the answer names what was forgotten: {body}"
+    );
+    assert!(
+        !cluster.nodes[0].nodes().iter().any(|row| row.id == gone),
+        "and it is out of alpha's membership, not marked down"
+    );
+    // With the grace still an hour away, this is the override doing
+    // the work.
+    until("the survivor holds every copy the victim held", || {
+        cluster.nodes[survivor].counter("sdmqtt_replica_sessions") == Some(before + lost)
+    });
+    assert_eq!(
+        cluster.nodes[0].counter("sdmqtt_replica_repairs_done_total"),
+        Some(lost)
+    );
+    let (code, _) = cluster.nodes[0].delete(&format!("/api/v1/nodes/{gone}"));
+    assert_eq!(code, 404, "forgetting twice finds nothing the second time");
+
+    // Forgotten is not banned: the node coming back, on the same store
+    // and so the same identity, is met again like any newcomer.
+    cluster.nodes[victim].restart();
+    until("the forgotten node is re-admitted when heard from", || {
+        cluster.nodes[0].how(&gone).as_deref() == Some("up")
+    });
+}
+
+/// Repair is rate limited.
+///
+/// One session a second, and sessions enough that the difference
+/// between "one a second" and "all at once" is several seconds wide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repair_sends_no_more_sessions_a_second_than_it_is_allowed() {
+    const SESSIONS: usize = 6;
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let mut cluster = Cluster::start_with(
+        directory.path(),
+        Knobs {
+            gone_after_ms: 2_000,
+            repair_per_second: 1,
+            ..Knobs::default()
+        },
+    )
+    .await;
+    cluster.settle();
+    let [on_beta, on_gamma] = queued_and_copied(&cluster, SESSIONS);
+    let (victim, lost) = if on_beta >= on_gamma {
+        (1, on_beta)
+    } else {
+        (2, on_gamma)
+    };
+    assert!(
+        lost >= 3,
+        "the hash gave the victim {lost}; six sessions should split 3+"
+    );
+    cluster.nodes[victim].kill();
+
+    // The first repair marks the grace having run out. From there, at
+    // one a second, the rest take `lost - 1` more seconds at least.
+    // At least one, not exactly one: a build with no limit sends every
+    // session in one sweep and would never show a count of one, and
+    // the timing below is what this test is about, not the count.
+    until("the first session is repaired", || {
+        cluster.nodes[0]
+            .counter("sdmqtt_replica_repairs_done_total")
+            .is_some_and(|done| done >= 1)
+    });
+    let started = Instant::now();
+    until("every session is repaired", || {
+        cluster.nodes[0].counter("sdmqtt_replica_repairs_done_total") == Some(lost)
+    });
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis((lost - 1) * 800),
+        "{lost} sessions at one a second cannot finish in {took:?}: the limit was not \
+         applied"
     );
 }
