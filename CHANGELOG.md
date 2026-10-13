@@ -87,6 +87,40 @@ on purpose.
   queue — one description of what happened, and both the store and
   the copy get it.
 
+- **A copy is on the disk, with its payloads.** The first version of
+  the stream shipped two defects the gauges could not see. A follower
+  wrote queue records for a session its store did not hold, which a
+  store refuses, so the copy existed only in the follower's in-memory
+  table; and the entries travelled without their payloads, so even a
+  stored copy was a queue of references to messages the follower had
+  never seen. The first append an owner streams for a session now
+  carries the session record, and every append carries the payload it
+  names. The three-node test kills and restarts each follower and
+  asserts the copies came back, because a restart is the only question
+  a gauge cannot answer from memory.
+
+  A third, smaller one beside them: a session that was handed over,
+  expired or taken over never left the owner's stream table, so the
+  node went on counting it as replicated and a client reconnecting
+  under the same identifier would have had its new stream numbered
+  from where the old one stopped — which a follower still holding the
+  old copy would have refused as duplicates.
+
+  And a fourth, which the migration test found on about half its
+  runs and which is a race rather than a flake: a client reconnecting
+  to the node that holds the copy of its session, at the moment that
+  copy is arriving. The copy's write and the connect's write meet on
+  one writer; when the copy lands first, the drain's queue entries
+  carry sequence numbers the copy already used, the store refuses the
+  whole connect batch as a reused sequence — correctly — and the
+  subscription register in that batch is abandoned with it, so no
+  other node ever learns the claiming node has the subscriber. The
+  copy now yields to the drain, written ahead of the connect on the
+  same writer. A test that waited for the copy before reconnecting
+  passed every run, with and without the fix, because the wait took
+  the race away; the test reconnects without waiting, as a client
+  would.
+
 - **`cluster.durability`, with `"sync"` available.** `async` is the
   default and is what the lag gauge is about. `sync` holds the
   acknowledgement until one follower has confirmed the append, so a

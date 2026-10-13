@@ -195,6 +195,19 @@ stored format, the owner's position, and the wiring. The stored format
 moved to **10**, not 9 — twice within this milestone, because a number
 already written to a disk has to keep meaning one thing.
 
+**And a fourth commit, after task 3, fixing four defects in the wiring
+that no gauge could see**: the follower's writes were refused for want
+of a session record; the entries travelled without their payloads; a
+handed-over session never left the owner's stream table; and a copy
+arriving at the node a client was reconnecting to raced the connect on
+one writer and, landing first, had the whole connect batch refused as
+a reused sequence — subscription register included. The first was
+found by killing and restarting the followers, which is the only
+question a gauge cannot answer from memory; the last by the migration
+test failing on half its runs, which looked like a flake and was a
+race. A version of that test which waited for the copy before
+reconnecting passed every run with the fix removed. It does not wait.
+
 ---
 
 ### Task 3: Acknowledged when, and by whom

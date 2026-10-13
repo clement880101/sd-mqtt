@@ -13,11 +13,13 @@ use broker_core::session::Action;
 use broker_core::subscriptions::{FilterEvent, SubscriberId};
 use cluster::migrate::{Claimed, Migrator};
 use cluster::{
-    Confirmed, Confirming, Copies, Durability, Gate, MetadataWrite, Operation, Replicated, Streamed,
+    Change, Confirmed, Confirming, Copies, Durability, Gate, MetadataWrite, Operation, Replicated,
+    Streamed,
 };
 use foldhash::fast::RandomState;
 use mqtt_codec::Packet;
 use parking_lot::{Mutex, RwLock};
+use storage::record::{BodyRecord, MessageId};
 use storage::SessionKey;
 use storage::{Applied, Durable, NotDurable, Record, Writer};
 use tokio::sync::mpsc;
@@ -529,13 +531,41 @@ impl Shared {
     /// Appends a `StreamAt` per session touched, to the same batch, so
     /// the position and the queue it counts cannot arrive separately.
     /// Empty on a node that does not cluster.
-    fn stream_changes(&self, records: &mut Vec<Record>) -> Vec<Streamed> {
+    fn stream_changes(&self, broker: &Broker, records: &mut Vec<Record>) -> Vec<Streamed> {
         let Some(copies) = self.copies.get() else {
             return Vec::new();
         };
+        // **The payloads this batch wrote, to travel with the entries
+        // that name them.** A queue entry carries a message identifier
+        // and not a message, so a follower sent entries alone holds a
+        // queue of references to payloads it has never seen — which
+        // restores as a queue of missing bodies and is worth nothing to
+        // a failover. The body is in the same batch as the entry that
+        // first names it, which is what makes pairing them here
+        // possible at all.
+        let bodies: HashMap<MessageId, &BodyRecord, RandomState> = records
+            .iter()
+            .filter_map(|record| match record {
+                Record::BodyPut { id, body } => Some((*id, body)),
+                _ => None,
+            })
+            .collect();
+
         let mut streamed = Vec::new();
         let mut reached: Vec<(SessionKey, u64)> = Vec::new();
         for record in records.iter() {
+            // **A session that goes takes its stream with it.** A
+            // hand-over, an expiry and a clean-start takeover all
+            // journal this, and an owner entry left behind would keep
+            // counting the session as streamed, keep every follower's
+            // mark for it, and — on a client reconnecting under the
+            // same identifier — number the new session's stream from
+            // where the old one stopped. `Copies::stop` was never
+            // called from anywhere before this line existed.
+            if let Record::SessionRemoved { session } = record {
+                copies.stop(session);
+                continue;
+            }
             let Some((session, change)) = cluster::change_for(record) else {
                 continue;
             };
@@ -547,6 +577,34 @@ impl Shared {
             if copies.follows(&session) {
                 continue;
             }
+            // **The first append to a session carries the session
+            // itself.** A store refuses a queue record for a session it
+            // does not hold, so a copy whose first record is a queue
+            // entry is a copy the store throws away — leaving the
+            // follower's table saying it holds something and its disk
+            // holding nothing. That is what this did before, and the
+            // gauge could not see it, because the gauge counts the
+            // table.
+            let change = match change {
+                Change::Appended { entry, .. } => {
+                    // The session rides the first append only; after
+                    // that the follower holds it and a queue of ten
+                    // thousand would otherwise carry ten thousand
+                    // copies of the same record.
+                    let session_record = (!copies.streams(&session))
+                        .then(|| broker.session_record(&session).map(Box::new))
+                        .flatten();
+                    let body = bodies
+                        .get(&entry.delivery.body)
+                        .map(|body| Box::new((*body).clone()));
+                    Change::Appended {
+                        entry,
+                        body,
+                        session: session_record,
+                    }
+                }
+                other => other,
+            };
             let sent = copies.send(&session, change);
             match reached.iter_mut().find(|(key, _)| *key == session) {
                 Some((_, at)) => *at = sent.at,
@@ -601,6 +659,48 @@ impl Shared {
     pub async fn claim_session(&self, session: &SessionKey, clean: bool) -> Option<Claimed> {
         let migrator = self.migrator.get()?;
         let claimed = migrator.claim(session, clean).await;
+        // **A copy this node holds of the session yields to the
+        // original it is about to receive.** Section 8.6 may have put
+        // a follower's copy of this very session here, and the drain
+        // brings the same queue entries under the same sequence
+        // numbers — which the store refuses, on purpose, as a reused
+        // sequence. The refusal takes the whole connect batch with it,
+        // and the subscription register inside that batch is then
+        // abandoned, so no peer ever learns this node has the
+        // subscriber: publications stop reaching the session.
+        //
+        // **It is a race, and it is this node's own writer that
+        // decides it.** The copy arrives on the link and is written
+        // aside; the client's connect arrives on the listener and is
+        // written here. Both go through one writer, in order. When the
+        // copy lands first the connect is refused; when the connect
+        // lands first the copy is refused instead, harmlessly. The
+        // migration test lost that race on four runs in six with this
+        // block removed and on none with it, and a version of the test
+        // that waited for the copy before reconnecting passed every run
+        // either way — the wait took the race away, which is why that
+        // test does not wait.
+        //
+        // Written aside, **before** the connect batch, on the same
+        // writer and so in order ahead of it. The removal takes the
+        // replica row with it. When the drain came up short the copy
+        // may hold what the drain did not, and task 4 of this
+        // milestone is where it becomes the source instead of being
+        // yielded; until then this restores what was true before any
+        // copy existed.
+        if let Some(copies) = self.copies.get() {
+            if copies.unfollow(session) {
+                tracing::info!(
+                    client = %session.client_id,
+                    mountpoint = %session.mountpoint,
+                    "this node held a copy of the session it is now claiming; the copy \
+                     yields to the drain"
+                );
+                self.apply_aside(vec![Record::SessionRemoved {
+                    session: session.clone(),
+                }]);
+            }
+        }
         if let Some(write) = claimed.write.clone() {
             self.originate(write);
         }
@@ -1088,7 +1188,7 @@ impl Shared {
         // anything that waits on the batch: the changes the followers
         // of these sessions need, and the positions that record how far
         // this node has got, which join the same batch.
-        let streamed = self.stream_changes(&mut records);
+        let streamed = self.stream_changes(broker, &mut records);
         // And, in synchronous mode, what this publisher waits for. The
         // registration happens **here, before the batch is handed to
         // the writer**, for the reason `Migrations::begin` does: a mark
@@ -1692,6 +1792,164 @@ mod tests {
     use storage::Record;
 
     use crate::metrics::{drop_label, shell_label, ShellDrop, ALL_DROP_REASONS, ALL_SHELL_DROPS};
+
+    /// What travels with an append, and what travels only once.
+    ///
+    /// **Both halves are what makes a copy usable at all.** A queue
+    /// entry names a payload rather than carrying one, and a store
+    /// refuses a queue record for a session it does not hold — so a
+    /// follower sent entries alone stores nothing, and one sent
+    /// entries without payloads stores a queue of references to
+    /// messages it has never seen. Neither is visible in the gauge
+    /// that counts copies, which is how the first of the two shipped.
+    #[test]
+    fn an_append_carries_the_payload_and_the_session_the_first_time() {
+        let shared = Shared::new(Default::default());
+        let copies = Arc::new(cluster::Copies::new());
+        shared.install_copies(Arc::clone(&copies));
+
+        let session = SessionKey::new("", "rover");
+        let body = MessageId([7; 16]);
+        let mut records = vec![
+            Record::BodyPut {
+                id: body,
+                body: storage::record::BodyRecord {
+                    topic: "site/1/temp".to_owned(),
+                    payload: bytes::Bytes::from_static(b"21.5"),
+                    qos: storage::record::Qos::AtLeastOnce,
+                    retain: false,
+                    expires_at: None,
+                    properties: bytes::Bytes::new(),
+                },
+            },
+            Record::QueuePushed {
+                session: session.clone(),
+                entry: storage::record::QueueEntry {
+                    sequence: 1,
+                    packet_id: None,
+                    delivery: storage::record::DeliveryRecord {
+                        body,
+                        qos: storage::record::Qos::AtLeastOnce,
+                        retain: false,
+                        subscription_ids: Vec::new(),
+                        dup: false,
+                    },
+                },
+            },
+        ];
+
+        // The broker holds no such session, so the record cannot
+        // travel — which is the honest answer here and is why the
+        // first append is the one that carries it.
+        let streamed = shared.with_broker(|broker| shared.stream_changes(broker, &mut records));
+        assert_eq!(streamed.len(), 1);
+        match &streamed[0].change {
+            cluster::Change::Appended { body, .. } => assert!(
+                body.is_some(),
+                "the payload must travel with the entry that names it, or the copy \
+                 restores as a queue of messages the follower has never seen"
+            ),
+            other => panic!("expected an append, got {other:?}"),
+        }
+
+        // And a second append to the same session does not carry the
+        // session record again: it is the same record every time, and
+        // a queue of ten thousand would otherwise carry ten thousand
+        // copies of it.
+        let mut again = vec![Record::QueuePushed {
+            session: session.clone(),
+            entry: storage::record::QueueEntry {
+                sequence: 2,
+                packet_id: None,
+                delivery: storage::record::DeliveryRecord {
+                    body,
+                    qos: storage::record::Qos::AtLeastOnce,
+                    retain: false,
+                    subscription_ids: Vec::new(),
+                    dup: false,
+                },
+            },
+        }];
+        let streamed = shared.with_broker(|broker| shared.stream_changes(broker, &mut again));
+        match &streamed[0].change {
+            cluster::Change::Appended { session, .. } => assert!(
+                session.is_none(),
+                "the session record travels once, not with every append"
+            ),
+            other => panic!("expected an append, got {other:?}"),
+        }
+        // And the position record joined the batch both times.
+        assert!(again
+            .iter()
+            .any(|record| matches!(record, Record::StreamAt { at: 2, .. })));
+    }
+
+    /// A session that goes takes its stream with it.
+    ///
+    /// Before this test, `Copies::stop` was never called from the
+    /// shell at all: a handed-over session kept its owner entry and
+    /// every follower's mark for ever, the gauge went on counting it
+    /// as streamed, and a client reconnecting under the same
+    /// identifier would have had its new stream numbered from where
+    /// the old one stopped — which a follower holding the old copy
+    /// would then refuse as duplicates.
+    #[test]
+    fn a_removed_session_stops_being_streamed() {
+        let shared = Shared::new(Default::default());
+        let copies = Arc::new(cluster::Copies::new());
+        shared.install_copies(Arc::clone(&copies));
+        let session = SessionKey::new("", "rover");
+
+        let mut records = vec![Record::QueuePushed {
+            session: session.clone(),
+            entry: storage::record::QueueEntry {
+                sequence: 1,
+                packet_id: None,
+                delivery: storage::record::DeliveryRecord {
+                    body: MessageId([7; 16]),
+                    qos: storage::record::Qos::AtLeastOnce,
+                    retain: false,
+                    subscription_ids: Vec::new(),
+                    dup: false,
+                },
+            },
+        }];
+        shared.with_broker(|broker| shared.stream_changes(broker, &mut records));
+        assert_eq!(copies.streaming(), 1, "the push started a stream");
+
+        let mut removed = vec![Record::SessionRemoved {
+            session: session.clone(),
+        }];
+        let streamed = shared.with_broker(|broker| shared.stream_changes(broker, &mut removed));
+        assert!(
+            streamed.is_empty(),
+            "a removal is not a change a follower applies"
+        );
+        assert_eq!(
+            copies.streaming(),
+            0,
+            "and the stream went with the session"
+        );
+
+        // A session recreated under the same key starts its stream at
+        // one, not where the old one stopped.
+        let mut again = vec![Record::QueuePushed {
+            session: session.clone(),
+            entry: storage::record::QueueEntry {
+                sequence: 1,
+                packet_id: None,
+                delivery: storage::record::DeliveryRecord {
+                    body: MessageId([7; 16]),
+                    qos: storage::record::Qos::AtLeastOnce,
+                    retain: false,
+                    subscription_ids: Vec::new(),
+                    dup: false,
+                },
+            },
+        }];
+        let streamed = shared.with_broker(|broker| shared.stream_changes(broker, &mut again));
+        assert_eq!(streamed[0].at, 1, "a new session is a new stream");
+    }
 
     #[tokio::test]
     async fn an_outbox_receives_what_is_addressed_to_it() {

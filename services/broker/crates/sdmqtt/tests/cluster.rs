@@ -99,6 +99,11 @@ const NODES: usize = 3;
 /// One running `sdmqtt`.
 struct Node {
     child: Child,
+    /// What it was started with, so a restart starts the same node.
+    config: PathBuf,
+    /// Where its store is. The point of a restart is that this
+    /// survives it.
+    store: PathBuf,
     admin: SocketAddr,
     /// Where its clients connect, which section 8.3's routing is about.
     mqtt: SocketAddr,
@@ -132,6 +137,27 @@ impl Node {
             self.admin,
             self.logged()
         ))
+    }
+
+    /// Stop this node and start it again against the same store.
+    ///
+    /// **The only way to ask whether something was really written
+    /// down.** Everything else a test can read — a gauge, a count, an
+    /// endpoint — is served from memory, so a copy that was never
+    /// stored looks exactly like one that was until the process goes
+    /// away and comes back.
+    ///
+    /// Killed rather than asked politely, for the reason every
+    /// durability test in this project kills: a clean shutdown flushes,
+    /// and a flush on the way out proves nothing about what was on the
+    /// disk a moment earlier.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.child = spawn(&self.config, &self.store, &self.log);
+        if let Err(why) = self.wait_until_listening() {
+            panic!("{} did not come back: {why}", self.label);
+        }
     }
 
     /// This node's own identity, as it reports it.
@@ -332,6 +358,41 @@ impl Drop for Node {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Start one broker against a configuration and a store.
+///
+/// Factored out because a restart is the same command: a node that
+/// came back differently would not be testing what a restart does.
+fn spawn(config: &Path, store: &Path, log: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_sdmqtt"))
+        .arg("serve")
+        .arg("--config")
+        .arg(config)
+        // On the command line as well as in the file, because the
+        // environment is emptied below and an empty
+        // `SDMQTT_STORAGE_DIRECTORY` takes a store *away*. A flag
+        // overrides both, which is what `tests/bridge.rs` does and
+        // for the same reason.
+        .arg("--store-directory")
+        .arg(store)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        // Emptied so that a configuration in the environment of
+        // whoever is running the tests cannot reach these brokers.
+        .env("SDMQTT_CONFIG", "")
+        .env("SDMQTT_STORAGE_DIRECTORY", "")
+        .stderr(Stdio::from(
+            // Appended rather than truncated, so a restart does not
+            // throw away the log of what happened before it.
+            File::options()
+                .create(true)
+                .append(true)
+                .open(log)
+                .expect("a log file can be opened"),
+        ))
+        .spawn()
+        .expect("the broker binary runs")
 }
 
 /// One node's row in another's listing.
@@ -842,34 +903,14 @@ impl Cluster {
                 &seeds,
             );
             let log = directory.join(format!("{label}.log"));
-            let child = Command::new(env!("CARGO_BIN_EXE_sdmqtt"))
-                .arg("serve")
-                .arg("--config")
-                .arg(&config)
-                // On the command line as well as in the file, because the
-                // environment is emptied below and an empty
-                // `SDMQTT_STORAGE_DIRECTORY` takes a store *away*. A flag
-                // overrides both, which is what `tests/bridge.rs` does and
-                // for the same reason.
-                .arg("--store-directory")
-                .arg(&store)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                // Emptied so that a configuration in the environment of
-                // whoever is running the tests cannot reach these brokers.
-                .env("SDMQTT_CONFIG", "")
-                .env("SDMQTT_STORAGE_DIRECTORY", "")
-                .stderr(Stdio::from(
-                    File::create(&log).expect("a log file can be created"),
-                ))
-                .spawn()
-                .expect("the broker binary runs");
             let mut node = Node {
-                child,
+                child: spawn(&config, &store, &log),
                 admin,
                 mqtt,
                 log,
                 label,
+                config,
+                store,
             };
             if let Err(why) = node.wait_until_listening() {
                 panic!("{why}");
@@ -1620,19 +1661,28 @@ async fn a_session_moves_to_the_node_its_client_returns_to() {
     );
 
     // ---- and the client comes back to gamma --------------
-    let (mut rover, present) = Client::resuming(nodes[2].mqtt, "rover");
+    //
+    // **Gamma by name, and without waiting for its copy to land.** A
+    // version of this test that waited for the copy and reconnected to
+    // whichever node held it passed every run — including runs with the
+    // fix below removed — because the wait moved the copy's write ahead
+    // of the connect and out of the race. The defect this guards is the
+    // race itself, so the client comes back the moment the publish has
+    // reached somebody, as a real client would.
+    let holder = 2;
+    let (mut rover, present) = Client::resuming(nodes[holder].mqtt, "rover");
     assert!(
         present,
-        "the session was found, which is section 8.4: gamma claimed it and drained \
-         it from alpha rather than making a new one"
+        "the session was found, which is section 8.4: the node it returned to claimed \
+         it and drained it from alpha rather than making a new one"
     );
     assert_eq!(
         rover.delivered_within(PATIENCE),
         Some((TOPIC.to_owned(), WHILE_AWAY.to_owned())),
-        "what was queued on alpha was delivered on gamma"
+        "what was queued on alpha was delivered where the client returned"
     );
 
-    // The session is on gamma and **not on alpha**, which is the half
+    // The session is on the holder and **not on alpha**, which is the half
     // of a handover that a drain alone does not prove: a node that kept
     // its copy would go on being forwarded messages for those filters
     // and would deliver them all again next time the client came back.
@@ -1640,27 +1690,39 @@ async fn a_session_moves_to_the_node_its_client_returns_to() {
         !nodes[0].sessions().contains("rover")
     });
     assert!(
-        nodes[2].sessions().contains("rover"),
-        "and gamma has it: {:?}",
-        nodes[2].sessions()
+        nodes[holder].sessions().contains("rover"),
+        "and the node it returned to has it: {:?}",
+        nodes[holder].sessions()
     );
 
     // ---- and the subscription moved with it --------------
     //
     // Published until one arrives, because a migration moves two
-    // registers independently — gamma gains a subscriber for the filter
+    // registers independently — the holder gains a subscriber for the filter
     // and alpha loses one — and a publication made between the two is
     // forwarded only to the node that no longer holds the session.
     // Numbered, so the delivery says which attempt reached it rather
     // than being anonymous.
     let mut attempt = 0;
+    // What beta said each publication reached, kept so a failure can
+    // say whether beta forwarded to nobody, to the wrong node, or to
+    // the right one that then delivered nothing. Three different
+    // defects, one assertion, and the number tells them apart.
+    let mut reached: Vec<u64> = Vec::new();
     let delivered = loop {
         attempt += 1;
+        // The number beta reported is in the message because it tells
+        // three defects apart: reaching nobody is a register that never
+        // arrived, reaching one node that delivers nothing is a stale
+        // route, and reaching the right node is a delivery fault. The
+        // first of those shipped once, as a refused batch on the
+        // claiming node — see the note above the reconnect.
         assert!(
             attempt <= 50,
-            "no publication made after the move ever reached the session"
+            "no publication made after the move ever reached the session; beta reported \
+             reaching, per attempt: {reached:?}"
         );
-        nodes[1].publish_reaching(TOPIC, &format!("after-the-move-{attempt}"));
+        reached.push(nodes[1].publish_reaching(TOPIC, &format!("after-the-move-{attempt}")));
         if let Some(delivery) = rover.delivered_within(Duration::from_millis(200)) {
             break delivery;
         }
@@ -1672,7 +1734,7 @@ async fn a_session_moves_to_the_node_its_client_returns_to() {
          the one from before it: {delivered:?}"
     );
 
-    // ---- and the migration is in gamma's exposition --------------
+    // ---- and the migration is in the holder's exposition ----------
     //
     // Section 8.4 asks for the shortfall to be "counted **and
     // surfaced**", and it was counted from this milestone's second
@@ -1692,9 +1754,9 @@ async fn a_session_moves_to_the_node_its_client_returns_to() {
         ("sdmqtt_migrated_messages_missing_total", 0),
     ] {
         assert_eq!(
-            nodes[2].counter(series),
+            nodes[holder].counter(series),
             Some(expected),
-            "{series} on gamma, which claimed the session and drained one message"
+            "{series} on the claiming node, which drained one message"
         );
     }
     assert_eq!(
@@ -1853,13 +1915,12 @@ async fn a_queued_message_is_copied_to_a_second_node() {
     const SESSIONS: usize = 6;
 
     let directory = tempfile::tempdir().expect("a temporary directory");
-    let cluster = Cluster::start(directory.path()).await;
+    let mut cluster = Cluster::start(directory.path()).await;
     cluster.settle();
-    let nodes = &cluster.nodes;
 
     // Nothing is replicated before anything is queued, and saying so
     // is what makes the count below a change rather than a reading.
-    for node in nodes.iter() {
+    for node in cluster.nodes.iter() {
         assert_eq!(
             node.counter("sdmqtt_replica_sessions"),
             Some(0),
@@ -1874,11 +1935,11 @@ async fn a_queued_message_is_copied_to_a_second_node() {
     for nth in 0..SESSIONS {
         let filter = format!("fleet/{nth}/+");
         let topic = format!("fleet/{nth}/telemetry");
-        let (mut rover, _) = Client::resuming(nodes[0].mqtt, &format!("rover-{nth}"));
+        let (mut rover, _) = Client::resuming(cluster.nodes[0].mqtt, &format!("rover-{nth}"));
         rover.subscribe(&filter);
         drop(rover);
         until("beta learns that somebody wants the filter", || {
-            nodes[1].publish_reaching(&topic, "copy-me") > 0
+            cluster.nodes[1].publish_reaching(&topic, "copy-me") > 0
         });
     }
 
@@ -1888,31 +1949,63 @@ async fn a_queued_message_is_copied_to_a_second_node() {
     // took the placement set whole without removing itself would do
     // the same for every session alpha is not ranked in the top two
     // for.
-    let copies_elsewhere = || {
-        nodes
+    let copies_elsewhere = |cluster: &Cluster| {
+        cluster
+            .nodes
             .iter()
             .skip(1)
             .filter_map(|node| node.counter("sdmqtt_replica_sessions"))
             .sum::<u64>()
     };
     until("every session has a copy on another node", || {
-        copies_elsewhere() == SESSIONS as u64
+        copies_elsewhere(&cluster) == SESSIONS as u64
     });
     keeps(
         "and exactly one copy each, not two",
         Duration::from_secs(3),
-        || copies_elsewhere() == SESSIONS as u64,
+        || copies_elsewhere(&cluster) == SESSIONS as u64,
+    );
+
+    // ---- and the copies are on a disk, not in a table --------------
+    //
+    // **The assertion the first version of this test did not make, and
+    // the defect it did not catch.** A follower wrote queue records for
+    // a session its store did not hold, which a store refuses; the
+    // copy existed only in the in-memory table, and
+    // `sdmqtt_replica_sessions` counts that table, so every gauge said
+    // the right thing while the disk held nothing.
+    //
+    // A restart is the only way to ask. Each follower is killed and
+    // started again against the same store, and what it reports
+    // afterwards is what it had actually written down.
+    let held_before: Vec<Option<u64>> = cluster
+        .nodes
+        .iter()
+        .map(|node| node.counter("sdmqtt_replica_sessions"))
+        .collect();
+    for at in 1..NODES {
+        cluster.nodes[at].restart();
+    }
+    for (at, expected) in held_before.iter().enumerate().skip(1) {
+        until("the node comes back holding what it had", || {
+            cluster.nodes[at].counter("sdmqtt_replica_sessions") == *expected
+        });
+    }
+    assert_eq!(
+        copies_elsewhere(&cluster),
+        SESSIONS as u64,
+        "every copy survived a restart, which means it was on a disk"
     );
 
     // The owner says it is streaming all of them, and says the copies
     // caught up. The lag is section 8.6's loss window: zero here is
     // the followers confirming they hold what the owner holds.
     assert_eq!(
-        nodes[0].counter("sdmqtt_replicated_sessions"),
+        cluster.nodes[0].counter("sdmqtt_replicated_sessions"),
         Some(SESSIONS as u64),
         "alpha owns every session and streams every one"
     );
     until("the copies catch up", || {
-        nodes[0].counter("sdmqtt_replication_lag") == Some(0)
+        cluster.nodes[0].counter("sdmqtt_replication_lag") == Some(0)
     });
 }

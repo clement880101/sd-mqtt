@@ -22,6 +22,7 @@ fn appended(sequence: u64) -> Change {
     Change::Appended {
         entry: Box::new(entry(sequence)),
         body: None,
+        session: None,
     }
 }
 

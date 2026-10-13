@@ -572,8 +572,21 @@ fn records_for_change(
     change: cluster::Change,
 ) -> Vec<storage::Record> {
     match change {
-        cluster::Change::Appended { entry, body } => {
+        cluster::Change::Appended {
+            entry,
+            body,
+            session: record,
+        } => {
             let mut records = Vec::new();
+            // **The session first, and that ordering is the whole
+            // point of it travelling.** A store refuses a queue record
+            // for a session it does not hold, so without this every
+            // record below is thrown away and the copy exists only in
+            // the follower's table. The owner sends it on the first
+            // append it streams for a session.
+            if let Some(record) = record {
+                records.push(storage::Record::SessionPut(*record));
+            }
             if let Some(body) = body {
                 records.push(storage::Record::BodyPut {
                     id: entry.delivery.body,

@@ -623,6 +623,24 @@ impl Broker {
         self.registry.subscriber_of(id)
     }
 
+    /// One session's durable record, by its stored key.
+    ///
+    /// For section 8.6: the first queue change a node streams for a
+    /// session carries the session itself, because a store refuses a
+    /// queue record for a session it does not hold. The record is the
+    /// same one the journal writes, from the same method, so a copy and
+    /// an original cannot differ in what a session *is*.
+    ///
+    /// `None` for a session this broker does not hold, which a caller
+    /// walking a journal can meet: the batch that removed it is in the
+    /// same journal as the changes that preceded it.
+    #[must_use]
+    pub fn session_record(&self, key: &storage::SessionKey) -> Option<storage::SessionRecord> {
+        let id = SessionId::new(&key.mountpoint, &key.client_id);
+        let subscriber = self.registry.subscriber_of(&id)?;
+        self.registry.get(subscriber).map(Session::record)
+    }
+
     /// One session, mutably.
     ///
     /// For the two settings a connection owns and a session does not:

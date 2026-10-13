@@ -51,7 +51,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use serde::{Deserialize, Serialize};
-use storage::record::{BodyRecord, QueueEntry};
+use storage::record::{BodyRecord, QueueEntry, SessionRecord};
 use storage::SessionKey;
 
 /// One change to a session's queue, on its way to a follower.
@@ -87,6 +87,23 @@ pub enum Change {
         entry: Box<QueueEntry>,
         /// The payload, when the follower may not hold it yet.
         body: Option<Box<BodyRecord>>,
+        /// The session itself, on the first append the owner streams.
+        ///
+        /// **Without it the follower cannot store anything.** A store
+        /// refuses a queue record for a session it does not hold —
+        /// `Rejection::NoSuchSession`, which `crates/storage`'s
+        /// contract tests pin — so a copy whose first record is a
+        /// queue entry is a copy the store throws away, leaving the
+        /// follower's table saying it holds something and the disk
+        /// holding nothing. That is exactly what this did before the
+        /// field existed, and nothing caught it: the gauge counts the
+        /// table.
+        ///
+        /// Sent once per session per owner rather than with every
+        /// append, because it is the same record every time and a
+        /// queue of ten thousand would otherwise carry ten thousand
+        /// copies of it.
+        session: Option<Box<SessionRecord>>,
     },
     /// The client acknowledged a delivery, so the entry is finished.
     Acknowledged {
@@ -311,6 +328,10 @@ pub fn change_for(record: &storage::Record) -> Option<(SessionKey, Change)> {
                 // as its own record, and whether this follower already
                 // holds it is the sender's question, not this one's.
                 body: None,
+                // The same: whether this is the first append to this
+                // session is what the owner's table knows and one
+                // record does not. See `Change::Appended::session`.
+                session: None,
             },
         )),
         storage::Record::QueuePopped { session, sequence } => Some((
@@ -458,6 +479,15 @@ impl Copies {
         locked(&self.inner)
             .owned
             .insert(session, Owner::resuming(at));
+    }
+
+    /// Whether this node has streamed anything for `session` yet.
+    ///
+    /// What decides whether an append carries the session record with
+    /// it; see `Change::Appended::session`.
+    #[must_use]
+    pub fn streams(&self, session: &SessionKey) -> bool {
+        locked(&self.inner).owned.contains_key(session)
     }
 
     /// Number the next change for a session this node owns.
