@@ -44,7 +44,8 @@
 //! caller's, for the reason the rest of this crate separates them:
 //! everything here has to be testable without a transport or a disk.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 use storage::record::{BodyRecord, QueueEntry};
@@ -316,6 +317,210 @@ pub fn change_for(record: &storage::Record) -> Option<(SessionKey, Change)> {
             },
         )),
         _ => None,
+    }
+}
+
+/// The lock, taken the way the rest of this crate takes one.
+///
+/// A poisoned lock is a panic that already happened somewhere else;
+/// what is behind this one is a position and a map, and refusing to
+/// read them because a different thread died would turn one fault into
+/// a node that stops replicating.
+fn locked<T>(what: &Mutex<T>) -> MutexGuard<'_, T> {
+    what.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Every session this node holds a copy of, and every stream it owns.
+///
+/// One table rather than two, because a session moves between the two
+/// halves — becoming a session's owner is exactly "stop following it
+/// and start streaming it" — and two tables would be two places for
+/// that to half-happen.
+///
+/// **Behind one lock, held only to read or move a number.** Nothing
+/// here touches a disk or a socket: what comes out is what the caller
+/// should write and send.
+#[derive(Debug, Default)]
+pub struct Copies {
+    inner: Mutex<Tables>,
+}
+
+/// The two halves, under [`Copies`]'s lock.
+#[derive(Debug, Default)]
+struct Tables {
+    /// Sessions this node follows, by the node that owns each.
+    followed: HashMap<SessionKey, ([u8; 16], Follower)>,
+    /// Sessions this node owns and streams, with how far it has sent.
+    owned: HashMap<SessionKey, Owner>,
+    /// What each follower last said about a session this node owns.
+    ///
+    /// Keyed by session and follower, because one session has several
+    /// followers and the lag is per link: a session whose nearest copy
+    /// is caught up and whose furthest is a thousand behind is not
+    /// described by either number alone.
+    marks: HashMap<(SessionKey, [u8; 16]), u64>,
+}
+
+impl Copies {
+    /// An empty table.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Begin following `session`, owned by `owner`, from `through`.
+    ///
+    /// Called from a restore for every copy the store held, and when a
+    /// stream for a session this node did not have arrives.
+    pub fn follow(&self, session: SessionKey, owner: [u8; 16], through: u64) {
+        locked(&self.inner)
+            .followed
+            .insert(session, (owner, Follower::resuming(through)));
+    }
+
+    /// Stop following `session`, whatever was known about it.
+    ///
+    /// Returns whether this node was following it, which is what the
+    /// caller writes a `ReplicaDropped` for.
+    pub fn unfollow(&self, session: &SessionKey) -> bool {
+        locked(&self.inner).followed.remove(session).is_some()
+    }
+
+    /// Whether this node holds a copy of `session`.
+    #[must_use]
+    pub fn follows(&self, session: &SessionKey) -> bool {
+        locked(&self.inner).followed.contains_key(session)
+    }
+
+    /// Offer an arriving change to the copy it is about.
+    ///
+    /// Returns the changes to apply, **in order**, with the position
+    /// each is at — the one offered when it was next, plus whatever it
+    /// released from behind a hole — and the mark to report. Empty when
+    /// the change was a duplicate or is waiting for a hole to fill, and
+    /// the mark is still returned in that case, because a follower that
+    /// said nothing while it waited would look to the owner exactly
+    /// like one that had stopped.
+    ///
+    /// `owner` is taken so that a stream arriving for a session this
+    /// node has never heard of begins following it, which is what makes
+    /// a new replica set start without a handshake of its own.
+    pub fn arrived(
+        &self,
+        session: &SessionKey,
+        owner: [u8; 16],
+        at: u64,
+        change: Change,
+    ) -> (Vec<(u64, Change)>, u64) {
+        let mut tables = locked(&self.inner);
+        let (_, follower) = tables
+            .followed
+            .entry(session.clone())
+            .or_insert_with(|| (owner, Follower::new()));
+        let mut taken = Vec::new();
+        if follower.offer(at, change.clone()) == Applied::Take {
+            taken.push((at, change));
+            taken.extend(follower.release());
+        }
+        (taken, follower.through())
+    }
+
+    /// How far a copy of `session` has got on this node.
+    ///
+    /// `None` when this node holds no copy of it, which is a different
+    /// answer from zero: zero is a copy that has applied nothing.
+    #[must_use]
+    pub fn through(&self, session: &SessionKey) -> Option<u64> {
+        locked(&self.inner)
+            .followed
+            .get(session)
+            .map(|(_, follower)| follower.through())
+    }
+
+    /// Resume a session's stream from the position the store held.
+    ///
+    /// Called once per owned session at startup, from
+    /// `storage::RestoredSession::stream_at`. **Not folded into
+    /// [`Copies::send`] as a fallback**, because a fallback would be
+    /// consulted on every change and would resume a session that had
+    /// been streaming all along — the position it carries is only ever
+    /// right the first time.
+    pub fn resume(&self, session: SessionKey, at: u64) {
+        locked(&self.inner)
+            .owned
+            .insert(session, Owner::resuming(at));
+    }
+
+    /// Number the next change for a session this node owns.
+    pub fn send(&self, session: &SessionKey, change: Change) -> Streamed {
+        let mut tables = locked(&self.inner);
+        let owner = tables.owned.entry(session.clone()).or_default();
+        owner.next(session, change)
+    }
+
+    /// Stop streaming `session`, because it has gone or moved.
+    pub fn stop(&self, session: &SessionKey) {
+        let mut tables = locked(&self.inner);
+        tables.owned.remove(session);
+        tables.marks.retain(|(held, _), _| held != session);
+    }
+
+    /// Record what a follower said about a session this node owns.
+    pub fn marked(&self, session: SessionKey, follower: [u8; 16], through: u64) {
+        locked(&self.inner)
+            .marks
+            .insert((session, follower), through);
+    }
+
+    /// The furthest any follower of `session` is behind this node.
+    ///
+    /// **The furthest rather than the nearest**, because the lag is a
+    /// statement about what a sudden loss would cost: section 8.6 makes
+    /// it the loss window in asynchronous mode, and a window measured
+    /// from the copy that happens to be closest describes a failure
+    /// that did not happen. A session with no follower that has ever
+    /// reported is `None` — no copy is not a long lag, it is a
+    /// different thing, and a zero there would read as perfect health.
+    #[must_use]
+    pub fn lag(&self, session: &SessionKey) -> Option<u64> {
+        let tables = locked(&self.inner);
+        let sent = tables.owned.get(session)?.at();
+        tables
+            .marks
+            .iter()
+            .filter(|((held, _), _)| held == session)
+            .map(|(_, through)| sent.saturating_sub(*through))
+            .max()
+    }
+
+    /// The furthest any follower of any owned session is behind.
+    ///
+    /// What the exposition carries: one number for the node, because a
+    /// gauge per session at the design's ceilings is a hundred thousand
+    /// series.
+    #[must_use]
+    pub fn worst_lag(&self) -> u64 {
+        let tables = locked(&self.inner);
+        tables
+            .marks
+            .iter()
+            .filter_map(|((session, _), through)| {
+                Some(tables.owned.get(session)?.at().saturating_sub(*through))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// How many sessions this node holds a copy of.
+    #[must_use]
+    pub fn following(&self) -> usize {
+        locked(&self.inner).followed.len()
+    }
+
+    /// How many sessions this node streams to somebody.
+    #[must_use]
+    pub fn streaming(&self) -> usize {
+        locked(&self.inner).owned.len()
     }
 }
 

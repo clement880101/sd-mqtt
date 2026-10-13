@@ -11,7 +11,7 @@ use broker_core::registry::SessionId;
 use broker_core::session::Action;
 use broker_core::subscriptions::{FilterEvent, SubscriberId};
 use cluster::migrate::{Claimed, Migrator};
-use cluster::{Gate, MetadataWrite, Operation, Replicated};
+use cluster::{Copies, Gate, MetadataWrite, Operation, Replicated, Streamed};
 use foldhash::fast::RandomState;
 use mqtt_codec::Packet;
 use parking_lot::{Mutex, RwLock};
@@ -70,6 +70,13 @@ pub struct Broadcastable {
     durable: Durable,
     /// What they were, in the order the broker produced them.
     writes: Vec<MetadataWrite>,
+    /// Section 8.6's queue changes, for the followers of each session.
+    ///
+    /// On the same queue as the registers rather than one of their own,
+    /// because they are the same promise: section 8.2's rule is that
+    /// nothing reaches a peer until the store has taken the batch, and
+    /// a second queue would be a second answer to when that is.
+    streamed: Vec<Streamed>,
 }
 
 impl Broadcastable {
@@ -85,12 +92,24 @@ impl Broadcastable {
     ///
     /// [`NotDurable`], unchanged from the writer, so that whoever logs it
     /// can say which of the two causes it was.
-    pub async fn landed(self) -> Result<Vec<MetadataWrite>, (NotDurable, Vec<MetadataWrite>)> {
+    pub async fn landed(self) -> Result<Landed, (NotDurable, Vec<MetadataWrite>)> {
         match self.durable.await {
-            Ok(()) => Ok(self.writes),
+            Ok(()) => Ok(Landed {
+                writes: self.writes,
+                streamed: self.streamed,
+            }),
             Err(why) => Err((why, self.writes)),
         }
     }
+}
+
+/// A batch the store took, and everything it owes a peer.
+#[derive(Debug)]
+pub struct Landed {
+    /// Section 8.2's registers, to broadcast.
+    pub writes: Vec<MetadataWrite>,
+    /// Section 8.6's queue changes, for the followers of each session.
+    pub streamed: Vec<Streamed>,
 }
 
 /// A journal already on its way to the store, and what is left to wait
@@ -305,6 +324,13 @@ pub struct Shared {
     /// the cost of the policy on a node that did not ask for it is one
     /// `OnceLock` read per operation.
     gate: OnceLock<Arc<Gate>>,
+    /// Section 8.6's copies: what this node follows, and how far it has
+    /// streamed each session it owns.
+    ///
+    /// Installed after construction, like the migrator and for the same
+    /// reason. `None` is a node that does not cluster, and then nothing
+    /// below costs more than one `OnceLock` read per batch.
+    copies: OnceLock<Arc<Copies>>,
 }
 
 impl Shared {
@@ -364,6 +390,7 @@ impl Shared {
             metrics: Arc::new(Metrics::new()),
             migrator: OnceLock::new(),
             gate: OnceLock::new(),
+            copies: OnceLock::new(),
         }
     }
 
@@ -390,6 +417,65 @@ impl Shared {
     /// may publish.
     pub fn install_gate(&self, gate: Arc<Gate>) {
         let _ = self.gate.set(gate);
+    }
+
+    /// Replicate queues through `copies`, section 8.6.
+    ///
+    /// Once, for [`Shared::install_migrator`]'s reason.
+    pub fn install_copies(&self, copies: Arc<Copies>) {
+        let _ = self.copies.set(copies);
+    }
+
+    /// What this node follows and streams, for whatever reports on it.
+    #[must_use]
+    pub fn copies(&self) -> Option<&Arc<Copies>> {
+        self.copies.get()
+    }
+
+    /// What the followers of these sessions need, numbered, and the
+    /// records saying how far this node has got. Section 8.6.
+    ///
+    /// **Derived from the journal rather than from the publish path.**
+    /// The broker already describes exactly what changed, in order, in
+    /// one batch; a second description built at the point of publishing
+    /// is a second account of the same event, free to disagree with the
+    /// one the store took. There is one, and both the store and the
+    /// follower get it.
+    ///
+    /// Appends a `StreamAt` per session touched, to the same batch, so
+    /// the position and the queue it counts cannot arrive separately.
+    /// Empty on a node that does not cluster.
+    fn stream_changes(&self, records: &mut Vec<Record>) -> Vec<Streamed> {
+        let Some(copies) = self.copies.get() else {
+            return Vec::new();
+        };
+        let mut streamed = Vec::new();
+        let mut reached: Vec<(SessionKey, u64)> = Vec::new();
+        for record in records.iter() {
+            let Some((session, change)) = cluster::change_for(record) else {
+                continue;
+            };
+            // **Not a session this node merely holds a copy of.** A
+            // follower writes the same queue records an owner does, so
+            // without this a copy would re-stream what it was sent,
+            // back at the node it came from and on to its own
+            // followers.
+            if copies.follows(&session) {
+                continue;
+            }
+            let sent = copies.send(&session, change);
+            match reached.iter_mut().find(|(key, _)| *key == session) {
+                Some((_, at)) => *at = sent.at,
+                None => reached.push((session, sent.at)),
+            }
+            streamed.push(sent);
+        }
+        records.extend(
+            reached
+                .into_iter()
+                .map(|(session, at)| Record::StreamAt { session, at }),
+        );
+        streamed
     }
 
     /// Whether `operation` may proceed, section 8.5.
@@ -564,6 +650,34 @@ impl Shared {
         given_up
     }
 
+    /// Write records that are the store's business and nobody else's.
+    ///
+    /// Section 8.6's copies. **Deliberately does not take the broker's
+    /// lock**, and that is the whole point of it: a copy of another
+    /// node's session is not a session this node serves. Put through
+    /// the broker it would enter that session in the registry, its
+    /// filters in this node's matching trie, and its messages would be
+    /// delivered to a client that is connected somewhere else.
+    ///
+    /// Nothing waits for the result. A copy is not a promise to a
+    /// publisher — the owner made that promise and kept it against its
+    /// own store — and a follower whose write was refused reports a
+    /// mark that stops moving, which is what the owner repairs from.
+    pub fn apply_aside(&self, records: Vec<Record>) {
+        let Some(writer) = &self.writer else {
+            return;
+        };
+        if writer.apply(records).is_err() {
+            self.metrics
+                .records_dropped(RecordDrop::WriterStopped)
+                .inc_by(1);
+            tracing::error!(
+                "the storage writer has stopped, so a copy of another node's queue was \
+                 not written down; its mark will stop moving"
+            );
+        }
+    }
+
     /// What this process counts.
     pub fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
@@ -599,7 +713,12 @@ impl Shared {
     /// does not cluster, and the write is still stored.
     pub fn broadcast_when_durable(&self, durable: Durable, writes: Vec<MetadataWrite>) {
         if let Some(broadcasts) = &self.broadcasts {
-            let _ = broadcasts.send(Broadcastable { durable, writes });
+            let _ = broadcasts.send(Broadcastable {
+                durable,
+                writes,
+                // A rule is not a queue, so this path streams nothing.
+                streamed: Vec::new(),
+            });
         }
     }
 
@@ -881,6 +1000,12 @@ impl Shared {
             self.take_retained(&mut records, &mut originated);
         }
 
+        // Section 8.6, after everything that writes a record and before
+        // anything that waits on the batch: the changes the followers
+        // of these sessions need, and the positions that record how far
+        // this node has got, which join the same batch.
+        let streamed = self.stream_changes(&mut records);
+
         let Some(writer) = &self.writer else {
             // No store: nothing is written down and nothing can be
             // promised to a device. Milestone one's mode, still
@@ -888,7 +1013,7 @@ impl Shared {
             // to grow.
             return Committed::Nothing;
         };
-        if !originated.is_empty() {
+        if !originated.is_empty() || !streamed.is_empty() {
             // Section 8.2's two-phase write. The batch is waited on twice:
             // once by whoever is about to broadcast, and once by this
             // caller if it promised a publisher anything. One batch and
@@ -908,6 +1033,7 @@ impl Shared {
                     let _ = broadcasts.send(Broadcastable {
                         durable: theirs,
                         writes: originated,
+                        streamed,
                     });
                     if promised {
                         Committed::Waiting(mine)

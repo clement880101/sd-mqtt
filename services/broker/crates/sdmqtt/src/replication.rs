@@ -67,9 +67,9 @@ use cluster::mesh::{Deliver, Mesh, Message};
 use cluster::metadata::{MetadataKey, MetadataValue};
 use cluster::migrate::{Drained, Migrations};
 use cluster::MemberState;
-use cluster::{MetadataWrite, NodeId, Replicator};
+use cluster::{MetadataWrite, NodeId, Placement, Replicator, Streamed};
 use rules::live::Registry;
-use sdmqtt_server::shared::{Broadcastable, Shared};
+use sdmqtt_server::shared::{Broadcastable, Landed, Shared};
 use storage::Writer;
 use tokio::sync::mpsc;
 
@@ -142,6 +142,45 @@ impl Replication {
     }
 }
 
+impl Replication {
+    /// Apply one change to a queue this node holds a copy of, and
+    /// say how far the copy has got.
+    fn copied(&self, from: NodeId, change: cluster::Streamed) -> Vec<Message> {
+        let Some(copies) = self.shared.copies() else {
+            // A node that does not cluster cannot be anybody's
+            // follower, and a change arriving at one is a peer that
+            // has not noticed yet. Nothing to apply and nothing to
+            // say.
+            return Vec::new();
+        };
+        let session = change.session.clone();
+        let (taken, through) = copies.arrived(&session, from.to_bytes(), change.at, change.change);
+
+        // **Written aside, not through the broker.** A copy is not a
+        // session this node serves: putting it through the broker
+        // would enter its filters in this node's trie and deliver its
+        // messages to nobody. See `Shared::apply_aside`.
+        let mut records = Vec::new();
+        for (_, change) in taken {
+            records.extend(records_for_change(&session, change));
+        }
+        if !records.is_empty() {
+            records.push(storage::Record::ReplicaFollows {
+                session: session.clone(),
+                owner: from.to_bytes(),
+                through,
+            });
+            self.shared.apply_aside(records);
+        }
+
+        // **Answered even when nothing was applied.** A follower that
+        // said nothing while it waited for a hole to fill would look
+        // to the owner exactly like one that had stopped, and the
+        // repair the owner makes is driven by this number.
+        vec![Message::Marked { session, through }]
+    }
+}
+
 impl Deliver for Replication {
     fn delivered(&self, from: NodeId, message: Message) -> Vec<Message> {
         let frame = match message {
@@ -177,6 +216,21 @@ impl Deliver for Replication {
             // waiting for it, or counted as late and dropped.
             Message::Drained(chunk) => {
                 self.migrations.arrived(chunk);
+                return Vec::new();
+            }
+            // Section 8.6: one change to a queue this node holds a
+            // copy of. Applied in order, and answered with how far
+            // this copy has got.
+            Message::Replicated(change) => {
+                return self.copied(from, change);
+            }
+            // A follower saying how far it has applied one session.
+            // Read by the lag, and by failover when it chooses between
+            // copies. Nothing is owed back.
+            Message::Marked { session, through } => {
+                if let Some(copies) = self.shared.copies() {
+                    copies.marked(session, from.to_bytes(), through);
+                }
                 return Vec::new();
             }
         };
@@ -455,10 +509,18 @@ pub async fn broadcasting(
     mut waiting: mpsc::UnboundedReceiver<Broadcastable>,
     replicator: Arc<Replicator>,
     mesh: Option<Arc<Mesh>>,
+    placement: Option<Arc<Placement>>,
 ) {
     while let Some(batch) = waiting.recv().await {
         match batch.landed().await {
-            Ok(writes) => {
+            Ok(landed) => {
+                let Landed { writes, streamed } = landed;
+                // Section 8.6, after the same wait: a follower is not
+                // told about a change the store has not taken, for the
+                // reason a peer is not told about a register.
+                if let (Some(mesh), Some(placement)) = (&mesh, &placement) {
+                    stream_to_followers(mesh, placement, streamed);
+                }
                 for write in &writes {
                     let Some(frame) = replicator.published(write) else {
                         // Already resolved, which is a write published
@@ -492,6 +554,89 @@ pub async fn broadcasting(
                 );
                 for write in &writes {
                     replicator.refused(write);
+                }
+            }
+        }
+    }
+}
+
+/// What one applied change leaves in the store.
+///
+/// The same records the owner wrote, which is the point: a copy that
+/// stored something else would not be a copy. The body rides with the
+/// append when the owner judged the follower might not hold it; a
+/// follower that is sent one it already has stores it again, and the
+/// store's reference count is what makes that cost nothing.
+fn records_for_change(
+    session: &storage::SessionKey,
+    change: cluster::Change,
+) -> Vec<storage::Record> {
+    match change {
+        cluster::Change::Appended { entry, body } => {
+            let mut records = Vec::new();
+            if let Some(body) = body {
+                records.push(storage::Record::BodyPut {
+                    id: entry.delivery.body,
+                    body: *body,
+                });
+            }
+            records.push(storage::Record::QueuePushed {
+                session: session.clone(),
+                entry: *entry,
+            });
+            records
+        }
+        // An acknowledgement and a removal both take the entry out of
+        // the queue; what differs is why, and the store has one record
+        // for both because to a queue they are the same event.
+        cluster::Change::Acknowledged { sequence } | cluster::Change::Removed { sequence } => {
+            vec![storage::Record::QueuePopped {
+                session: session.clone(),
+                sequence,
+            }]
+        }
+    }
+}
+
+/// Send each change to the nodes that hold a copy of its session.
+///
+/// **One frame per follower, not a broadcast.** Section 8.6 puts two
+/// copies of a session on two nodes; telling fifty nodes about a queue
+/// forty-eight of them hold nothing of would cost the cluster its own
+/// capacity, and it is the same economy section 8.3 makes for a
+/// publication.
+///
+/// A drop is counted and logged rather than retried here: the follower
+/// reports a mark that stops moving, and repairing from that is the
+/// owner's business and not this task's. See `cluster::replica`.
+fn stream_to_followers(mesh: &Arc<Mesh>, placement: &Arc<Placement>, streamed: Vec<Streamed>) {
+    if streamed.is_empty() {
+        return;
+    }
+    let members = placement.members();
+    for change in streamed {
+        // **This node is the owner, whatever rendezvous thinks.**
+        // Section 8.4 puts a session where its client connected, and
+        // placement is advice; the two agree most of the time and need
+        // not. So this node is skipped wherever it appears and the
+        // first `factor - 1` of the rest are the followers, which keeps
+        // the number of copies at `factor` either way. Taking the
+        // placement set whole would give `factor + 1` copies for every
+        // session whose client happened to connect somewhere else.
+        let followers = cluster::place(&change.session, &members, placement.factor())
+            .into_iter()
+            .filter(|node| *node != placement.me())
+            .take(placement.factor().copies().saturating_sub(1));
+        for node in followers {
+            match mesh.send(node, &Message::Replicated(change.clone())) {
+                Some(Ok(cluster::link::Sent::Queued)) => {}
+                _ => {
+                    tracing::warn!(
+                        peer = %node,
+                        client = %change.session.client_id,
+                        "a queue change was not sent to a node holding a copy of this \
+                         session; its mark will stop moving until the copy is repaired"
+                    );
                 }
             }
         }

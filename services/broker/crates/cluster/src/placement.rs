@@ -54,10 +54,14 @@
 //! distribution test is about, and what the mutation that drops the
 //! node digest breaks.
 
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
 use aws_lc_rs::digest;
 use storage::SessionKey;
 use thiserror::Error;
 
+use crate::membership::MemberState;
+use crate::mesh::Mesh;
 use crate::NodeId;
 
 /// How many nodes hold a session's queue when nothing says otherwise.
@@ -240,6 +244,88 @@ pub fn place(session: &SessionKey, members: &[Weighted], factor: Factor) -> Vec<
         .take(factor.copies())
         .map(|(_, node)| node)
         .collect()
+}
+
+/// This node, its replication factor, and the members to weigh.
+///
+/// What a caller holds to answer "who should hold this session". The
+/// mesh is read for its live members; see [`Placement::members`] for
+/// why the digests behind them are not recomputed every time.
+#[derive(Debug)]
+pub struct Placement {
+    me: NodeId,
+    factor: Factor,
+    mesh: Arc<Mesh>,
+    /// The weighed members, and the identities they were built from.
+    ///
+    /// **A cache, because the digests are the expensive part.** The
+    /// module documentation promises that a node's digest is computed
+    /// once when the member set changes rather than per session, and
+    /// this is where that is kept: a batch compares at most fifty
+    /// identities instead of hashing fifty of them.
+    weighed: Mutex<(Vec<NodeId>, Vec<Weighted>)>,
+}
+
+/// The lock, taken the way the rest of this crate takes one.
+fn locked<T>(what: &Mutex<T>) -> MutexGuard<'_, T> {
+    what.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Placement {
+    /// Place sessions for `me` across `mesh`, keeping `factor` copies.
+    #[must_use]
+    pub fn new(me: NodeId, factor: Factor, mesh: Arc<Mesh>) -> Arc<Self> {
+        Arc::new(Self {
+            me,
+            factor,
+            mesh,
+            weighed: Mutex::new((Vec::new(), Vec::new())),
+        })
+    }
+
+    /// Which node this is.
+    #[must_use]
+    pub fn me(&self) -> NodeId {
+        self.me
+    }
+
+    /// How many copies of each session.
+    #[must_use]
+    pub fn factor(&self) -> Factor {
+        self.factor
+    }
+
+    /// The live members, weighed, **this node included**.
+    ///
+    /// Itself included because a session has to be placeable on the
+    /// node serving it — rendezvous puts the owner first, and a set
+    /// computed without this node would make every session's owner
+    /// somebody else.
+    ///
+    /// A peer that is suspect or down is left out, which is section
+    /// 8.6's "live members": a copy sent to a node that is not
+    /// answering is a copy nobody holds. That it is this node's own
+    /// judgement, and that another node may judge differently, is why
+    /// placement decides nothing — see the module documentation.
+    #[must_use]
+    pub fn members(&self) -> Vec<Weighted> {
+        let mut live: Vec<NodeId> = self
+            .mesh
+            .members()
+            .into_iter()
+            .filter(|member| member.state == MemberState::Alive)
+            .map(|member| member.identity.id())
+            .collect();
+        live.push(self.me);
+        live.sort_unstable_by_key(|node| node.to_bytes());
+
+        let mut weighed = locked(&self.weighed);
+        if weighed.0 != live {
+            weighed.1 = live.iter().copied().map(Weighted::new).collect();
+            weighed.0 = live;
+        }
+        weighed.1.clone()
+    }
 }
 
 #[cfg(test)]

@@ -1817,3 +1817,102 @@ async fn two_nodes_that_accepted_one_client_resolve_on_heal() {
         "gamma kept the session it won"
     );
 }
+
+/// A session's queue exists on a second node, section 8.6.
+///
+/// The whole of this milestone's first half in one test, against three
+/// real processes: a message queued for an offline session on the node
+/// that owns it is streamed to the node rendezvous put behind it, and
+/// that node holds a copy it does not serve.
+///
+/// # Which node holds each copy is not this test's to predict
+///
+/// Placement is a hash of the session identity against the live
+/// members, and the members are three UUIDs minted at startup. So this
+/// asserts what the design promises — **`replication_factor` copies in
+/// the cluster, one of them not on the owner** — rather than naming a
+/// node, which would be asserting the hash rather than the behaviour.
+///
+/// # Several sessions, and that is not padding
+///
+/// Every one of them is owned by alpha, because that is where their
+/// clients connected, but rendezvous ranks the three nodes per session
+/// and alpha is **not** in the top two for all of them. A build that
+/// streamed the placement set whole, without removing itself, puts two
+/// copies on other nodes for exactly the sessions where alpha is
+/// ranked third — and one copy, correctly, for all the rest. With one
+/// session that mutation survives on a coin flip; it was written with
+/// one session first, and it did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_message_is_copied_to_a_second_node() {
+    /// How many sessions to leave queued.
+    ///
+    /// Enough that rendezvous ranks alpha outside the top two for some
+    /// of them; see the note above. Six, so the test stays seconds
+    /// rather than minutes.
+    const SESSIONS: usize = 6;
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cluster = Cluster::start(directory.path()).await;
+    cluster.settle();
+    let nodes = &cluster.nodes;
+
+    // Nothing is replicated before anything is queued, and saying so
+    // is what makes the count below a change rather than a reading.
+    for node in nodes.iter() {
+        assert_eq!(
+            node.counter("sdmqtt_replica_sessions"),
+            Some(0),
+            "{} should hold no copies before anything is queued",
+            node.label
+        );
+    }
+
+    // Sessions on alpha with queues and nobody connected to drain
+    // them: the messages stay in the queues, which is what gets
+    // copied.
+    for nth in 0..SESSIONS {
+        let filter = format!("fleet/{nth}/+");
+        let topic = format!("fleet/{nth}/telemetry");
+        let (mut rover, _) = Client::resuming(nodes[0].mqtt, &format!("rover-{nth}"));
+        rover.subscribe(&filter);
+        drop(rover);
+        until("beta learns that somebody wants the filter", || {
+            nodes[1].publish_reaching(&topic, "copy-me") > 0
+        });
+    }
+
+    // **One copy each, and no more.** The default factor is two: the
+    // owner and one follower. A build that streamed to every member
+    // would put two copies of each session elsewhere, and one that
+    // took the placement set whole without removing itself would do
+    // the same for every session alpha is not ranked in the top two
+    // for.
+    let copies_elsewhere = || {
+        nodes
+            .iter()
+            .skip(1)
+            .filter_map(|node| node.counter("sdmqtt_replica_sessions"))
+            .sum::<u64>()
+    };
+    until("every session has a copy on another node", || {
+        copies_elsewhere() == SESSIONS as u64
+    });
+    keeps(
+        "and exactly one copy each, not two",
+        Duration::from_secs(3),
+        || copies_elsewhere() == SESSIONS as u64,
+    );
+
+    // The owner says it is streaming all of them, and says the copies
+    // caught up. The lag is section 8.6's loss window: zero here is
+    // the followers confirming they hold what the owner holds.
+    assert_eq!(
+        nodes[0].counter("sdmqtt_replicated_sessions"),
+        Some(SESSIONS as u64),
+        "alpha owns every session and streams every one"
+    );
+    until("the copies catch up", || {
+        nodes[0].counter("sdmqtt_replication_lag") == Some(0)
+    });
+}

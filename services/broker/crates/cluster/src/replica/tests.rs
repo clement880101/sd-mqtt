@@ -231,3 +231,124 @@ fn a_queue_record_becomes_a_change_and_everything_else_becomes_nothing() {
     }))
     .is_none());
 }
+
+// -----------------------------------------------------------
+// The table both halves live in.
+// -----------------------------------------------------------
+
+fn key(client: &str) -> SessionKey {
+    SessionKey::new("", client)
+}
+
+const ALPHA: [u8; 16] = [0xaa; 16];
+const BETA: [u8; 16] = [0xbb; 16];
+
+#[test]
+fn a_stream_for_a_session_this_node_has_never_heard_of_starts_following_it() {
+    // What makes a new replica set begin without a handshake of its
+    // own: the first change that arrives is the introduction.
+    let copies = Copies::new();
+    let session = key("rover");
+    assert!(!copies.follows(&session));
+
+    let (taken, through) = copies.arrived(&session, ALPHA, 1, appended(1));
+    assert_eq!(taken.len(), 1);
+    assert_eq!(through, 1);
+    assert!(copies.follows(&session));
+    assert_eq!(copies.through(&session), Some(1));
+}
+
+#[test]
+fn a_change_behind_a_hole_takes_nothing_and_still_reports_the_mark() {
+    // **Still reports.** A follower that said nothing while it waited
+    // would look to the owner exactly like one that had stopped, and
+    // the owner's repair is driven by the mark.
+    let copies = Copies::new();
+    let session = key("rover");
+    copies.arrived(&session, ALPHA, 1, appended(1));
+
+    let (taken, through) = copies.arrived(&session, ALPHA, 3, appended(3));
+    assert!(taken.is_empty(), "three is not next");
+    assert_eq!(
+        through, 1,
+        "and the mark says so rather than saying nothing"
+    );
+
+    // Two arrives and both come out, in order.
+    let (taken, through) = copies.arrived(&session, ALPHA, 2, appended(2));
+    assert_eq!(
+        taken.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
+        vec![2, 3],
+        "the one offered, then what was waiting behind it"
+    );
+    assert_eq!(through, 3);
+}
+
+#[test]
+fn a_session_this_node_holds_no_copy_of_is_not_zero() {
+    // Zero is a copy that has applied nothing. No copy is a different
+    // answer, and a caller choosing between replicas has to be able to
+    // tell them apart.
+    let copies = Copies::new();
+    assert_eq!(copies.through(&key("nobody")), None);
+    copies.arrived(&key("rover"), ALPHA, 1, appended(1));
+    copies.unfollow(&key("rover"));
+    assert_eq!(copies.through(&key("rover")), None);
+    assert!(!copies.unfollow(&key("rover")), "and twice is not an error");
+}
+
+#[test]
+fn the_lag_is_measured_from_the_follower_that_is_furthest_behind() {
+    // **The furthest, not the nearest.** Section 8.6 makes the lag the
+    // loss window: what a sudden loss of this node would cost. Measured
+    // from the closest copy it would describe a failure that did not
+    // happen.
+    let copies = Copies::new();
+    let session = key("rover");
+    for at in 1..=10 {
+        copies.send(&session, appended(at));
+    }
+    copies.marked(session.clone(), ALPHA, 9);
+    copies.marked(session.clone(), BETA, 4);
+    assert_eq!(copies.lag(&session), Some(6), "ten sent, four applied");
+    assert_eq!(copies.worst_lag(), 6);
+
+    // A session nobody has reported on has no lag rather than a lag of
+    // zero: no copy is not perfect health.
+    assert_eq!(copies.lag(&key("alone")), None);
+}
+
+#[test]
+fn an_owned_session_resumes_from_the_stored_position_only_once() {
+    // The store's number seeds the stream at startup; after that the
+    // table is what counts. A resume consulted on every change would
+    // put a long-running session back where it began.
+    let copies = Copies::new();
+    let session = key("rover");
+    copies.resume(session.clone(), 40);
+    assert_eq!(copies.send(&session, appended(1)).at, 41);
+    assert_eq!(
+        copies.send(&session, appended(2)).at,
+        42,
+        "the second change carries on rather than resuming again"
+    );
+
+    // And a session nobody resumed starts at one.
+    assert_eq!(copies.send(&key("fresh"), appended(1)).at, 1);
+}
+
+#[test]
+fn a_session_that_stops_being_streamed_takes_its_marks_with_it() {
+    // Or a session recreated under the same key would inherit a lag
+    // measured against a stream that no longer exists.
+    let copies = Copies::new();
+    let session = key("rover");
+    copies.send(&session, appended(1));
+    copies.marked(session.clone(), ALPHA, 1);
+    assert_eq!(copies.streaming(), 1);
+
+    copies.stop(&session);
+    assert_eq!(copies.streaming(), 0);
+    assert_eq!(copies.lag(&session), None);
+    assert_eq!(copies.worst_lag(), 0);
+}

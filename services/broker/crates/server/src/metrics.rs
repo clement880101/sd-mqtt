@@ -792,6 +792,9 @@ pub trait ClusterMetrics: std::fmt::Debug + Send + Sync + 'static {
     fn bytes_received(&self) -> u64;
     /// Bytes never written, because a peer's queue was full.
     fn bytes_dropped(&self) -> u64;
+    /// Section 8.6's replication numbers, in the order
+    /// [`REPLICATION_NUMBERS`] names them.
+    fn replication(&self) -> [u64; REPLICATION_NUMBERS.len()];
     /// Section 8.4's migration numbers, in the order
     /// [`MIGRATION_NUMBERS`] names them.
     ///
@@ -801,6 +804,36 @@ pub trait ClusterMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// answer one of them from the wrong field.
     fn migrations(&self) -> [u64; MIGRATION_NUMBERS.len()];
 }
+
+/// Section 8.6's replication numbers: the metric name, its help text,
+/// and the order [`ClusterMetrics::replication`] returns them in.
+///
+/// **`replication_lag` is the one section 8.6 names.** In asynchronous
+/// mode the loss window *is* the lag — what the owner has acknowledged
+/// and no copy holds is what losing the owner would lose — so the
+/// design says it is exposed and alerted on, and milestone 6's exit
+/// criterion reads this series to bound what a kill may lose.
+///
+/// It is the **furthest** any follower is behind, across every session
+/// this node owns, because the window is about what a failure would
+/// cost: measured from the copy that happens to be closest it would
+/// describe a failure that did not happen. One number rather than one
+/// per session, because a gauge per session at the design's ceilings is
+/// a hundred thousand series.
+pub const REPLICATION_NUMBERS: [(&str, &str); 3] = [
+    (
+        "replication_lag",
+        "Changes the furthest-behind copy of any session this node owns has not applied",
+    ),
+    (
+        "replicated_sessions",
+        "Sessions this node owns and streams to at least one other node",
+    ),
+    (
+        "replica_sessions",
+        "Sessions this node holds a copy of for another node",
+    ),
+];
 
 /// Section 8.4's migration numbers: the metric name, its help text,
 /// and the order [`ClusterMetrics::migrations`] returns them in.
@@ -1383,6 +1416,17 @@ impl Collector for ClusterLive {
             let descriptor = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
             counter.encode(descriptor)?;
         }
+
+        // Section 8.6's, which are **gauges and not counters**: a lag
+        // and a count of sessions are levels that go down as well as
+        // up, and rendering a level as a counter tells every scraper
+        // it may take differences of it.
+        let replication = self.0.replication();
+        for ((name, help), value) in REPLICATION_NUMBERS.iter().zip(replication) {
+            let gauge = ConstGauge::new(i64::try_from(value).unwrap_or(i64::MAX));
+            let descriptor = encoder.encode_descriptor(name, help, None, gauge.metric_type())?;
+            gauge.encode(descriptor)?;
+        }
         Ok(())
     }
 }
@@ -1915,6 +1959,9 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
         fn migrations(&self) -> [u64; MIGRATION_NUMBERS.len()] {
             [41, 42, 43, 44, 45, 46, 47]
         }
+        fn replication(&self) -> [u64; REPLICATION_NUMBERS.len()] {
+            [51, 52, 53]
+        }
     }
 
     #[test]
@@ -1967,6 +2014,30 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
             rendered.contains("sdmqtt_sessions_migrated_incomplete_total 43\n"),
             "section 8.4's shortfall is this series:\n{rendered}"
         );
+
+        // Section 8.6's three, which are **gauges**: a lag and a count
+        // of sessions go down as well as up, and a counter tells a
+        // scraper it may take differences.
+        for ((name, help), value) in REPLICATION_NUMBERS.iter().zip([51, 52, 53]) {
+            let family = format!("sdmqtt_{name}");
+            let shown = block(&rendered, &family);
+            assert!(
+                shown.contains(&format!("# TYPE {family} gauge\n")),
+                "{family} is a level, not a counter:\n{shown}"
+            );
+            assert!(
+                shown.contains(&format!("{family} {value}\n")),
+                "{family} should be {value} in:\n{shown}"
+            );
+            assert!(
+                shown.contains(help),
+                "{family} carries its own help:\n{shown}"
+            );
+        }
+        assert!(
+            rendered.contains("sdmqtt_replication_lag 51\n"),
+            "section 8.6's loss window is this series:\n{rendered}"
+        );
     }
 
     #[test]
@@ -1977,7 +2048,7 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
         // statements, and a scraper cannot tell them apart from a zero.
         let rendered = Metrics::new().render();
         assert!(!rendered.contains("sdmqtt_cluster_members"), "{rendered}");
-        for (name, _) in MIGRATION_NUMBERS {
+        for (name, _) in MIGRATION_NUMBERS.iter().chain(REPLICATION_NUMBERS.iter()) {
             assert!(
                 !rendered.contains(&format!("sdmqtt_{name}")),
                 "{name} should be absent on a node that does not cluster:\n{rendered}"

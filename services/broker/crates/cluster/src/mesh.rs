@@ -165,6 +165,32 @@ pub enum Message {
     /// claim, so that a drain which stops partway has still moved what
     /// it managed to; the last one says so.
     Drained(crate::migrate::Drained),
+    /// Section 8.6: one change to a session's queue, for a node that
+    /// holds a copy of it.
+    ///
+    /// Sent to the followers [`crate::placement`] names and to no other
+    /// peer, which is [`Self::Forward`]'s economy for the same reason:
+    /// a node that holds no copy of this session has nothing to do with
+    /// its queue.
+    ///
+    /// **Answered with [`Self::Marked`]**, which makes this unlike a
+    /// forward. The answer is not an acknowledgement that the change is
+    /// safe — section 8.6's synchronous mode needs that and reads it
+    /// from the mark — it is the follower saying how far it has got,
+    /// which is also what the lag is measured from.
+    Replicated(crate::replica::Streamed),
+    /// How far a follower has applied one session's stream.
+    ///
+    /// The highest **contiguous** position, which is the whole of what
+    /// makes it worth sending: a mark that had skipped a hole would
+    /// make this node prefer a copy with a message missing from the
+    /// middle. See `crate::replica`.
+    Marked {
+        /// Whose queue.
+        session: storage::SessionKey,
+        /// The highest contiguous position applied.
+        through: u64,
+    },
 }
 
 /// What something on top of the mesh does with a peer's message.

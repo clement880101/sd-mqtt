@@ -74,6 +74,28 @@ on purpose.
   ownership stays with the epoch-stamped register from milestone 5, so
   that disagreement costs nothing.
 
+- **Queues are replicated.** An owner streams every change to a
+  session's queue — an append, an acknowledgement, a removal — to the
+  nodes rendezvous puts behind it, and those nodes hold a copy they do
+  not serve. One frame per follower rather than a broadcast, which is
+  the economy section 8.3 already makes for a publication: telling
+  fifty nodes about a queue forty-eight of them hold nothing of would
+  cost the cluster its own capacity.
+
+  Nothing reaches a follower until the store has taken the batch,
+  which is section 8.2's rule for registers applied to the same
+  queue — one description of what happened, and both the store and
+  the copy get it.
+
+- **Three gauges for it**: `sdmqtt_replication_lag`,
+  `sdmqtt_replicated_sessions` and `sdmqtt_replica_sessions`. The
+  first is section 8.6's loss window — in asynchronous mode what a
+  sudden loss of a node would cost **is** the lag — and it is measured
+  from the copy that is furthest behind, because a window measured
+  from the closest one describes a failure that did not happen. Absent
+  rather than zero on a node that does not cluster, like every other
+  cluster series.
+
 - **A follower's half of the stream**, and what it keeps across a
   restart. Changes to a session's queue carry a stream position, and a
   follower applies them in order: a position after a hole is held
