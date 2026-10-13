@@ -418,3 +418,30 @@ synchronous test published on a non-owner and lost three of eight
 acknowledged messages. The tests publish on the owner, and the spec
 says why; closing it is an acknowledgement across the mesh, a design
 of its own.
+
+---
+
+## Closing walk (convention 8)
+
+Section 8.6 read sentence by sentence against the code, at the close:
+
+- **Placement, the hash, the mixer, the golden vectors**: as written.
+- **"Repaired when members return"**: a member that comes back is named
+  by rendezvous again and holds no mark for the sessions it is named
+  for, so the sweep sends it their queues — the same path as a set
+  short past the grace, and the `forgetting` test's restarted node is
+  re-admitted by it.
+- **"Message bodies travel once"**: once per append, in the batch that
+  first names the body. A message queued to two sessions whose copies
+  are on the same follower travels to it twice. Noted, not fixed: the
+  saving is a per-follower dedup in `stream_to_followers`, and it is a
+  cost, not a correctness matter.
+- **"Configurable globally and overridable per listener"**: the
+  override was never built. **Deferred to milestone 7**, where a
+  listener gains its other per-listener settings, and the spec now says
+  so rather than promising it.
+- **Both modes, the unconfirmed count, the strict flag, failover
+  backing the drain, re-replication with grace and override, progress
+  in the UI, the cost in the budgets**: as written, with the
+  forwarded-publish gap recorded under the modes.
+
