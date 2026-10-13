@@ -352,3 +352,131 @@ fn a_session_that_stops_being_streamed_takes_its_marks_with_it() {
     assert_eq!(copies.lag(&session), None);
     assert_eq!(copies.worst_lag(), 0);
 }
+
+// -----------------------------------------------------------
+// Section 8.6's synchronous mode: waiting for a copy.
+// -----------------------------------------------------------
+
+/// Patience a test does not spend when it is not meant to.
+const BRIEF: Duration = Duration::from_millis(100);
+
+#[tokio::test]
+async fn a_position_a_follower_already_holds_needs_no_wait() {
+    // The ordinary case under any load: the mark arrives while the
+    // store is still being waited on, so the publisher waits for
+    // nothing it was not already waiting for.
+    let copies = Copies::new();
+    let session = key("rover");
+    copies.send(&session, appended(1));
+    copies.marked(session.clone(), ALPHA, 1);
+
+    assert!(matches!(
+        copies.confirming(&session, 1),
+        Confirming::Already
+    ));
+    assert_eq!(
+        copies.confirming(&session, 1).within(BRIEF).await,
+        Confirmed::Yes
+    );
+}
+
+#[tokio::test]
+async fn a_session_with_no_follower_is_answered_rather_than_waited_on() {
+    // **A cluster of one, a factor of one, every follower down.**
+    // Section 8.6 acknowledges anyway and counts it, so this has to be
+    // an answer: a publisher left waiting for a confirmation that
+    // cannot come is the outage the acknowledgement avoids.
+    let copies = Copies::new();
+    let session = key("alone");
+    copies.send(&session, appended(1));
+
+    assert!(matches!(copies.confirming(&session, 1), Confirming::Nobody));
+    let started = std::time::Instant::now();
+    assert_eq!(
+        copies
+            .confirming(&session, 1)
+            .within(Duration::from_secs(30))
+            .await,
+        Confirmed::No
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "it answered rather than waiting: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_mark_that_reaches_the_position_releases_the_publisher() {
+    let copies = std::sync::Arc::new(Copies::new());
+    let session = key("rover");
+    for at in 1..=3 {
+        copies.send(&session, appended(at));
+    }
+    // A follower exists but is behind, so this is a real wait.
+    copies.marked(session.clone(), ALPHA, 1);
+
+    let waiting = copies.confirming(&session, 3);
+    assert!(matches!(waiting, Confirming::Waiting(_)));
+
+    let releasing = std::sync::Arc::clone(&copies);
+    let told = session.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        releasing.marked(told, ALPHA, 3);
+    });
+    assert_eq!(waiting.within(Duration::from_secs(5)).await, Confirmed::Yes);
+}
+
+#[tokio::test]
+async fn one_follower_confirming_is_enough() {
+    // **The mutation this exists for is a wait that needs every
+    // follower.** Section 8.6 says at least one; waiting for all of
+    // them makes the slowest copy the publisher's latency and stalls
+    // every durable publish the moment one node goes quiet. A test
+    // with a single follower passes either way.
+    let copies = std::sync::Arc::new(Copies::new());
+    let session = key("rover");
+    for at in 1..=3 {
+        copies.send(&session, appended(at));
+    }
+    // Two followers, and one of them is never going to answer.
+    copies.marked(session.clone(), ALPHA, 0);
+    copies.marked(session.clone(), BETA, 0);
+
+    let waiting = copies.confirming(&session, 3);
+    let releasing = std::sync::Arc::clone(&copies);
+    let told = session.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        releasing.marked(told, BETA, 3);
+    });
+    assert_eq!(
+        waiting.within(Duration::from_secs(5)).await,
+        Confirmed::Yes,
+        "beta confirmed; alpha never did and must not have been needed"
+    );
+}
+
+#[tokio::test]
+async fn a_follower_that_goes_quiet_does_not_hold_the_publisher_for_ever() {
+    // The case synchronous mode exists for is also the case where
+    // waiting without a bound turns one slow node into every
+    // publisher's outage.
+    let copies = Copies::new();
+    let session = key("rover");
+    copies.send(&session, appended(1));
+    copies.marked(session.clone(), ALPHA, 0);
+
+    let started = std::time::Instant::now();
+    assert_eq!(
+        copies.confirming(&session, 1).within(BRIEF).await,
+        Confirmed::No
+    );
+    assert!(started.elapsed() >= BRIEF, "it waited");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "and then stopped: {:?}",
+        started.elapsed()
+    );
+}

@@ -2,8 +2,9 @@
 //! where to write what it says.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use broker_core::broker::{Addressed, Broker, BrokerConfig};
 use broker_core::handover::Handover;
@@ -11,7 +12,9 @@ use broker_core::registry::SessionId;
 use broker_core::session::Action;
 use broker_core::subscriptions::{FilterEvent, SubscriberId};
 use cluster::migrate::{Claimed, Migrator};
-use cluster::{Copies, Gate, MetadataWrite, Operation, Replicated, Streamed};
+use cluster::{
+    Confirmed, Confirming, Copies, Durability, Gate, MetadataWrite, Operation, Replicated, Streamed,
+};
 use foldhash::fast::RandomState;
 use mqtt_codec::Packet;
 use parking_lot::{Mutex, RwLock};
@@ -136,6 +139,22 @@ pub enum Committed {
     /// A promise was made and the writer was already gone, so it will
     /// never be kept and nobody is left to report on it.
     Stopped,
+    /// A promise was made, and section 8.6's synchronous mode is also
+    /// waiting for a follower to confirm it.
+    ///
+    /// Two waits and not one, in this order: the store first, because
+    /// a copy of something this node has not written down is a copy of
+    /// nothing, and section 8.2's rule that a peer is not told until
+    /// the store has taken the batch is the same rule.
+    Replicated {
+        /// The flush that keeps the promise.
+        durable: Durable,
+        /// A follower reaching the position this batch streamed, for
+        /// every session it appended to.
+        confirming: Vec<Confirming>,
+        /// How long to give it.
+        patience: Duration,
+    },
     /// Nothing was promised, and the writer is behind: the caller waits
     /// for it to catch up before it does anything else.
     ///
@@ -163,16 +182,38 @@ impl Committed {
     /// failed, and when the writer has stopped. The caller must not
     /// acknowledge anything.
     pub async fn wait(self) -> Result<(), NotDurable> {
+        self.settled().await.0
+    }
+
+    /// The same, saying what the copies did as well.
+    ///
+    /// [`Confirmed::Yes`] on every path that did not ask, which is
+    /// asynchronous mode and every node that does not cluster: what
+    /// the caller does with a `No` is count it and perhaps refuse, and
+    /// neither belongs to a publish that never promised a copy.
+    pub async fn settled(self) -> (Result<(), NotDurable>, Confirmed) {
         match self {
-            Self::Nothing => Ok(()),
-            Self::Waiting(durable) => durable.await,
-            Self::Stopped => Err(NotDurable::WriterStopped),
+            Self::Nothing => (Ok(()), Confirmed::Yes),
+            Self::Waiting(durable) => (durable.await, Confirmed::Yes),
+            Self::Stopped => (Err(NotDurable::WriterStopped), Confirmed::Yes),
+            // **The store first.** A copy of something this node has
+            // not written down is a copy of nothing, and a batch the
+            // store refused must not be waited on for a confirmation
+            // that would make it look kept.
+            Self::Replicated {
+                durable,
+                confirming,
+                patience,
+            } => match durable.await {
+                Ok(()) => (Ok(()), Confirming::all(confirming, patience).await),
+                Err(why) => (Err(why), Confirmed::Yes),
+            },
             // Not an error however it ends. Nothing was promised, so
             // there is nothing to fail: this waited to pace a producer,
             // and the producer has been paced.
             Self::Paced(writer) => {
                 writer.relief().await;
-                Ok(())
+                (Ok(()), Confirmed::Yes)
             }
         }
     }
@@ -331,6 +372,21 @@ pub struct Shared {
     /// reason. `None` is a node that does not cluster, and then nothing
     /// below costs more than one `OnceLock` read per batch.
     copies: OnceLock<Arc<Copies>>,
+    /// When a durable publish is acknowledged, and how long a
+    /// synchronous one waits. Section 8.6.
+    ///
+    /// Beside the copies because they are read on the same path and in
+    /// the same breath: a mode with nothing to replicate to is
+    /// asynchronous whatever it says.
+    durability: OnceLock<(Durability, Duration)>,
+    /// Whether an unconfirmed durable publish is refused rather than
+    /// acknowledged. Section 8.6's strict flag.
+    ///
+    /// An atomic rather than a `OnceLock` because it is read on every
+    /// durable publish and written once, and because `false` has to be
+    /// the reading before anything is installed — a node still
+    /// starting must not refuse.
+    refuse_unconfirmed: AtomicBool,
 }
 
 impl Shared {
@@ -391,6 +447,8 @@ impl Shared {
             migrator: OnceLock::new(),
             gate: OnceLock::new(),
             copies: OnceLock::new(),
+            durability: OnceLock::new(),
+            refuse_unconfirmed: AtomicBool::new(false),
         }
     }
 
@@ -430,6 +488,32 @@ impl Shared {
     #[must_use]
     pub fn copies(&self) -> Option<&Arc<Copies>> {
         self.copies.get()
+    }
+
+    /// Whether a publish no copy confirmed is refused rather than
+    /// acknowledged. Section 8.6.
+    ///
+    /// False unless an operator set `cluster.strict.unconfirmed`,
+    /// which is section 8.6's default and section 8.5's trade: the
+    /// loss of one node must not become an outage for every durable
+    /// publish.
+    #[must_use]
+    pub fn refuses_unconfirmed(&self) -> bool {
+        self.refuse_unconfirmed.load(Ordering::Relaxed)
+    }
+
+    /// Refuse publishes no copy confirmed, section 8.6.
+    pub fn install_strict_unconfirmed(&self, refuse: bool) {
+        self.refuse_unconfirmed.store(refuse, Ordering::Relaxed);
+    }
+
+    /// Acknowledge durable publishes this way, section 8.6.
+    ///
+    /// Once, for [`Shared::install_migrator`]'s reason. Not installed
+    /// at all is [`Durability::Async`], which is the default and is
+    /// what a node that does not cluster can do.
+    pub fn install_durability(&self, mode: Durability, patience: Duration) {
+        let _ = self.durability.set((mode, patience));
     }
 
     /// What the followers of these sessions need, numbered, and the
@@ -1005,6 +1089,13 @@ impl Shared {
         // of these sessions need, and the positions that record how far
         // this node has got, which join the same batch.
         let streamed = self.stream_changes(&mut records);
+        // And, in synchronous mode, what this publisher waits for. The
+        // registration happens **here, before the batch is handed to
+        // the writer**, for the reason `Migrations::begin` does: a mark
+        // that arrived between the write and the registration would
+        // find nobody waiting, and the publisher would then wait for a
+        // position that had already gone past.
+        let confirming = self.confirming(promised, &streamed);
 
         let Some(writer) = &self.writer else {
             // No store: nothing is written down and nothing can be
@@ -1013,18 +1104,22 @@ impl Shared {
             // to grow.
             return Committed::Nothing;
         };
-        if !originated.is_empty() || !streamed.is_empty() {
+        // **The channel is part of the condition, not an assertion
+        // inside it.** This used to return `Committed::Nothing` when
+        // there was nothing to broadcast over, on the grounds that a
+        // node originating writes always has one. Section 8.6 made
+        // that false: a node can have copies to stream and no
+        // broadcast queue, and the branch then answered a publisher
+        // without waiting for the store at all. Falling through to the
+        // ordinary path is what a node with nowhere to send should do.
+        let has_peers = self.broadcasts.as_ref();
+        if let Some(broadcasts) =
+            has_peers.filter(|_| !originated.is_empty() || !streamed.is_empty())
+        {
             // Section 8.2's two-phase write. The batch is waited on twice:
             // once by whoever is about to broadcast, and once by this
             // caller if it promised a publisher anything. One batch and
             // one outcome, because whether the store took it is one fact.
-            let Some(broadcasts) = &self.broadcasts else {
-                // Unreachable: writes are only originated by a node that
-                // has a `Replicated`, and the queue is made beside it.
-                // Refusing to broadcast is the safe answer if it ever
-                // happens, rather than broadcasting without the store.
-                return Committed::Nothing;
-            };
             return match writer.apply_durable_twice(records) {
                 Ok((mine, theirs)) => {
                     // Never blocks: the queue is unbounded, and a send
@@ -1036,7 +1131,7 @@ impl Shared {
                         streamed,
                     });
                     if promised {
-                        Committed::Waiting(mine)
+                        Self::promised(mine, confirming)
                     } else {
                         // Nothing was promised to a publisher, so nobody
                         // here waits. The broadcast still does.
@@ -1089,9 +1184,75 @@ impl Shared {
         // connection acknowledging something another batch journalled
         // still has to wait for that batch to reach the device.
         match writer.apply_durable(records) {
-            Ok(durable) => Committed::Waiting(durable),
+            Ok(durable) => Self::promised(durable, confirming),
             Err(_) => Committed::Stopped,
         }
+    }
+
+    /// The handle a publisher waits on: the store, and a copy when one
+    /// was asked for.
+    fn promised(durable: Durable, confirming: Option<(Vec<Confirming>, Duration)>) -> Committed {
+        match confirming {
+            Some((confirming, patience)) if !confirming.is_empty() => Committed::Replicated {
+                durable,
+                confirming,
+                patience,
+            },
+            _ => Committed::Waiting(durable),
+        }
+    }
+
+    /// What this publisher waits for a follower to confirm, if
+    /// anything. Section 8.6's synchronous mode.
+    ///
+    /// `None` in asynchronous mode, on a node that does not cluster,
+    /// and for a batch that promised nobody anything — a publish at
+    /// at-most-once, or a batch that journalled no queue change at all.
+    ///
+    /// **Registered before the batch reaches the writer.** A mark that
+    /// arrived between the write and the registration would find
+    /// nobody waiting, and the publisher would then wait for a
+    /// position already gone past; `cluster::migrate` registers its
+    /// drains in the same order for the same reason.
+    fn confirming(
+        &self,
+        promised: bool,
+        streamed: &[Streamed],
+    ) -> Option<(Vec<Confirming>, Duration)> {
+        if !promised {
+            return None;
+        }
+        let (mode, patience) = self.durability.get().copied()?;
+        if !mode.waits() {
+            return None;
+        }
+        let copies = self.copies.get()?;
+        // **One per session this batch appended to**, at the
+        // furthest position it reached on each. A publish matching two
+        // offline subscribers appends to two queues in one batch, and
+        // a publisher told its message was replicated when only one of
+        // the two copies exists has been told something untrue — so
+        // every one of them is waited for.
+        //
+        // Positions are per session and are not comparable across
+        // them, which is why this is a list rather than one number.
+        let mut furthest: Vec<(SessionKey, u64)> = Vec::new();
+        for change in streamed {
+            match furthest
+                .iter_mut()
+                .find(|(session, _)| *session == change.session)
+            {
+                Some((_, at)) => *at = (*at).max(change.at),
+                None => furthest.push((change.session.clone(), change.at)),
+            }
+        }
+        Some((
+            furthest
+                .into_iter()
+                .map(|(session, at)| copies.confirming(&session, at))
+                .collect(),
+            patience,
+        ))
     }
 
     /// Claim the outbox for a session, returning the receiving half.

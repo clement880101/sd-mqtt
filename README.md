@@ -536,6 +536,45 @@ allows, and it is repaired when the other nodes arrive.
 `SDMQTT_CLUSTER_REPLICATION_FACTOR` sets the same value. A number
 outside one to three is refused at startup rather than clamped.
 
+### When a durable publish is acknowledged
+
+```toml
+[cluster]
+durability = "async"              # or "sync"
+sync_timeout_ms = 2000            # how long sync waits for a copy
+```
+
+`async` is the default: a publish is acknowledged once *this* node has
+it on disk, and the copy follows behind. What a sudden loss of the node
+would cost is therefore whatever has not been copied yet, which is
+`sdmqtt_replication_lag` — watch that series, and alert on it.
+
+`sync` acknowledges once **one** follower has confirmed it, so a single
+node failing loses nothing. The cost is one local round trip per
+durable publish. One follower and not all of them: waiting for every
+copy would make the slowest one every publisher's latency.
+
+**With no follower to ask, a synchronous publish is acknowledged
+anyway** — a cluster of one, `replication_factor = 1`, or every
+follower down — and counted as
+`sdmqtt_publishes_unconfirmed_total`. Refusing instead would turn the
+loss of one node into an outage for every durable publish. If that is
+the trade you want:
+
+```toml
+[cluster.strict]
+unconfirmed = true                # refuse rather than acknowledge
+```
+
+The refusal closes the connection with reason code 0x83, as the other
+"this broker will not answer for your message" refusals do. The flag
+is refused at startup when `durability` is `"async"` — nothing would
+ever be unconfirmed — and when the node does not cluster, where there
+can never be a follower.
+
+`SDMQTT_CLUSTER_DURABILITY`, `SDMQTT_CLUSTER_SYNC_TIMEOUT_MS` and
+`SDMQTT_CLUSTER_STRICT_UNCONFIRMED` set the same three.
+
 Messages published on either side of a partition are not exchanged
 afterwards, whatever the flags say, and a node that acknowledged a
 message it never managed to replicate loses it when it rejoins.

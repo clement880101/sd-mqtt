@@ -46,6 +46,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use tokio::sync::oneshot;
 
 use serde::{Deserialize, Serialize};
 use storage::record::{BodyRecord, QueueEntry};
@@ -352,6 +355,12 @@ struct Tables {
     followed: HashMap<SessionKey, ([u8; 16], Follower)>,
     /// Sessions this node owns and streams, with how far it has sent.
     owned: HashMap<SessionKey, Owner>,
+    /// Publishers waiting for a follower to confirm a position.
+    ///
+    /// Section 8.6's synchronous mode. Keyed by session, because that
+    /// is what a mark is about; several publishers can wait on one
+    /// session at once and each wants a different position.
+    waiting: HashMap<SessionKey, Vec<(u64, oneshot::Sender<()>)>>,
     /// What each follower last said about a session this node owns.
     ///
     /// Keyed by session and follower, because one session has several
@@ -467,9 +476,60 @@ impl Copies {
 
     /// Record what a follower said about a session this node owns.
     pub fn marked(&self, session: SessionKey, follower: [u8; 16], through: u64) {
-        locked(&self.inner)
+        let mut tables = locked(&self.inner);
+        tables.marks.insert((session.clone(), follower), through);
+        // **Any follower will do.** Section 8.6 says a synchronous
+        // publish waits for *at least one* follower to confirm the
+        // append; waiting for all of them would make the slowest copy
+        // the publisher's latency and would stall every durable
+        // publish the moment one node went quiet.
+        let Some(waiting) = tables.waiting.get_mut(&session) else {
+            return;
+        };
+        // What the retain removes are the senders whose position this
+        // mark has reached, and dropping a sender is how its waiter
+        // learns.
+        waiting.retain(|(at, _)| *at > through);
+        if waiting.is_empty() {
+            tables.waiting.remove(&session);
+        }
+    }
+
+    /// Wait for some follower of `session` to have applied through
+    /// `at`, section 8.6's synchronous mode.
+    ///
+    /// [`Confirming::Already`] when one already has, which is the
+    /// ordinary case under any load at all: the mark usually arrives
+    /// while the store is still being waited on, so the publisher waits
+    /// for nothing it was not already waiting for.
+    ///
+    /// **[`Confirming::Nobody`] when this node has no follower for the
+    /// session** — a cluster of one, a replication factor of one, every
+    /// follower down. That is an answer rather than a wait: section 8.6
+    /// acknowledges anyway and counts it, and a publisher left waiting
+    /// for a confirmation that cannot come is the outage the
+    /// acknowledgement exists to avoid.
+    pub fn confirming(&self, session: &SessionKey, at: u64) -> Confirming {
+        let mut tables = locked(&self.inner);
+        let mut followers = tables
             .marks
-            .insert((session, follower), through);
+            .iter()
+            .filter(|((held, _), _)| held == session)
+            .map(|(_, through)| *through)
+            .peekable();
+        if followers.peek().is_none() {
+            return Confirming::Nobody;
+        }
+        if followers.any(|through| through >= at) {
+            return Confirming::Already;
+        }
+        let (tell, told) = oneshot::channel();
+        tables
+            .waiting
+            .entry(session.clone())
+            .or_default()
+            .push((at, tell));
+        Confirming::Waiting(told)
     }
 
     /// The furthest any follower of `session` is behind this node.
@@ -521,6 +581,119 @@ impl Copies {
     #[must_use]
     pub fn streaming(&self) -> usize {
         locked(&self.inner).owned.len()
+    }
+}
+
+/// When a durable publish is acknowledged. Section 8.6.
+///
+/// Configurable globally and per listener, because the trade is a
+/// deployment's: a listener carrying commands that must not be lost
+/// can be synchronous while one carrying telemetry is not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Durability {
+    /// Acknowledge once this node has it durably. The default.
+    ///
+    /// Replication proceeds behind the acknowledgement, and the loss
+    /// window is the replication lag — which is why the lag is a
+    /// metric and why section 8.6 says it is alerted on.
+    #[default]
+    Async,
+    /// Acknowledge once a follower has confirmed the append.
+    ///
+    /// A single node failure then loses nothing. The cost is one
+    /// local network round trip per durable publish, and it is one
+    /// round trip rather than one per follower: section 8.6 says at
+    /// least one confirms.
+    Sync,
+}
+
+impl Durability {
+    /// Whether a publish waits for a copy before it is acknowledged.
+    #[must_use]
+    pub fn waits(self) -> bool {
+        matches!(self, Self::Sync)
+    }
+}
+
+/// Whether a follower has confirmed a position, or when it will.
+#[derive(Debug)]
+pub enum Confirming {
+    /// One already had, before anybody asked.
+    Already,
+    /// This node has no follower for that session to ask.
+    ///
+    /// A cluster of one, a replication factor of one, or every
+    /// follower down. Section 8.6 acknowledges anyway and counts it,
+    /// so this is an answer rather than a wait.
+    Nobody,
+    /// Somebody is being waited for.
+    Waiting(oneshot::Receiver<()>),
+}
+
+/// What a synchronous publish found out about its copies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirmed {
+    /// A follower holds it. The guarantee is kept.
+    Yes,
+    /// Nobody holds it, and nobody was going to.
+    ///
+    /// Counted and surfaced rather than silent: an operator who asked
+    /// for synchronous mode and is getting this is not getting what
+    /// they asked for, and section 8.6 says they must be able to see
+    /// that.
+    No,
+}
+
+impl Confirming {
+    /// Wait for all of `these`, up to `patience` between them.
+    ///
+    /// **All of them, because one publish can queue for several
+    /// sessions**: a message matching two offline subscribers appends
+    /// to two queues in one batch, and a publisher told its message
+    /// was replicated when only one of the two copies exists has been
+    /// told something that is not true. Any one of them failing is a
+    /// [`Confirmed::No`] for the batch.
+    ///
+    /// The patience covers the set rather than each, so a batch
+    /// touching ten sessions does not wait ten times as long as one
+    /// touching one.
+    pub async fn all(these: Vec<Self>, patience: Duration) -> Confirmed {
+        if these.is_empty() {
+            return Confirmed::Yes;
+        }
+        let waiting = async {
+            for one in these {
+                if one.within(Duration::MAX).await == Confirmed::No {
+                    return Confirmed::No;
+                }
+            }
+            Confirmed::Yes
+        };
+        (tokio::time::timeout(patience, waiting).await).unwrap_or(Confirmed::No)
+    }
+
+    /// Wait, up to `patience`.
+    ///
+    /// **Bounded, and a timeout answers [`Confirmed::No`] rather than
+    /// holding the publisher.** A follower that has gone quiet is the
+    /// case synchronous mode exists for, and it is also the case where
+    /// waiting for ever turns one slow node into every publisher's
+    /// outage — which is the trade section 8.5 already made the other
+    /// way round.
+    pub async fn within(self, patience: Duration) -> Confirmed {
+        match self {
+            Self::Already => Confirmed::Yes,
+            Self::Nobody => Confirmed::No,
+            Self::Waiting(told) => {
+                match tokio::time::timeout(patience, told).await {
+                    // The sender was dropped by `marked`, which is how
+                    // it says the position was reached.
+                    Ok(_) => Confirmed::Yes,
+                    Err(_) => Confirmed::No,
+                }
+            }
+        }
     }
 }
 

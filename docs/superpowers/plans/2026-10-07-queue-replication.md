@@ -211,7 +211,7 @@ durably. Synchronous waits for one follower to confirm the append.
 The same code path in both: one awaits what the other ignores. Read
 `with_broker_committed` before writing any of it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 - Asynchronous acknowledges **before** any follower has confirmed. Prove it
   with a follower that never confirms, not with a fast one.
@@ -228,7 +228,7 @@ The same code path in both: one awaits what the other ignores. Read
   the shape `cluster::policy` already has, so follow it rather than
   inventing a second one.
 
-- [ ] **Step 2: Implement, confirm teeth, commit**
+- [x] **Step 2: Implement, confirm teeth, commit**
 
 Mutations: synchronous awaiting nothing, which must fail the stalled
 follower test rather than hang it; the wait requiring every follower; the

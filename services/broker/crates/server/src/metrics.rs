@@ -326,6 +326,9 @@ pub enum SocketOutcome {
     /// protocol left no room to answer — 3.1.1 publishes, and
     /// at-most-once ones.
     NotWhole,
+    /// A durable publish no copy confirmed, on a node configured to
+    /// refuse those. Section 8.6.
+    NotConfirmed,
     /// The connection was dropped before it finished: a shutdown, or
     /// a panic. Counted from [`Drop`] rather than from a return, so
     /// that a cancelled connection is an ending like any other rather
@@ -334,7 +337,7 @@ pub enum SocketOutcome {
 }
 
 /// Every socket outcome, in the order the handles are indexed in.
-const SOCKET_OUTCOMES: [SocketOutcome; 10] = [
+const SOCKET_OUTCOMES: [SocketOutcome; 11] = [
     SocketOutcome::Clean,
     SocketOutcome::ConnectTimeout,
     SocketOutcome::NotAConnect,
@@ -349,6 +352,7 @@ const SOCKET_OUTCOMES: [SocketOutcome; 10] = [
     // `outcome_index` returns, so inserting one in the middle
     // renumbers every outcome after it and relabels their counters.
     SocketOutcome::NotWhole,
+    SocketOutcome::NotConfirmed,
 ];
 
 /// The label value for a socket outcome.
@@ -363,6 +367,7 @@ fn outcome_label(outcome: SocketOutcome) -> &'static str {
         SocketOutcome::Codec => "codec",
         SocketOutcome::NotDurable => "not_durable",
         SocketOutcome::NotWhole => "not_whole",
+        SocketOutcome::NotConfirmed => "not_confirmed",
         SocketOutcome::Abandoned => "abandoned",
     }
 }
@@ -380,6 +385,7 @@ fn outcome_index(outcome: SocketOutcome) -> usize {
         SocketOutcome::NotDurable => 7,
         SocketOutcome::Abandoned => 8,
         SocketOutcome::NotWhole => 9,
+        SocketOutcome::NotConfirmed => 10,
     }
 }
 
@@ -730,6 +736,8 @@ pub struct Metrics {
     /// counter is to be able to see the difference.
     bytes_received: Counter,
     bytes_sent: Counter,
+    /// Section 8.6's synchronous publishes that no copy confirmed.
+    publishes_unconfirmed: Counter,
     sockets_opened: Counter,
     sockets_refused: Counter,
     /// Section 11.3, for the admin events stream: a reader that has
@@ -835,6 +843,22 @@ pub const REPLICATION_NUMBERS: [(&str, &str); 3] = [
     ),
 ];
 
+/// Durable publishes acknowledged in synchronous mode that no follower
+/// confirmed. Section 8.6.
+///
+/// **A counter rather than a gauge**, unlike the three above: this one
+/// only ever goes up, and what an operator alerts on is the rate.
+///
+/// It exists because section 8.6 acknowledges such a publish anyway —
+/// refusing would turn the loss of one node into an outage for every
+/// durable publish — and an operator who asked for synchronous mode and
+/// is getting this is not getting what they asked for. Silent, it would
+/// be a guarantee quietly not kept.
+pub const UNCONFIRMED: (&str, &str) = (
+    "publishes_unconfirmed",
+    "Durable publishes acknowledged in synchronous mode with no follower confirming",
+);
+
 /// Section 8.4's migration numbers: the metric name, its help text,
 /// and the order [`ClusterMetrics::migrations`] returns them in.
 ///
@@ -914,6 +938,9 @@ impl Metrics {
             "Bytes written to client sockets",
             bytes_sent.clone(),
         );
+
+        let publishes_unconfirmed = Counter::default();
+        registry.register(UNCONFIRMED.0, UNCONFIRMED.1, publishes_unconfirmed.clone());
 
         let sockets_opened = Counter::default();
         registry.register(
@@ -1039,6 +1066,7 @@ impl Metrics {
             packets_sent,
             bytes_received,
             bytes_sent,
+            publishes_unconfirmed,
             sockets_opened,
             sockets_refused,
             sockets_closed,
@@ -1175,6 +1203,16 @@ impl Metrics {
     /// these was a log line at best.
     pub fn publication_refused(&self, reason: Refusal) -> &Counter {
         &self.publications_refused[refusal_index(reason)]
+    }
+
+    /// A durable publish acknowledged with no copy confirming it.
+    ///
+    /// Section 8.6. **Registered on every node**, not only a
+    /// clustering one, unlike the cluster gauges: a node running in
+    /// synchronous mode with nothing to replicate to is exactly the
+    /// case this counts, and an absent series there would hide it.
+    pub fn publish_unconfirmed(&self) -> &Counter {
+        &self.publishes_unconfirmed
     }
 
     /// A socket that has finished, by how it ended.

@@ -87,6 +87,27 @@ on purpose.
   queue — one description of what happened, and both the store and
   the copy get it.
 
+- **`cluster.durability`, with `"sync"` available.** `async` is the
+  default and is what the lag gauge is about. `sync` holds the
+  acknowledgement until one follower has confirmed the append, so a
+  single node failing loses nothing; the cost is one local round trip
+  per durable publish, and it is one round trip rather than one per
+  copy because section 8.6 asks for at least one.
+
+  **With no follower to ask, it is acknowledged anyway and counted**
+  as `sdmqtt_publishes_unconfirmed_total` — a cluster of one, a factor
+  of one, every follower down. Refusing would turn the loss of one
+  node into an outage for every durable publish, which is the trade
+  section 8.5 already made the other way. `cluster.strict.unconfirmed`
+  is there for a deployment that wants the refusal, and the refusal
+  carries reason code 0x83 rather than a closed socket.
+
+  `cluster.sync_timeout_ms` bounds the wait. A follower that has gone
+  quiet is the case synchronous mode exists for, and it is also the
+  case where waiting without a bound turns one slow node into every
+  publisher's outage, so running out counts as unconfirmed rather than
+  holding the client.
+
 - **Three gauges for it**: `sdmqtt_replication_lag`,
   `sdmqtt_replicated_sessions` and `sdmqtt_replica_sessions`. The
   first is section 8.6's loss window — in asynchronous mode what a

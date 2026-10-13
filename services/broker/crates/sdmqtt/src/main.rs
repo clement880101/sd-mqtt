@@ -1072,6 +1072,17 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         // moment between the listener opening and this is a moment
         // whose messages have one copy.
         rebuilt.shared.install_copies(Arc::clone(&rebuilt.copies));
+        // Section 8.6's two, in the same window: a publish that found
+        // no mode installed is asynchronous, which is the default and
+        // not a failure, but an operator who asked for synchronous
+        // must not get a window of publishes that were not.
+        rebuilt.shared.install_durability(
+            config.cluster.durability,
+            std::time::Duration::from_millis(config.cluster.sync_timeout_ms),
+        );
+        rebuilt
+            .shared
+            .install_strict_unconfirmed(config.cluster.strict.unconfirmed);
     }
     // The four tasks of section 8.2, started once there is a mesh for them
     // to talk over. A node that does not cluster starts none of them: its

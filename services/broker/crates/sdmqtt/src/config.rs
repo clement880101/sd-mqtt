@@ -64,7 +64,9 @@ use std::time::Duration;
 use broker_core::broker::BrokerConfig;
 use cluster::membership::Detection;
 use cluster::mesh::MeshSettings;
-use cluster::{ClusterSettings, Factor, Policy, Strict, DEFAULT_CLUSTER_NAME, DEFAULT_FACTOR};
+use cluster::{
+    ClusterSettings, Durability, Factor, Policy, Strict, DEFAULT_CLUSTER_NAME, DEFAULT_FACTOR,
+};
 use mqtt_codec::Limits;
 use sdmqtt_admin::config::{AdminConfig, AdminStartError, Token};
 use sdmqtt_server::connection::{outbox_depth_for, ConnectionConfig};
@@ -761,6 +763,24 @@ pub struct ClusterSection {
     /// mismatched secret is a configuration error that will not fix
     /// itself.
     pub refused_backoff_ms: u64,
+    /// When a durable publish is acknowledged. Section 8.6.
+    ///
+    /// `async` by default: acknowledged once this node has it durably,
+    /// with replication proceeding behind it and the loss window
+    /// exposed as `sdmqtt_replication_lag`. `sync` waits for one
+    /// follower to confirm, which costs a local round trip per durable
+    /// publish and loses nothing to a single node failure.
+    pub durability: Durability,
+    /// How long a synchronous publish waits for a follower, in
+    /// milliseconds. Section 8.6.
+    ///
+    /// **A bound, not a deadline the follower must meet.** When it
+    /// runs out the publish is acknowledged anyway and counted as
+    /// unconfirmed, because a follower that has gone quiet is the case
+    /// synchronous mode exists for and is also the case where waiting
+    /// for ever turns one slow node into every publisher's outage. Set
+    /// `cluster.strict.unconfirmed` to be refused instead.
+    pub sync_timeout_ms: u64,
     /// How many nodes hold a copy of each session's queue. Section 8.6.
     ///
     /// Two by default: the owner and one follower, which is what makes
@@ -824,6 +844,8 @@ impl Default for ClusterSection {
             reconnect_min_ms: 200,
             reconnect_max_ms: 30_000,
             refused_backoff_ms: 300_000,
+            durability: Durability::default(),
+            sync_timeout_ms: 2_000,
             replication_factor: DEFAULT_FACTOR,
             expected_size: None,
             strict: Strict::default(),
@@ -1266,6 +1288,15 @@ impl Config {
                           out",
                 });
             }
+            if self.cluster.strict.unconfirmed {
+                return Err(ConfigError::Unusable {
+                    key: "cluster.strict.unconfirmed",
+                    value: "true".to_owned(),
+                    why: "this node does not cluster, because cluster.address is unset, so \
+                          it has no follower to confirm anything and every durable publish \
+                          would be refused. Set cluster.address, or leave the flag out",
+                });
+            }
             if let Some(expected) = self.cluster.expected_size {
                 return Err(ConfigError::Unusable {
                     key: "cluster.expected_size",
@@ -1328,6 +1359,31 @@ impl Config {
         // behaviour an operator asked for the way a strict flag is,
         // it is a dial on a thing that is either on or off.
         self.cluster.factor()?;
+
+        // **A flag that can never fire is refused**, which is the rule
+        // section 8.5's three already follow. This one is evaluable
+        // without an expected size — it asks whether a follower
+        // answered — but it is still meaningless in two
+        // configurations, and both are easy to write by accident.
+        if self.cluster.strict.unconfirmed && !self.cluster.durability.waits() {
+            return Err(ConfigError::Unusable {
+                key: "cluster.strict.unconfirmed",
+                value: "true".to_owned(),
+                why: "cluster.durability is \"async\", which never waits for a follower, so \
+                      nothing is ever unconfirmed and this flag can never refuse anything. \
+                      Set cluster.durability = \"sync\", or leave the flag out",
+            });
+        }
+
+        if self.cluster.sync_timeout_ms == 0 {
+            return Err(ConfigError::Unusable {
+                key: "cluster.sync_timeout_ms",
+                value: "0".to_owned(),
+                why: "a bound of zero gives a follower no time at all, so every durable \
+                      publish would be counted unconfirmed. Write the milliseconds a local \
+                      round trip may take, or leave the key out",
+            });
+        }
 
         if self.cluster.heartbeat_ms == 0 {
             return Err(ConfigError::Unusable {
@@ -1479,6 +1535,31 @@ impl Config {
         }
         if let Some(value) = lookup("SDMQTT_CLUSTER_ADVERTISE") {
             self.cluster.advertise = Some(value);
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_DURABILITY") {
+            self.cluster.durability = match value.as_str() {
+                "async" => Durability::Async,
+                "sync" => Durability::Sync,
+                // Named rather than guessed at, for the reason the
+                // strict flags are: a template that expanded to
+                // something else must not quietly acknowledge before a
+                // copy exists.
+                _ => {
+                    return Err(ConfigError::Environment {
+                        variable: "SDMQTT_CLUSTER_DURABILITY",
+                        value,
+                        expected: "async or sync",
+                    })
+                }
+            };
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_SYNC_TIMEOUT_MS") {
+            self.cluster.sync_timeout_ms =
+                parse("SDMQTT_CLUSTER_SYNC_TIMEOUT_MS", &value, "milliseconds")?;
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_STRICT_UNCONFIRMED") {
+            self.cluster.strict.unconfirmed =
+                parse("SDMQTT_CLUSTER_STRICT_UNCONFIRMED", &value, "true or false")?;
         }
         if let Some(value) = lookup("SDMQTT_CLUSTER_REPLICATION_FACTOR") {
             self.cluster.replication_factor = parse(
@@ -4033,6 +4114,8 @@ dead_after_ms = 4000
             connects: true,
             publishes: true,
             subscribes: true,
+            // Section 8.6's flag is not one of section 8.5's three.
+            unconfirmed: false,
         };
         config
             .validate()

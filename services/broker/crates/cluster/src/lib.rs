@@ -187,7 +187,10 @@ pub use oplog::{Logged, OpLog, FIRST_SEQUENCE};
 pub use placement::{place, Factor, FactorError, Placement, Weighted, DEFAULT_FACTOR, MAX_FACTOR};
 pub use policy::{Gate, Live, Operation, Policy, PolicyError, Strict};
 pub use register::{Register, Stamp};
-pub use replica::{change_for, Applied, Change, Copies, Follower, Owner, Streamed};
+pub use replica::{
+    change_for, Applied, Change, Confirmed, Confirming, Copies, Durability, Follower, Owner,
+    Streamed,
+};
 pub use replicate::{
     choose, jitter, Handled, Replication, ReplicationError, ReplicationSettings, Replicator, Swept,
     DEFAULT_BATCH, DEFAULT_EXCHANGE, DEFAULT_TOMBSTONE_GRACE,
