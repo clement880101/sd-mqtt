@@ -165,6 +165,73 @@ pub enum Message {
     /// claim, so that a drain which stops partway has still moved what
     /// it managed to; the last one says so.
     Drained(crate::migrate::Drained),
+    /// Section 8.6: one change to a session's queue, for a node that
+    /// holds a copy of it.
+    ///
+    /// Sent to the followers [`crate::placement`] names and to no other
+    /// peer, which is [`Self::Forward`]'s economy for the same reason:
+    /// a node that holds no copy of this session has nothing to do with
+    /// its queue.
+    ///
+    /// **Answered with [`Self::Marked`]**, which makes this unlike a
+    /// forward. The answer is not an acknowledgement that the change is
+    /// safe — section 8.6's synchronous mode needs that and reads it
+    /// from the mark — it is the follower saying how far it has got,
+    /// which is also what the lag is measured from.
+    Replicated(crate::replica::Streamed),
+    /// How far a follower has applied one session's stream.
+    ///
+    /// The highest **contiguous** position, which is the whole of what
+    /// makes it worth sending: a mark that had skipped a hole would
+    /// make this node prefer a copy with a message missing from the
+    /// middle. See `crate::replica`.
+    Marked {
+        /// Whose queue.
+        session: storage::SessionKey,
+        /// The highest contiguous position applied.
+        through: u64,
+    },
+    /// Section 8.6's failover, first question: "how far does your copy
+    /// of this session go?"
+    ///
+    /// Asked of every reachable member of the session's replica set by
+    /// a node whose drain came up short — the previous owner could not
+    /// be reached, or did not finish — and answered with
+    /// [`Self::Holds`]. A question, like [`Self::Claim`]: the asker is
+    /// waiting, with a bound.
+    HowFar {
+        /// Whose queue.
+        session: storage::SessionKey,
+    },
+    /// The answer: the highest contiguous position this node's copy
+    /// has applied, or nothing if it holds no copy.
+    ///
+    /// **`None` is an answer and not a silence.** A node that holds no
+    /// copy says so, because the asker is choosing between copies by
+    /// their marks and a silence would be a copy it waited the whole
+    /// bound for. Zero is a copy that has applied nothing, which is a
+    /// different thing and is `Some(0)`.
+    Holds {
+        /// Whose queue.
+        session: storage::SessionKey,
+        /// How far, if a copy is held at all.
+        through: Option<u64>,
+    },
+    /// Section 8.6's failover, second question: "send me your copy."
+    ///
+    /// Sent to the one member whose answer to [`Self::HowFar`] was
+    /// furthest ahead, and answered with [`Self::Drained`] chunks under
+    /// this epoch — the same chunks and the same collection as a drain
+    /// from an owner, because to the node receiving them the two are
+    /// the same thing: what the session held, in instalments, with the
+    /// last one saying so.
+    PullCopy {
+        /// Whose queue.
+        session: storage::SessionKey,
+        /// The epoch the asker claimed under, which is what routes the
+        /// chunks to the connection waiting for them.
+        epoch: u64,
+    },
 }
 
 /// What something on top of the mesh does with a peer's message.
@@ -487,6 +554,33 @@ impl Mesh {
     #[must_use]
     pub fn alive(&self) -> usize {
         locked(&self.state.members).alive()
+    }
+
+    /// How long `peer` has been silent. `None` for a peer never met.
+    pub fn silent_for(&self, peer: NodeId) -> Option<Duration> {
+        locked(&self.state.members).silent_for(peer, Instant::now())
+    }
+
+    /// Take `peer` out of membership altogether, and drop its link.
+    ///
+    /// Section 8.6's operator override: a node that is never coming
+    /// back is forgotten at once rather than after the grace, so the
+    /// replica sets that included it are repaired now. The link is
+    /// aborted first, because a member forgotten while its link stayed
+    /// up would be re-admitted by its very next heartbeat.
+    ///
+    /// **A forgotten peer that comes back is re-admitted.** Its
+    /// handshake inserts it like any peer met for the first time, and
+    /// a configured seed is still dialled; forgetting is about this
+    /// node's table, not about the other node's right to exist.
+    ///
+    /// Returns whether there was anything to forget.
+    pub fn forget(&self, peer: NodeId) -> bool {
+        if let Some(link) = locked(&self.state.links).remove(&peer) {
+            link.reader.abort();
+            link.writer.abort();
+        }
+        locked(&self.state.members).forget(peer)
     }
 
     /// Which end of the link to this peer this node is, if there is

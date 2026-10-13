@@ -737,7 +737,13 @@ tagged with the session sequence number. Followers apply operations in order
 and report their high-water mark. Message bodies travel once and are
 reference counted on the follower exactly as on the owner.
 
-**Durability modes.** Configurable globally and overridable per listener.
+**Durability modes.** Configurable globally. **The per-listener override
+is deferred to milestone 7**, found by convention 8's walk at the close of
+milestone 6: nothing in this milestone's tasks carried a listener's mode
+into the commit path, and milestone 7 is where a listener gains its other
+per-listener settings (TLS, WebSocket, a maximum quality of service), so
+the override belongs with them rather than as one more field bolted on
+here. Until then every listener has the global mode.
 
 - `async`, the default. The publisher is acknowledged as soon as the owner
   has the message durably. Replication proceeds in the background. The loss
@@ -749,6 +755,24 @@ reference counted on the follower exactly as on the owner.
 
 The code path is the same in both modes. Synchronous mode awaits the
 confirmation that asynchronous mode ignores.
+
+**Both modes describe the node that accepted the publish, about its
+own sessions.** A publish accepted by one node for a session another
+node owns is forwarded under 8.3, and the accepting node acknowledges
+when *it* has done what the mode asks of it — which, for a session it
+does not own, is nothing: the owner has not appended yet, and no copy
+has either. So a `sync` acknowledgement from a node that is not the
+owner is not evidence that a copy exists, and the owner's lag does not
+count what is still in flight towards it. Milestone 6's exit criteria
+are met for a publish accepted by the owner, which is where a client
+connected to the node its session lives on publishes, and the tests
+publish there. Closing the gap is an acknowledgement carried across
+the mesh — the forwarding node waiting for the owner, which waits for
+its follower — and is deferred as its own design rather than done
+quietly here, because it changes what 8.3's bounded, droppable link
+promises. Found by the first version of the synchronous exit-criteria
+test, which published on a non-owner and lost three of eight
+acknowledged messages.
 
 **With no reachable follower, a synchronous publish is acknowledged anyway
 and the unconfirmed acknowledgement is counted.** A single-node cluster, a
@@ -1135,6 +1159,20 @@ section 11.3 puts them. The page says in words that every state is this
 node's own view, because membership is deliberately not replicated and two
 nodes' pages disagreeing during a one-way partition is the truth rather than
 a fault in one of them.
+
+**Replica health on the Cluster page is this node's too.** Section 8.6
+asks for replica health per replica set and re-replication progress, and
+both come from `/health/cluster`'s `replication` object: the mode, the
+sessions this node streams and the copies it holds, the lag, sessions
+short of a copy and how many have been re-streamed, the unconfirmed
+count, and a row per peer — how many of this node's sessions that peer
+has confirmed a copy of, how far behind it is, how many of its sessions
+are held here. A replica set is a session's owner and its followers, and
+"per set" on a page is therefore per peer, read from this end: the sets
+this node is in with that peer. Nothing about replication is replicated,
+for the reason membership is not, so the peer's page reads the same sets
+from the other end and may disagree about the lag, which is a statement
+about one direction of one link.
 
 The page polls rather than following the events stream, and it is the only
 one that does. Membership is not on the stream because there is no

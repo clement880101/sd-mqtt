@@ -48,6 +48,20 @@ pub struct Strict {
     pub publishes: bool,
     /// Refuse a subscription.
     pub subscribes: bool,
+    /// Refuse a durable publish that no follower confirmed. Section
+    /// 8.6.
+    ///
+    /// **Not about the cluster being whole**, which is what the three
+    /// above are about, and it is in this struct anyway because it is
+    /// the same kind of thing: an operator choosing to lose
+    /// availability rather than accept something weaker than they
+    /// asked for. Without it a synchronous publish with no reachable
+    /// follower is acknowledged and counted, which is section 8.6's
+    /// default and section 8.5's trade.
+    ///
+    /// It needs no expected size, because what it is evaluated against
+    /// is whether a follower answered — a fact this node has to hand.
+    pub unconfirmed: bool,
 }
 
 impl Strict {
@@ -65,6 +79,8 @@ impl Strict {
             (self.connects, "cluster.strict.connects"),
             (self.publishes, "cluster.strict.publishes"),
             (self.subscribes, "cluster.strict.subscribes"),
+            // **Not in `Policy::new`'s refusal below**, because this
+            // one is evaluable without an expected size: see the field.
         ]
         .into_iter()
         .find_map(|(set, name)| set.then_some(name))
@@ -277,6 +293,7 @@ mod tests {
             connects: true,
             publishes: true,
             subscribes: true,
+            unconfirmed: true,
         }
     }
 
@@ -407,6 +424,31 @@ mod tests {
                 PolicyError::NoExpectedSize { what: named },
                 "the refusal names the flag an operator has to go and fix"
             );
+        }
+    }
+
+    /// The one flag that needs no expected size.
+    ///
+    /// The other three are about whether the cluster is whole, which
+    /// nothing but a configured size can say. This one is about
+    /// whether a follower answered — a fact this node has to hand —
+    /// so refusing it for want of a number it does not use would
+    /// refuse a configuration that works.
+    #[test]
+    fn refusing_an_unconfirmed_publish_needs_no_expected_size() {
+        let policy = Policy::new(
+            None,
+            Strict {
+                unconfirmed: true,
+                ..Strict::default()
+            },
+        )
+        .expect("this flag is evaluable without a cluster size");
+        assert_eq!(policy.expected(), None);
+        // And it does not make the other three fire: a node with no
+        // expected size is never short, so nothing else is refused.
+        for operation in [Operation::Connect, Operation::Publish, Operation::Subscribe] {
+            assert!(policy.allows(operation, 1));
         }
     }
 

@@ -838,6 +838,18 @@ impl Session<'_> {
                     "an inbound message could not be made durable"
                 );
             }
+            // Kept here and confirmed nowhere, with the strict flag
+            // set. The remote was acknowledged by the time this is
+            // known, so there is nothing to tell it: counted, and said.
+            Err(refused @ PublishRefused::NotConfirmed) => {
+                self.carried.refused += 1;
+                tracing::warn!(
+                    rule = self.bridge.rule.as_str(),
+                    topic = %local,
+                    why = %refused,
+                    "an inbound message was kept here but no copy confirmed it"
+                );
+            }
             // The node's limit, which is not this bridge's: `carry`
             // above has already applied `mqtt_bridge.max_hops` and
             // would have refused anything over it. Reaching this means

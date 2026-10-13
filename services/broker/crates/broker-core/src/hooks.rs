@@ -189,6 +189,16 @@ pub enum Refusal {
     Reserved,
     /// The batch could not be made durable, so nothing was promised.
     NotDurable,
+    /// It was written here and no copy confirmed it in time, and the
+    /// operator asked that such a publication be refused rather than
+    /// acknowledged. Section 8.6's synchronous mode, strict.
+    ///
+    /// The message is **kept** on this node — it was durable before
+    /// the copies were asked — and what is refused is the promise.
+    /// A caller that retries sends a duplicate, which is what
+    /// at-least-once means and is the same outcome a connection's
+    /// publisher gets.
+    NotConfirmed,
 }
 
 /// What a message hook says should happen to the message.

@@ -566,6 +566,7 @@ async fn a_message_this_bridge_already_carried_is_refused_and_counted() {
         Refusal::NotATopic,
         Refusal::Reserved,
         Refusal::NotDurable,
+        Refusal::NotConfirmed,
     ] {
         assert_eq!(
             metrics.metrics().publication_refused(other).get(),

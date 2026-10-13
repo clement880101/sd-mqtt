@@ -126,9 +126,9 @@ use std::collections::BinaryHeap;
 use std::net::SocketAddr;
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRequestParts, Query, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use broker_core::broker::Broker;
 use broker_core::registry::SessionId;
@@ -141,7 +141,7 @@ use serde::{Deserialize, Serialize};
 use storage::record::{Qos, RetainHandling, SubscriptionRecord};
 
 use crate::error::{ApiError, ErrorCode};
-use crate::AdminState;
+use crate::{AdminState, Forgotten};
 
 /// How many rows a page holds when the request does not say.
 pub const DEFAULT_LIMIT: usize = 100;
@@ -493,6 +493,45 @@ pub struct NodeView {
     /// How long it has been serving, `null` for a peer and for the
     /// same reason.
     pub uptime_seconds: Option<u64>,
+}
+
+/// What a forgotten node is answered with.
+#[derive(Debug, Serialize)]
+struct Forgot {
+    id: String,
+}
+
+/// Take a node out of this node's membership at once.
+///
+/// Section 8.6's operator override: a node that is never coming back is
+/// forgotten now rather than after `cluster.gone_after_ms`, and the
+/// replica sets that included it are repaired now. **This node's own
+/// table only.** Membership is not replicated — section 8.2 — so an
+/// operator decommissioning a node tells each surviving node, or waits
+/// for the grace on the ones not told. The response says so.
+///
+/// Token-guarded like every write here. A node that does not cluster
+/// has nothing to forget and answers not found for any identifier.
+async fn forget_node(
+    State(state): State<AdminState>,
+    _authorized: Authorized,
+    Path(id): Path<String>,
+) -> Result<Json<Forgot>, ApiError> {
+    let Some(cluster) = &state.cluster else {
+        return Err(ApiError::not_found(
+            "this node does not cluster, so there is no membership to forget a node from",
+        ));
+    };
+    match cluster.forget(&id) {
+        Forgotten::Gone => Ok(Json(Forgot { id })),
+        Forgotten::NotMet => Err(ApiError::not_found(format!(
+            "this node has not met a node {id}; nothing to forget. Each node keeps its own \
+             membership, so a node already forgotten here may still be known elsewhere"
+        ))),
+        Forgotten::Myself => Err(ApiError::invalid_request(
+            "a node cannot forget itself; to decommission this node, stop it",
+        )),
+    }
 }
 
 async fn nodes(State(state): State<AdminState>, paging: Paging) -> Json<Page<NodeView>> {
@@ -1272,6 +1311,10 @@ pub(crate) fn publish_refusal(refused: &PublishRefused) -> ApiError {
             ApiError::in_field(ErrorCode::InvalidRequest, "topic", refused.to_string())
         }
         PublishRefused::NotDurable => ApiError::new(ErrorCode::Internal, refused.to_string()),
+        // Kept here, confirmed nowhere, and the operator asked for
+        // that to be a refusal: the one refusal in this list that is
+        // not a fault in the request or in this node.
+        PublishRefused::NotConfirmed => ApiError::new(ErrorCode::Unavailable, refused.to_string()),
         // The cycle this bounds has no bridge in it and no admin API
         // in it either: an operator publishing by hand carries no hop
         // count, so there is no chain here for a limit to end. Should
@@ -1339,6 +1382,7 @@ async fn publish(
 pub(crate) fn routes() -> Router<AdminState> {
     Router::new()
         .route("/api/v1/nodes", get(nodes))
+        .route("/api/v1/nodes/{id}", delete(forget_node))
         .route("/api/v1/listeners", get(listeners))
         .route("/api/v1/clients", get(clients))
         .route("/api/v1/sessions", get(sessions))
@@ -1674,6 +1718,14 @@ mod tests {
         /// Nothing configured, which is what this listing is about: it
         /// reports the nodes met and never a count of them.
         fn expected(&self) -> Option<usize> {
+            None
+        }
+
+        fn forget(&self, _: &str) -> crate::Forgotten {
+            crate::Forgotten::NotMet
+        }
+
+        fn replication(&self) -> Option<crate::Replication> {
             None
         }
     }

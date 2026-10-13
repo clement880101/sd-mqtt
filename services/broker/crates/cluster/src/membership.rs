@@ -218,6 +218,34 @@ impl Membership {
         }
     }
 
+    /// Take `id` out of the table altogether.
+    ///
+    /// **The first thing in this design that makes membership smaller.**
+    /// Until it existed a peer once met was remembered as `down` for
+    /// ever, which is the blind spot section 8.5's expected size works
+    /// around and the hole section 8.6's repair cannot fill: a replica
+    /// set is repaired *away* from a node, and a node that is never
+    /// forgotten is never repaired away from.
+    ///
+    /// A forgotten peer that comes back is re-admitted by
+    /// [`Membership::heard`], which inserts what it does not hold.
+    /// Returns whether there was anything to forget.
+    pub fn forget(&mut self, id: NodeId) -> bool {
+        self.members.remove(&id).is_some()
+    }
+
+    /// How long `id` has been silent, as of `now`.
+    ///
+    /// `None` for a peer this node has not met. What section 8.6's
+    /// grace is measured against: a peer dead for longer than it is
+    /// treated as gone.
+    #[must_use]
+    pub fn silent_for(&self, id: NodeId, now: Instant) -> Option<Duration> {
+        self.members
+            .get(&id)
+            .map(|member| now.saturating_duration_since(member.last_heard))
+    }
+
     /// Recompute every peer's state against the clock.
     ///
     /// Called on every beat. Returns the peers whose state changed, so
@@ -468,5 +496,46 @@ mod tests {
         assert_eq!(MemberState::Alive.label(), "up");
         assert_eq!(MemberState::Suspect.label(), "suspect");
         assert_eq!(MemberState::Dead.label(), "down");
+    }
+
+    /// Forgetting is the first thing that makes the table smaller, and
+    /// a forgotten peer that speaks again is a peer met for the first
+    /// time.
+    #[test]
+    fn a_forgotten_peer_is_gone_and_is_re_admitted_when_heard() {
+        let mut membership = Membership::new(detection());
+        let peer = NodeIdentity::new(NodeId::from_bytes([7; 16]), "beta");
+        let now = Instant::now();
+        membership.heard(&peer, "127.0.0.1:7701", now);
+        assert_eq!(membership.len(), 1);
+        assert_eq!(membership.silent_for(peer.id(), now), Some(Duration::ZERO));
+
+        assert!(
+            membership.forget(peer.id()),
+            "there was something to forget"
+        );
+        assert_eq!(
+            membership.len(),
+            0,
+            "and it is gone from the table, not marked"
+        );
+        assert_eq!(
+            membership.silent_for(peer.id(), now),
+            None,
+            "a peer not in the table has no silence to measure"
+        );
+        assert!(
+            !membership.forget(peer.id()),
+            "forgetting twice is not an error"
+        );
+
+        // It speaks again, and it is back: forgetting is about this
+        // node's table, not the other node's right to exist.
+        membership.heard(&peer, "127.0.0.1:7701", now);
+        assert_eq!(membership.len(), 1);
+        assert_eq!(
+            membership.member(peer.id()).map(|member| member.state),
+            Some(MemberState::Alive)
+        );
     }
 }

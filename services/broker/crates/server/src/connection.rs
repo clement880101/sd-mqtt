@@ -35,7 +35,7 @@ use broker_core::registry::SessionId;
 use broker_core::session::Action;
 use broker_core::subscriptions::SubscriberId;
 use bytes::BytesMut;
-use cluster::Operation;
+use cluster::{Confirmed, Operation};
 use mqtt_codec::packet::{Ack, ConnAck, Connect, Disconnect, SubAck};
 use mqtt_codec::{
     encode, CodecError, Limits, Packet, PacketKind, Properties, QoS, ReasonCode, Version,
@@ -115,6 +115,17 @@ const NOT_WHOLE_CONNECT: ReasonCode = ReasonCode::ServerUnavailable;
 /// broker declining to take responsibility for a message rather than
 /// objecting to anything about it.
 const NOT_WHOLE: ReasonCode = ReasonCode::ImplementationSpecificError;
+
+/// And what a publish no copy confirmed is refused with, when an
+/// operator asked for that. Section 8.6.
+///
+/// 0x83 again, and for [`NOT_DURABLE`]'s reason: the broker is
+/// declining to take responsibility for the message rather than
+/// objecting to anything about it. The three refusals this broker can
+/// make about a publication are one code because they are one
+/// statement — *I will not answer for this* — and a client's move is
+/// the same for all three.
+const NOT_CONFIRMED: ReasonCode = ReasonCode::ImplementationSpecificError;
 
 /// How deep a session's outbox must be for the queue and window it
 /// drains, or `None` when those bounds are too large for one to be
@@ -252,6 +263,17 @@ pub enum ConnectionError {
     /// there.
     #[error("refused while the cluster is not whole: {0:?}")]
     NotWhole(ReasonCode),
+    /// A durable publish that no copy confirmed, on a node configured
+    /// to refuse those. Section 8.6.
+    ///
+    /// Its own variant rather than [`ConnectionError::NotDurable`],
+    /// although both are "this broker will not answer for your
+    /// message": that one is a store that failed, which is a fault,
+    /// and this one is a replica that did not answer on a node whose
+    /// operator asked to be told. One is a thing to go and fix, the
+    /// other is a thing that was configured.
+    #[error("refused because no copy confirmed it")]
+    NotConfirmed,
 }
 
 /// Serve one connection until it ends, whatever ends it.
@@ -1072,7 +1094,37 @@ impl Attached {
                 |(_, actions)| promises_durability(actions),
             );
 
-            if let Err(error) = committed.wait().await {
+            let (durable, confirmed) = committed.settled().await;
+
+            // Section 8.6, before the durability outcome is handled:
+            // an acknowledgement no copy confirmed. The publish is
+            // acknowledged anyway unless an operator said otherwise,
+            // because refusing turns the loss of one node into an
+            // outage for every durable publish — which is the trade
+            // section 8.5 already made. Counted either way, so that an
+            // operator who asked for synchronous mode can see when
+            // they are not getting it.
+            if confirmed == Confirmed::No {
+                self.metrics.publish_unconfirmed().inc();
+                if self.shared.refuses_unconfirmed() {
+                    tracing::warn!(
+                        subscriber = self.subscriber.0,
+                        "a durable publish was not confirmed by any copy and \
+                         cluster.strict.unconfirmed is set, so it is refused rather \
+                         than acknowledged"
+                    );
+                    self.shared.deliver(
+                        actions
+                            .into_iter()
+                            .filter(|(to, _)| *to != self.subscriber)
+                            .collect(),
+                    );
+                    self.close_with(NOT_CONFIRMED);
+                    return Err(ConnectionError::NotConfirmed);
+                }
+            }
+
+            if let Err(error) = durable {
                 // Only a batch that promised a publisher something can
                 // fail here; everything else waits for nothing and
                 // succeeds at once. Not acknowledged, and not
@@ -1566,6 +1618,7 @@ impl OpenSocket {
             Err(ConnectionError::Protocol(_)) => SocketOutcome::Protocol,
             Err(ConnectionError::NotDurable(_)) => SocketOutcome::NotDurable,
             Err(ConnectionError::NotWhole(_)) => SocketOutcome::NotWhole,
+            Err(ConnectionError::NotConfirmed) => SocketOutcome::NotConfirmed,
         });
     }
 }
@@ -4335,7 +4388,23 @@ mod tests {
 
     /// Connect, and say what came back.
     async fn connected(client: &mut tokio::io::DuplexStream, version: Version) -> ConnAck {
-        let mut connect = connect("sensor", 0);
+        connected_as(client, version, "sensor").await
+    }
+
+    /// The same, under an identifier of the caller's choosing.
+    ///
+    /// **A publisher must not share an identifier with the session it
+    /// is publishing to.** A second connect under one identifier is a
+    /// takeover, and a takeover with a clean start wipes the session
+    /// and its subscriptions — so a test that used one name for both
+    /// publishes into an empty broker and reads
+    /// `NoMatchingSubscribers`, which is what this one did first.
+    async fn connected_as(
+        client: &mut tokio::io::DuplexStream,
+        version: Version,
+        client_id: &str,
+    ) -> ConnAck {
+        let mut connect = connect(client_id, 0);
         connect.version = version;
         write(client, &Packet::Connect(Box::new(connect)), version).await;
         match read(client, version).await {
@@ -4478,6 +4547,8 @@ mod tests {
             connects: true,
             publishes: true,
             subscribes: true,
+            // Section 8.6's flag, which this test is not about.
+            unconfirmed: false,
         };
         let shared = short_by(3, 3, strict);
         let mut client = serve_one(Arc::clone(&shared));
@@ -4852,5 +4923,255 @@ mod tests {
             1,
             "and the client it is serving is untouched"
         );
+    }
+
+    // -----------------------------------------------------------
+    // Section 8.6's durability modes.
+    // -----------------------------------------------------------
+
+    /// A broker that replicates, with a follower that behaves as the
+    /// test says.
+    ///
+    /// The follower is a `Copies` table driven by hand rather than a
+    /// second process: what is under test is when the acknowledgement
+    /// is sent, and a real follower would make that a question about
+    /// two schedulers.
+    fn replicating(
+        mode: cluster::Durability,
+        patience: Duration,
+    ) -> (Arc<Shared>, Arc<cluster::Copies>) {
+        let store = Arc::new(GatedStore::new());
+        let writer = Writer::spawn(
+            Arc::clone(&store) as Arc<dyn storage::Storage>,
+            storage::WriterConfig::default(),
+        )
+        .expect("a writer thread");
+        let shared = Arc::new(Shared::with_store(
+            Broker::new(BrokerConfig::default()),
+            Arc::new(writer),
+        ));
+        let copies = Arc::new(cluster::Copies::new());
+        shared.install_copies(Arc::clone(&copies));
+        shared.install_durability(mode, patience);
+        (shared, copies)
+    }
+
+    /// Subscribe a durable session that will not be connected, so a
+    /// publication to it queues rather than being delivered.
+    async fn a_queued_session(shared: &Arc<Shared>, client_id: &str, filter: &str) {
+        let mut session = serve_one(Arc::clone(shared));
+        let mut connect = connect(client_id, 0);
+        connect.clean_start = false;
+        connect.properties.session_expiry_interval = Some(300);
+        write(
+            &mut session,
+            &Packet::Connect(Box::new(connect)),
+            Version::V5,
+        )
+        .await;
+        match read(&mut session, Version::V5).await {
+            Packet::ConnAck(ack) => assert_eq!(ack.reason, ReasonCode::Success),
+            other => panic!("expected an acknowledgement, got {other:?}"),
+        }
+        write(
+            &mut session,
+            &Packet::Subscribe(mqtt_codec::packet::Subscribe {
+                packet_id: 1,
+                filters: vec![mqtt_codec::packet::SubscriptionOptions {
+                    filter: filter.into(),
+                    qos: QoS::AtLeastOnce,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: mqtt_codec::packet::RetainHandling::DoNotSend,
+                }],
+                properties: Properties::default(),
+            }),
+            Version::V5,
+        )
+        .await;
+        match read(&mut session, Version::V5).await {
+            Packet::SubAck(ack) => assert_eq!(ack.reasons, vec![ReasonCode::GrantedQos1]),
+            other => panic!("expected a subscription acknowledgement, got {other:?}"),
+        }
+        // The socket goes; the session and its subscription stay.
+        drop(session);
+    }
+
+    /// One at-least-once publish, and the acknowledgement for it.
+    async fn publish_once(client: &mut tokio::io::DuplexStream, topic: &str) -> Ack {
+        write(
+            client,
+            &Packet::Publish(mqtt_codec::packet::Publish {
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                topic: topic.into(),
+                packet_id: Some(9),
+                payload: bytes::Bytes::from_static(b"21.5"),
+                properties: Properties::default(),
+            }),
+            Version::V5,
+        )
+        .await;
+        match read(client, Version::V5).await {
+            Packet::PubAck(ack) => ack,
+            other => panic!("expected a publish acknowledgement, got {other:?}"),
+        }
+    }
+
+    /// Asynchronous mode acknowledges before any copy exists.
+    ///
+    /// **Proved against a follower that never confirms**, not a fast
+    /// one: a test with a quick follower passes whether or not the
+    /// acknowledgement waited.
+    #[tokio::test]
+    async fn asynchronous_mode_acknowledges_before_a_follower_confirms() {
+        let (shared, copies) = replicating(cluster::Durability::Async, Duration::from_secs(30));
+        a_queued_session(&shared, "sensor", "site/+/temp").await;
+        // A follower exists and is at zero. It will never move.
+        copies.marked(SessionKey::new("", "sensor"), [0xaa; 16], 0);
+
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected_as(&mut client, Version::V5, "publisher")
+                .await
+                .reason,
+            ReasonCode::Success
+        );
+        let started = std::time::Instant::now();
+        let ack = publish_once(&mut client, "site/1/temp").await;
+        assert_eq!(ack.reason, ReasonCode::Success);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it did not wait for the follower: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            shared.metrics().publish_unconfirmed().get(),
+            0,
+            "asynchronous mode never asked, so nothing is unconfirmed"
+        );
+    }
+
+    /// Synchronous mode waits, and then acknowledges.
+    ///
+    /// **The mutation this exists for is a synchronous wait that
+    /// awaits nothing**, which the test above passes.
+    #[tokio::test]
+    async fn synchronous_mode_waits_for_a_follower_and_then_acknowledges() {
+        let (shared, copies) = replicating(cluster::Durability::Sync, Duration::from_secs(30));
+        a_queued_session(&shared, "sensor", "site/+/temp").await;
+        let session = SessionKey::new("", "sensor");
+        copies.marked(session.clone(), [0xaa; 16], 0);
+
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected_as(&mut client, Version::V5, "publisher")
+                .await
+                .reason,
+            ReasonCode::Success
+        );
+
+        // The follower catches up after a pause, and the
+        // acknowledgement must arrive after that rather than before.
+        let releasing = Arc::clone(&copies);
+        let told = session.clone();
+        let confirmed_at = Arc::new(std::sync::Mutex::new(None));
+        let noted = Arc::clone(&confirmed_at);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            *noted.lock().expect("a lock") = Some(std::time::Instant::now());
+            releasing.marked(told, [0xaa; 16], u64::MAX);
+        });
+
+        let ack = publish_once(&mut client, "site/1/temp").await;
+        let acknowledged_at = std::time::Instant::now();
+        assert_eq!(ack.reason, ReasonCode::Success);
+
+        let confirmed = confirmed_at.lock().expect("a lock").expect(
+            "the acknowledgement arrived before the follower confirmed, so it did not wait",
+        );
+        assert!(
+            acknowledged_at >= confirmed,
+            "the acknowledgement must follow the confirmation"
+        );
+        assert_eq!(shared.metrics().publish_unconfirmed().get(), 0);
+    }
+
+    /// With no follower at all, it is acknowledged anyway and counted.
+    ///
+    /// Section 8.6: a cluster of one, a replication factor of one and
+    /// every follower down all reach this, and refusing would turn the
+    /// loss of one node into an outage for every durable publish.
+    /// **Both halves asserted**: a build that acknowledged without
+    /// counting would be a guarantee quietly not kept.
+    #[tokio::test]
+    async fn synchronous_mode_with_no_follower_acknowledges_and_counts_it() {
+        let (shared, _copies) = replicating(cluster::Durability::Sync, Duration::from_secs(30));
+        a_queued_session(&shared, "sensor", "site/+/temp").await;
+
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected_as(&mut client, Version::V5, "publisher")
+                .await
+                .reason,
+            ReasonCode::Success
+        );
+        let started = std::time::Instant::now();
+        let ack = publish_once(&mut client, "site/1/temp").await;
+        assert_eq!(ack.reason, ReasonCode::Success);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "with nobody to ask it answered rather than waiting out the patience: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            shared.metrics().publish_unconfirmed().get(),
+            1,
+            "an operator who asked for synchronous mode has to be able to see this"
+        );
+    }
+
+    /// And with the strict flag, it is refused instead.
+    #[tokio::test]
+    async fn the_strict_flag_refuses_an_unconfirmed_publish() {
+        let (shared, _copies) = replicating(cluster::Durability::Sync, Duration::from_secs(30));
+        shared.install_strict_unconfirmed(true);
+        a_queued_session(&shared, "sensor", "site/+/temp").await;
+
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected_as(&mut client, Version::V5, "publisher")
+                .await
+                .reason,
+            ReasonCode::Success
+        );
+        write(
+            &mut client,
+            &Packet::Publish(mqtt_codec::packet::Publish {
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                topic: "site/1/temp".into(),
+                packet_id: Some(9),
+                payload: bytes::Bytes::from_static(b"21.5"),
+                properties: Properties::default(),
+            }),
+            Version::V5,
+        )
+        .await;
+        // **Not acknowledged.** The reason arrives in a disconnect,
+        // because a PUBACK carrying 0x83 and a PUBACK carrying success
+        // are the same packet to a client that has already been told
+        // its message was taken.
+        match read(&mut client, Version::V5).await {
+            Packet::Disconnect(said) => assert_eq!(
+                said.reason,
+                ReasonCode::ImplementationSpecificError,
+                "the refusal carries a reason, as section 8.5's do"
+            ),
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
+        assert_eq!(shared.metrics().publish_unconfirmed().get(), 1);
     }
 }

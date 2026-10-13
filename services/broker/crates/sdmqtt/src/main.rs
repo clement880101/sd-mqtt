@@ -228,6 +228,14 @@ pub enum StartupError {
     /// an operator has to go and fix.
     #[error("{0}")]
     Policy(#[from] cluster::PolicyError),
+    /// The replication factor cannot mean what it says. Section 8.6.
+    ///
+    /// Carried verbatim, like the refusals above it. `Config::validate`
+    /// has already refused it, so reaching this is a startup that
+    /// stopped validating — which then refuses to start with the right
+    /// message rather than panicking.
+    #[error("{0}")]
+    Factor(#[from] cluster::FactorError),
     /// The cluster listener could not be bound.
     ///
     /// Fatal, and for the reason the other listeners' failures are: a
@@ -253,6 +261,12 @@ pub enum StartupError {
 struct MeshView {
     /// Who this node has met, and how each of them is doing.
     mesh: Arc<Mesh>,
+    /// Section 8.6's copies, for the three numbers it is asked for.
+    copies: Arc<cluster::Copies>,
+    /// Who this node is, so that it refuses to forget itself.
+    me: cluster::NodeId,
+    /// Section 8.6's mode, for the page to say which it is in.
+    durability: cluster::Durability,
     /// Section 8.4's drains, for the seven numbers it is asked for.
     ///
     /// The same table the mesh's handler and the migrator hold. Not
@@ -288,6 +302,51 @@ impl sdmqtt_admin::Cluster for MeshView {
     fn expected(&self) -> Option<usize> {
         self.gate.expected()
     }
+
+    fn forget(&self, id: &str) -> sdmqtt_admin::Forgotten {
+        // An identifier that is not one names nobody this node has
+        // met, which is the same answer as an identifier it has not.
+        let Ok(id) = cluster::NodeId::parse(id) else {
+            return sdmqtt_admin::Forgotten::NotMet;
+        };
+        if id == self.me {
+            return sdmqtt_admin::Forgotten::Myself;
+        }
+        if self.mesh.forget(id) {
+            // Its marks go with it: placement no longer names it, so
+            // they already count for nothing, and they would otherwise
+            // sit in the table for the life of the process.
+            self.copies.forgot(id.to_bytes());
+            sdmqtt_admin::Forgotten::Gone
+        } else {
+            sdmqtt_admin::Forgotten::NotMet
+        }
+    }
+
+    fn replication(&self) -> Option<sdmqtt_admin::Replication> {
+        Some(sdmqtt_admin::Replication {
+            mode: match self.durability {
+                cluster::Durability::Async => "async",
+                cluster::Durability::Sync => "sync",
+            },
+            streaming: self.copies.streaming() as u64,
+            holding: self.copies.following() as u64,
+            lag: self.copies.worst_lag(),
+            repairs_pending: self.copies.repairs_pending(),
+            repairs_done: self.copies.repairs_done(),
+            peers: self
+                .copies
+                .by_peer()
+                .into_iter()
+                .map(|peer| sdmqtt_admin::PeerReplication {
+                    id: cluster::NodeId::from_bytes(peer.node).to_string(),
+                    confirmed: peer.confirmed,
+                    behind: peer.behind,
+                    held: peer.held,
+                })
+                .collect(),
+        })
+    }
 }
 
 impl sdmqtt_server::metrics::ClusterMetrics for MeshView {
@@ -315,6 +374,22 @@ impl sdmqtt_server::metrics::ClusterMetrics for MeshView {
         self.mesh.stats().bytes_dropped
     }
 
+    fn replication(&self) -> [u64; sdmqtt_server::metrics::REPLICATION_NUMBERS.len()] {
+        [
+            self.copies.worst_lag(),
+            self.copies.streaming() as u64,
+            self.copies.following() as u64,
+        ]
+    }
+
+    fn replica_applied(&self) -> u64 {
+        self.copies.applied()
+    }
+
+    fn repairs(&self) -> (u64, u64) {
+        (self.copies.repairs_pending(), self.copies.repairs_done())
+    }
+
     fn migrations(&self) -> [u64; sdmqtt_server::metrics::MIGRATION_NUMBERS.len()] {
         // Read once, so the seven numbers are one reading of the table
         // rather than seven: a scrape that caught a migration halfway
@@ -329,6 +404,8 @@ impl sdmqtt_server::metrics::ClusterMetrics for MeshView {
             stats.messages(),
             stats.missing(),
             stats.late(),
+            stats.pulled(),
+            stats.pulled_messages(),
         ]
     }
 }
@@ -346,6 +423,8 @@ struct Node<'a> {
     mesh: Option<&'a Arc<Mesh>>,
     /// Section 8.4's table of drains, which every node has.
     migrations: &'a Arc<Migrations>,
+    /// Section 8.6's copies, on a node that has a store.
+    copies: Option<&'a Arc<cluster::Copies>>,
     /// Section 8.5's policy, on the same nodes as the mesh: the two
     /// are made together and neither is useful without the other.
     gate: Option<&'a Arc<Gate>>,
@@ -503,6 +582,14 @@ struct Rebuilt {
     /// if the store has never held one, which is what makes a store
     /// directory and a node the same thing.
     identity: NodeIdentity,
+    /// Section 8.6's copies, seeded from the same restore.
+    ///
+    /// What this node follows and how far each copy had been applied,
+    /// and where each stream it owns had got to. Out of the restore
+    /// rather than counted from zero, because a follower refuses
+    /// anything at or below its mark and an owner that began again
+    /// would have everything it sent refused as a duplicate.
+    copies: Arc<cluster::Copies>,
     /// This node's replicated metadata, section 8.2.
     ///
     /// Opened out of the same restore as everything else, which is
@@ -549,6 +636,28 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, Sta
 
     let mut broker = Broker::new(config.server().broker);
     let report = broker_core::restore::restore(&mut broker, &restored, now);
+
+    // Section 8.6, out of the same restore and **before the broker is
+    // handed anything**. `restored.replicas` is deliberately a list of
+    // its own: these are sessions another node owns, and the restore
+    // above is handed `restored.sessions`, which does not include
+    // them. A build that passed both would put a stranger's filters in
+    // this node's trie.
+    let copies = Arc::new(cluster::Copies::new());
+    for copy in &restored.replicas {
+        copies.follow(copy.session.session.key.clone(), copy.owner, copy.through);
+    }
+    for session in &restored.sessions {
+        if session.stream_at > 0 {
+            copies.resume(session.session.key.clone(), session.stream_at);
+        }
+    }
+    if !restored.replicas.is_empty() {
+        tracing::info!(
+            copies = restored.replicas.len(),
+            "this node holds copies of other nodes' sessions"
+        );
+    }
 
     let writer = Arc::new(
         Writer::spawn(Arc::clone(&store), config.storage.writer()).map_err(StartupError::Writer)?,
@@ -685,6 +794,7 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, Sta
         store,
         writer,
         identity: reconciled.identity,
+        copies,
         replicated,
     })
 }
@@ -744,12 +854,18 @@ async fn start_admin(
             .with_node_id(identity.id().to_string())
             .with_node_name(identity.name());
     }
-    if let (Some(mesh), Some(gate)) = (node.mesh, node.gate) {
+    if let (Some(mesh), Some(gate), Some(copies)) = (node.mesh, node.gate, node.copies) {
         state = state
             .with_node_address(mesh.advertise())
             .with_cluster(Some(Arc::new(MeshView {
                 mesh: Arc::clone(mesh),
                 migrations: Arc::clone(node.migrations),
+                copies: Arc::clone(copies),
+                me: node
+                    .identity
+                    .expect("a node with a mesh has an identity")
+                    .id(),
+                durability: config.cluster.durability,
                 gate: Arc::clone(gate),
             }) as Arc<dyn sdmqtt_admin::Cluster>));
     }
@@ -933,6 +1049,9 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             Arc::clone(&replicator),
             Arc::clone(&rebuilt.shared),
             Arc::clone(&migrations),
+            // To answer a pull: a copy is in the store and not in the
+            // broker, so the handler reads the store.
+            Arc::clone(&rebuilt.store),
         );
         (replicator, handler, applying)
     });
@@ -954,6 +1073,55 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     let gate = mesh
         .as_ref()
         .map(|mesh| Gate::new(policy, Arc::clone(mesh) as Arc<dyn Live>));
+    // Section 8.6: who holds a copy of each session. Made here because
+    // it reads the mesh's live members, and on a node that does not
+    // cluster there is nothing to place anything across.
+    let factor = config.cluster.factor()?;
+    // The same table the restore seeded, for the two things that
+    // report on it. `None` is a node with no store, which cannot
+    // cluster and so holds no copies.
+    let copies = rebuilt.as_ref().map(|rebuilt| Arc::clone(&rebuilt.copies));
+    let placement = match (&mesh, rebuilt.as_ref()) {
+        (Some(mesh), Some(rebuilt)) => Some(cluster::Placement::new(
+            rebuilt.identity.id(),
+            factor,
+            Arc::clone(mesh),
+            // Section 8.6's grace: how long a dead node keeps its place
+            // in every replica set before the sets are repaired without
+            // it.
+            std::time::Duration::from_millis(config.cluster.gone_after_ms),
+        )),
+        _ => None,
+    };
+    // Section 8.6: who a session is streamed to, so that a synchronous
+    // publish to a fresh session waits for the follower that is about
+    // to be sent it rather than counting it as nobody. Placement's
+    // choice, less this node, less anybody dead — the same set
+    // `replication::stream_to_followers` sends to, minus the dead,
+    // because "no reachable follower" is the case section 8.6
+    // acknowledges anyway and a dead one would be waited for in vain.
+    if let (Some(mesh), Some(copies), Some(placement)) = (&mesh, &copies, &placement) {
+        let mesh = Arc::clone(mesh);
+        let placement = Arc::clone(placement);
+        copies.install_followers(move |session| {
+            let reachable: std::collections::HashSet<[u8; 16]> = mesh
+                .members()
+                .into_iter()
+                .filter(|member| member.state != MemberState::Dead)
+                .map(|member| member.identity.id().to_bytes())
+                .collect();
+            cluster::place(session, &placement.members(), placement.factor())
+                .into_iter()
+                .filter(|node| *node != placement.me())
+                .take(placement.factor().copies().saturating_sub(1))
+                .map(|node| node.to_bytes())
+                .map(|node| cluster::Placed {
+                    node,
+                    reachable: reachable.contains(&node),
+                })
+                .collect()
+        });
+    }
     // Section 8.3, and **before any of the tasks below**: this is the
     // only thing that makes `Broker::publish` forward anything, so the
     // window between the mesh accepting links and this being installed
@@ -986,6 +1154,14 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             Arc::clone(mesh),
             Arc::clone(&migrations),
             std::time::Duration::from_millis(config.cluster.drain_timeout_ms),
+            // Section 8.6's failover: what a short drain falls back to.
+            // All three are this node's, made above, and are what make
+            // a copy readable rather than only written.
+            cluster::migrate::Failover {
+                placement: placement.clone(),
+                copies: Some(Arc::clone(&rebuilt.copies)),
+                store: Some(Arc::clone(&rebuilt.store)),
+            },
         ));
         // Section 8.5, here for the same reason and in the same
         // window: an operator who asked for connects to be refused
@@ -999,6 +1175,22 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         if let Some(gate) = &gate {
             rebuilt.shared.install_gate(Arc::clone(gate));
         }
+        // Section 8.6, in the same window and for the same reason: a
+        // publish that found no copies table streams nothing, so the
+        // moment between the listener opening and this is a moment
+        // whose messages have one copy.
+        rebuilt.shared.install_copies(Arc::clone(&rebuilt.copies));
+        // Section 8.6's two, in the same window: a publish that found
+        // no mode installed is asynchronous, which is the default and
+        // not a failure, but an operator who asked for synchronous
+        // must not get a window of publishes that were not.
+        rebuilt.shared.install_durability(
+            config.cluster.durability,
+            std::time::Duration::from_millis(config.cluster.sync_timeout_ms),
+        );
+        rebuilt
+            .shared
+            .install_strict_unconfirmed(config.cluster.strict.unconfirmed);
     }
     // The four tasks of section 8.2, started once there is a mesh for them
     // to talk over. A node that does not cluster starts none of them: its
@@ -1017,6 +1209,7 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
                 waiting,
                 Arc::clone(&replicator),
                 mesh.clone(),
+                placement.clone(),
             )));
         }
         if let Some(mesh) = &mesh {
@@ -1044,10 +1237,31 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             );
         }
     }
-    if let (Some(mesh), Some(gate)) = (&mesh, &gate) {
+    // Section 8.6's repair: a sweep that sends a session's queue to a
+    // follower that holds none of it, at the configured rate. Only on a
+    // node that places sessions, because only such a node has anything
+    // to repair.
+    if let (Some(mesh), Some(placement), Some(rebuilt)) = (&mesh, &placement, rebuilt.as_ref()) {
+        replicating.push(tokio::spawn(replication::repairing(
+            Arc::clone(&rebuilt.shared),
+            Arc::clone(mesh),
+            Arc::clone(placement),
+            Arc::clone(&rebuilt.copies),
+            Arc::clone(&rebuilt.store),
+            config.cluster.repair_sessions_per_second,
+        )));
+    }
+    if let (Some(mesh), Some(gate), Some(copies)) = (&mesh, &gate, &copies) {
         let metrics: Arc<dyn sdmqtt_server::metrics::ClusterMetrics> = Arc::new(MeshView {
             mesh: Arc::clone(mesh),
             migrations: Arc::clone(&migrations),
+            copies: Arc::clone(copies),
+            me: rebuilt
+                .as_ref()
+                .expect("a node with a mesh has a store")
+                .identity
+                .id(),
+            durability: config.cluster.durability,
             gate: Arc::clone(gate),
         });
         // Section 11.3's four cluster numbers and section 8.4's seven,
@@ -1107,6 +1321,7 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             identity: rebuilt.as_ref().map(|rebuilt| &rebuilt.identity),
             mesh: mesh.as_ref(),
             migrations: &migrations,
+            copies: copies.as_ref(),
             gate: gate.as_ref(),
         },
     )

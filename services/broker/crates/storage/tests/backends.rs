@@ -2853,6 +2853,185 @@ mod contract {
 
     // ---- flush ------------------------------------------------------------
 
+    /// The owner's own position in the stream comes back with the
+    /// session, and goes when the session goes.
+    ///
+    /// **Why it is stored at all**: a follower refuses anything at or
+    /// below its mark, so an owner that restarted its count from one
+    /// would have everything it sent refused as a duplicate —
+    /// silently, until the session had produced as many operations as
+    /// it had before. A follower that quietly stops following is the
+    /// failure replication exists to prevent.
+    pub fn the_owners_stream_position_survives_and_goes_with_the_session<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = new();
+        apply(&store, &[Record::SessionPut(session("mine"))]);
+        assert_eq!(
+            session_of(&restore(&store), "mine").stream_at,
+            0,
+            "a session that has never been streamed reads as zero, not as absent"
+        );
+
+        apply(
+            &store,
+            &[Record::StreamAt {
+                session: key("mine"),
+                at: 4,
+            }],
+        );
+        apply(
+            &store,
+            &[Record::StreamAt {
+                session: key("mine"),
+                at: 9,
+            }],
+        );
+        assert_eq!(
+            session_of(&restore(&store), "mine").stream_at,
+            9,
+            "one row, overwritten, not a history"
+        );
+
+        // And a client reconnecting under the same identifier inherits
+        // nothing, this included: a position left behind would have
+        // the next stream start part way through a session that has
+        // none of it.
+        apply(
+            &store,
+            &[
+                Record::SessionRemoved {
+                    session: key("mine"),
+                },
+                Record::SessionPut(session("mine")),
+            ],
+        );
+        assert_eq!(session_of(&restore(&store), "mine").stream_at, 0);
+    }
+
+    /// A session this node merely holds a copy of comes back as a
+    /// copy, and **not in the list the broker is handed**.
+    ///
+    /// Section 8.6. Every record a followed session is made of is the
+    /// same record an owned one is made of — the session, its
+    /// subscriptions, its queue — so the only thing that can tell them
+    /// apart is the replica row. A restore that lost it would hand the
+    /// broker another node's session: its filters would enter this
+    /// node's matching trie, it would be forwarded publications for
+    /// them, and it would deliver them to a client connected
+    /// somewhere else.
+    pub fn a_followed_session_restores_as_a_copy_and_not_as_a_session<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = new();
+        apply(
+            &store,
+            &[
+                Record::SessionPut(session("mine")),
+                Record::SessionPut(session("theirs")),
+                Record::BodyPut {
+                    id: body_id(1),
+                    body: body(1),
+                },
+                Record::QueuePushed {
+                    session: key("theirs"),
+                    entry: queue_entry(1, body_id(1)),
+                },
+                Record::ReplicaFollows {
+                    session: key("theirs"),
+                    owner: [0xbb; 16],
+                    through: 7,
+                },
+            ],
+        );
+
+        let restored = restore(&store);
+        assert_eq!(
+            restored
+                .sessions
+                .iter()
+                .map(|held| held.session.key.client_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["mine".to_owned()],
+            "the followed session must not be in the list the broker is handed"
+        );
+        assert_eq!(restored.replicas.len(), 1);
+        let copy = &restored.replicas[0];
+        assert_eq!(copy.session.session.key, key("theirs"));
+        assert_eq!(copy.owner, [0xbb; 16]);
+        assert_eq!(
+            copy.through, 7,
+            "the mark comes back, or the follower re-applies a stream it already has"
+        );
+        assert_eq!(
+            copy.session.queue.len(),
+            1,
+            "and the copy is a whole session: the queue came with it"
+        );
+    }
+
+    /// The mark is overwritten rather than appended to, and dropping
+    /// the row keeps the session.
+    ///
+    /// Both halves matter. A mark that accumulated rows would grow a
+    /// row per replicated operation for the life of the session. And
+    /// **becoming a session's owner is the removal of one row**: the
+    /// queue, the subscriptions and the session itself stay exactly
+    /// where they are, which is what makes failover keep what it
+    /// pulled.
+    pub fn a_replica_mark_is_overwritten_and_dropping_it_keeps_the_session<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = new();
+        apply(
+            &store,
+            &[
+                Record::SessionPut(session("theirs")),
+                Record::BodyPut {
+                    id: body_id(1),
+                    body: body(1),
+                },
+                Record::QueuePushed {
+                    session: key("theirs"),
+                    entry: queue_entry(1, body_id(1)),
+                },
+                Record::ReplicaFollows {
+                    session: key("theirs"),
+                    owner: [0xbb; 16],
+                    through: 1,
+                },
+            ],
+        );
+        apply(
+            &store,
+            &[Record::ReplicaFollows {
+                session: key("theirs"),
+                owner: [0xbb; 16],
+                through: 2,
+            }],
+        );
+
+        let restored = restore(&store);
+        assert_eq!(restored.replicas.len(), 1, "one row, not two");
+        assert_eq!(restored.replicas[0].through, 2);
+
+        // And now this node becomes the owner.
+        apply(
+            &store,
+            &[Record::ReplicaDropped {
+                session: key("theirs"),
+            }],
+        );
+        let restored = restore(&store);
+        assert!(restored.replicas.is_empty());
+        let now_ours = session_of(&restored, "theirs");
+        assert_eq!(
+            now_ours.queue.len(),
+            1,
+            "the queue stayed: becoming the owner keeps everything and changes whose it is"
+        );
+    }
+
     /// A flush changes nothing about what the store holds, and a store
     /// goes on working after one.
     ///
@@ -2940,6 +3119,9 @@ macro_rules! every_contract_test {
             a_collected_register_is_the_only_thing_that_removes_one,
             what_has_been_read_of_each_peers_log_is_held_in_node_order,
             a_flush_keeps_everything_and_leaves_the_store_usable,
+            a_followed_session_restores_as_a_copy_and_not_as_a_session,
+            a_replica_mark_is_overwritten_and_dropping_it_keeps_the_session,
+            the_owners_stream_position_survives_and_goes_with_the_session,
         }
     };
 }

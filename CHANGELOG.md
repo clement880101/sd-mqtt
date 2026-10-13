@@ -7,6 +7,266 @@ milestones, which is what this project actually ships in.
 **The one thing to read before upgrading is "Before you upgrade" under
 the milestone you are moving to.** Everything else is description.
 
+## Unreleased — milestone 6: queue replication
+
+### Before you upgrade: a store written before this milestone is refused
+
+**A broker built from this milestone will not open a store written by
+milestone 5. It refuses to start, and says so:**
+
+```
+store format version 8 is not readable by this build, which reads version 10.
+The store is not damaged; it was written by a different build. Nothing is
+released yet, so there is no migration: see CHANGELOG.md for what moved and
+what starting with a fresh store directory throws away.
+```
+
+**What to do.** The same as every other version move: stop the broker,
+move or delete the store directory (`storage.directory`, holding
+`sdmqtt.redb`), and start the new build, which creates a fresh store.
+What that throws away is the list in the milestone 5 section —
+durable sessions, queued messages, retained messages, wills, rules,
+outboxes, this node's identity, its clock and its replicated
+registers. **Throw away one store, not every store:** on a node
+already in a cluster the registers come back from the next
+anti-entropy exchange, and on the last node of a cluster they are the
+cluster's metadata and do not.
+
+**Why the version moved to 10.** Twice, within this one unreleased
+milestone: to 9 when a node could hold a copy of another node's
+session, and to 10 when the owner's own position in that stream was
+stored beside it. The number moved the second time rather than version
+9 being redefined, for the reason the check is exact in the first
+place — redefining a number already written to somebody's disk is how
+a silent misread happens.
+
+A node can now hold a copy of a
+session another node owns. The records that make up such a copy are
+the same records as any other session's — the session, its
+subscriptions, its queue — so the store gained a row saying *this one
+is a copy, owned by that node, applied this far*. Without it a restore
+would hand the broker another node's session: its filters would enter
+this node's matching trie, it would be forwarded publications for
+them, and it would deliver them to a client connected somewhere else.
+
+The owner's position is stored rather than counted from zero at
+startup because a follower refuses anything at or below its own mark:
+an owner that restarted its count would have everything it sent
+refused as a duplicate, silently, until the session had produced as
+many operations as it had before. A follower that quietly stops
+following is the failure replication exists to prevent.
+
+A version 8 store holds neither, so nothing is lost by their absence
+— but a version 8 *build* reading a later store would meet record
+variants it has no arm for, and the check is exact in both directions
+on purpose.
+
+### Added
+
+- **Which nodes hold a session's queue.** Rendezvous hashing over the
+  live members picks a replica set per session:
+  `cluster.replication_factor`, one to three, two by default, also
+  `SDMQTT_CLUSTER_REPLICATION_FACTOR`. Nothing streams anything yet;
+  this is the placement and its configuration.
+
+  It is **advice, not authority**. Membership is local judgement, so
+  two nodes on opposite sides of a partition compute different sets;
+  ownership stays with the epoch-stamped register from milestone 5, so
+  that disagreement costs nothing.
+
+- **Queues are replicated.** An owner streams every change to a
+  session's queue — an append, an acknowledgement, a removal — to the
+  nodes rendezvous puts behind it, and those nodes hold a copy they do
+  not serve. One frame per follower rather than a broadcast, which is
+  the economy section 8.3 already makes for a publication: telling
+  fifty nodes about a queue forty-eight of them hold nothing of would
+  cost the cluster its own capacity.
+
+  Nothing reaches a follower until the store has taken the batch,
+  which is section 8.2's rule for registers applied to the same
+  queue — one description of what happened, and both the store and
+  the copy get it.
+
+- **A copy is on the disk, with its payloads.** The first version of
+  the stream shipped two defects the gauges could not see. A follower
+  wrote queue records for a session its store did not hold, which a
+  store refuses, so the copy existed only in the follower's in-memory
+  table; and the entries travelled without their payloads, so even a
+  stored copy was a queue of references to messages the follower had
+  never seen. The first append an owner streams for a session now
+  carries the session record, and every append carries the payload it
+  names. The three-node test kills and restarts each follower and
+  asserts the copies came back, because a restart is the only question
+  a gauge cannot answer from memory.
+
+  A third, smaller one beside them: a session that was handed over,
+  expired or taken over never left the owner's stream table, so the
+  node went on counting it as replicated and a client reconnecting
+  under the same identifier would have had its new stream numbered
+  from where the old one stopped — which a follower still holding the
+  old copy would have refused as duplicates.
+
+  And a fourth, which the migration test found on about half its
+  runs and which is a race rather than a flake: a client reconnecting
+  to the node that holds the copy of its session, at the moment that
+  copy is arriving. The copy's write and the connect's write meet on
+  one writer; when the copy lands first, the drain's queue entries
+  carry sequence numbers the copy already used, the store refuses the
+  whole connect batch as a reused sequence — correctly — and the
+  subscription register in that batch is abandoned with it, so no
+  other node ever learns the claiming node has the subscriber. The
+  copy now yields to the drain, written ahead of the connect on the
+  same writer. A test that waited for the copy before reconnecting
+  passed every run, with and without the fix, because the wait took
+  the race away; the test reconnects without waiting, as a client
+  would.
+
+- **A replica set that is short repairs itself**, and a node can be
+  taken out of membership. Section 8.6's re-replication. A node that
+  is down keeps its place in every replica set until
+  `cluster.gone_after_ms` runs out — an hour by default, because a node
+  that is down is usually restarting and copying the whole queue estate
+  on every restart is what the grace prevents — and is then given up
+  on: the sets that included it are repaired onto the nodes that
+  remain, each session's queue sent to its new follower as one
+  snapshot, at most `cluster.repair_sessions_per_second` a second.
+
+  **`DELETE /api/v1/nodes/{id}`** forgets a node at once, on the node
+  asked. It is the first thing in this design that makes membership
+  smaller: until now a peer once met was remembered as `down` for
+  ever, which is the hole repair could not fill, because a set is
+  repaired *away* from a node and a node never forgotten is never
+  repaired away from. A forgotten node that comes back is re-admitted.
+
+  A snapshot does not consume a stream position, and that is the
+  design: a new follower starts at zero while the owner's stream is at
+  some position the other followers have reached, and re-sending the
+  queue as ordinary appends would either put the others behind or
+  leave the newcomer with a hole nothing fills. The snapshot carries
+  the owner's position, the follower takes it whole, and the next live
+  change is the next change for everybody.
+
+  `sdmqtt_replica_repairs_pending` and `sdmqtt_replica_repairs_done_total`
+  are section 8.6's "progress visible".
+
+- **Losing the owner does not lose the queue.** Section 8.6's failover.
+  When a drain comes up short — the previous owner cannot be reached,
+  or does not finish in time — the claiming node asks every reachable
+  member of the session's replica set how far its copy goes, weighs
+  its own copy against the answers, and pulls from whichever is
+  furthest ahead. **The drain still comes first**, because the owner
+  holds the authoritative queue and asking it is the complete answer;
+  the pull is what happens on the timeout that used to be counted as a
+  shortfall, and the shortfall is now what is still missing *after* the
+  pull. A drain that fell short by five and a pull that brought all
+  five reports nothing lost, because nothing was.
+
+  The copy furthest ahead, **not the nearest**. Under any partition
+  worth failing over from, the nearest copy is the one that was cut
+  off with the claiming node and is furthest behind, and it answers
+  first because it is nearest. The three-node test holds one
+  follower's link back, kills the owner, and reconnects the client to
+  the laggard — which must pull from the other node anyway.
+
+  Two counters beside the migration ones: `sdmqtt_sessions_pulled_total`
+  and `sdmqtt_pulled_messages_total`. And one on the follower's side,
+  `sdmqtt_replica_changes_applied_total`: the gauges say what a node
+  holds, and a node that holds copies and has quietly stopped applying
+  to them looks the same on all three. A flat line here on a node that
+  is meant to be following is that node. A copy holds the queue and only
+  the queue — no subscriptions, no inflight window — so a client that
+  failed over has its messages and re-subscribes, which is what
+  section 8.6 replicates and all it says it does.
+
+- **`cluster.durability`, with `"sync"` available.** `async` is the
+  default and is what the lag gauge is about. `sync` holds the
+  acknowledgement until one follower has confirmed the append, so a
+  single node failing loses nothing; the cost is one local round trip
+  per durable publish, and it is one round trip rather than one per
+  copy because section 8.6 asks for at least one.
+
+  **With no follower to ask, it is acknowledged anyway and counted**
+  as `sdmqtt_publishes_unconfirmed_total` — a cluster of one, a factor
+  of one, every follower down. Refusing would turn the loss of one
+  node into an outage for every durable publish, which is the trade
+  section 8.5 already made the other way. `cluster.strict.unconfirmed`
+  is there for a deployment that wants the refusal, and the refusal
+  carries reason code 0x83 rather than a closed socket.
+
+  `cluster.sync_timeout_ms` bounds the wait. A follower that has gone
+  quiet is the case synchronous mode exists for, and it is also the
+  case where waiting without a bound turns one slow node into every
+  publisher's outage, so running out counts as unconfirmed rather than
+  holding the client.
+
+  **The mode applies to `POST /api/v1/publish` and to ingest rules as
+  well.** The first version waited for the copy on that path and
+  then threw the answer away, so an operator who set `sync` and
+  published by hand to check it was told `durable: true` by the store
+  alone. Now an unconfirmed answer is counted on the same series, and
+  with the strict flag refused with `503` and the code `unavailable`
+  (a new error code). The message is kept; the promise is refused.
+
+  **A placed follower that has not reported yet is waited for.** Found
+  by the exit-criteria test: "has a follower" meant "a follower has
+  reported a mark", so the first few publishes to every fresh session
+  were acknowledged unconfirmed, and counted, on a cluster with
+  nothing wrong with it — three of eight. The owner now knows who
+  placement names for each session and waits for one that can be
+  reached; a dead one is nobody to wait for, as before.
+
+  **Both modes describe the node that accepted the publish.** A
+  publish accepted by one node for a session owned by another is
+  forwarded under section 8.3, and the accepting node answers when it
+  is done — before the owner has appended, let alone a copy. The
+  exit-criteria tests publish on the owner for that reason, and the
+  spec now says so where the modes are defined. It is written down as
+  a gap rather than filled: filling it is an acknowledgement across
+  the mesh, which is a design of its own.
+
+- **Three gauges for it**: `sdmqtt_replication_lag`,
+  `sdmqtt_replicated_sessions` and `sdmqtt_replica_sessions`. The
+  first is section 8.6's loss window — in asynchronous mode what a
+  sudden loss of a node would cost **is** the lag — and it is measured
+  from the copy that is furthest behind, because a window measured
+  from the closest one describes a failure that did not happen. Absent
+  rather than zero on a node that does not cluster, like every other
+  cluster series.
+
+  The lag counts the followers placement names, and no others. Found
+  on the Cluster page: a removed node's last mark stayed in the
+  owner's table and the gauge grew by one with every publish, for
+  ever. A node dead *within* the grace still counts, because its copy
+  is still in the set and how far behind it is is the loss window; a
+  node given up on or forgotten does not, and forgetting one purges
+  its marks.
+
+- **The Cluster page shows replica health and re-replication
+  progress**, which is the last of milestone 6's exit criteria. Four
+  gauges from `GET /health/cluster`'s new `replication` object: the
+  durability mode; sessions streamed and copies held; the lag; and
+  sessions short of a copy, with how many have been re-streamed so
+  far. In synchronous mode a fifth appears when any acknowledgement
+  went unconfirmed. Three columns join the membership table — copies
+  of this node's sessions the peer has confirmed, how far behind it
+  is, and copies of the peer's sessions held here — and the page says
+  in words that these are this node's numbers, as every state on it
+  is. Checked against three real brokers: a session queued, a follower
+  killed and forgotten, and the repair watched happen.
+
+- **`unavailable`, a new API error code**, answered with `503`: the
+  request was well formed and taken, and the guarantee it asked for is
+  what is not available right now. Only synchronous mode's strict
+  refusal answers it so far.
+
+- **A follower's half of the stream**, and what it keeps across a
+  restart. Changes to a session's queue carry a stream position, and a
+  follower applies them in order: a position after a hole is held
+  rather than applied, and the high-water mark it reports is the
+  highest *contiguous* position — a mark that skipped a hole would
+  make failover prefer the copy with a message missing from the
+  middle.
+
 ## Unreleased — milestone 5: the cluster mesh
 
 ### Before you upgrade: a store written before this milestone is refused

@@ -64,7 +64,9 @@ use std::time::Duration;
 use broker_core::broker::BrokerConfig;
 use cluster::membership::Detection;
 use cluster::mesh::MeshSettings;
-use cluster::{ClusterSettings, Policy, Strict, DEFAULT_CLUSTER_NAME};
+use cluster::{
+    ClusterSettings, Durability, Factor, Policy, Strict, DEFAULT_CLUSTER_NAME, DEFAULT_FACTOR,
+};
 use mqtt_codec::Limits;
 use sdmqtt_admin::config::{AdminConfig, AdminStartError, Token};
 use sdmqtt_server::connection::{outbox_depth_for, ConnectionConfig};
@@ -173,6 +175,11 @@ pub enum ConfigError {
     /// fix and what the two ways out of it are.
     #[error("{0}")]
     Policy(#[from] cluster::PolicyError),
+    /// The replication factor cannot mean what it says. Section 8.6.
+    ///
+    /// Carried verbatim, like the three refusals above it.
+    #[error("{0}")]
+    Factor(#[from] cluster::FactorError),
     /// A rule cannot mean what it says.
     ///
     /// Its own variant rather than [`ConfigError::Unusable`] because a
@@ -756,6 +763,60 @@ pub struct ClusterSection {
     /// mismatched secret is a configuration error that will not fix
     /// itself.
     pub refused_backoff_ms: u64,
+    /// When a durable publish is acknowledged. Section 8.6.
+    ///
+    /// `async` by default: acknowledged once this node has it durably,
+    /// with replication proceeding behind it and the loss window
+    /// exposed as `sdmqtt_replication_lag`. `sync` waits for one
+    /// follower to confirm, which costs a local round trip per durable
+    /// publish and loses nothing to a single node failure.
+    pub durability: Durability,
+    /// How long a synchronous publish waits for a follower, in
+    /// milliseconds. Section 8.6.
+    ///
+    /// **A bound, not a deadline the follower must meet.** When it
+    /// runs out the publish is acknowledged anyway and counted as
+    /// unconfirmed, because a follower that has gone quiet is the case
+    /// synchronous mode exists for and is also the case where waiting
+    /// for ever turns one slow node into every publisher's outage. Set
+    /// `cluster.strict.unconfirmed` to be refused instead.
+    pub sync_timeout_ms: u64,
+    /// How long a node may be down before it is treated as gone, in
+    /// milliseconds. Section 8.6.
+    ///
+    /// **An hour by default, and that is the point of it.** A node that
+    /// is down may be restarting, and a cluster that repaired its
+    /// replica sets the moment a peer missed a heartbeat would copy its
+    /// whole queue estate every time somebody applied a patch. Until
+    /// this runs out, a dead node keeps its place in every replica set
+    /// — short by one copy, which `sdmqtt_replication_lag` and the
+    /// unconfirmed counter both show — and once it runs out, the sets
+    /// that included it are repaired onto the nodes that remain.
+    ///
+    /// `DELETE /api/v1/nodes/{id}` is the override: an operator who
+    /// knows a node is never coming back starts the repair at once,
+    /// and one doing long maintenance raises this and it does not
+    /// start at all.
+    pub gone_after_ms: u64,
+    /// How many sessions a repair may copy per second. Section 8.6.
+    ///
+    /// The rate limit that keeps losing one node from saturating the
+    /// cluster: a repair after a node is gone has every session it
+    /// held a copy of to send somewhere else, and sending them all at
+    /// once is the failure the limit prevents.
+    pub repair_sessions_per_second: u64,
+    /// How many nodes hold a copy of each session's queue. Section 8.6.
+    ///
+    /// Two by default: the owner and one follower, which is what makes
+    /// losing a single node lose no durable message. One keeps no
+    /// follower and replicates nothing, and three is the most this
+    /// broker takes — each copy costs a full copy of the durable queue
+    /// data and proportionate traffic between nodes, which section 15
+    /// states as a budget.
+    ///
+    /// A cluster smaller than this is not an error: the set is as large
+    /// as membership allows and is repaired when the members arrive.
+    pub replication_factor: usize,
     /// How many nodes this cluster is meant to have. Section 8.5.
     ///
     /// **The only thing that can say whether the cluster is whole.**
@@ -807,6 +868,11 @@ impl Default for ClusterSection {
             reconnect_min_ms: 200,
             reconnect_max_ms: 30_000,
             refused_backoff_ms: 300_000,
+            durability: Durability::default(),
+            sync_timeout_ms: 2_000,
+            replication_factor: DEFAULT_FACTOR,
+            gone_after_ms: 3_600_000,
+            repair_sessions_per_second: 50,
             expected_size: None,
             strict: Strict::default(),
             drain_timeout_ms: 2_000,
@@ -822,6 +888,17 @@ impl ClusterSection {
             name: self.name.clone(),
             secret: self.secret.clone(),
         }
+    }
+
+    /// How many copies of a queue, for `cluster` to check. Section 8.6.
+    ///
+    /// # Errors
+    ///
+    /// `cluster::FactorError` for zero and for more than three, which
+    /// are two mistakes with two messages, written once where the rule
+    /// is rather than here.
+    pub fn factor(&self) -> Result<Factor, cluster::FactorError> {
+        Factor::new(self.replication_factor)
     }
 
     /// The partition policy, for `cluster` to check. Section 8.5.
@@ -1237,6 +1314,15 @@ impl Config {
                           out",
                 });
             }
+            if self.cluster.strict.unconfirmed {
+                return Err(ConfigError::Unusable {
+                    key: "cluster.strict.unconfirmed",
+                    value: "true".to_owned(),
+                    why: "this node does not cluster, because cluster.address is unset, so \
+                          it has no follower to confirm anything and every durable publish \
+                          would be refused. Set cluster.address, or leave the flag out",
+                });
+            }
             if let Some(expected) = self.cluster.expected_size {
                 return Err(ConfigError::Unusable {
                     key: "cluster.expected_size",
@@ -1294,6 +1380,56 @@ impl Config {
                       key out to advertise the bind address",
             });
         }
+        // Section 8.6, beside the other parameters of clustering
+        // rather than before the switch above: a factor is not a
+        // behaviour an operator asked for the way a strict flag is,
+        // it is a dial on a thing that is either on or off.
+        self.cluster.factor()?;
+
+        // **A flag that can never fire is refused**, which is the rule
+        // section 8.5's three already follow. This one is evaluable
+        // without an expected size — it asks whether a follower
+        // answered — but it is still meaningless in two
+        // configurations, and both are easy to write by accident.
+        if self.cluster.strict.unconfirmed && !self.cluster.durability.waits() {
+            return Err(ConfigError::Unusable {
+                key: "cluster.strict.unconfirmed",
+                value: "true".to_owned(),
+                why: "cluster.durability is \"async\", which never waits for a follower, so \
+                      nothing is ever unconfirmed and this flag can never refuse anything. \
+                      Set cluster.durability = \"sync\", or leave the flag out",
+            });
+        }
+
+        if self.cluster.gone_after_ms == 0 {
+            return Err(ConfigError::Unusable {
+                key: "cluster.gone_after_ms",
+                value: "0".to_owned(),
+                why: "a grace of zero treats every missed heartbeat as a node gone for good \
+                      and copies the whole queue estate on every restart. Write the \
+                      milliseconds a node may be down before it is given up on, or leave \
+                      the key out for an hour",
+            });
+        }
+        if self.cluster.repair_sessions_per_second == 0 {
+            return Err(ConfigError::Unusable {
+                key: "cluster.repair_sessions_per_second",
+                value: "0".to_owned(),
+                why: "a limit of zero sessions a second is a repair that never runs, and a \
+                      replica set left short for ever. Write how many a second the cluster \
+                      can spare, or leave the key out",
+            });
+        }
+        if self.cluster.sync_timeout_ms == 0 {
+            return Err(ConfigError::Unusable {
+                key: "cluster.sync_timeout_ms",
+                value: "0".to_owned(),
+                why: "a bound of zero gives a follower no time at all, so every durable \
+                      publish would be counted unconfirmed. Write the milliseconds a local \
+                      round trip may take, or leave the key out",
+            });
+        }
+
         if self.cluster.heartbeat_ms == 0 {
             return Err(ConfigError::Unusable {
                 key: "cluster.heartbeat_ms",
@@ -1444,6 +1580,49 @@ impl Config {
         }
         if let Some(value) = lookup("SDMQTT_CLUSTER_ADVERTISE") {
             self.cluster.advertise = Some(value);
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_DURABILITY") {
+            self.cluster.durability = match value.as_str() {
+                "async" => Durability::Async,
+                "sync" => Durability::Sync,
+                // Named rather than guessed at, for the reason the
+                // strict flags are: a template that expanded to
+                // something else must not quietly acknowledge before a
+                // copy exists.
+                _ => {
+                    return Err(ConfigError::Environment {
+                        variable: "SDMQTT_CLUSTER_DURABILITY",
+                        value,
+                        expected: "async or sync",
+                    })
+                }
+            };
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_SYNC_TIMEOUT_MS") {
+            self.cluster.sync_timeout_ms =
+                parse("SDMQTT_CLUSTER_SYNC_TIMEOUT_MS", &value, "milliseconds")?;
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_STRICT_UNCONFIRMED") {
+            self.cluster.strict.unconfirmed =
+                parse("SDMQTT_CLUSTER_STRICT_UNCONFIRMED", &value, "true or false")?;
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_GONE_AFTER_MS") {
+            self.cluster.gone_after_ms =
+                parse("SDMQTT_CLUSTER_GONE_AFTER_MS", &value, "milliseconds")?;
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_REPAIR_SESSIONS_PER_SECOND") {
+            self.cluster.repair_sessions_per_second = parse(
+                "SDMQTT_CLUSTER_REPAIR_SESSIONS_PER_SECOND",
+                &value,
+                "sessions a second",
+            )?;
+        }
+        if let Some(value) = lookup("SDMQTT_CLUSTER_REPLICATION_FACTOR") {
+            self.cluster.replication_factor = parse(
+                "SDMQTT_CLUSTER_REPLICATION_FACTOR",
+                &value,
+                "a copy count of 1, 2 or 3",
+            )?;
         }
         if let Some(value) = lookup("SDMQTT_CLUSTER_EXPECTED_SIZE") {
             // Section 8.5's number. In the environment as well as the
@@ -3991,6 +4170,8 @@ dead_after_ms = 4000
             connects: true,
             publishes: true,
             subscribes: true,
+            // Section 8.6's flag is not one of section 8.5's three.
+            unconfirmed: false,
         };
         config
             .validate()
@@ -4146,5 +4327,72 @@ dead_after_ms = 4000
             assert!(said.contains("SDMQTT_CLUSTER_STRICT_CONNECTS"), "{said}");
             assert!(said.contains("true or false"), "{said}");
         }
+    }
+
+    /// Section 8.6's replication factor, refused outside one to three.
+    #[test]
+    fn a_replication_factor_outside_one_to_three_is_refused() {
+        let clustered = |factor: usize| {
+            let mut config = Config::default();
+            config.node.name = "alpha".to_owned();
+            config.storage.directory = Some(PathBuf::from("/tmp/sd-mqtt-test-store"));
+            config.cluster.secret = Some(Secret::new("a-shared-secret"));
+            config.cluster.address = Some("127.0.0.1:7700".parse().expect("an address"));
+            config.cluster.replication_factor = factor;
+            config
+        };
+
+        // The default is two copies, and it validates.
+        assert_eq!(Config::default().cluster.replication_factor, DEFAULT_FACTOR);
+        clustered(DEFAULT_FACTOR)
+            .validate()
+            .expect("the default is a working configuration");
+        clustered(1)
+            .validate()
+            .expect("one copy replicates nothing");
+        clustered(3).validate().expect("three is the ceiling");
+
+        for (factor, expected) in [
+            (0, cluster::FactorError::None),
+            (4, cluster::FactorError::TooMany { asked: 4 }),
+        ] {
+            let error = clustered(factor)
+                .validate()
+                .expect_err("a factor outside the range is refused");
+            assert!(
+                matches!(&error, ConfigError::Factor(why) if *why == expected),
+                "{factor} should be refused as {expected:?}, got {error}"
+            );
+            // The message names the key, because an operator reading
+            // a refusal has to know which line to go and change.
+            assert!(
+                error.to_string().contains("cluster.replication_factor"),
+                "{error}"
+            );
+        }
+    }
+
+    /// And from the environment, which is how a container is
+    /// configured.
+    #[test]
+    fn the_replication_factor_is_read_from_the_environment() {
+        let mut config = Config::default();
+        config
+            .apply_env(|name| (name == "SDMQTT_CLUSTER_REPLICATION_FACTOR").then(|| "3".to_owned()))
+            .expect("three copies");
+        assert_eq!(config.cluster.replication_factor, 3);
+
+        // **Refused at the variable rather than clamped**, and the
+        // message names the variable: a container whose value came
+        // from a template that expanded wrongly must not quietly run
+        // with a different number of copies than the operator wrote.
+        let mut config = Config::default();
+        let error = config
+            .apply_env(|name| {
+                (name == "SDMQTT_CLUSTER_REPLICATION_FACTOR").then(|| "two".to_owned())
+            })
+            .expect_err("a factor that is not a number is refused");
+        let said = error.to_string();
+        assert!(said.contains("SDMQTT_CLUSTER_REPLICATION_FACTOR"), "{said}");
     }
 }

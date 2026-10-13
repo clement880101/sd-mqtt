@@ -36,10 +36,28 @@
  * never heard of the others reports a complete cluster of one — which
  * is why the document carries `expected_configured` and why this page
  * says, in words, which of the two it is looking at.
+ *
+ * # Replica health is this node's too
+ *
+ * Section 8.6 asks the page to show replica health per replica set
+ * and re-replication progress while it runs. Both come from
+ * `/health/cluster`, and both are **this node's** numbers: the
+ * sessions it owns and streams, the copies it holds for others, how
+ * far each peer is behind *it*. The per-peer columns are the sets this
+ * node is in with that peer, read from this end; the peer's page reads
+ * the same sets from the other end and need not agree about the lag,
+ * because the lag is a statement about one direction of one link.
  */
 import { useSignal, useSignalEffect } from '@preact/signals';
 
-import { fetchClusterHealth, fetchPage, type ClusterHealth, type NodeView } from '../api.js';
+import {
+  fetchClusterHealth,
+  fetchPage,
+  type ClusterHealth,
+  type NodeView,
+  type PeerReplication,
+  type Replication,
+} from '../api.js';
 import { generation } from '../live.js';
 
 /**
@@ -96,8 +114,19 @@ function standalone(nodes: NodeView[]): boolean {
   return nodes.length === 1 && nodes[0].this_node && nodes[0].address === '';
 }
 
-/** One member's row. */
-function Member({ node }: { node: NodeView }) {
+/**
+ * A count in a cell, or a dash where there is nothing to count.
+ *
+ * A dash rather than a zero on this node's own row: it holds no copy
+ * *for itself* and is behind itself by nothing, and a zero there would
+ * read as a measurement.
+ */
+function count(value: number | null): string {
+  return value === null ? '—' : value.toLocaleString();
+}
+
+/** One member's row, with what section 8.6 says about this node and it. */
+function Member({ node, copies }: { node: NodeView; copies: PeerReplication | null }) {
   return (
     <div class={`row${node.this_node ? ' row-self' : ''}`}>
       <span>
@@ -119,7 +148,81 @@ function Member({ node }: { node: NodeView }) {
           here" rather than as missing data. */}
       <span>{node.version ?? '—'}</span>
       <span>{node.uptime_seconds === null ? '—' : uptimeOf(node.uptime_seconds)}</span>
+      {/* Three columns from this node's copies table. A peer this node
+          shares no copy with has a row of zeros, not dashes: that is
+          a measurement — nothing is replicated between the two — and
+          an operator with a factor of two on five nodes should expect
+          to see it. */}
+      <span class="mono">{count(copies?.confirmed ?? (node.this_node ? null : 0))}</span>
+      <span class={`mono${(copies?.behind ?? 0) > 0 ? ' state-suspect' : ''}`}>
+        {count(copies?.behind ?? (node.this_node ? null : 0))}
+      </span>
+      <span class="mono">{count(copies?.held ?? (node.this_node ? null : 0))}</span>
     </div>
+  );
+}
+
+/** Section 8.6's four numbers, as gauges beside the membership ones. */
+function Copies({ replication }: { replication: Replication }) {
+  const repairing = replication.repairs_pending > 0;
+  return (
+    <>
+      <div class="gauges">
+        <div class="gauge">
+          <span class="gauge-value">{replication.mode}</span>
+          <span class="gauge-label">durability</span>
+        </div>
+        <div class="gauge">
+          <span class="gauge-value">
+            {replication.streaming.toLocaleString()} / {replication.holding.toLocaleString()}
+          </span>
+          <span class="gauge-label">sessions streamed / copies held</span>
+        </div>
+        <div class="gauge">
+          <span class={`gauge-value${replication.lag > 0 ? ' state-suspect' : ''}`}>
+            {replication.lag.toLocaleString()}
+          </span>
+          <span class="gauge-label">changes the furthest copy is behind</span>
+        </div>
+        <div class="gauge">
+          <span class={`gauge-value${repairing ? ' state-suspect' : ''}`}>
+            {replication.repairs_pending.toLocaleString()}
+          </span>
+          <span class="gauge-label">
+            {repairing ? 'sessions short of a copy, being repaired' : 'sessions short of a copy'}
+            {replication.repairs_done > 0
+              ? ` · ${replication.repairs_done.toLocaleString()} re-streamed so far`
+              : ''}
+          </span>
+        </div>
+        {replication.mode === 'sync' && replication.unconfirmed > 0 ? (
+          <div class="gauge">
+            <span class="gauge-value state-down">{replication.unconfirmed.toLocaleString()}</span>
+            <span class="gauge-label">synchronous acknowledgements no copy confirmed</span>
+          </div>
+        ) : null}
+      </div>
+      <p class="quiet">
+        {replication.mode === 'sync' ? (
+          <>
+            A durable publish is acknowledged once a follower <strong>confirms</strong> the
+            append, so the lag is a delay and not a loss window.
+          </>
+        ) : (
+          <>
+            A durable publish is acknowledged once <strong>this node</strong> has it, and the
+            copies follow behind. The lag is what would be lost if this node died now.
+          </>
+        )}{' '}
+        {repairing ? (
+          <>
+            A replica set is short — a member is gone past the grace, or was removed — and the
+            queues it held are being re-streamed to the nodes that replace it, at the configured
+            rate.
+          </>
+        ) : null}
+      </p>
+    </>
   );
 }
 
@@ -166,6 +269,9 @@ export function Cluster() {
   const held = fetched.value;
   const health = held?.health ?? null;
   const nodes = held?.nodes ?? [];
+  const replication = health?.replication ?? null;
+  const copiesOf = (node: NodeView): PeerReplication | null =>
+    replication?.peers.find((peer) => peer.id === node.id) ?? null;
 
   return (
     <section class="page">
@@ -222,6 +328,8 @@ export function Cluster() {
         </p>
       ) : null}
 
+      {replication !== null && !standalone(nodes) ? <Copies replication={replication} /> : null}
+
       {nodes.length > 0 && !standalone(nodes) ? (
         <>
           <div class="table cluster-table">
@@ -232,15 +340,24 @@ export function Cluster() {
               <span>state</span>
               <span>version</span>
               <span>up</span>
+              <span title="sessions this node owns that the peer holds a confirmed copy of">
+                copies there
+              </span>
+              <span title="changes the peer's copies have yet to apply">behind</span>
+              <span title="sessions the peer owns that this node holds a copy of">
+                copies here
+              </span>
             </div>
             {nodes.map((node) => (
-              <Member key={node.id} node={node} />
+              <Member key={node.id} node={node} copies={copiesOf(node)} />
             ))}
           </div>
           <p class="footer quiet">
             Every state is <strong>this node's view</strong> of that peer. Another node may
             disagree, and during a one-way partition it will — two pages showing two answers is
-            what a partition looks like, not a fault in one of them.
+            what a partition looks like, not a fault in one of them. The three copy columns are
+            this node's as well: what it streams to each peer, how far that peer is behind it,
+            and what it holds for that peer.
           </p>
         </>
       ) : null}

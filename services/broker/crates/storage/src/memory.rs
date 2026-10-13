@@ -34,7 +34,7 @@ use crate::record::{
     MetadataRecord, NodeIdentityRecord, OutboxRecord, QueueEntry, Record, RetainedRecord,
     RuleRecord, SeenRecord, SessionKey, SessionRecord, SubscriptionRecord,
 };
-use crate::restore::{Restored, RestoredSession};
+use crate::restore::{Restored, RestoredReplica, RestoredSession};
 use crate::{Rejection, Storage, StorageError};
 
 /// A [`Storage`] that keeps everything in maps and loses it on exit.
@@ -79,6 +79,18 @@ struct State {
     retained: BTreeMap<String, RetainedRecord>,
     /// Rules by identifier, ordered so that restore is deterministic.
     rules: BTreeMap<String, RuleRecord>,
+    /// Sessions this node holds a copy of rather than owns, section
+    /// 8.6: the owning node's sixteen bytes and how far the stream has
+    /// been applied.
+    ///
+    /// Beside the sessions rather than inside them, because a replica
+    /// is a session plus a fact about who owns it — and becoming the
+    /// owner is then the removal of a fact rather than a rewrite of
+    /// the session.
+    replicas: BTreeMap<SessionKey, ([u8; 16], u64)>,
+    /// How far this node has sent, for each session it owns, section
+    /// 8.6. The owner's counterpart to `replicas`.
+    streams: BTreeMap<SessionKey, u64>,
     /// Who this node is, once something has said. Section 8.1.
     ///
     /// One row rather than a table: a store belongs to one node.
@@ -248,6 +260,13 @@ impl State {
                 // reference belongs to whoever took it; see the note on
                 // `Storage::apply`.
                 self.sessions.remove(session);
+                // Both stream rows go with it, for the reason the
+                // queue does: a client reconnecting under the same
+                // identifier must inherit nothing, and a position left
+                // behind would have the next stream start part way
+                // through a session that has none of it.
+                self.replicas.remove(session);
+                self.streams.remove(session);
             }
             Record::SubscriptionAdded {
                 session,
@@ -336,6 +355,23 @@ impl State {
             }
             Record::RulePut { rule } => {
                 self.rules.insert(rule.id.clone(), rule.clone());
+            }
+            Record::ReplicaFollows {
+                session,
+                owner,
+                through,
+            } => {
+                // Overwritten, not appended to: one row per followed
+                // session holding where its stream has got to.
+                self.replicas.insert(session.clone(), (*owner, *through));
+            }
+            Record::ReplicaDropped { session } => {
+                // **The session stays.** Becoming its owner keeps every
+                // queue entry and changes only whose it is.
+                self.replicas.remove(session);
+            }
+            Record::StreamAt { session, at } => {
+                self.streams.insert(session.clone(), *at);
             }
             Record::RuleRemoved { id } => {
                 // The outbox goes with the rule, as a session's queue
@@ -488,19 +524,41 @@ impl Storage for MemoryStorage {
 
     fn restore(&self) -> Result<Restored, StorageError> {
         let state = self.state();
+        let restored = |session: &SessionState| RestoredSession {
+            session: session.record.clone(),
+            subscriptions: session.subscriptions.values().cloned().collect(),
+            inbound: session.inbound.iter().copied().collect(),
+            inflight: session.inflight.values().cloned().collect(),
+            // In sequence order, which is arrival order, because the
+            // queue is keyed by it.
+            queue: session.queue.values().cloned().collect(),
+            highest_sequence: session.highest_sequence,
+            stream_at: state.streams.get(&session.record.key).copied().unwrap_or(0),
+        };
         Ok(Restored {
+            // **Split by the replica table**, so that a session this
+            // node merely holds a copy of never reaches the list the
+            // broker is handed. See `Restored::replicas`.
             sessions: state
                 .sessions
-                .values()
-                .map(|session| RestoredSession {
-                    session: session.record.clone(),
-                    subscriptions: session.subscriptions.values().cloned().collect(),
-                    inbound: session.inbound.iter().copied().collect(),
-                    inflight: session.inflight.values().cloned().collect(),
-                    // In sequence order, which is arrival order, because
-                    // the queue is keyed by it.
-                    queue: session.queue.values().cloned().collect(),
-                    highest_sequence: session.highest_sequence,
+                .iter()
+                .filter(|(key, _)| !state.replicas.contains_key(*key))
+                .map(|(_, session)| restored(session))
+                .collect(),
+            replicas: state
+                .replicas
+                .iter()
+                .filter_map(|(key, (owner, through))| {
+                    // A replica row for a session that is not there is
+                    // not a thing a batch can write — the session
+                    // record and the row ride together — so this is
+                    // skipped rather than invented.
+                    let session = state.sessions.get(key)?;
+                    Some(RestoredReplica {
+                        session: restored(session),
+                        owner: *owner,
+                        through: *through,
+                    })
                 })
                 .collect(),
             retained: state

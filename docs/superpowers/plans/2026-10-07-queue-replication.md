@@ -101,7 +101,7 @@ Nothing streams anything yet. This task is a pure function and its
 configuration, and it is first because every other task is written in terms
 of its answer.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 The weight has golden vectors, and they are **derived from the SHA-256
 standard rather than printed from this implementation**: compute the digest
@@ -124,7 +124,7 @@ Then the properties, over proptest where they are properties:
 
 And the configuration: zero, four, and a value with the key absent.
 
-- [ ] **Step 2: Implement, confirm teeth, commit**
+- [x] **Step 2: Implement, confirm teeth, commit**
 
 Mutations: the node digest not mixed into the weight, which places every
 session on one node and which the determinism test passes; the set ordered by
@@ -155,7 +155,7 @@ so a restore that does not know the difference brings up another node's
 session here, with its subscriptions in this node's trie and its queue being
 delivered to nobody. Stored format version 8.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 - Operations arrive and are applied **in order**, and the high-water mark is
   what has been applied rather than what has arrived.
@@ -178,7 +178,7 @@ delivered to nobody. Stored format version 8.
   this series to bound what a kill may lose, so a build without it has no
   exit criterion to meet.
 
-- [ ] **Step 2: Implement, confirm teeth, commit**
+- [x] **Step 2: Implement, confirm teeth, commit**
 
 Mutations: the sequence not checked, so an out-of-order operation applies;
 the high-water mark advanced on receipt rather than on apply; a restored
@@ -189,6 +189,24 @@ reported as zero whatever the marks are.
 ```bash
 git commit -m "feat(cluster): a queue has a copy on another node"
 ```
+
+Landed as three commits rather than one: the follower's half with the
+stored format, the owner's position, and the wiring. The stored format
+moved to **10**, not 9 — twice within this milestone, because a number
+already written to a disk has to keep meaning one thing.
+
+**And a fourth commit, after task 3, fixing four defects in the wiring
+that no gauge could see**: the follower's writes were refused for want
+of a session record; the entries travelled without their payloads; a
+handed-over session never left the owner's stream table; and a copy
+arriving at the node a client was reconnecting to raced the connect on
+one writer and, landing first, had the whole connect batch refused as
+a reused sequence — subscription register included. The first was
+found by killing and restarting the followers, which is the only
+question a gauge cannot answer from memory; the last by the migration
+test failing on half its runs, which looked like a flake and was a
+race. A version of that test which waited for the copy before
+reconnecting passed every run with the fix removed. It does not wait.
 
 ---
 
@@ -206,7 +224,7 @@ durably. Synchronous waits for one follower to confirm the append.
 The same code path in both: one awaits what the other ignores. Read
 `with_broker_committed` before writing any of it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 - Asynchronous acknowledges **before** any follower has confirmed. Prove it
   with a follower that never confirms, not with a fast one.
@@ -223,7 +241,7 @@ The same code path in both: one awaits what the other ignores. Read
   the shape `cluster::policy` already has, so follow it rather than
   inventing a second one.
 
-- [ ] **Step 2: Implement, confirm teeth, commit**
+- [x] **Step 2: Implement, confirm teeth, commit**
 
 Mutations: synchronous awaiting nothing, which must fail the stalled
 follower test rather than hang it; the wait requiring every follower; the
@@ -252,7 +270,7 @@ then streams to the remaining followers.
 already counts, and the count stays too: what is lost shrinks to what no
 replica held.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 - The owner is unreachable and the queue arrives from a replica anyway. The
   whole feature in one test.
@@ -267,7 +285,7 @@ replica held.
   **zero** when one did. Both, because a counter that never moves and a
   counter that always moves look the same from one test.
 
-- [ ] **Step 2: Implement, confirm teeth, commit**
+- [x] **Step 2: Implement, confirm teeth, commit**
 
 Mutations: the first reachable replica used rather than the most advanced;
 the pull replacing the drain rather than backing it, which must fail a test
@@ -277,6 +295,16 @@ copy; the shortfall counted even when the pull filled it.
 ```bash
 git commit -m "feat(cluster): a new owner takes the furthest copy"
 ```
+
+The "most advanced" test was written with the laggard reachable first,
+as this task asks, and it still took two runs to get right — not
+because of the chooser, which chose correctly every time, but because
+the test killed the owner the moment *gamma* lagged, with no way to
+know *beta* had caught up. Beta had one message on one run and three
+on the next. That is why `sdmqtt_replica_changes_applied_total` exists:
+a follower's progress was not observable from outside the node, by a
+test or by an operator, and a test that cannot observe a precondition
+substitutes a sleep or a guess.
 
 ---
 
@@ -297,7 +325,7 @@ membership.** Until now the table could only grow. Removing a node that is
 still alive has to do something defined — it will be met again on the next
 heartbeat — so decide it, write it down, and test it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 - Down past the grace: the sets that included it are repaired onto the
   remaining members, and the new follower ends up holding the same queue.
@@ -309,7 +337,7 @@ heartbeat — so decide it, write it down, and test it.
   copying happened.
 - A set that did not include the departed member is **not** touched.
 
-- [ ] **Step 2: Implement, confirm teeth, commit**
+- [x] **Step 2: Implement, confirm teeth, commit**
 
 Mutations: the grace ignored; the rate limit ignored; every set repaired
 rather than the ones that are short; a removed node that comes back not
@@ -318,6 +346,23 @@ re-admitted.
 ```bash
 git commit -m "feat(cluster): a short replica set repairs itself"
 ```
+
+No `repair.rs`: the sweep lives in `sdmqtt/src/replication.rs` beside
+the handler that applies what it sends, because what it sends is a
+`Change::Snapshot` on the existing stream and the only new thing in the
+`cluster` crate is the grace, which is placement's business. A snapshot
+does **not** take a stream position: it carries the owner's current
+mark and the follower resumes from there, so the owner's `at` for every
+other follower is untouched and an append after a repair is numbered
+the same on every copy.
+
+All four mutations died, with one lesson: the rate-limit test first
+waited for the done counter to be *exactly* one, and the unlimited
+mutant died because it never was — it jumped straight to six. That was
+a kill by accident; the test is about time, not the count, and now
+waits for *at least* one so the timing assertion is what does the
+killing. "Removed node re-admitted" is the membership unit test and the
+three-node test restarting the forgotten node on the same store.
 
 ---
 
@@ -330,7 +375,7 @@ git commit -m "feat(cluster): a short replica set repairs itself"
 Milestone six's exit criteria, against the real binary, plus the two things
 section 11.2 asks the Cluster page to show.
 
-- [ ] **Step 1: Write it, run it several times, commit**
+- [x] **Step 1: Write it, run it several times, commit**
 
 Say how many times, and check free space first.
 
@@ -348,3 +393,55 @@ Say how many times, and check free space first.
 ```bash
 git commit -m "test: a killed owner loses nothing, and the page says so"
 ```
+
+Run: the two loss tests six times in a row and the cluster suite three
+times, with 75 GiB free. Three things were found and fixed on the way,
+each by the test refusing to pass:
+
+- **The synchronous mode did not apply to `POST /api/v1/publish`.**
+  The shared publish waited for the copy and discarded the answer.
+  Now counted and, with the strict flag, refused with `503
+  unavailable`.
+- **A fresh session's first publishes were acknowledged unconfirmed.**
+  "Has a follower" meant "has reported a mark", so the follower that
+  was about to be sent the first append was nobody. The owner now
+  knows who placement names and waits for a reachable one.
+- **The lag grew for ever after a node was forgotten.** Found on the
+  page against real brokers, not by a test: a removed node's last mark
+  stayed in the table. The lag now counts placed followers only, and
+  forgetting purges the marks.
+
+And one gap written down rather than filled: both modes describe the
+node that accepted the publish, and a publish forwarded under 8.3 is
+acknowledged before the owner has it. The first version of the
+synchronous test published on a non-owner and lost three of eight
+acknowledged messages. The tests publish on the owner, and the spec
+says why; closing it is an acknowledgement across the mesh, a design
+of its own.
+
+---
+
+## Closing walk (convention 8)
+
+Section 8.6 read sentence by sentence against the code, at the close:
+
+- **Placement, the hash, the mixer, the golden vectors**: as written.
+- **"Repaired when members return"**: a member that comes back is named
+  by rendezvous again and holds no mark for the sessions it is named
+  for, so the sweep sends it their queues — the same path as a set
+  short past the grace, and the `forgetting` test's restarted node is
+  re-admitted by it.
+- **"Message bodies travel once"**: once per append, in the batch that
+  first names the body. A message queued to two sessions whose copies
+  are on the same follower travels to it twice. Noted, not fixed: the
+  saving is a per-follower dedup in `stream_to_followers`, and it is a
+  cost, not a correctness matter.
+- **"Configurable globally and overridable per listener"**: the
+  override was never built. **Deferred to milestone 7**, where a
+  listener gains its other per-listener settings, and the spec now says
+  so rather than promising it.
+- **Both modes, the unconfirmed count, the strict flag, failover
+  backing the drain, re-replication with grace and override, progress
+  in the UI, the cost in the budgets**: as written, with the
+  forwarded-publish gap recorded under the modes.
+

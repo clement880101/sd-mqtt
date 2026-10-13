@@ -326,6 +326,9 @@ pub enum SocketOutcome {
     /// protocol left no room to answer — 3.1.1 publishes, and
     /// at-most-once ones.
     NotWhole,
+    /// A durable publish no copy confirmed, on a node configured to
+    /// refuse those. Section 8.6.
+    NotConfirmed,
     /// The connection was dropped before it finished: a shutdown, or
     /// a panic. Counted from [`Drop`] rather than from a return, so
     /// that a cancelled connection is an ending like any other rather
@@ -334,7 +337,7 @@ pub enum SocketOutcome {
 }
 
 /// Every socket outcome, in the order the handles are indexed in.
-const SOCKET_OUTCOMES: [SocketOutcome; 10] = [
+const SOCKET_OUTCOMES: [SocketOutcome; 11] = [
     SocketOutcome::Clean,
     SocketOutcome::ConnectTimeout,
     SocketOutcome::NotAConnect,
@@ -349,6 +352,7 @@ const SOCKET_OUTCOMES: [SocketOutcome; 10] = [
     // `outcome_index` returns, so inserting one in the middle
     // renumbers every outcome after it and relabels their counters.
     SocketOutcome::NotWhole,
+    SocketOutcome::NotConfirmed,
 ];
 
 /// The label value for a socket outcome.
@@ -363,6 +367,7 @@ fn outcome_label(outcome: SocketOutcome) -> &'static str {
         SocketOutcome::Codec => "codec",
         SocketOutcome::NotDurable => "not_durable",
         SocketOutcome::NotWhole => "not_whole",
+        SocketOutcome::NotConfirmed => "not_confirmed",
         SocketOutcome::Abandoned => "abandoned",
     }
 }
@@ -380,6 +385,7 @@ fn outcome_index(outcome: SocketOutcome) -> usize {
         SocketOutcome::NotDurable => 7,
         SocketOutcome::Abandoned => 8,
         SocketOutcome::NotWhole => 9,
+        SocketOutcome::NotConfirmed => 10,
     }
 }
 
@@ -550,6 +556,7 @@ reason_table!(Refusal, ALL_REFUSALS, refusal_label, refusal_index, {
     NotATopic => "not_a_topic",
     Reserved => "reserved",
     NotDurable => "not_durable",
+    NotConfirmed => "not_confirmed",
 });
 
 /// What a rule did, as a label value.
@@ -730,6 +737,8 @@ pub struct Metrics {
     /// counter is to be able to see the difference.
     bytes_received: Counter,
     bytes_sent: Counter,
+    /// Section 8.6's synchronous publishes that no copy confirmed.
+    publishes_unconfirmed: Counter,
     sockets_opened: Counter,
     sockets_refused: Counter,
     /// Section 11.3, for the admin events stream: a reader that has
@@ -792,6 +801,16 @@ pub trait ClusterMetrics: std::fmt::Debug + Send + Sync + 'static {
     fn bytes_received(&self) -> u64;
     /// Bytes never written, because a peer's queue was full.
     fn bytes_dropped(&self) -> u64;
+    /// Section 8.6's replication numbers, in the order
+    /// [`REPLICATION_NUMBERS`] names them.
+    fn replication(&self) -> [u64; REPLICATION_NUMBERS.len()];
+    /// Changes this node has applied as a follower, ever. See
+    /// [`REPLICA_APPLIED`].
+    fn replica_applied(&self) -> u64;
+    /// Sessions whose replica set was short at the last sweep, and
+    /// sessions re-streamed to a new follower ever: a gauge and a
+    /// counter. See [`REPAIRS_PENDING`] and [`REPAIRS_DONE`].
+    fn repairs(&self) -> (u64, u64);
     /// Section 8.4's migration numbers, in the order
     /// [`MIGRATION_NUMBERS`] names them.
     ///
@@ -801,6 +820,83 @@ pub trait ClusterMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// answer one of them from the wrong field.
     fn migrations(&self) -> [u64; MIGRATION_NUMBERS.len()];
 }
+
+/// Section 8.6's replication numbers: the metric name, its help text,
+/// and the order [`ClusterMetrics::replication`] returns them in.
+///
+/// **`replication_lag` is the one section 8.6 names.** In asynchronous
+/// mode the loss window *is* the lag — what the owner has acknowledged
+/// and no copy holds is what losing the owner would lose — so the
+/// design says it is exposed and alerted on, and milestone 6's exit
+/// criterion reads this series to bound what a kill may lose.
+///
+/// It is the **furthest** any follower is behind, across every session
+/// this node owns, because the window is about what a failure would
+/// cost: measured from the copy that happens to be closest it would
+/// describe a failure that did not happen. One number rather than one
+/// per session, because a gauge per session at the design's ceilings is
+/// a hundred thousand series.
+pub const REPLICATION_NUMBERS: [(&str, &str); 3] = [
+    (
+        "replication_lag",
+        "Changes the furthest-behind copy of any session this node owns has not applied",
+    ),
+    (
+        "replicated_sessions",
+        "Sessions this node owns and streams to at least one other node",
+    ),
+    (
+        "replica_sessions",
+        "Sessions this node holds a copy of for another node",
+    ),
+];
+
+/// Changes this node has applied as a follower, ever. Section 8.6.
+///
+/// A counter, beside the three gauges above, because it is the one
+/// number that says a follower is still *doing* anything: the gauges
+/// describe what this node holds, and a node that holds copies and
+/// has quietly stopped applying to them looks identical on all three.
+/// A flat line here on a node that is meant to be following is that
+/// node. It is also the only way a test can know a follower has caught
+/// up before it does something irreversible to the owner.
+pub const REPLICA_APPLIED: (&str, &str) = (
+    "replica_changes_applied",
+    "Queue changes this node has applied to copies it holds for other nodes",
+);
+
+/// Sessions this node owns whose replica set is short. Section 8.6.
+///
+/// What section 8.6 means by repair progress being visible: the number
+/// goes up when a node is gone and comes down as the sweep sends each
+/// session's queue to the follower that replaced it, at the configured
+/// rate. A gauge, because it goes both ways.
+pub const REPAIRS_PENDING: (&str, &str) = (
+    "replica_repairs_pending",
+    "Sessions this node owns whose replica set is short of a copy",
+);
+
+/// Sessions re-streamed to a new follower, ever. A counter.
+pub const REPAIRS_DONE: (&str, &str) = (
+    "replica_repairs_done",
+    "Sessions whose queue this node has re-streamed to a follower that held no copy",
+);
+
+/// Durable publishes acknowledged in synchronous mode that no follower
+/// confirmed. Section 8.6.
+///
+/// **A counter rather than a gauge**, unlike the three above: this one
+/// only ever goes up, and what an operator alerts on is the rate.
+///
+/// It exists because section 8.6 acknowledges such a publish anyway —
+/// refusing would turn the loss of one node into an outage for every
+/// durable publish — and an operator who asked for synchronous mode and
+/// is getting this is not getting what they asked for. Silent, it would
+/// be a guarantee quietly not kept.
+pub const UNCONFIRMED: (&str, &str) = (
+    "publishes_unconfirmed",
+    "Durable publishes acknowledged in synchronous mode with no follower confirming",
+);
 
 /// Section 8.4's migration numbers: the metric name, its help text,
 /// and the order [`ClusterMetrics::migrations`] returns them in.
@@ -814,7 +910,7 @@ pub trait ClusterMetrics: std::fmt::Debug + Send + Sync + 'static {
 /// here because a shortfall with nothing to compare it against cannot
 /// be read: a hundred incomplete drains is an outage or a quiet
 /// afternoon depending on how many there were altogether.
-pub const MIGRATION_NUMBERS: [(&str, &str); 7] = [
+pub const MIGRATION_NUMBERS: [(&str, &str); 9] = [
     (
         "sessions_claimed",
         "Sessions this node claimed from another node",
@@ -842,6 +938,15 @@ pub const MIGRATION_NUMBERS: [(&str, &str); 7] = [
     (
         "migrated_messages_late",
         "Chunks that arrived for a drain nothing was waiting for any more",
+    ),
+    (
+        "sessions_pulled",
+        "Claims whose queue came from a copy, because the owner could not be reached or did \
+         not finish",
+    ),
+    (
+        "pulled_messages",
+        "Messages that arrived in a pull from a copy",
     ),
 ];
 
@@ -881,6 +986,9 @@ impl Metrics {
             "Bytes written to client sockets",
             bytes_sent.clone(),
         );
+
+        let publishes_unconfirmed = Counter::default();
+        registry.register(UNCONFIRMED.0, UNCONFIRMED.1, publishes_unconfirmed.clone());
 
         let sockets_opened = Counter::default();
         registry.register(
@@ -1006,6 +1114,7 @@ impl Metrics {
             packets_sent,
             bytes_received,
             bytes_sent,
+            publishes_unconfirmed,
             sockets_opened,
             sockets_refused,
             sockets_closed,
@@ -1142,6 +1251,16 @@ impl Metrics {
     /// these was a log line at best.
     pub fn publication_refused(&self, reason: Refusal) -> &Counter {
         &self.publications_refused[refusal_index(reason)]
+    }
+
+    /// A durable publish acknowledged with no copy confirming it.
+    ///
+    /// Section 8.6. **Registered on every node**, not only a
+    /// clustering one, unlike the cluster gauges: a node running in
+    /// synchronous mode with nothing to replicate to is exactly the
+    /// case this counts, and an absent series there would hide it.
+    pub fn publish_unconfirmed(&self) -> &Counter {
+        &self.publishes_unconfirmed
     }
 
     /// A socket that has finished, by how it ended.
@@ -1383,6 +1502,40 @@ impl Collector for ClusterLive {
             let descriptor = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
             counter.encode(descriptor)?;
         }
+
+        // Section 8.6's, which are **gauges and not counters**: a lag
+        // and a count of sessions are levels that go down as well as
+        // up, and rendering a level as a counter tells every scraper
+        // it may take differences of it.
+        let replication = self.0.replication();
+        for ((name, help), value) in REPLICATION_NUMBERS.iter().zip(replication) {
+            let gauge = ConstGauge::new(i64::try_from(value).unwrap_or(i64::MAX));
+            let descriptor = encoder.encode_descriptor(name, help, None, gauge.metric_type())?;
+            gauge.encode(descriptor)?;
+        }
+        // And the one that only goes up, as a counter.
+        let applied = ConstCounter::new(self.0.replica_applied());
+        let descriptor = encoder.encode_descriptor(
+            REPLICA_APPLIED.0,
+            REPLICA_APPLIED.1,
+            None,
+            applied.metric_type(),
+        )?;
+        applied.encode(descriptor)?;
+        // Section 8.6's repair: a level and a total.
+        let (pending, done) = self.0.repairs();
+        let pending = ConstGauge::new(i64::try_from(pending).unwrap_or(i64::MAX));
+        let descriptor = encoder.encode_descriptor(
+            REPAIRS_PENDING.0,
+            REPAIRS_PENDING.1,
+            None,
+            pending.metric_type(),
+        )?;
+        pending.encode(descriptor)?;
+        let done = ConstCounter::new(done);
+        let descriptor =
+            encoder.encode_descriptor(REPAIRS_DONE.0, REPAIRS_DONE.1, None, done.metric_type())?;
+        done.encode(descriptor)?;
         Ok(())
     }
 }
@@ -1913,7 +2066,16 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
             33
         }
         fn migrations(&self) -> [u64; MIGRATION_NUMBERS.len()] {
-            [41, 42, 43, 44, 45, 46, 47]
+            [41, 42, 43, 44, 45, 46, 47, 48, 49]
+        }
+        fn replication(&self) -> [u64; REPLICATION_NUMBERS.len()] {
+            [51, 52, 53]
+        }
+        fn replica_applied(&self) -> u64 {
+            54
+        }
+        fn repairs(&self) -> (u64, u64) {
+            (55, 56)
         }
     }
 
@@ -1947,7 +2109,10 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
 
         // Section 8.4's seven, each against the name it belongs to and
         // not merely present somewhere.
-        for ((name, help), value) in MIGRATION_NUMBERS.iter().zip([41, 42, 43, 44, 45, 46, 47]) {
+        for ((name, help), value) in MIGRATION_NUMBERS
+            .iter()
+            .zip([41, 42, 43, 44, 45, 46, 47, 48, 49])
+        {
             let family = format!("sdmqtt_{name}");
             let shown = block(&rendered, &family);
             assert!(
@@ -1967,6 +2132,51 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
             rendered.contains("sdmqtt_sessions_migrated_incomplete_total 43\n"),
             "section 8.4's shortfall is this series:\n{rendered}"
         );
+
+        // Section 8.6's three, which are **gauges**: a lag and a count
+        // of sessions go down as well as up, and a counter tells a
+        // scraper it may take differences.
+        for ((name, help), value) in REPLICATION_NUMBERS.iter().zip([51, 52, 53]) {
+            let family = format!("sdmqtt_{name}");
+            let shown = block(&rendered, &family);
+            assert!(
+                shown.contains(&format!("# TYPE {family} gauge\n")),
+                "{family} is a level, not a counter:\n{shown}"
+            );
+            assert!(
+                shown.contains(&format!("{family} {value}\n")),
+                "{family} should be {value} in:\n{shown}"
+            );
+            assert!(
+                shown.contains(help),
+                "{family} carries its own help:\n{shown}"
+            );
+        }
+        assert!(
+            rendered.contains("sdmqtt_replication_lag 51\n"),
+            "section 8.6's loss window is this series:\n{rendered}"
+        );
+        let applied = block(&rendered, "sdmqtt_replica_changes_applied");
+        assert!(
+            applied.contains("# TYPE sdmqtt_replica_changes_applied counter\n"),
+            "applied changes only go up, so this is a counter:\n{applied}"
+        );
+        assert!(
+            applied.contains("sdmqtt_replica_changes_applied_total 54\n"),
+            "{applied}"
+        );
+        let pending = block(&rendered, "sdmqtt_replica_repairs_pending");
+        assert!(
+            pending.contains("# TYPE sdmqtt_replica_repairs_pending gauge\n")
+                && pending.contains("sdmqtt_replica_repairs_pending 55\n"),
+            "repairs pending is a level:\n{pending}"
+        );
+        let done = block(&rendered, "sdmqtt_replica_repairs_done");
+        assert!(
+            done.contains("# TYPE sdmqtt_replica_repairs_done counter\n")
+                && done.contains("sdmqtt_replica_repairs_done_total 56\n"),
+            "repairs done is a total:\n{done}"
+        );
     }
 
     #[test]
@@ -1977,7 +2187,11 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
         // statements, and a scraper cannot tell them apart from a zero.
         let rendered = Metrics::new().render();
         assert!(!rendered.contains("sdmqtt_cluster_members"), "{rendered}");
-        for (name, _) in MIGRATION_NUMBERS {
+        for (name, _) in MIGRATION_NUMBERS
+            .iter()
+            .chain(REPLICATION_NUMBERS.iter())
+            .chain([&REPLICA_APPLIED, &REPAIRS_PENDING, &REPAIRS_DONE])
+        {
             assert!(
                 !rendered.contains(&format!("sdmqtt_{name}")),
                 "{name} should be absent on a node that does not cluster:\n{rendered}"

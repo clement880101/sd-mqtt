@@ -125,10 +125,18 @@ mod golden {
         // something already stored rather than adding a variant at the
         // end, so a version 7 register is sixteen bytes where this
         // build expects sixteen and a varint and a reader would run off
-        // the end of one record into the next.
+        // the end of one record into the next, and from 8 when a node
+        // began holding copies of other nodes' session queues, because
+        // a version 8 build reading one of those would meet a record
+        // variant it has no arm for, and from 9 when the owner's own
+        // position in that stream was stored beside it — a version
+        // that existed for one commit of the same unreleased
+        // milestone, and that moved again rather than being redefined,
+        // because redefining a number already on somebody's disk is
+        // how a silent misread happens.
         let expected: &[u8] = &[
             b's', b'd', b'm', b'q', b't', b't', b's', b't', // magic "sdmqttst"
-            0x08, // version 8
+            0x0a, // version 10
         ];
         assert_eq!(FormatMarker::current().encode(), expected);
         assert_eq!(
@@ -1133,6 +1141,44 @@ mod golden {
             0xac, 0x02, // through 300
         ];
         pins(&Record::OpLogTruncated { through: 300 }, expected);
+    }
+
+    #[test]
+    fn replica_follows() {
+        // A fixed-size array is its elements with no length prefix, so
+        // the owner's sixteen bytes are sixteen bytes; the mark is a
+        // varint, and 300 = 2 * 128 + 44, so it is 44|0x80 then 2.
+        let mut expected = keyed(0x1a, &[]); // variant 26
+        expected.extend_from_slice(&[0xaa; 16]); // the owning node
+        expected.extend_from_slice(&[0xac, 0x02]); // through 300
+        pins(
+            &Record::ReplicaFollows {
+                session: key(),
+                owner: [0xaa; 16],
+                through: 300,
+            },
+            &expected,
+        );
+    }
+
+    #[test]
+    fn stream_at() {
+        // 300 = 2 * 128 + 44, so the varint is 44|0x80 then 2.
+        pins(
+            &Record::StreamAt {
+                session: key(),
+                at: 300,
+            },
+            &keyed(0x1c, &[0xac, 0x02]), // variant 28
+        );
+    }
+
+    #[test]
+    fn replica_dropped() {
+        pins(
+            &Record::ReplicaDropped { session: key() },
+            &keyed(0x1b, &[]), // variant 27, then the key and nothing else
+        );
     }
 }
 
