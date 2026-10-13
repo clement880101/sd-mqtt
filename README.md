@@ -575,6 +575,20 @@ can never be a follower.
 `SDMQTT_CLUSTER_DURABILITY`, `SDMQTT_CLUSTER_SYNC_TIMEOUT_MS` and
 `SDMQTT_CLUSTER_STRICT_UNCONFIRMED` set the same three.
 
+### What happens when a node dies
+
+A client whose node has gone reconnects to any other node, and gets
+its queue back from whichever copy is furthest ahead. Nothing to
+configure: the node it connects to first asks the old owner, and when
+that cannot be reached asks the copies. `sdmqtt_sessions_pulled_total`
+counts how often a copy was what answered;
+`sdmqtt_migrated_messages_missing_total` is what was lost after it did,
+which with a factor of two and one node down is nothing.
+
+A copy holds the queue and only the queue. The client's subscriptions
+are not in it, so a client that has failed over re-subscribes — as it
+would after any session loss — and then receives what was queued.
+
 Messages published on either side of a partition are not exchanged
 afterwards, whatever the flags say, and a node that acknowledged a
 message it never managed to replicate loses it when it rejoins.

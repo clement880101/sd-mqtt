@@ -109,6 +109,13 @@ pub struct Replication {
     /// installs into `Shared`, because a chunk arrives on a link —
     /// here — and the connection waiting for it is over there.
     migrations: Arc<Migrations>,
+    /// Where this node's copies of other nodes' sessions are read
+    /// from, to answer a `PullCopy`. Section 8.6.
+    ///
+    /// The store and not the broker, deliberately: a copy is not a
+    /// session this node serves and is not in the broker at all. See
+    /// `Shared::apply_aside`, which is how it got there.
+    store: Arc<dyn storage::Storage>,
 }
 
 /// Writes a peer sent that won, and the records that go with them.
@@ -128,6 +135,7 @@ impl Replication {
         replicator: Arc<Replicator>,
         shared: Arc<Shared>,
         migrations: Arc<Migrations>,
+        store: Arc<dyn storage::Storage>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<Applying>) {
         let (applying, waiting) = mpsc::unbounded_channel();
         (
@@ -136,6 +144,7 @@ impl Replication {
                 applying,
                 shared,
                 migrations,
+                store,
             }),
             waiting,
         )
@@ -232,6 +241,49 @@ impl Deliver for Replication {
                     copies.marked(session, from.to_bytes(), through);
                 }
                 return Vec::new();
+            }
+            // Section 8.6's failover, first question: how far does this
+            // node's copy of the session go? **Answered even when the
+            // answer is nothing**, because the asker is choosing
+            // between copies by their marks under a bound, and a
+            // silence would be a copy it waited the whole bound for.
+            Message::HowFar { session } => {
+                let through = self
+                    .shared
+                    .copies()
+                    .and_then(|copies| copies.through(&session));
+                return vec![Message::Holds { session, through }];
+            }
+            // The answer, routed to whoever is asking.
+            Message::Holds { session, through } => {
+                self.migrations.held(from, &session, through);
+                return Vec::new();
+            }
+            // Section 8.6's failover, second question: send the copy.
+            // Read out of the store, because a copy is not in the
+            // broker, and cut into the same chunks a drain is cut into
+            // — to the node collecting them the two are the same thing.
+            Message::PullCopy { session, epoch } => {
+                let handover = match cluster::copy_as_handover(self.store.as_ref(), &session) {
+                    Ok(handover) => handover,
+                    Err(why) => {
+                        // Answered with an empty, complete handover
+                        // rather than with silence: the asker would
+                        // otherwise wait the whole bound for a copy
+                        // this node has just failed to read.
+                        tracing::error!(
+                            peer = %from,
+                            client = %session.client_id,
+                            %why,
+                            "a copy of a session could not be read to answer a pull"
+                        );
+                        Default::default()
+                    }
+                };
+                return Drained::chunks(&session, epoch, handover)
+                    .into_iter()
+                    .map(Message::Drained)
+                    .collect();
             }
         };
         let handled = match self.replicator.received(from, frame) {

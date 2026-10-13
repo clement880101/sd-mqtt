@@ -367,6 +367,15 @@ fn locked<T>(what: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Debug, Default)]
 pub struct Copies {
     inner: Mutex<Tables>,
+    /// Changes this node has applied as a follower, ever.
+    ///
+    /// A counter rather than a mark, and for a reader outside the
+    /// node: a follower's marks are per session and are not in the
+    /// exposition, so without this nothing an operator — or a test —
+    /// can read says whether a follower is still applying anything. A
+    /// flat line here on a node that is meant to be following is a
+    /// follower that has stopped.
+    applied: std::sync::atomic::AtomicU64,
 }
 
 /// The two halves, under [`Copies`]'s lock.
@@ -452,6 +461,8 @@ impl Copies {
             taken.push((at, change));
             taken.extend(follower.release());
         }
+        self.applied
+            .fetch_add(taken.len() as u64, std::sync::atomic::Ordering::Relaxed);
         (taken, follower.through())
     }
 
@@ -601,6 +612,12 @@ impl Copies {
             .unwrap_or(0)
     }
 
+    /// Changes this node has applied as a follower, ever.
+    #[must_use]
+    pub fn applied(&self) -> u64 {
+        self.applied.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// How many sessions this node holds a copy of.
     #[must_use]
     pub fn following(&self) -> usize {
@@ -725,6 +742,53 @@ impl Confirming {
             }
         }
     }
+}
+
+/// What a stored copy of `session` holds, as a handover.
+///
+/// Section 8.6's failover reads this on the node whose copy is furthest
+/// ahead — remotely, to answer a `PullCopy`, and locally, when the node
+/// doing the claiming is itself the one holding the best copy. One
+/// function for both, because the two must hand over the same thing.
+///
+/// **Only the queue, and that is the whole of what a copy is.** The
+/// stream carries appends, acknowledgements and removals and nothing
+/// else; a copy holds no subscriptions, no inflight window and no
+/// inbound identifiers, so none come back from it. A client that
+/// failed over has its queue and re-subscribes as it would after any
+/// session loss — section 8.6 replicates offline queues, and says so.
+///
+/// Walked with `queue_head` from a cursor rather than restored whole,
+/// for the reason that method exists: a restore reads every session
+/// the node holds to answer about one.
+///
+/// # Errors
+///
+/// Whatever the store said. A copy that cannot be read is a copy that
+/// cannot be pulled, and the caller counts it as nothing held.
+pub fn copy_as_handover(
+    store: &dyn storage::Storage,
+    session: &SessionKey,
+) -> Result<broker_core::handover::Handover, storage::StorageError> {
+    let mut handover = broker_core::handover::Handover {
+        highest_sequence: store.highest_sequence(session)?,
+        ..Default::default()
+    };
+    let mut cursor = 0u64;
+    while let Some(entry) = store.queue_head(session, cursor)? {
+        // Past this one next time: sequence numbers are never reused,
+        // so a cursor one past the head cannot miss anything.
+        cursor = entry.sequence + 1;
+        let Some(body) = store.body(&entry.delivery.body)? else {
+            // An entry whose payload is gone is a message that cannot
+            // be delivered, and handing it over would hand over a
+            // reference to nothing. Left out rather than failing the
+            // whole pull: the rest of the queue is still worth having.
+            continue;
+        };
+        handover.queued.push((entry, body));
+    }
+    Ok(handover)
 }
 
 #[cfg(test)]

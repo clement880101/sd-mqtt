@@ -313,3 +313,170 @@ async fn a_waiter_leaves_the_table_when_the_wait_is_over() {
 /// Long enough that a loaded machine does not mistake scheduling for a
 /// bound, short enough that the test is not a wait.
 const PATIENCE: Duration = Duration::from_millis(300);
+
+// -----------------------------------------------------------
+// Section 8.6's failover: choosing a copy, and counting what it gave.
+// -----------------------------------------------------------
+
+fn node(nth: u8) -> NodeId {
+    NodeId::from_bytes([nth; 16])
+}
+
+#[test]
+fn the_copy_furthest_ahead_is_chosen_whatever_order_the_answers_came_in() {
+    // **The laggard answers first.** Under any partition worth failing
+    // over from, the nearest copy is the one cut off with this node
+    // and furthest behind, and it answers first because it is nearest.
+    // A chooser that took the first answer would pick the worst copy
+    // exactly when it mattered.
+    let answers = [(node(1), 3), (node(2), 9), (node(3), 7)];
+    assert_eq!(most_advanced(None, &answers), Choice::Remote(node(2)));
+    let reversed = [(node(3), 7), (node(2), 9), (node(1), 3)];
+    assert_eq!(most_advanced(None, &reversed), Choice::Remote(node(2)));
+}
+
+#[test]
+fn this_nodes_own_copy_competes_on_its_mark_and_wins_a_tie() {
+    // A remote copy strictly ahead is taken, because the whole point is
+    // the furthest copy. A tie goes to the local one: no round trip,
+    // and a copy this node holds is one it knows it can read.
+    assert_eq!(
+        most_advanced(Some(4), &[(node(1), 9)]),
+        Choice::Remote(node(1))
+    );
+    assert_eq!(most_advanced(Some(9), &[(node(1), 9)]), Choice::Local);
+    assert_eq!(most_advanced(Some(9), &[(node(1), 4)]), Choice::Local);
+    assert_eq!(most_advanced(Some(0), &[]), Choice::Local);
+}
+
+#[test]
+fn nobody_holding_a_copy_is_said_rather_than_guessed() {
+    assert_eq!(most_advanced(None, &[]), Choice::Nobody);
+}
+
+#[test]
+fn two_remote_copies_at_one_mark_choose_the_same_node_from_either_side() {
+    // Two nodes asking about one session must choose the same copy,
+    // or each pulls a different one and the two owners-to-be disagree
+    // about what the queue held.
+    let one = most_advanced(None, &[(node(2), 5), (node(1), 5)]);
+    let other = most_advanced(None, &[(node(1), 5), (node(2), 5)]);
+    assert_eq!(one, other);
+    assert_eq!(
+        one,
+        Choice::Remote(node(1)),
+        "the lower identity, as every tie here"
+    );
+}
+
+#[tokio::test]
+async fn answers_that_hold_nothing_count_towards_the_expected_number() {
+    // **A node that holds no copy says so, and that is what makes the
+    // answer worth sending**: without it the asker would wait the whole
+    // bound for a copy that does not exist.
+    let migrations = Arc::new(Migrations::default());
+    let session = key();
+    let asking = migrations.ask(&session);
+    migrations.held(node(1), &session, None);
+    migrations.held(node(2), &session, Some(6));
+    let started = std::time::Instant::now();
+    let held = asking.collect(Duration::from_secs(10), 2).await;
+    assert_eq!(held, vec![(node(2), 6)], "only the holder is returned");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "two answers were expected and two came, so nothing waited: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn asking_is_bounded_and_returns_what_arrived() {
+    let migrations = Arc::new(Migrations::default());
+    let session = key();
+    let asking = migrations.ask(&session);
+    migrations.held(node(1), &session, Some(2));
+    // Three expected, one came. The bound is what ends the wait.
+    let held = bounded_ask(asking.collect(Duration::from_millis(150), 3)).await;
+    assert_eq!(held, vec![(node(1), 2)]);
+    // And the table is clean afterwards: an answer now goes nowhere
+    // rather than to a channel nobody reads.
+    assert!(locked(&migrations.asking).is_empty());
+}
+
+/// A bounded wait on an ask, for the reason `bounded` exists above:
+/// the bound is the thing under test, so the test's own wait must be
+/// a different one.
+async fn bounded_ask<F: std::future::Future<Output = Vec<(NodeId, u64)>>>(
+    ask: F,
+) -> Vec<(NodeId, u64)> {
+    tokio::time::timeout(Duration::from_secs(10), ask)
+        .await
+        .expect("a bounded ask returns")
+}
+
+#[test]
+fn a_short_drain_made_whole_by_a_pull_has_no_shortfall() {
+    // **The number section 8.6 says an operator alerts on.** A drain
+    // that fell short by five and a pull that brought everything is a
+    // session made whole; five missing would report a loss that did
+    // not happen. The drain still counts as having fallen short,
+    // because it did.
+    let stats = Stats::default();
+    let short = Drain {
+        handover: handover(1),
+        complete: false,
+        missing: 5,
+    };
+    let pulled = Drain {
+        handover: handover(6),
+        complete: true,
+        missing: 0,
+    };
+    stats.account(&short, Some(&pulled));
+    assert_eq!(stats.incomplete(), 1, "the drain fell short, and says so");
+    assert_eq!(stats.missing(), 0, "but nothing was lost");
+    assert_eq!(stats.pulled(), 1);
+    assert_eq!(stats.pulled_messages(), 6);
+    assert_eq!(
+        stats.messages(),
+        6,
+        "the session got the pull's six, not the drain's one"
+    );
+}
+
+#[test]
+fn a_short_drain_with_no_copy_to_pull_from_counts_its_shortfall() {
+    let stats = Stats::default();
+    let short = Drain {
+        handover: handover(1),
+        complete: false,
+        missing: 5,
+    };
+    stats.account(&short, None);
+    assert_eq!(stats.incomplete(), 1);
+    assert_eq!(
+        stats.missing(),
+        5,
+        "nothing made it whole, so five is the truth"
+    );
+    assert_eq!(stats.pulled(), 0);
+    assert_eq!(stats.messages(), 1);
+}
+
+#[test]
+fn a_pull_that_itself_fell_short_counts_what_it_left_missing() {
+    let stats = Stats::default();
+    let pulled = Drain {
+        handover: handover(3),
+        complete: false,
+        missing: 2,
+    };
+    stats.account(&Drain::empty(), Some(&pulled));
+    assert_eq!(stats.incomplete(), 1);
+    assert_eq!(
+        stats.missing(),
+        2,
+        "the pull's own shortfall is the shortfall"
+    );
+    assert_eq!(stats.pulled(), 1);
+}

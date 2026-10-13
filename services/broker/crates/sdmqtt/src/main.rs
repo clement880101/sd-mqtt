@@ -333,6 +333,10 @@ impl sdmqtt_server::metrics::ClusterMetrics for MeshView {
         ]
     }
 
+    fn replica_applied(&self) -> u64 {
+        self.copies.applied()
+    }
+
     fn migrations(&self) -> [u64; sdmqtt_server::metrics::MIGRATION_NUMBERS.len()] {
         // Read once, so the seven numbers are one reading of the table
         // rather than seven: a scrape that caught a migration halfway
@@ -347,6 +351,8 @@ impl sdmqtt_server::metrics::ClusterMetrics for MeshView {
             stats.messages(),
             stats.missing(),
             stats.late(),
+            stats.pulled(),
+            stats.pulled_messages(),
         ]
     }
 }
@@ -985,6 +991,9 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             Arc::clone(&replicator),
             Arc::clone(&rebuilt.shared),
             Arc::clone(&migrations),
+            // To answer a pull: a copy is in the store and not in the
+            // broker, so the handler reads the store.
+            Arc::clone(&rebuilt.store),
         );
         (replicator, handler, applying)
     });
@@ -1054,6 +1063,14 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             Arc::clone(mesh),
             Arc::clone(&migrations),
             std::time::Duration::from_millis(config.cluster.drain_timeout_ms),
+            // Section 8.6's failover: what a short drain falls back to.
+            // All three are this node's, made above, and are what make
+            // a copy readable rather than only written.
+            cluster::migrate::Failover {
+                placement: placement.clone(),
+                copies: Some(Arc::clone(&rebuilt.copies)),
+                store: Some(Arc::clone(&rebuilt.store)),
+            },
         ));
         // Section 8.5, here for the same reason and in the same
         // window: an operator who asked for connects to be refused

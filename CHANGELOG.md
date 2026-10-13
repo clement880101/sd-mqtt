@@ -121,6 +121,35 @@ on purpose.
   the race away; the test reconnects without waiting, as a client
   would.
 
+- **Losing the owner does not lose the queue.** Section 8.6's failover.
+  When a drain comes up short — the previous owner cannot be reached,
+  or does not finish in time — the claiming node asks every reachable
+  member of the session's replica set how far its copy goes, weighs
+  its own copy against the answers, and pulls from whichever is
+  furthest ahead. **The drain still comes first**, because the owner
+  holds the authoritative queue and asking it is the complete answer;
+  the pull is what happens on the timeout that used to be counted as a
+  shortfall, and the shortfall is now what is still missing *after* the
+  pull. A drain that fell short by five and a pull that brought all
+  five reports nothing lost, because nothing was.
+
+  The copy furthest ahead, **not the nearest**. Under any partition
+  worth failing over from, the nearest copy is the one that was cut
+  off with the claiming node and is furthest behind, and it answers
+  first because it is nearest. The three-node test holds one
+  follower's link back, kills the owner, and reconnects the client to
+  the laggard — which must pull from the other node anyway.
+
+  Two counters beside the migration ones: `sdmqtt_sessions_pulled_total`
+  and `sdmqtt_pulled_messages_total`. And one on the follower's side,
+  `sdmqtt_replica_changes_applied_total`: the gauges say what a node
+  holds, and a node that holds copies and has quietly stopped applying
+  to them looks the same on all three. A flat line here on a node that
+  is meant to be following is that node. A copy holds the queue and only
+  the queue — no subscriptions, no inflight window — so a client that
+  failed over has its messages and re-subscribes, which is what
+  section 8.6 replicates and all it says it does.
+
 - **`cluster.durability`, with `"sync"` available.** `async` is the
   default and is what the lag gauge is about. `sync` holds the
   acknowledgement until one follower has confirmed the append, so a

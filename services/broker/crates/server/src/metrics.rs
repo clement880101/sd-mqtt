@@ -803,6 +803,9 @@ pub trait ClusterMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// Section 8.6's replication numbers, in the order
     /// [`REPLICATION_NUMBERS`] names them.
     fn replication(&self) -> [u64; REPLICATION_NUMBERS.len()];
+    /// Changes this node has applied as a follower, ever. See
+    /// [`REPLICA_APPLIED`].
+    fn replica_applied(&self) -> u64;
     /// Section 8.4's migration numbers, in the order
     /// [`MIGRATION_NUMBERS`] names them.
     ///
@@ -843,6 +846,20 @@ pub const REPLICATION_NUMBERS: [(&str, &str); 3] = [
     ),
 ];
 
+/// Changes this node has applied as a follower, ever. Section 8.6.
+///
+/// A counter, beside the three gauges above, because it is the one
+/// number that says a follower is still *doing* anything: the gauges
+/// describe what this node holds, and a node that holds copies and
+/// has quietly stopped applying to them looks identical on all three.
+/// A flat line here on a node that is meant to be following is that
+/// node. It is also the only way a test can know a follower has caught
+/// up before it does something irreversible to the owner.
+pub const REPLICA_APPLIED: (&str, &str) = (
+    "replica_changes_applied",
+    "Queue changes this node has applied to copies it holds for other nodes",
+);
+
 /// Durable publishes acknowledged in synchronous mode that no follower
 /// confirmed. Section 8.6.
 ///
@@ -871,7 +888,7 @@ pub const UNCONFIRMED: (&str, &str) = (
 /// here because a shortfall with nothing to compare it against cannot
 /// be read: a hundred incomplete drains is an outage or a quiet
 /// afternoon depending on how many there were altogether.
-pub const MIGRATION_NUMBERS: [(&str, &str); 7] = [
+pub const MIGRATION_NUMBERS: [(&str, &str); 9] = [
     (
         "sessions_claimed",
         "Sessions this node claimed from another node",
@@ -899,6 +916,15 @@ pub const MIGRATION_NUMBERS: [(&str, &str); 7] = [
     (
         "migrated_messages_late",
         "Chunks that arrived for a drain nothing was waiting for any more",
+    ),
+    (
+        "sessions_pulled",
+        "Claims whose queue came from a copy, because the owner could not be reached or did \
+         not finish",
+    ),
+    (
+        "pulled_messages",
+        "Messages that arrived in a pull from a copy",
     ),
 ];
 
@@ -1465,6 +1491,15 @@ impl Collector for ClusterLive {
             let descriptor = encoder.encode_descriptor(name, help, None, gauge.metric_type())?;
             gauge.encode(descriptor)?;
         }
+        // And the one that only goes up, as a counter.
+        let applied = ConstCounter::new(self.0.replica_applied());
+        let descriptor = encoder.encode_descriptor(
+            REPLICA_APPLIED.0,
+            REPLICA_APPLIED.1,
+            None,
+            applied.metric_type(),
+        )?;
+        applied.encode(descriptor)?;
         Ok(())
     }
 }
@@ -1995,10 +2030,13 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
             33
         }
         fn migrations(&self) -> [u64; MIGRATION_NUMBERS.len()] {
-            [41, 42, 43, 44, 45, 46, 47]
+            [41, 42, 43, 44, 45, 46, 47, 48, 49]
         }
         fn replication(&self) -> [u64; REPLICATION_NUMBERS.len()] {
             [51, 52, 53]
+        }
+        fn replica_applied(&self) -> u64 {
+            54
         }
     }
 
@@ -2032,7 +2070,10 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
 
         // Section 8.4's seven, each against the name it belongs to and
         // not merely present somewhere.
-        for ((name, help), value) in MIGRATION_NUMBERS.iter().zip([41, 42, 43, 44, 45, 46, 47]) {
+        for ((name, help), value) in MIGRATION_NUMBERS
+            .iter()
+            .zip([41, 42, 43, 44, 45, 46, 47, 48, 49])
+        {
             let family = format!("sdmqtt_{name}");
             let shown = block(&rendered, &family);
             assert!(
@@ -2076,6 +2117,15 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
             rendered.contains("sdmqtt_replication_lag 51\n"),
             "section 8.6's loss window is this series:\n{rendered}"
         );
+        let applied = block(&rendered, "sdmqtt_replica_changes_applied");
+        assert!(
+            applied.contains("# TYPE sdmqtt_replica_changes_applied counter\n"),
+            "applied changes only go up, so this is a counter:\n{applied}"
+        );
+        assert!(
+            applied.contains("sdmqtt_replica_changes_applied_total 54\n"),
+            "{applied}"
+        );
     }
 
     #[test]
@@ -2086,7 +2136,11 @@ sdmqtt_router_matches_total{scope=\"remote\"} 0
         // statements, and a scraper cannot tell them apart from a zero.
         let rendered = Metrics::new().render();
         assert!(!rendered.contains("sdmqtt_cluster_members"), "{rendered}");
-        for (name, _) in MIGRATION_NUMBERS.iter().chain(REPLICATION_NUMBERS.iter()) {
+        for (name, _) in MIGRATION_NUMBERS
+            .iter()
+            .chain(REPLICATION_NUMBERS.iter())
+            .chain(std::iter::once(&REPLICA_APPLIED))
+        {
             assert!(
                 !rendered.contains(&format!("sdmqtt_{name}")),
                 "{name} should be absent on a node that does not cluster:\n{rendered}"

@@ -104,6 +104,8 @@ struct Node {
     /// Where its store is. The point of a restart is that this
     /// survives it.
     store: PathBuf,
+    /// How many copies of each session, so a restart keeps it.
+    factor: usize,
     admin: SocketAddr,
     /// Where its clients connect, which section 8.3's routing is about.
     mqtt: SocketAddr,
@@ -139,6 +141,23 @@ impl Node {
         ))
     }
 
+    /// Kill this node, and say who it was.
+    ///
+    /// The identity is read **before** the kill, because afterwards
+    /// there is nobody to ask: what a survivor is asked about is the
+    /// identity, and a test that wanted it later would find the admin
+    /// listener gone.
+    ///
+    /// Killed, not stopped. A clean shutdown could hand sessions over
+    /// on the way out, and a test about losing an owner would then be
+    /// a test about section 8.4 working rather than section 8.6.
+    fn kill(&mut self) -> String {
+        let identity = self.identity();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        identity
+    }
+
     /// Stop this node and start it again against the same store.
     ///
     /// **The only way to ask whether something was really written
@@ -154,7 +173,7 @@ impl Node {
     fn restart(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        self.child = spawn(&self.config, &self.store, &self.log);
+        self.child = spawn(&self.config, &self.store, &self.log, self.factor);
         if let Err(why) = self.wait_until_listening() {
             panic!("{} did not come back: {why}", self.label);
         }
@@ -364,7 +383,7 @@ impl Drop for Node {
 ///
 /// Factored out because a restart is the same command: a node that
 /// came back differently would not be testing what a restart does.
-fn spawn(config: &Path, store: &Path, log: &Path) -> Child {
+fn spawn(config: &Path, store: &Path, log: &Path, factor: usize) -> Child {
     Command::new(env!("CARGO_BIN_EXE_sdmqtt"))
         .arg("serve")
         .arg("--config")
@@ -382,6 +401,10 @@ fn spawn(config: &Path, store: &Path, log: &Path) -> Child {
         // whoever is running the tests cannot reach these brokers.
         .env("SDMQTT_CONFIG", "")
         .env("SDMQTT_STORAGE_DIRECTORY", "")
+        // Section 8.6's copies per session. In the environment rather
+        // than the file so that one harness serves every factor a test
+        // wants, and so that a restart starts with the same one.
+        .env("SDMQTT_CLUSTER_REPLICATION_FACTOR", factor.to_string())
         .stderr(Stdio::from(
             // Appended rather than truncated, so a restart does not
             // throw away the log of what happened before it.
@@ -854,6 +877,15 @@ struct Cluster {
 impl Cluster {
     /// Start three nodes under `directory`, each with a store of its own.
     async fn start(directory: &Path) -> Self {
+        Self::start_with_factor(directory, cluster::DEFAULT_FACTOR).await
+    }
+
+    /// The same, keeping `factor` copies of each session.
+    ///
+    /// Three nodes with a factor of three put a copy of every session
+    /// on every node, which is what a test about choosing *between*
+    /// copies needs: two followers, one of them held back.
+    async fn start_with_factor(directory: &Path, factor: usize) -> Self {
         let labels = LABELS;
 
         // The three cluster ports, chosen before anything starts so that
@@ -904,13 +936,14 @@ impl Cluster {
             );
             let log = directory.join(format!("{label}.log"));
             let mut node = Node {
-                child: spawn(&config, &store, &log),
+                child: spawn(&config, &store, &log, factor),
                 admin,
                 mqtt,
                 log,
                 label,
                 config,
                 store,
+                factor,
             };
             if let Err(why) = node.wait_until_listening() {
                 panic!("{why}");
@@ -986,6 +1019,7 @@ async fn three_processes_form_a_mesh_and_survive_a_partition() {
         nodes,
         gates,
         advertised,
+        ..
     } = Cluster::start(directory.path()).await;
 
     // ---- they all find each other --------------------------------
@@ -1858,6 +1892,16 @@ async fn two_nodes_that_accepted_one_client_resolve_on_heal() {
     until("alpha has let the session go", || {
         !nodes[0].sessions().contains("twin")
     });
+    // **And its stream of the session with it.** Section 8.6: a stale
+    // owner returning from a partition discards its copy. The session
+    // left alpha above; what this asserts is that alpha stopped
+    // counting it as a session it replicates, which is the owner-side
+    // table and is a separate thing from the session — it was left
+    // behind once, and the gauge went on saying a session nobody held
+    // was being streamed.
+    until("and stopped streaming it", || {
+        nodes[0].counter("sdmqtt_replicated_sessions") == Some(0)
+    });
 
     // And the winner is still serving, asserted by using it rather
     // than by waiting for nothing to happen. Published and subscribed
@@ -2008,4 +2052,211 @@ async fn a_queued_message_is_copied_to_a_second_node() {
     until("the copies catch up", || {
         cluster.nodes[0].counter("sdmqtt_replication_lag") == Some(0)
     });
+}
+
+/// Killing the owner does not lose the queue, section 8.6's failover.
+///
+/// The exit criterion this milestone is for, in its simplest form: a
+/// session with a queued message, its owner killed with the signal
+/// rather than asked, and the client reconnecting somewhere else and
+/// receiving the message — from the node that held the copy, over a
+/// link, because the node it reconnected to is deliberately not that
+/// one.
+///
+/// Killed, not stopped: a clean shutdown could hand the session over
+/// on the way out, and that would be section 8.4 working rather than
+/// section 8.6.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn killing_the_owner_does_not_lose_the_queue() {
+    const FILTER: &str = "fleet/+/telemetry";
+    const TOPIC: &str = "fleet/0007/telemetry";
+    const WHILE_AWAY: &str = "survives-the-owner";
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let mut cluster = Cluster::start(directory.path()).await;
+    cluster.settle();
+
+    // A session on alpha with one queued message, copied to one of the
+    // other two.
+    let (mut rover, _) = Client::resuming(cluster.nodes[0].mqtt, "rover");
+    rover.subscribe(FILTER);
+    drop(rover);
+    until("beta learns that somebody wants the filter", || {
+        cluster.nodes[1].publish_reaching(TOPIC, WHILE_AWAY) > 0
+    });
+    until("a copy of the session exists on another node", || {
+        cluster
+            .nodes
+            .iter()
+            .skip(1)
+            .any(|node| node.counter("sdmqtt_replica_sessions") == Some(1))
+    });
+    let holder = (1..NODES)
+        .find(|at| cluster.nodes[*at].counter("sdmqtt_replica_sessions") == Some(1))
+        .expect("the wait above found one");
+    // The node the client comes back to is the one that holds nothing,
+    // so the queue has to cross a link to reach it.
+    let elsewhere = (1..NODES).find(|at| *at != holder).expect("three nodes");
+
+    // ---- the owner dies --------------
+    let alpha = cluster.nodes[0].kill();
+    until("the survivors declare alpha dead", || {
+        (1..NODES).all(|at| cluster.nodes[at].how(&alpha).as_deref() == Some("down"))
+    });
+
+    // ---- and the client comes back somewhere that held nothing ----
+    let (mut rover, present) = Client::resuming(cluster.nodes[elsewhere].mqtt, "rover");
+    assert!(present, "the session was found: pulled from the copy");
+    assert_eq!(
+        rover.delivered_within(PATIENCE),
+        Some((TOPIC.to_owned(), WHILE_AWAY.to_owned())),
+        "the message queued before the owner died was delivered after it"
+    );
+
+    // ---- and the exposition says how --------------
+    //
+    // Unreachable once, pulled once, one message pulled, and **nothing
+    // missing**: the shortfall is what is still lost after the pull,
+    // and nothing is.
+    for (series, expected) in [
+        ("sdmqtt_sessions_claimed_total", 1),
+        ("sdmqtt_sessions_migrated_unreachable_total", 1),
+        ("sdmqtt_sessions_migrated_incomplete_total", 1),
+        ("sdmqtt_sessions_pulled_total", 1),
+        ("sdmqtt_pulled_messages_total", 1),
+        ("sdmqtt_migrated_messages_missing_total", 0),
+    ] {
+        assert_eq!(
+            cluster.nodes[elsewhere].counter(series),
+            Some(expected),
+            "{series} on the node that pulled"
+        );
+    }
+}
+
+/// Of two copies, the one furthest ahead is the one taken.
+///
+/// **This is the test the chooser exists for.** With a factor of three
+/// every node holds a copy, and the link carrying alpha's stream to
+/// gamma is stalled so gamma's copy falls behind beta's. Alpha is
+/// killed, and the client comes back to **gamma** — the laggard, whose
+/// own copy answers first and costs no round trip — which must pull
+/// from beta anyway, because beta's mark is higher. A chooser that
+/// took the nearest copy would deliver a short queue here and look
+/// correct on every test where the nearest copy happened to be whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_copy_furthest_ahead_is_the_one_pulled() {
+    const FILTER: &str = "fleet/+/telemetry";
+    const TOPIC: &str = "fleet/0042/telemetry";
+    /// How many to queue. Enough that a short copy is unmistakable.
+    const MESSAGES: usize = 5;
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let mut cluster = Cluster::start_with_factor(directory.path(), 3).await;
+    cluster.settle();
+
+    let (mut rover, _) = Client::resuming(cluster.nodes[0].mqtt, "rover");
+    rover.subscribe(FILTER);
+    drop(rover);
+    until("beta learns that somebody wants the filter", || {
+        cluster.nodes[1].publish_reaching(TOPIC, "message-0") > 0
+    });
+    // Both followers have the first message: a factor of three is
+    // every node.
+    until("both other nodes hold a copy", || {
+        (1..NODES).all(|at| cluster.nodes[at].counter("sdmqtt_replica_sessions") == Some(1))
+    });
+
+    // ---- gamma's copy is held back --------------
+    //
+    // Stalled rather than cut: the bytes alpha sends gamma are read by
+    // nobody, so alpha's link queue to gamma fills and drops, and
+    // gamma's mark stops. Beta's does not.
+    cluster.gates[&(0, 2)].stall(Direction::Forward);
+    for nth in 1..MESSAGES {
+        assert!(
+            cluster.nodes[1].publish_reaching(TOPIC, &format!("message-{nth}")) > 0,
+            "the filter is known by now"
+        );
+    }
+    // **Beta has every change and gamma has one, and both are waited
+    // for before the owner is killed.** The first version of this test
+    // waited only for alpha to report *a* copy behind, which is true
+    // the moment gamma lags by one — and then killed alpha while it was
+    // still streaming to beta. Beta had one message on one run and
+    // three on the next, the chooser picked it correctly each time,
+    // and the test failed for a reason that had nothing to do with
+    // the chooser. The applied counter is what makes a follower's
+    // progress something a test, or an operator, can wait on.
+    until("beta has applied every change", || {
+        cluster.nodes[1].counter("sdmqtt_replica_changes_applied_total") == Some(MESSAGES as u64)
+    });
+    assert_eq!(
+        cluster.nodes[2].counter("sdmqtt_replica_changes_applied_total"),
+        Some(1),
+        "gamma's link is stalled, so it applied the first change and no more"
+    );
+    until("alpha reports a copy behind", || {
+        cluster.nodes[0]
+            .counter("sdmqtt_replication_lag")
+            .is_some_and(|lag| lag > 0)
+    });
+
+    // ---- the owner dies, and the laggard is asked --------------
+    let alpha = cluster.nodes[0].kill();
+    until("the survivors declare alpha dead", || {
+        (1..NODES).all(|at| cluster.nodes[at].how(&alpha).as_deref() == Some("down"))
+    });
+    let (mut rover, present) = Client::resuming(cluster.nodes[2].mqtt, "rover");
+    assert!(present);
+
+    // **The counter first, because it says which copy was taken.** A
+    // short delivery below could be a pull from the wrong copy or a
+    // delivery fault after the right one; the number of messages
+    // pulled tells the two apart, and the node's own log says which
+    // copy it chose and why.
+    let pulled = cluster.nodes[2].counter("sdmqtt_pulled_messages_total");
+    let lines_about = |node: &Node, needles: &[&str]| {
+        node.logged()
+            .lines()
+            .filter(|line| needles.iter().any(|needle| line.contains(needle)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        pulled,
+        Some(MESSAGES as u64),
+        "gamma should have pulled beta's whole copy; gamma's choice:\n{}\nalpha's stream \
+         (its log outlives it):\n{}\nbeta's side:\n{}",
+        lines_about(&cluster.nodes[2], &["choosing a copy", "copy answered"]),
+        lines_about(
+            &cluster.nodes[0],
+            &["WARN", "ERROR", "copy", "stream", "follower"]
+        ),
+        lines_about(
+            &cluster.nodes[1],
+            &["WARN", "ERROR", "copy", "stream", "follower"]
+        ),
+    );
+
+    // Every message, in order: the queue came from beta, not from the
+    // copy gamma itself was holding.
+    let mut got = Vec::new();
+    while let Some((_, payload)) = rover.delivered_within(Duration::from_secs(5)) {
+        got.push(payload);
+        if got.len() == MESSAGES {
+            break;
+        }
+    }
+    assert_eq!(
+        got,
+        (0..MESSAGES)
+            .map(|nth| format!("message-{nth}"))
+            .collect::<Vec<_>>(),
+        "the furthest copy was the one pulled, and all of it was delivered"
+    );
+    assert_eq!(
+        cluster.nodes[2].counter("sdmqtt_migrated_messages_missing_total"),
+        Some(0)
+    );
 }

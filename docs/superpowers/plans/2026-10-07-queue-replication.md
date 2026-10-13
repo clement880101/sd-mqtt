@@ -270,7 +270,7 @@ then streams to the remaining followers.
 already counts, and the count stays too: what is lost shrinks to what no
 replica held.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 - The owner is unreachable and the queue arrives from a replica anyway. The
   whole feature in one test.
@@ -285,7 +285,7 @@ replica held.
   **zero** when one did. Both, because a counter that never moves and a
   counter that always moves look the same from one test.
 
-- [ ] **Step 2: Implement, confirm teeth, commit**
+- [x] **Step 2: Implement, confirm teeth, commit**
 
 Mutations: the first reachable replica used rather than the most advanced;
 the pull replacing the drain rather than backing it, which must fail a test
@@ -295,6 +295,16 @@ copy; the shortfall counted even when the pull filled it.
 ```bash
 git commit -m "feat(cluster): a new owner takes the furthest copy"
 ```
+
+The "most advanced" test was written with the laggard reachable first,
+as this task asks, and it still took two runs to get right — not
+because of the chooser, which chose correctly every time, but because
+the test killed the owner the moment *gamma* lagged, with no way to
+know *beta* had caught up. Beta had one message on one run and three
+on the next. That is why `sdmqtt_replica_changes_applied_total` exists:
+a follower's progress was not observable from outside the node, by a
+test or by an operator, and a test that cannot observe a precondition
+substitutes a sleep or a guess.
 
 ---
 

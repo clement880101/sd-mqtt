@@ -223,6 +223,8 @@ pub struct Stats {
     messages: AtomicU64,
     missing: AtomicU64,
     late: AtomicU64,
+    pulled: AtomicU64,
+    pulled_messages: AtomicU64,
 }
 
 impl Stats {
@@ -241,10 +243,13 @@ impl Stats {
 
     /// Drains that did not finish, for any reason.
     ///
-    /// **The count the spec means by "the shortfall is counted".** It
-    /// covers the unreachable owner, where no figure can be known, and
-    /// the drain that stopped partway, where [`Self::missing`] says by
-    /// how much.
+    /// A fact about drains, and **not** the shortfall: a drain that
+    /// fell short and was then made whole by a pull from a copy still
+    /// counts here, because it fell short. [`Self::missing`] is the
+    /// shortfall — what was lost after the pull was tried — and
+    /// [`Self::pulled`] is how often the pull was what made the
+    /// difference. It covers the unreachable owner, where no figure can
+    /// be known, and the drain that stopped partway.
     #[must_use]
     pub fn incomplete(&self) -> u64 {
         self.incomplete.load(Ordering::Relaxed)
@@ -256,10 +261,26 @@ impl Stats {
         self.unreachable.load(Ordering::Relaxed)
     }
 
-    /// Messages that arrived in a drain.
+    /// Messages that arrived in a drain or a pull.
     #[must_use]
     pub fn messages(&self) -> u64 {
         self.messages.load(Ordering::Relaxed)
+    }
+
+    /// Claims whose queue came from a copy rather than the owner.
+    ///
+    /// Section 8.6's failover doing its job: the owner could not be
+    /// reached or did not finish, a member of the replica set held the
+    /// queue, and the session was made whole from it.
+    #[must_use]
+    pub fn pulled(&self) -> u64 {
+        self.pulled.load(Ordering::Relaxed)
+    }
+
+    /// Messages that arrived in a pull.
+    #[must_use]
+    pub fn pulled_messages(&self) -> u64 {
+        self.pulled_messages.load(Ordering::Relaxed)
     }
 
     /// Messages a previous owner said it held and this node never got.
@@ -288,6 +309,13 @@ impl Stats {
 #[derive(Debug, Default)]
 pub struct Migrations {
     waiting: Mutex<HashMap<(SessionKey, u64), mpsc::UnboundedSender<Drained>>>,
+    /// Section 8.6's failover: who is asking the replica set how far
+    /// their copies of a session go, keyed by session.
+    ///
+    /// By session alone rather than by session and epoch, because the
+    /// question is about copies and a copy has no epoch: it is as far
+    /// as the stream got, whoever was streaming.
+    asking: Mutex<HashMap<SessionKey, mpsc::UnboundedSender<Answer>>>,
     stats: Stats,
 }
 
@@ -318,6 +346,35 @@ impl Migrations {
             session: session.clone(),
             epoch,
             chunks,
+            counted: true,
+        }
+    }
+
+    /// Start asking the replica set how far their copies of `session`
+    /// go, section 8.6's failover.
+    ///
+    /// Registered **before** the questions go out, for
+    /// [`Migrations::begin`]'s reason: an answer that arrived before
+    /// anybody was waiting for it would be an answer nobody heard.
+    pub fn ask(self: &Arc<Self>, session: &SessionKey) -> Asking {
+        let (sender, answers) = mpsc::unbounded_channel();
+        locked(&self.asking).insert(session.clone(), sender);
+        Asking {
+            migrations: Arc::clone(self),
+            session: session.clone(),
+            answers,
+        }
+    }
+
+    /// A node said how far its copy of `session` goes.
+    ///
+    /// Routed to whoever is asking, or dropped: an answer to a question
+    /// nobody is still asking is a copy that was chosen or passed over
+    /// already.
+    pub fn held(&self, from: NodeId, session: &SessionKey, through: Option<u64>) {
+        let sender = locked(&self.asking).get(session).cloned();
+        if let Some(sender) = sender {
+            let _ = sender.send((from, through));
         }
     }
 
@@ -345,8 +402,14 @@ impl Migrations {
     /// Section 8.4's other half of the same sentence as a timeout, and
     /// counted as its own thing because an operator reading a standing
     /// count of these is reading a partition rather than a slow peer.
+    /// The previous owner could not be asked.
+    ///
+    /// Counts only `unreachable`. The drain this amounts to is an
+    /// empty incomplete one, and `Stats::account` counts that — once,
+    /// together with whatever a pull then brought. Counting
+    /// `incomplete` here as well was the double count the first
+    /// failover test caught: two incomplete drains for one claim.
     fn no_owner_to_ask(&self) {
-        self.stats.incomplete.fetch_add(1, Ordering::Relaxed);
         self.stats.unreachable.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -362,6 +425,103 @@ pub struct Awaiting {
     session: SessionKey,
     epoch: u64,
     chunks: mpsc::UnboundedReceiver<Drained>,
+    /// Whether [`Awaiting::collect`] updates the stats itself.
+    ///
+    /// True for a plain drain. False when the caller is going to try a
+    /// pull afterwards and will account for the two together, because
+    /// a drain that fell short and a pull that made it whole must not
+    /// count as a shortfall.
+    counted: bool,
+}
+
+/// One node's answer to [`Migrations::ask`]: how far its copy goes, or
+/// `None` for no copy at all.
+pub type Answer = (NodeId, Option<u64>);
+
+/// Answers to a [`Migrations::ask`], as they arrive.
+#[derive(Debug)]
+pub struct Asking {
+    migrations: Arc<Migrations>,
+    session: SessionKey,
+    answers: mpsc::UnboundedReceiver<Answer>,
+}
+
+impl Drop for Asking {
+    fn drop(&mut self) {
+        locked(&self.migrations.asking).remove(&self.session);
+    }
+}
+
+impl Asking {
+    /// Collect up to `expected` answers, or whatever arrived within
+    /// `patience`.
+    ///
+    /// Returns only the nodes that hold a copy, with how far it goes.
+    /// A node that answered that it holds nothing still counts towards
+    /// `expected`, which is what makes that answer worth sending:
+    /// without it the asker would wait the whole bound for a copy that
+    /// does not exist.
+    pub async fn collect(mut self, patience: Duration, expected: usize) -> Vec<(NodeId, u64)> {
+        let deadline = tokio::time::Instant::now() + patience;
+        let mut held = Vec::new();
+        let mut answered = 0usize;
+        while answered < expected {
+            match tokio::time::timeout_at(deadline, self.answers.recv()).await {
+                Ok(Some((from, through))) => {
+                    answered += 1;
+                    if let Some(through) = through {
+                        held.push((from, through));
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        held
+    }
+}
+
+/// Which copy to take, section 8.6: the one furthest ahead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    /// This node's own copy is as far as any.
+    ///
+    /// Preferred on a tie, because it costs no round trip and because
+    /// a copy this node holds is one it knows it can read.
+    Local,
+    /// Another node's copy is strictly further ahead.
+    Remote(NodeId),
+    /// Nobody holds a copy, this node included.
+    Nobody,
+}
+
+/// Choose the copy furthest ahead.
+///
+/// **By the mark and never by the order answers arrived in.** The
+/// nearest copy answers first, and the nearest copy is, under any
+/// partition worth failing over from, the one that was cut off with
+/// this node and is furthest behind. A chooser that took the first
+/// answer would pick the worst copy exactly when it mattered; the test
+/// that pins this hands it the laggard first.
+///
+/// Ties between remote copies break on the node's identity, so two
+/// nodes asking about one session choose the same copy.
+#[must_use]
+pub fn most_advanced(local: Option<u64>, remote: &[(NodeId, u64)]) -> Choice {
+    let best_remote = remote.iter().copied().max_by(|(a, at_a), (b, at_b)| {
+        at_a.cmp(at_b).then_with(|| b.to_bytes().cmp(&a.to_bytes()))
+    });
+    match (local, best_remote) {
+        (None, None) => Choice::Nobody,
+        (Some(_), None) => Choice::Local,
+        (None, Some((node, _))) => Choice::Remote(node),
+        (Some(mine), Some((node, theirs))) => {
+            if theirs > mine {
+                Choice::Remote(node)
+            } else {
+                Choice::Local
+            }
+        }
+    }
 }
 
 impl Drop for Awaiting {
@@ -407,20 +567,68 @@ impl Awaiting {
         }
         let received = handover.messages() as u64;
         let missing = announced.saturating_sub(received);
-        let stats = &self.migrations.stats;
-        stats.messages.fetch_add(received, Ordering::Relaxed);
-        if complete {
-            stats.drained.fetch_add(1, Ordering::Relaxed);
-        } else {
-            stats.incomplete.fetch_add(1, Ordering::Relaxed);
-            stats.missing.fetch_add(missing, Ordering::Relaxed);
-        }
-        Drain {
+        let drain = Drain {
             handover,
             complete,
-            // A completed drain is short by nothing, whatever arithmetic
-            // on a figure the far node sent would say.
             missing: if complete { 0 } else { missing },
+        };
+        if self.counted {
+            self.migrations.stats.account(&drain, None);
+        }
+        drain
+    }
+
+    /// The same wait, with the accounting left to the caller.
+    ///
+    /// For a drain that may be followed by a pull: see
+    /// [`Stats::account`] for why the two are counted together.
+    #[must_use]
+    pub fn uncounted(mut self) -> Self {
+        self.counted = false;
+        self
+    }
+}
+
+impl Stats {
+    /// Count what a claim ended up with.
+    ///
+    /// `drain` is what the owner sent, or an empty incomplete drain when
+    /// it could not be asked. `pulled` is what a copy sent afterwards,
+    /// if one was tried and answered.
+    ///
+    /// **The shortfall is what is still missing after the pull.** A
+    /// drain that fell short by five and a pull that brought all five
+    /// is a session made whole, and counting five missing would report
+    /// a loss that did not happen — which is the one number section
+    /// 8.6 says an operator alerts on. The drain still counts as having
+    /// fallen short, because it did.
+    pub fn account(&self, drain: &Drain, pulled: Option<&Drain>) {
+        let whole = pulled.unwrap_or(drain);
+        self.messages
+            .fetch_add(whole.handover.messages() as u64, Ordering::Relaxed);
+        if drain.complete {
+            self.drained.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.incomplete.fetch_add(1, Ordering::Relaxed);
+            self.missing.fetch_add(whole.missing, Ordering::Relaxed);
+        }
+        if let Some(pulled) = pulled {
+            self.pulled.fetch_add(1, Ordering::Relaxed);
+            self.pulled_messages
+                .fetch_add(pulled.handover.messages() as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drain {
+    /// A drain that brought nothing and did not finish: what an owner
+    /// that could not be asked amounts to.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            handover: Handover::default(),
+            complete: false,
+            missing: 0,
         }
     }
 }
@@ -469,6 +677,51 @@ pub struct Migrator {
     mesh: Arc<Mesh>,
     migrations: Arc<Migrations>,
     patience: Duration,
+    /// Section 8.6's three, for the pull a short drain falls back to.
+    ///
+    /// All three or none: a node that places sessions also holds
+    /// copies and has a store to read them from, and a node with none
+    /// of them is one that does not replicate queues and has nothing
+    /// to pull from. [`Failover::none`] is that node.
+    failover: Failover,
+}
+
+/// What a pull needs, on a node that replicates queues.
+#[derive(Clone)]
+pub struct Failover {
+    /// Who holds a copy of each session.
+    pub placement: Option<Arc<crate::placement::Placement>>,
+    /// This node's own copies, which compete on their marks too.
+    pub copies: Option<Arc<crate::replica::Copies>>,
+    /// Where this node's own copy is read from when it wins.
+    pub store: Option<Arc<dyn storage::Storage>>,
+}
+
+impl std::fmt::Debug for Failover {
+    /// Which parts are present, without printing a store.
+    ///
+    /// `dyn Storage` is not `Debug` and should not have to be, for the
+    /// reason `policy::Gate` gives about its mesh: a store printing
+    /// itself into a connection log is section 12.3's problem.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Failover")
+            .field("placement", &self.placement.is_some())
+            .field("copies", &self.copies.is_some())
+            .field("store", &self.store.is_some())
+            .finish()
+    }
+}
+
+impl Failover {
+    /// A node that does not replicate queues.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            placement: None,
+            copies: None,
+            store: None,
+        }
+    }
 }
 
 impl Migrator {
@@ -485,13 +738,118 @@ impl Migrator {
         mesh: Arc<Mesh>,
         migrations: Arc<Migrations>,
         patience: Duration,
+        failover: Failover,
     ) -> Arc<Self> {
         Arc::new(Self {
             replicated,
             mesh,
             migrations,
             patience,
+            failover,
         })
+    }
+
+    /// Take `session`'s queue from whichever copy is furthest ahead,
+    /// section 8.6's failover.
+    ///
+    /// What a short drain falls back to. Asks every reachable member
+    /// of the session's replica set how far its copy goes, weighs this
+    /// node's own copy against the answers, and pulls from the winner
+    /// — remotely, under `epoch` so the chunks route to the connection
+    /// waiting for them, or locally, straight out of the store.
+    ///
+    /// `None` when nobody holds a copy, this node included, or when
+    /// this node does not replicate queues at all. The caller then has
+    /// what the drain gave it and counts the rest as lost, which is
+    /// what it did before copies existed.
+    ///
+    /// **Two bounded waits, not one unbounded.** The question and the
+    /// pull each get `patience`, so a pull costs at most twice what a
+    /// drain does, and a copy that stops answering halfway through
+    /// leaves the connection accepted with what arrived, exactly as a
+    /// drain that stops partway does.
+    pub async fn pull(&self, session: &SessionKey, epoch: u64) -> Option<Drain> {
+        let placement = self.failover.placement.as_ref()?;
+        let members = placement.members();
+        let me = placement.me();
+        let others: Vec<NodeId> = crate::placement::place(session, &members, placement.factor())
+            .into_iter()
+            .filter(|node| *node != me)
+            .collect();
+
+        // Registered before the questions go out, for the reason
+        // `Migrations::begin` is.
+        let asking = self.migrations.ask(session);
+        let mut sent = 0usize;
+        for node in &others {
+            if matches!(
+                self.mesh.send(
+                    *node,
+                    &mesh::Message::HowFar {
+                        session: session.clone()
+                    }
+                ),
+                Some(Ok(crate::link::Sent::Queued))
+            ) {
+                sent += 1;
+            }
+        }
+        let answers = asking.collect(self.patience, sent).await;
+
+        let local = self
+            .failover
+            .copies
+            .as_ref()
+            .and_then(|copies| copies.through(session));
+        let choice = most_advanced(local, &answers);
+        tracing::info!(
+            client = %session.client_id,
+            asked = others.len(),
+            sent,
+            answered = answers.len(),
+            ?local,
+            ?answers,
+            ?choice,
+            "choosing a copy to pull a session from"
+        );
+        match choice {
+            Choice::Nobody => None,
+            Choice::Local => {
+                let store = self.failover.store.as_ref()?;
+                match crate::replica::copy_as_handover(store.as_ref(), session) {
+                    Ok(handover) => Some(Drain {
+                        handover,
+                        complete: true,
+                        missing: 0,
+                    }),
+                    Err(why) => {
+                        tracing::error!(
+                            client = %session.client_id,
+                            %why,
+                            "this node's own copy of a session could not be read for a pull"
+                        );
+                        None
+                    }
+                }
+            }
+            Choice::Remote(node) => {
+                let awaiting = self.migrations.begin(session, epoch).uncounted();
+                let asked = self.mesh.send(
+                    node,
+                    &mesh::Message::PullCopy {
+                        session: session.clone(),
+                        epoch,
+                    },
+                );
+                if !matches!(asked, Some(Ok(crate::link::Sent::Queued))) {
+                    // Answered a moment ago and gone now. What the
+                    // drain gave is what there is.
+                    drop(awaiting);
+                    return None;
+                }
+                Some(awaiting.collect(self.patience).await)
+            }
+        }
     }
 
     /// The drains this node is waiting for, for whatever delivers
@@ -562,34 +920,88 @@ impl Migrator {
         if !reached {
             drop(awaiting);
             self.migrations.no_owner_to_ask();
-            tracing::warn!(
-                client = %session.client_id,
-                %previous,
-                "the previous owner of a session could not be asked for it, so the \
-                 connection is accepted with nothing and the shortfall is counted"
-            );
+            // Section 8.6: the owner cannot be asked, so a copy is. An
+            // unreachable owner is exactly the case the copies exist
+            // for, and the drain here is an empty incomplete one for
+            // `Stats::account` to measure the pull against.
+            let pulled = self.pull(session, claim.epoch).await;
+            self.migrations
+                .stats
+                .account(&Drain::empty(), pulled.as_ref());
+            match &pulled {
+                Some(drain) => tracing::info!(
+                    client = %session.client_id,
+                    %previous,
+                    messages = drain.handover.messages(),
+                    complete = drain.complete,
+                    "the previous owner of a session could not be asked for it, and a \
+                     copy answered instead"
+                ),
+                None => tracing::warn!(
+                    client = %session.client_id,
+                    %previous,
+                    "the previous owner of a session could not be asked for it and no \
+                     copy answered, so the connection is accepted with nothing and the \
+                     shortfall is counted"
+                ),
+            }
             return Claimed {
                 epoch: claim.epoch,
                 previous: Some(previous),
                 write: claim.write,
-                drain: None,
+                drain: pulled,
             };
         }
-        let drain = awaiting.collect(self.patience).await;
-        if !drain.complete {
-            tracing::warn!(
-                client = %session.client_id,
-                %previous,
-                missing = drain.missing,
-                "a session's drain did not finish, so the connection is accepted with \
-                 what arrived"
-            );
+        // Uncounted here, because a drain that falls short may be made
+        // whole by a pull below, and the two are counted together.
+        let drain = awaiting.uncounted().collect(self.patience).await;
+        if drain.complete {
+            self.migrations.stats.account(&drain, None);
+            return Claimed {
+                epoch: claim.epoch,
+                previous: Some(previous),
+                write: claim.write,
+                drain: Some(drain),
+            };
         }
-        Claimed {
-            epoch: claim.epoch,
-            previous: Some(previous),
-            write: claim.write,
-            drain: Some(drain),
+        // Short. Section 8.6: a copy may hold the rest, and a complete
+        // copy is the whole queue — it is taken whole rather than merged
+        // with the partial drain, because the two describe the same
+        // queue and the copy's description is the one that finished.
+        let pulled = self.pull(session, claim.epoch).await;
+        self.migrations.stats.account(&drain, pulled.as_ref());
+        match pulled {
+            Some(pulled) => {
+                tracing::info!(
+                    client = %session.client_id,
+                    %previous,
+                    drained = drain.handover.messages(),
+                    pulled = pulled.handover.messages(),
+                    complete = pulled.complete,
+                    "a session's drain did not finish, and a copy answered for the rest"
+                );
+                Claimed {
+                    epoch: claim.epoch,
+                    previous: Some(previous),
+                    write: claim.write,
+                    drain: Some(pulled),
+                }
+            }
+            None => {
+                tracing::warn!(
+                    client = %session.client_id,
+                    %previous,
+                    missing = drain.missing,
+                    "a session's drain did not finish and no copy answered, so the \
+                     connection is accepted with what arrived"
+                );
+                Claimed {
+                    epoch: claim.epoch,
+                    previous: Some(previous),
+                    write: claim.write,
+                    drain: Some(drain),
+                }
+            }
         }
     }
 }

@@ -181,15 +181,16 @@ pub use metadata::{
     Claim, MetadataError, MetadataKey, MetadataValue, MetadataWrite, Ownership, Replicated,
 };
 pub use migrate::{
-    Awaiting, Claimed, Claiming, Drain, Drained, Migrations, Migrator, DEFAULT_PATIENCE,
+    most_advanced, Asking, Awaiting, Choice, Claimed, Claiming, Drain, Drained, Failover,
+    Migrations, Migrator, DEFAULT_PATIENCE,
 };
 pub use oplog::{Logged, OpLog, FIRST_SEQUENCE};
 pub use placement::{place, Factor, FactorError, Placement, Weighted, DEFAULT_FACTOR, MAX_FACTOR};
 pub use policy::{Gate, Live, Operation, Policy, PolicyError, Strict};
 pub use register::{Register, Stamp};
 pub use replica::{
-    change_for, Applied, Change, Confirmed, Confirming, Copies, Durability, Follower, Owner,
-    Streamed,
+    change_for, copy_as_handover, Applied, Change, Confirmed, Confirming, Copies, Durability,
+    Follower, Owner, Streamed,
 };
 pub use replicate::{
     choose, jitter, Handled, Replication, ReplicationError, ReplicationSettings, Replicator, Swept,

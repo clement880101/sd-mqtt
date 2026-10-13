@@ -191,6 +191,47 @@ pub enum Message {
         /// The highest contiguous position applied.
         through: u64,
     },
+    /// Section 8.6's failover, first question: "how far does your copy
+    /// of this session go?"
+    ///
+    /// Asked of every reachable member of the session's replica set by
+    /// a node whose drain came up short — the previous owner could not
+    /// be reached, or did not finish — and answered with
+    /// [`Self::Holds`]. A question, like [`Self::Claim`]: the asker is
+    /// waiting, with a bound.
+    HowFar {
+        /// Whose queue.
+        session: storage::SessionKey,
+    },
+    /// The answer: the highest contiguous position this node's copy
+    /// has applied, or nothing if it holds no copy.
+    ///
+    /// **`None` is an answer and not a silence.** A node that holds no
+    /// copy says so, because the asker is choosing between copies by
+    /// their marks and a silence would be a copy it waited the whole
+    /// bound for. Zero is a copy that has applied nothing, which is a
+    /// different thing and is `Some(0)`.
+    Holds {
+        /// Whose queue.
+        session: storage::SessionKey,
+        /// How far, if a copy is held at all.
+        through: Option<u64>,
+    },
+    /// Section 8.6's failover, second question: "send me your copy."
+    ///
+    /// Sent to the one member whose answer to [`Self::HowFar`] was
+    /// furthest ahead, and answered with [`Self::Drained`] chunks under
+    /// this epoch — the same chunks and the same collection as a drain
+    /// from an owner, because to the node receiving them the two are
+    /// the same thing: what the session held, in instalments, with the
+    /// last one saying so.
+    PullCopy {
+        /// Whose queue.
+        session: storage::SessionKey,
+        /// The epoch the asker claimed under, which is what routes the
+        /// chunks to the connection waiting for them.
+        epoch: u64,
+    },
 }
 
 /// What something on top of the mesh does with a peer's message.
