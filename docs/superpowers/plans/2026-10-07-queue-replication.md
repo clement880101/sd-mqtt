@@ -101,7 +101,7 @@ Nothing streams anything yet. This task is a pure function and its
 configuration, and it is first because every other task is written in terms
 of its answer.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 The weight has golden vectors, and they are **derived from the SHA-256
 standard rather than printed from this implementation**: compute the digest
@@ -124,7 +124,7 @@ Then the properties, over proptest where they are properties:
 
 And the configuration: zero, four, and a value with the key absent.
 
-- [ ] **Step 2: Implement, confirm teeth, commit**
+- [x] **Step 2: Implement, confirm teeth, commit**
 
 Mutations: the node digest not mixed into the weight, which places every
 session on one node and which the determinism test passes; the set ordered by
@@ -155,7 +155,7 @@ so a restore that does not know the difference brings up another node's
 session here, with its subscriptions in this node's trie and its queue being
 delivered to nobody. Stored format version 8.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 - Operations arrive and are applied **in order**, and the high-water mark is
   what has been applied rather than what has arrived.
@@ -178,7 +178,7 @@ delivered to nobody. Stored format version 8.
   this series to bound what a kill may lose, so a build without it has no
   exit criterion to meet.
 
-- [ ] **Step 2: Implement, confirm teeth, commit**
+- [x] **Step 2: Implement, confirm teeth, commit**
 
 Mutations: the sequence not checked, so an out-of-order operation applies;
 the high-water mark advanced on receipt rather than on apply; a restored
@@ -189,6 +189,11 @@ reported as zero whatever the marks are.
 ```bash
 git commit -m "feat(cluster): a queue has a copy on another node"
 ```
+
+Landed as three commits rather than one: the follower's half with the
+stored format, the owner's position, and the wiring. The stored format
+moved to **10**, not 9 — twice within this milestone, because a number
+already written to a disk has to keep meaning one thing.
 
 ---
 
