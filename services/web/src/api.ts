@@ -33,6 +33,7 @@ export type ErrorCode =
   | 'conflict'
   | 'resource_exhausted'
   | 'loop_detected'
+  | 'unavailable'
   | 'internal';
 
 /** A failure the API described in its own shape. */
@@ -124,6 +125,47 @@ export interface ClusterHealth {
    * came up alone and never heard of the others.
    */
   expected_configured: boolean;
+  /** Section 8.6, on a node that replicates. Null otherwise. */
+  replication: Replication | null;
+}
+
+/**
+ * What this node knows about its copies. Section 8.6.
+ *
+ * Every number is this node's own — the sessions it owns and streams,
+ * the copies it holds for others, how far its followers are behind
+ * it. Nothing here is cluster-wide, for the reason the membership
+ * table is not: two nodes' pages disagreeing is each of them telling
+ * the truth about its own queues.
+ */
+export interface Replication {
+  /** `async` or `sync`: when a durable publish is acknowledged. */
+  mode: string;
+  /** Sessions this node owns and streams to at least one follower. */
+  streaming: number;
+  /** Sessions this node holds a copy of for another node. */
+  holding: number;
+  /** Changes the furthest-behind copy is yet to apply: the loss window in `async`. */
+  lag: number;
+  /** Sessions this node owns whose replica set is short, as of the last sweep. */
+  repairs_pending: number;
+  /** Sessions re-streamed to a follower that held none, ever. */
+  repairs_done: number;
+  /** Synchronous acknowledgements no follower confirmed, ever. */
+  unconfirmed: number;
+  /** One row per peer this node shares a copy with. */
+  peers: PeerReplication[];
+}
+
+/** One peer's share of this node's copies. */
+export interface PeerReplication {
+  id: string;
+  /** Sessions this node owns that the peer has confirmed a copy of. */
+  confirmed: number;
+  /** The furthest any of those copies is behind this node. */
+  behind: number;
+  /** Sessions the peer owns that this node holds a copy of. */
+  held: number;
 }
 
 /** Ask whether this node's view of the cluster is complete. */

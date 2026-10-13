@@ -529,3 +529,166 @@ fn a_snapshot_replaces_whatever_copy_was_held_and_sets_the_mark() {
     ));
     assert_eq!(copies.through(&session), Some(10));
 }
+
+/// A follower placement names, that has not reported yet, is waited
+/// for rather than written off.
+///
+/// **The first publish to a fresh session**, in synchronous mode: the
+/// stream to the follower is on its way and no mark has come back.
+/// Without the placement installed that reads as nobody, and the
+/// publish is acknowledged unconfirmed on a cluster with nothing wrong
+/// with it.
+#[tokio::test]
+async fn a_placed_follower_that_has_not_reported_is_waited_for() {
+    let copies = Copies::new();
+    copies.install_followers(|_| {
+        vec![Placed {
+            node: [0xbb; 16],
+            reachable: true,
+        }]
+    });
+    let session = key("fresh");
+    copies.send(&session, appended(1));
+
+    let confirming = copies.confirming(&session, 1);
+    assert!(
+        matches!(confirming, Confirming::Waiting(_)),
+        "a named follower is somebody: {confirming:?}"
+    );
+    copies.marked(session.clone(), [0xbb; 16], 1);
+    assert_eq!(
+        confirming.within(Duration::from_secs(5)).await,
+        Confirmed::Yes
+    );
+    assert!(matches!(
+        copies.confirming(&session, 1),
+        Confirming::Already
+    ));
+}
+
+/// And one placement names nobody for is still nobody, with the
+/// placement installed: a factor of one, or every follower dead.
+#[tokio::test]
+async fn a_session_placement_names_no_follower_for_is_still_nobody() {
+    let copies = Copies::new();
+    copies.install_followers(|_| Vec::new());
+    let session = key("alone");
+    copies.send(&session, appended(1));
+    assert!(matches!(copies.confirming(&session, 1), Confirming::Nobody));
+}
+
+/// The copies table read by peer, for the Cluster page's columns.
+///
+/// Two followers of one owned session at different marks, and a copy
+/// held for one of them: the rows say what each peer holds of this
+/// node's and what this node holds of theirs, and the lag per peer is
+/// that peer's furthest mark behind, which is the reading the gauge
+/// gives per session.
+#[test]
+fn the_table_read_by_peer_says_what_each_holds_and_how_far_behind() {
+    let copies = Copies::new();
+    let owned = key("mine");
+    for _ in 0..5 {
+        copies.send(&owned, appended(1));
+    }
+    copies.marked(owned.clone(), [0xaa; 16], 5);
+    copies.marked(owned.clone(), [0xbb; 16], 2);
+    let second = key("mine-too");
+    copies.send(&second, appended(1));
+    copies.marked(second, [0xbb; 16], 1);
+    // And a copy this node holds for 0xaa.
+    copies.follow(key("theirs"), [0xaa; 16], 3);
+
+    let by_peer = copies.by_peer();
+    assert_eq!(
+        by_peer,
+        vec![
+            PeerCopies {
+                node: [0xaa; 16],
+                confirmed: 1,
+                behind: 0,
+                held: 1,
+            },
+            PeerCopies {
+                node: [0xbb; 16],
+                confirmed: 2,
+                behind: 3,
+                held: 0,
+            },
+        ],
+        "by identity; 0xbb is three behind on the first session and caught up on the second"
+    );
+}
+
+/// A placed follower that is dead is nobody to wait for, and one that
+/// is placed and dead still counts toward the lag.
+///
+/// The two readings of "placed" pull in different directions, and
+/// both are right: a synchronous publish waiting on a dead node is the
+/// outage section 8.6 avoids, and a dead node's copy falling out of
+/// the lag would hide exactly the loss window the metric exists for.
+#[tokio::test]
+async fn a_dead_follower_is_nobody_to_wait_for_but_still_counts_as_behind() {
+    let copies = Copies::new();
+    copies.install_followers(|_| {
+        vec![Placed {
+            node: [0xcc; 16],
+            reachable: false,
+        }]
+    });
+    let session = key("stranded");
+    for _ in 0..4 {
+        copies.send(&session, appended(1));
+    }
+    copies.marked(session.clone(), [0xcc; 16], 1);
+
+    assert_eq!(copies.lag(&session), Some(3), "three behind, dead or not");
+    assert_eq!(copies.worst_lag(), 3);
+    // Its mark is at one and the publish is at four: a live follower
+    // would be waited for. A dead one is not, and the publish is an
+    // unconfirmed acknowledgement rather than a wait for nobody.
+    assert!(matches!(copies.confirming(&session, 4), Confirming::Nobody));
+}
+
+/// A follower placement no longer names leaves the lag, whether or not
+/// its marks are purged.
+///
+/// Found on the page: a node was removed, its last mark stayed in the
+/// table, and the lag gauge grew by one with every publish for ever.
+#[test]
+fn a_follower_no_longer_placed_leaves_the_lag() {
+    let copies = Copies::new();
+    copies.install_followers(|_| {
+        vec![Placed {
+            node: [0xaa; 16],
+            reachable: true,
+        }]
+    });
+    let session = key("mine");
+    for _ in 0..6 {
+        copies.send(&session, appended(1));
+    }
+    copies.marked(session.clone(), [0xaa; 16], 6);
+    // 0xbb reported once and is no longer placed.
+    copies.marked(session.clone(), [0xbb; 16], 1);
+
+    assert_eq!(
+        copies.lag(&session),
+        Some(0),
+        "the placed follower is caught up"
+    );
+    assert_eq!(copies.worst_lag(), 0);
+    assert_eq!(
+        copies
+            .by_peer()
+            .iter()
+            .map(|peer| peer.node)
+            .collect::<Vec<_>>(),
+        vec![[0xaa; 16]],
+        "and the page's rows are the placed followers only"
+    );
+    // Purged on forget, so the row does not sit there for ever.
+    copies.forgot([0xbb; 16]);
+    assert!(!copies.has_mark(&session, [0xbb; 16]));
+    assert!(copies.has_mark(&session, [0xaa; 16]));
+}

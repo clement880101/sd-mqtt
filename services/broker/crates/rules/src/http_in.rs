@@ -858,6 +858,16 @@ async fn ingest_one(
                 refused.to_string(),
             )
         }
+        // 503, the same answer the admin API gives: taken, kept, and
+        // the guarantee asked for not available right now.
+        Err(refused @ PublishRefused::NotConfirmed) => {
+            stats.failed();
+            ApiError::refusal(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                refused.to_string(),
+            )
+        }
         // 508, which is "Loop Detected" and says exactly this. A
         // caller told nothing would go on feeding the cycle at full
         // speed, and this endpoint is the only place in it that can be

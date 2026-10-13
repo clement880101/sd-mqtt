@@ -159,6 +159,13 @@ pub enum PublishRefused {
     /// The batch could not be made durable, so nothing is acknowledged.
     #[error("the message could not be written to the store, so it is not acknowledged")]
     NotDurable,
+    /// Durable here, confirmed by no copy, and the operator asked for
+    /// that to be a refusal. See [`Refusal::NotConfirmed`].
+    #[error(
+        "the message was written here but no other node confirmed a copy of it within \
+         cluster.sync_timeout_ms, and cluster.strict.unconfirmed refuses such a publication"
+    )]
+    NotConfirmed,
     /// It had been through more connectors than `broker.max_hops`
     /// allows.
     ///
@@ -202,6 +209,7 @@ impl PublishRefused {
             Self::NotATopic(_) => Refusal::NotATopic,
             Self::Reserved => Refusal::Reserved,
             Self::NotDurable => Refusal::NotDurable,
+            Self::NotConfirmed => Refusal::NotConfirmed,
             Self::TooManyHops(_) => Refusal::TooManyHops,
         }
     }
@@ -341,7 +349,37 @@ pub async fn publish(
     };
     let (delivered, actions) = outcome;
 
-    if let Err(error) = committed.wait().await {
+    // Section 8.6, the same as on a connection: this path asked the
+    // copies too, and an answer that said `durable: true` to a caller
+    // in synchronous mode while no copy held the message would be the
+    // mode not applying to the one publish the operator makes by hand.
+    // Counted either way; refused when the operator said so.
+    let (durable, confirmed) = committed.settled().await;
+    if confirmed == cluster::Confirmed::No {
+        shared.metrics().publish_unconfirmed().inc();
+        if shared.refuses_unconfirmed() {
+            tracing::warn!(
+                %origin,
+                topic,
+                "a publication made without a session was not confirmed by any copy and \
+                 cluster.strict.unconfirmed is set, so it is refused rather than answered"
+            );
+            // The subscribers were promised nothing and have the
+            // delivery recorded against their windows; see the
+            // durability failure below for why they are served.
+            shared.deliver(actions);
+            refuse(
+                shared,
+                &origin,
+                &topic,
+                qos,
+                PublishRefused::NotConfirmed.refusal(),
+            );
+            return Err(PublishRefused::NotConfirmed);
+        }
+    }
+
+    if let Err(error) = durable {
         // The same partition a connection makes, with the easy half:
         // nothing in this batch is addressed to the caller, because the
         // caller has no session. So every action goes, exactly as it
@@ -381,6 +419,7 @@ pub async fn publish(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use broker_core::broker::BrokerConfig;
     use broker_core::hooks::{ClientInfo, Disposition, Hook};
@@ -597,6 +636,7 @@ mod tests {
                 Refusal::NotATopic,
                 Refusal::Reserved,
                 Refusal::NotDurable,
+                Refusal::NotConfirmed,
             ] {
                 let moved = u64::from(reason == expected);
                 assert_eq!(
@@ -656,6 +696,170 @@ mod tests {
             recorder.seen().is_empty(),
             "a refused publication fired a rule: {:?}",
             recorder.seen()
+        );
+    }
+
+    // -----------------------------------------------------------
+    // Section 8.6 on this path.
+    // -----------------------------------------------------------
+
+    /// A node replicating in `mode`, with a gated store behind it so
+    /// the batch is durable at once and the only wait is the copies'.
+    fn replicating(
+        mode: cluster::Durability,
+        patience: Duration,
+    ) -> (Arc<Shared>, Arc<cluster::Copies>) {
+        let store = Arc::new(crate::shared::gated::GatedStore::new());
+        let writer = storage::Writer::spawn(
+            Arc::clone(&store) as Arc<dyn storage::Storage>,
+            storage::WriterConfig::default(),
+        )
+        .expect("a writer thread");
+        let shared = Arc::new(Shared::with_store(
+            broker_core::broker::Broker::new(BrokerConfig::default()),
+            Arc::new(writer),
+        ));
+        let copies = Arc::new(cluster::Copies::new());
+        shared.install_copies(Arc::clone(&copies));
+        shared.install_durability(mode, patience);
+        (shared, copies)
+    }
+
+    /// A durable session that is not connected, subscribed to
+    /// `filter`, so a publication to it queues and is replicated.
+    fn a_queued_session(shared: &Shared, client_id: &str, filter: &str) -> storage::SessionKey {
+        shared.with_broker(|broker| {
+            let mut out = Vec::new();
+            let connect = mqtt_codec::packet::Connect {
+                version: mqtt_codec::Version::V5,
+                client_id: client_id.into(),
+                clean_start: false,
+                keep_alive: 0,
+                username: None,
+                password: None,
+                will: None,
+                properties: Properties {
+                    session_expiry_interval: Some(300),
+                    ..Properties::default()
+                },
+            };
+            let registration = broker
+                .connect("", &connect, &mut out)
+                .expect("a fresh session is admitted");
+            broker
+                .handle(
+                    registration.subscriber,
+                    &mqtt_codec::Packet::Subscribe(mqtt_codec::packet::Subscribe {
+                        packet_id: 1,
+                        filters: vec![mqtt_codec::packet::SubscriptionOptions {
+                            filter: filter.into(),
+                            qos: QoS::AtLeastOnce,
+                            no_local: false,
+                            retain_as_published: false,
+                            retain_handling: mqtt_codec::packet::RetainHandling::DoNotSend,
+                        }],
+                        properties: Properties::default(),
+                    }),
+                    &mut out,
+                )
+                .expect("the subscription is taken");
+            broker.disconnect(registration.subscriber, &mut out);
+        });
+        storage::SessionKey::new("", client_id)
+    }
+
+    /// An at-least-once publication, which is the level that promises.
+    fn acknowledged(topic: &str) -> Publication {
+        Publication {
+            qos: QoS::AtLeastOnce,
+            ..publication(topic, Vec::new())
+        }
+    }
+
+    /// Synchronous mode applies to a publication made here, as it does
+    /// to one made on a connection.
+    ///
+    /// Until this test the answer said `durable: true` the moment the
+    /// store had it, in every mode: an operator who set `sync` and
+    /// published by hand to check it was being told the store's
+    /// answer and not the copies'.
+    #[tokio::test]
+    async fn synchronous_mode_waits_for_a_follower_here_as_well() {
+        let (shared, copies) = replicating(cluster::Durability::Sync, Duration::from_secs(30));
+        let session = a_queued_session(&shared, "sensor", "site/+/temp");
+        copies.marked(session.clone(), [0xaa; 16], 0);
+
+        let releasing = Arc::clone(&copies);
+        let told = session.clone();
+        let confirmed_at = Arc::new(Mutex::new(None));
+        let noted = Arc::clone(&confirmed_at);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            *noted.lock().expect("a lock") = Some(std::time::Instant::now());
+            releasing.marked(told, [0xaa; 16], u64::MAX);
+        });
+
+        let published = publish(&shared, acknowledged("site/1/temp"))
+            .await
+            .expect("the follower confirms, late");
+        let answered_at = std::time::Instant::now();
+        assert!(published.durable);
+        let confirmed = confirmed_at
+            .lock()
+            .expect("a lock")
+            .expect("the answer came before the follower confirmed, so it did not wait");
+        assert!(
+            answered_at >= confirmed,
+            "the answer must follow the confirmation"
+        );
+        assert_eq!(shared.metrics().publish_unconfirmed().get(), 0);
+    }
+
+    /// And one no copy confirms is counted, and with the flag refused.
+    ///
+    /// Both halves in one test, in that order, because the counter has
+    /// to move whether or not the flag is set and a test of the
+    /// refusal alone would pass against a build that only counted on
+    /// refusing.
+    #[tokio::test]
+    async fn an_unconfirmed_publication_is_counted_and_with_the_flag_refused() {
+        let (shared, copies) = replicating(cluster::Durability::Sync, Duration::from_millis(100));
+        let session = a_queued_session(&shared, "sensor", "site/+/temp");
+        // A follower that has reported once and will never catch up.
+        copies.marked(session, [0xaa; 16], 0);
+
+        let published = publish(&shared, acknowledged("site/1/temp"))
+            .await
+            .expect("without the flag an unconfirmed publication is answered");
+        assert!(
+            published.durable,
+            "the store had it; the copies are what did not"
+        );
+        assert_eq!(shared.metrics().publish_unconfirmed().get(), 1);
+        assert_eq!(
+            shared
+                .metrics()
+                .publication_refused(Refusal::NotConfirmed)
+                .get(),
+            0,
+            "counted as unconfirmed is not counted as refused"
+        );
+
+        shared.install_strict_unconfirmed(true);
+        let refused = publish(&shared, acknowledged("site/2/temp"))
+            .await
+            .expect_err("with the flag it is refused");
+        assert!(
+            matches!(refused, PublishRefused::NotConfirmed),
+            "refused for the right reason, not another: {refused}"
+        );
+        assert_eq!(shared.metrics().publish_unconfirmed().get(), 2);
+        assert_eq!(
+            shared
+                .metrics()
+                .publication_refused(Refusal::NotConfirmed)
+                .get(),
+            1
         );
     }
 }

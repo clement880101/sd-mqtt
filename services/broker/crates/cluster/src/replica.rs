@@ -403,6 +403,36 @@ pub struct Copies {
     repairs_pending: std::sync::atomic::AtomicU64,
     /// Sessions this node has re-streamed to a new follower, ever.
     repairs_done: std::sync::atomic::AtomicU64,
+    /// Who a session this node owns is streamed to, if this node knows.
+    ///
+    /// Installed by the node from its placement; see
+    /// [`Copies::install_followers`]. Without it, the followers of a
+    /// session are the ones that have reported a mark, which is what a
+    /// unit test has and what a node that does not cluster has.
+    followers: std::sync::OnceLock<Followers>,
+}
+
+/// How a node answers who follows a session. See
+/// [`Copies::install_followers`].
+struct Followers(Box<Placer>);
+
+/// What answers who follows a session.
+type Placer = dyn Fn(&SessionKey) -> Vec<Placed> + Send + Sync;
+
+/// One follower placement names for a session, and whether it can be
+/// reached right now. See [`Copies::install_followers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placed {
+    /// The follower.
+    pub node: [u8; 16],
+    /// Whether this node can reach it: alive or suspect, not dead.
+    pub reachable: bool,
+}
+
+impl std::fmt::Debug for Followers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Followers(..)")
+    }
 }
 
 /// The two halves, under [`Copies`]'s lock.
@@ -587,6 +617,81 @@ impl Copies {
         }
     }
 
+    /// Tell this table who a session it owns is streamed to.
+    ///
+    /// `followers` answers, for a session, the nodes this node sends
+    /// that session's changes to — placement's choice, less this node
+    /// — and whether each can be reached. It decides two things.
+    ///
+    /// **Whom a synchronous publish waits for.** Before this was
+    /// installed, "has a follower" meant "a follower has reported a
+    /// mark", and a follower that had been sent the first append and
+    /// not yet answered looked like no follower at all — so the first
+    /// few publishes to every new session were acknowledged
+    /// unconfirmed in synchronous mode, and counted as such, on a
+    /// cluster with nothing wrong with it. Three of eight, in the test
+    /// that found it. A placed follower that can be reached is
+    /// somebody to wait for; one that is dead is not.
+    ///
+    /// **Whose marks count toward the lag.** A follower placement no
+    /// longer names — gone past the grace, or forgotten — leaves its
+    /// last mark in the table, and the owner keeps appending past it.
+    /// Without this the lag grew without bound after every node an
+    /// operator removed, which was found by removing one and watching
+    /// the page. Dead *within* the grace still counts: that copy is
+    /// still in the set, and how far behind it is is exactly what the
+    /// loss window is about.
+    ///
+    /// Once, like the rest of a node's wiring.
+    pub fn install_followers(
+        &self,
+        followers: impl Fn(&SessionKey) -> Vec<Placed> + Send + Sync + 'static,
+    ) {
+        let _ = self.followers.set(Followers(Box::new(followers)));
+    }
+
+    /// Who placement names for `session`, if this node has said.
+    ///
+    /// `None` when nothing is installed, and then every mark counts
+    /// and any mark is somebody: what a unit test has, and a node
+    /// that does not cluster.
+    fn placed(&self, session: &SessionKey) -> Option<Vec<Placed>> {
+        self.followers.get().map(|followers| (followers.0)(session))
+    }
+
+    /// Whether `follower`'s marks for `session` count: it is placed,
+    /// or nothing has been installed to say.
+    fn counts(placed: Option<&[Placed]>, follower: [u8; 16]) -> bool {
+        placed.is_none_or(|placed| placed.iter().any(|one| one.node == follower))
+    }
+
+    /// Whether `follower` is somebody a publish can wait for: placed
+    /// and reachable, or nothing has been installed to say.
+    ///
+    /// A dead follower's last mark is a position it will not move
+    /// past, and a publisher waiting on it waits for the patience and
+    /// is then told no — which is the same answer as [`Confirming::Nobody`],
+    /// a round trip later.
+    fn answers(placed: Option<&[Placed]>, follower: [u8; 16]) -> bool {
+        placed.is_none_or(|placed| {
+            placed
+                .iter()
+                .any(|one| one.node == follower && one.reachable)
+        })
+    }
+
+    /// Drop every mark `follower` has reported, because it is gone.
+    ///
+    /// Called when a node is forgotten. The table does not need it to
+    /// read right — [`Copies::install_followers`] already leaves an
+    /// unplaced follower out — but a mark for a node that will never
+    /// report again is a row that would otherwise stay for the life
+    /// of the process.
+    pub fn forgot(&self, follower: [u8; 16]) {
+        let mut tables = locked(&self.inner);
+        tables.marks.retain(|(_, who), _| *who != follower);
+    }
+
     /// Wait for some follower of `session` to have applied through
     /// `at`, section 8.6's synchronous mode.
     ///
@@ -600,19 +705,27 @@ impl Copies {
     /// follower down. That is an answer rather than a wait: section 8.6
     /// acknowledges anyway and counts it, and a publisher left waiting
     /// for a confirmation that cannot come is the outage the
-    /// acknowledgement exists to avoid.
+    /// acknowledgement exists to avoid. A follower is one placement
+    /// names and can be reached, when the node has said so through
+    /// [`Copies::install_followers`], **or** one that has reported a
+    /// mark: a follower that has been sent the stream and has not yet
+    /// answered is somebody, not nobody.
     pub fn confirming(&self, session: &SessionKey, at: u64) -> Confirming {
+        let placed = self.placed(session);
+        let somebody_placed = placed
+            .as_deref()
+            .is_some_and(|placed| placed.iter().any(|one| one.reachable));
         let mut tables = locked(&self.inner);
-        let mut followers = tables
+        let mut reported = tables
             .marks
             .iter()
-            .filter(|((held, _), _)| held == session)
+            .filter(|((held, who), _)| held == session && Self::answers(placed.as_deref(), *who))
             .map(|(_, through)| *through)
             .peekable();
-        if followers.peek().is_none() {
+        if !somebody_placed && reported.peek().is_none() {
             return Confirming::Nobody;
         }
-        if followers.any(|through| through >= at) {
+        if reported.any(|through| through >= at) {
             return Confirming::Already;
         }
         let (tell, told) = oneshot::channel();
@@ -635,12 +748,13 @@ impl Copies {
     /// different thing, and a zero there would read as perfect health.
     #[must_use]
     pub fn lag(&self, session: &SessionKey) -> Option<u64> {
+        let placed = self.placed(session);
         let tables = locked(&self.inner);
         let sent = tables.owned.get(session)?.at();
         tables
             .marks
             .iter()
-            .filter(|((held, _), _)| held == session)
+            .filter(|((held, who), _)| held == session && Self::counts(placed.as_deref(), *who))
             .map(|(_, through)| sent.saturating_sub(*through))
             .max()
     }
@@ -652,10 +766,22 @@ impl Copies {
     /// series.
     #[must_use]
     pub fn worst_lag(&self) -> u64 {
+        // Placement asked per session, outside the lock, because the
+        // answer is computed from the membership table and that is
+        // not this table's lock to hold while asking.
+        let placed: HashMap<SessionKey, Vec<Placed>> = self
+            .owned_sessions()
+            .into_iter()
+            .filter_map(|session| Some((session.clone(), self.placed(&session)?)))
+            .collect();
+        let installed = self.followers.get().is_some();
         let tables = locked(&self.inner);
         tables
             .marks
             .iter()
+            .filter(|((session, who), _)| {
+                !installed || Self::counts(placed.get(session).map(Vec::as_slice), *who)
+            })
             .filter_map(|((session, _), through)| {
                 Some(tables.owned.get(session)?.at().saturating_sub(*through))
             })
@@ -713,6 +839,48 @@ impl Copies {
         self.applied.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Section 8.6's copies, per peer: what each other node holds
+    /// for this one and what this one holds for it.
+    ///
+    /// What the Cluster page's per-member columns are made of, and the
+    /// one place the table is read by peer rather than by session. A
+    /// peer appears when it has confirmed a copy of something this
+    /// node owns, or this node holds a copy of something it owns;
+    /// `behind` is the furthest of that peer's marks behind this
+    /// node's position, which is the same reading [`Copies::lag`]
+    /// gives per session. Sorted by identity, like everything else.
+    #[must_use]
+    pub fn by_peer(&self) -> Vec<PeerCopies> {
+        let placed: HashMap<SessionKey, Vec<Placed>> = self
+            .owned_sessions()
+            .into_iter()
+            .filter_map(|session| Some((session.clone(), self.placed(&session)?)))
+            .collect();
+        let installed = self.followers.get().is_some();
+        let tables = locked(&self.inner);
+        let mut peers: BTreeMap<[u8; 16], PeerCopies> = BTreeMap::new();
+        for ((session, follower), through) in &tables.marks {
+            let Some(owner) = tables.owned.get(session) else {
+                continue;
+            };
+            if installed && !Self::counts(placed.get(session).map(Vec::as_slice), *follower) {
+                continue;
+            }
+            let entry = peers
+                .entry(*follower)
+                .or_insert_with(|| PeerCopies::new(*follower));
+            entry.confirmed += 1;
+            entry.behind = entry.behind.max(owner.at().saturating_sub(*through));
+        }
+        for (owner, _) in tables.followed.values() {
+            peers
+                .entry(*owner)
+                .or_insert_with(|| PeerCopies::new(*owner))
+                .held += 1;
+        }
+        peers.into_values().collect()
+    }
+
     /// How many sessions this node holds a copy of.
     #[must_use]
     pub fn following(&self) -> usize {
@@ -723,6 +891,30 @@ impl Copies {
     #[must_use]
     pub fn streaming(&self) -> usize {
         locked(&self.inner).owned.len()
+    }
+}
+
+/// One peer's share of this node's copies. See [`Copies::by_peer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerCopies {
+    /// The peer.
+    pub node: [u8; 16],
+    /// Sessions this node owns that the peer has confirmed a copy of.
+    pub confirmed: u64,
+    /// The furthest any of those copies is behind this node.
+    pub behind: u64,
+    /// Sessions the peer owns that this node holds a copy of.
+    pub held: u64,
+}
+
+impl PeerCopies {
+    fn new(node: [u8; 16]) -> Self {
+        Self {
+            node,
+            confirmed: 0,
+            behind: 0,
+            held: 0,
+        }
     }
 }
 

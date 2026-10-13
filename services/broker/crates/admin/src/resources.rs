@@ -1311,6 +1311,10 @@ pub(crate) fn publish_refusal(refused: &PublishRefused) -> ApiError {
             ApiError::in_field(ErrorCode::InvalidRequest, "topic", refused.to_string())
         }
         PublishRefused::NotDurable => ApiError::new(ErrorCode::Internal, refused.to_string()),
+        // Kept here, confirmed nowhere, and the operator asked for
+        // that to be a refusal: the one refusal in this list that is
+        // not a fault in the request or in this node.
+        PublishRefused::NotConfirmed => ApiError::new(ErrorCode::Unavailable, refused.to_string()),
         // The cycle this bounds has no bridge in it and no admin API
         // in it either: an operator publishing by hand carries no hop
         // count, so there is no chain here for a limit to end. Should
@@ -1719,6 +1723,10 @@ mod tests {
 
         fn forget(&self, _: &str) -> crate::Forgotten {
             crate::Forgotten::NotMet
+        }
+
+        fn replication(&self) -> Option<crate::Replication> {
+            None
         }
     }
 

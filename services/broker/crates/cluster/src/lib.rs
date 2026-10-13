@@ -190,7 +190,7 @@ pub use policy::{Gate, Live, Operation, Policy, PolicyError, Strict};
 pub use register::{Register, Stamp};
 pub use replica::{
     change_for, copy_as_handover, Applied, Change, Confirmed, Confirming, Copies, Durability,
-    Follower, Owner, Streamed,
+    Follower, Owner, PeerCopies, Placed, Streamed,
 };
 pub use replicate::{
     choose, jitter, Handled, Replication, ReplicationError, ReplicationSettings, Replicator, Swept,

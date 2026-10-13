@@ -463,7 +463,14 @@ itself.
 configured with a production secret still cannot join production.
 
 `GET /api/v1/nodes` lists what this node can see, and
-`GET /health/cluster` says whether that view is complete.
+`GET /health/cluster` says whether that view is complete. On a node
+that replicates, the latter also carries `replication`: the mode, the
+sessions this node streams and the copies it holds, the lag, the
+repair numbers, the unconfirmed count, and a row per peer saying how
+many of this node's sessions that peer holds a confirmed copy of, how
+far behind it is, and how many of its sessions this node holds. The
+Cluster page shows all of it beside the membership table; every
+number is this node's own, for the reason every state on that page is.
 
 ### A partition: keep serving, or refuse on purpose
 
@@ -571,6 +578,24 @@ The refusal closes the connection with reason code 0x83, as the other
 is refused at startup when `durability` is `"async"` — nothing would
 ever be unconfirmed — and when the node does not cluster, where there
 can never be a follower.
+
+The same mode applies to a publish made through `POST /api/v1/publish`
+and through an ingest rule: in `sync` the answer waits for a copy as
+a client's acknowledgement does, an unconfirmed one is counted on the
+same series, and with the strict flag it is refused with `503` and
+the code `unavailable`. The message is kept on this node either way;
+what is refused is the promise, and a retry is a duplicate, which is
+what at-least-once has always meant.
+
+**Both modes describe the node that accepted the publish.** A publish
+accepted by one node for a session owned by another is forwarded over
+the mesh, and the accepting node answers when *it* is done — the
+owner has not appended yet, and no copy of the owner's has either. So
+a `sync` acknowledgement from a node that is not the owner is not
+evidence of a copy, and the lag on the owner does not count what is
+still in flight towards it. Publish to the owner for the guarantee as
+written: a client connected to the node its session lives on, which is
+the ordinary case, gets exactly it.
 
 `SDMQTT_CLUSTER_DURABILITY`, `SDMQTT_CLUSTER_SYNC_TIMEOUT_MS` and
 `SDMQTT_CLUSTER_STRICT_UNCONFIRMED` set the same three.

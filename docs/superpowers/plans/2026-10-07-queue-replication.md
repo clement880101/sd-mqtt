@@ -375,7 +375,7 @@ three-node test restarting the forgotten node on the same store.
 Milestone six's exit criteria, against the real binary, plus the two things
 section 11.2 asks the Cluster page to show.
 
-- [ ] **Step 1: Write it, run it several times, commit**
+- [x] **Step 1: Write it, run it several times, commit**
 
 Say how many times, and check free space first.
 
@@ -393,3 +393,28 @@ Say how many times, and check free space first.
 ```bash
 git commit -m "test: a killed owner loses nothing, and the page says so"
 ```
+
+Run: the two loss tests six times in a row and the cluster suite three
+times, with 75 GiB free. Three things were found and fixed on the way,
+each by the test refusing to pass:
+
+- **The synchronous mode did not apply to `POST /api/v1/publish`.**
+  The shared publish waited for the copy and discarded the answer.
+  Now counted and, with the strict flag, refused with `503
+  unavailable`.
+- **A fresh session's first publishes were acknowledged unconfirmed.**
+  "Has a follower" meant "has reported a mark", so the follower that
+  was about to be sent the first append was nobody. The owner now
+  knows who placement names and waits for a reachable one.
+- **The lag grew for ever after a node was forgotten.** Found on the
+  page against real brokers, not by a test: a removed node's last mark
+  stayed in the table. The lag now counts placed followers only, and
+  forgetting purges the marks.
+
+And one gap written down rather than filled: both modes describe the
+node that accepted the publish, and a publish forwarded under 8.3 is
+acknowledged before the owner has it. The first version of the
+synchronous test published on a non-owner and lost three of eight
+acknowledged messages. The tests publish on the owner, and the spec
+says why; closing it is an acknowledgement across the mesh, a design
+of its own.

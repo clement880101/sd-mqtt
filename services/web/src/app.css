@@ -544,11 +544,19 @@ input[aria-invalid='true'] {
  * ---------------------------------------------------------------- */
 
 .cluster-table .row {
-  /* Six columns of its own: the Clients table's seven are sized for
-     counts, and an identity is a thirty-six character string that
-     needs the room. */
-  grid-template-columns: minmax(7rem, 1fr) minmax(12rem, 2fr) minmax(8rem, 1fr) 6rem 5rem 5rem;
+  /* Nine columns of its own, the last three section 8.6's. The
+     Clients table's seven are sized for counts, and an identity is a
+     thirty-six character string that needs the room. */
+  grid-template-columns:
+    minmax(6rem, 1fr) minmax(10rem, 2fr) minmax(7rem, 1fr) 4.5rem 4.5rem 4rem 5.5rem 4.5rem 5.5rem;
   block-size: var(--size-8);
+}
+
+.cluster-table {
+  /* Nine columns do not fit a narrow pane, and a clipped count is a
+     wrong count: the table scrolls sideways rather than hiding its
+     last column. */
+  overflow-x: auto;
 }
 
 .cluster-table .row-self {

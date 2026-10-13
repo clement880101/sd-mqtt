@@ -542,6 +542,7 @@ impl Poller {
                 Polled::Refused(refused.to_string())
             }
             Err(refused @ PublishRefused::NotDurable) => Polled::Refused(refused.to_string()),
+            Err(refused @ PublishRefused::NotConfirmed) => Polled::Refused(refused.to_string()),
             // Unreachable while a poller stamps the first hop, which
             // is under every maximum `validate` permits. Answered
             // rather than made a panic, because "unreachable" here

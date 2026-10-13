@@ -23,6 +23,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+use serde::Serialize;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
@@ -141,6 +143,56 @@ pub trait Cluster: Send + Sync + 'static {
     /// trait says which rather than returning a bool and leaving the
     /// handler to guess why.
     fn forget(&self, id: &str) -> Forgotten;
+
+    /// Section 8.6's copies, as this node sees them.
+    ///
+    /// `None` on a node that does not replicate — one without a
+    /// store, or a cluster of one with nothing to copy to — and the
+    /// page then shows no replication block rather than a row of
+    /// zeros that would read as "healthy and idle".
+    fn replication(&self) -> Option<Replication>;
+}
+
+/// What this node knows about its copies. Section 8.6.
+///
+/// **Every number is this node's own**: sessions it owns and streams,
+/// copies it holds for others, and how far its followers are behind
+/// *it*. There is no cluster-wide figure here for the reason the
+/// membership table has none: nothing is replicated about
+/// replication, and two nodes' pages disagreeing is each of them
+/// telling the truth about its own queues.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Replication {
+    /// `async` or `sync`: when a durable publish is acknowledged.
+    pub mode: &'static str,
+    /// Sessions this node owns and streams to at least one follower.
+    pub streaming: u64,
+    /// Sessions this node holds a copy of for another node.
+    pub holding: u64,
+    /// Changes the furthest-behind copy of any session this node
+    /// owns has not applied. The loss window in asynchronous mode.
+    pub lag: u64,
+    /// Sessions this node owns whose replica set is short of a copy,
+    /// as of the last repair sweep.
+    pub repairs_pending: u64,
+    /// Sessions whose queue this node has re-streamed to a follower
+    /// that held none, ever.
+    pub repairs_done: u64,
+    /// One row per peer this node shares a copy with, by identity.
+    pub peers: Vec<PeerReplication>,
+}
+
+/// One peer's share of this node's copies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PeerReplication {
+    /// The peer's identity, in the canonical text.
+    pub id: String,
+    /// Sessions this node owns that the peer has confirmed a copy of.
+    pub confirmed: u64,
+    /// The furthest any of those copies is behind this node.
+    pub behind: u64,
+    /// Sessions the peer owns that this node holds a copy of.
+    pub held: u64,
 }
 
 /// What forgetting a node came to.

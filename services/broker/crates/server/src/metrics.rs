@@ -556,6 +556,7 @@ reason_table!(Refusal, ALL_REFUSALS, refusal_label, refusal_index, {
     NotATopic => "not_a_topic",
     Reserved => "reserved",
     NotDurable => "not_durable",
+    NotConfirmed => "not_confirmed",
 });
 
 /// What a rule did, as a label value.

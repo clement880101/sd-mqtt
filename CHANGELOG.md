@@ -199,6 +199,31 @@ on purpose.
   publisher's outage, so running out counts as unconfirmed rather than
   holding the client.
 
+  **The mode applies to `POST /api/v1/publish` and to ingest rules as
+  well.** The first version waited for the copy on that path and
+  then threw the answer away, so an operator who set `sync` and
+  published by hand to check it was told `durable: true` by the store
+  alone. Now an unconfirmed answer is counted on the same series, and
+  with the strict flag refused with `503` and the code `unavailable`
+  (a new error code). The message is kept; the promise is refused.
+
+  **A placed follower that has not reported yet is waited for.** Found
+  by the exit-criteria test: "has a follower" meant "a follower has
+  reported a mark", so the first few publishes to every fresh session
+  were acknowledged unconfirmed, and counted, on a cluster with
+  nothing wrong with it — three of eight. The owner now knows who
+  placement names for each session and waits for one that can be
+  reached; a dead one is nobody to wait for, as before.
+
+  **Both modes describe the node that accepted the publish.** A
+  publish accepted by one node for a session owned by another is
+  forwarded under section 8.3, and the accepting node answers when it
+  is done — before the owner has appended, let alone a copy. The
+  exit-criteria tests publish on the owner for that reason, and the
+  spec now says so where the modes are defined. It is written down as
+  a gap rather than filled: filling it is an acknowledgement across
+  the mesh, which is a design of its own.
+
 - **Three gauges for it**: `sdmqtt_replication_lag`,
   `sdmqtt_replicated_sessions` and `sdmqtt_replica_sessions`. The
   first is section 8.6's loss window — in asynchronous mode what a
@@ -207,6 +232,32 @@ on purpose.
   from the closest one describes a failure that did not happen. Absent
   rather than zero on a node that does not cluster, like every other
   cluster series.
+
+  The lag counts the followers placement names, and no others. Found
+  on the Cluster page: a removed node's last mark stayed in the
+  owner's table and the gauge grew by one with every publish, for
+  ever. A node dead *within* the grace still counts, because its copy
+  is still in the set and how far behind it is is the loss window; a
+  node given up on or forgotten does not, and forgetting one purges
+  its marks.
+
+- **The Cluster page shows replica health and re-replication
+  progress**, which is the last of milestone 6's exit criteria. Four
+  gauges from `GET /health/cluster`'s new `replication` object: the
+  durability mode; sessions streamed and copies held; the lag; and
+  sessions short of a copy, with how many have been re-streamed so
+  far. In synchronous mode a fifth appears when any acknowledgement
+  went unconfirmed. Three columns join the membership table — copies
+  of this node's sessions the peer has confirmed, how far behind it
+  is, and copies of the peer's sessions held here — and the page says
+  in words that these are this node's numbers, as every state on it
+  is. Checked against three real brokers: a session queued, a follower
+  killed and forgotten, and the repair watched happen.
+
+- **`unavailable`, a new API error code**, answered with `503`: the
+  request was well formed and taken, and the guarantee it asked for is
+  what is not available right now. Only synchronous mode's strict
+  refusal answers it so far.
 
 - **A follower's half of the stream**, and what it keeps across a
   restart. Changes to a session's queue carry a stream position, and a

@@ -134,6 +134,13 @@ pub enum ErrorCode {
     /// what has to change is a configuration, and the status says which
     /// kind of problem it is.
     LoopDetected,
+    /// The node took the request and cannot currently give what it
+    /// asked for: section 8.6's synchronous mode with no copy
+    /// answering, and `cluster.strict.unconfirmed` set. The message
+    /// is kept here; the promise is what is refused. Retrying later
+    /// is the right response, and a retry is a duplicate, which is
+    /// what at-least-once has always meant.
+    Unavailable,
     /// Something went wrong that is not the caller's fault.
     Internal,
 }
@@ -159,6 +166,10 @@ impl ErrorCode {
             // 508, which is what "Loop Detected" is for and says the
             // whole thing without a sentence.
             ErrorCode::LoopDetected => StatusCode::LOOP_DETECTED,
+            // 503: the service is up and the request was well formed,
+            // and the guarantee it asked for is what is not available
+            // right now.
+            ErrorCode::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

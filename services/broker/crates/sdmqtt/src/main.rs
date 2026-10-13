@@ -265,6 +265,8 @@ struct MeshView {
     copies: Arc<cluster::Copies>,
     /// Who this node is, so that it refuses to forget itself.
     me: cluster::NodeId,
+    /// Section 8.6's mode, for the page to say which it is in.
+    durability: cluster::Durability,
     /// Section 8.4's drains, for the seven numbers it is asked for.
     ///
     /// The same table the mesh's handler and the migrator hold. Not
@@ -311,10 +313,39 @@ impl sdmqtt_admin::Cluster for MeshView {
             return sdmqtt_admin::Forgotten::Myself;
         }
         if self.mesh.forget(id) {
+            // Its marks go with it: placement no longer names it, so
+            // they already count for nothing, and they would otherwise
+            // sit in the table for the life of the process.
+            self.copies.forgot(id.to_bytes());
             sdmqtt_admin::Forgotten::Gone
         } else {
             sdmqtt_admin::Forgotten::NotMet
         }
+    }
+
+    fn replication(&self) -> Option<sdmqtt_admin::Replication> {
+        Some(sdmqtt_admin::Replication {
+            mode: match self.durability {
+                cluster::Durability::Async => "async",
+                cluster::Durability::Sync => "sync",
+            },
+            streaming: self.copies.streaming() as u64,
+            holding: self.copies.following() as u64,
+            lag: self.copies.worst_lag(),
+            repairs_pending: self.copies.repairs_pending(),
+            repairs_done: self.copies.repairs_done(),
+            peers: self
+                .copies
+                .by_peer()
+                .into_iter()
+                .map(|peer| sdmqtt_admin::PeerReplication {
+                    id: cluster::NodeId::from_bytes(peer.node).to_string(),
+                    confirmed: peer.confirmed,
+                    behind: peer.behind,
+                    held: peer.held,
+                })
+                .collect(),
+        })
     }
 }
 
@@ -834,6 +865,7 @@ async fn start_admin(
                     .identity
                     .expect("a node with a mesh has an identity")
                     .id(),
+                durability: config.cluster.durability,
                 gate: Arc::clone(gate),
             }) as Arc<dyn sdmqtt_admin::Cluster>));
     }
@@ -1061,6 +1093,35 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         )),
         _ => None,
     };
+    // Section 8.6: who a session is streamed to, so that a synchronous
+    // publish to a fresh session waits for the follower that is about
+    // to be sent it rather than counting it as nobody. Placement's
+    // choice, less this node, less anybody dead — the same set
+    // `replication::stream_to_followers` sends to, minus the dead,
+    // because "no reachable follower" is the case section 8.6
+    // acknowledges anyway and a dead one would be waited for in vain.
+    if let (Some(mesh), Some(copies), Some(placement)) = (&mesh, &copies, &placement) {
+        let mesh = Arc::clone(mesh);
+        let placement = Arc::clone(placement);
+        copies.install_followers(move |session| {
+            let reachable: std::collections::HashSet<[u8; 16]> = mesh
+                .members()
+                .into_iter()
+                .filter(|member| member.state != MemberState::Dead)
+                .map(|member| member.identity.id().to_bytes())
+                .collect();
+            cluster::place(session, &placement.members(), placement.factor())
+                .into_iter()
+                .filter(|node| *node != placement.me())
+                .take(placement.factor().copies().saturating_sub(1))
+                .map(|node| node.to_bytes())
+                .map(|node| cluster::Placed {
+                    node,
+                    reachable: reachable.contains(&node),
+                })
+                .collect()
+        });
+    }
     // Section 8.3, and **before any of the tasks below**: this is the
     // only thing that makes `Broker::publish` forward anything, so the
     // window between the mesh accepting links and this being installed
@@ -1200,6 +1261,7 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
                 .expect("a node with a mesh has a store")
                 .identity
                 .id(),
+            durability: config.cluster.durability,
             gate: Arc::clone(gate),
         });
         // Section 11.3's four cluster numbers and section 8.4's seven,

@@ -429,6 +429,8 @@ struct Knobs {
     gone_after_ms: u64,
     /// How many sessions a repair may send a second.
     repair_per_second: u64,
+    /// `async` or `sync`: when a durable publish is acknowledged.
+    durability: &'static str,
 }
 
 impl Default for Knobs {
@@ -439,6 +441,7 @@ impl Default for Knobs {
             factor: cluster::DEFAULT_FACTOR,
             gone_after_ms: 3_600_000,
             repair_per_second: 50,
+            durability: "async",
         }
     }
 }
@@ -476,6 +479,7 @@ fn spawn(config: &Path, store: &Path, log: &Path, knobs: Knobs) -> Child {
             "SDMQTT_CLUSTER_REPAIR_SESSIONS_PER_SECOND",
             knobs.repair_per_second.to_string(),
         )
+        .env("SDMQTT_CLUSTER_DURABILITY", knobs.durability)
         .stderr(Stdio::from(
             // Appended rather than truncated, so a restart does not
             // throw away the log of what happened before it.
@@ -2562,5 +2566,190 @@ async fn repair_sends_no_more_sessions_a_second_than_it_is_allowed() {
         took >= Duration::from_millis((lost - 1) * 800),
         "{lost} sessions at one a second cannot finish in {took:?}: the limit was not \
          applied"
+    );
+}
+
+// -------------------------------------------------------------------
+// Milestone 6's exit criteria, against the real binary.
+// -------------------------------------------------------------------
+
+/// Everything `rover` is delivered, in order, giving up after five
+/// seconds of silence.
+fn everything_delivered_to(rover: &mut Client) -> Vec<String> {
+    let mut got = Vec::new();
+    while let Some((_, payload)) = rover.delivered_within(Duration::from_secs(5)) {
+        got.push(payload);
+    }
+    got
+}
+
+/// Synchronous mode loses nothing when the owner is killed.
+///
+/// **No waiting on a gauge between the last publish and the kill.**
+/// The test above this one waits for a copy to exist before it kills,
+/// which is a test of the stream; this one is a test of the mode, and
+/// the mode's whole claim is that the acknowledgement *is* the
+/// evidence a copy exists. So each publish is acknowledged, the owner
+/// is killed the moment the last one is, and every message has to be
+/// on the node the client comes back to.
+///
+/// **Published on the owner.** Section 8.6 describes both modes in
+/// terms of the owner having the message: that is what the node that
+/// accepted the publish can promise about its own sessions. A publish
+/// accepted on *another* node is forwarded under section 8.3, and its
+/// acknowledgement is that node's — the owner has not appended yet
+/// when it is sent. The first version of this test published on beta
+/// and lost three of eight acknowledged messages, which is that gap
+/// and not a fault in the mode; it is written down in the spec rather
+/// than papered over here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn synchronous_mode_loses_nothing_when_the_owner_is_killed() {
+    const FILTER: &str = "fleet/+/telemetry";
+    const TOPIC: &str = "fleet/0007/telemetry";
+    const MESSAGES: usize = 8;
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let mut cluster = Cluster::start_with(
+        directory.path(),
+        Knobs {
+            durability: "sync",
+            ..Knobs::default()
+        },
+    )
+    .await;
+    cluster.settle();
+
+    let (mut rover, _) = Client::resuming(cluster.nodes[0].mqtt, "rover");
+    rover.subscribe(FILTER);
+    drop(rover);
+    for nth in 0..MESSAGES {
+        assert_eq!(
+            cluster.nodes[0].publish_reaching(TOPIC, &format!("message-{nth}")),
+            1,
+            "the owner knows its own session's filter"
+        );
+    }
+    // Acknowledged, so a copy exists: the mode says so, and nothing
+    // else is consulted before the kill. The counter is read first
+    // because the node is about to die, and a zero there is what
+    // makes the acknowledgements evidence.
+    assert_eq!(
+        cluster.nodes[0].counter("sdmqtt_publishes_unconfirmed_total"),
+        Some(0),
+        "every acknowledgement was a confirmed one; otherwise the mode said nothing"
+    );
+    let alpha = cluster.nodes[0].kill();
+
+    until("the survivors declare alpha dead", || {
+        (1..NODES).all(|at| cluster.nodes[at].how(&alpha).as_deref() == Some("down"))
+    });
+    // Back on whichever node holds nothing, so the queue crosses a
+    // link to get there. Read after the kill, which is the only place
+    // a gauge is consulted and which cannot have helped the copy.
+    let holder = (1..NODES)
+        .find(|at| cluster.nodes[*at].counter("sdmqtt_replica_sessions") == Some(1))
+        .expect("the mode put a copy somewhere");
+    let elsewhere = (1..NODES).find(|at| *at != holder).expect("three nodes");
+    let (mut rover, present) = Client::resuming(cluster.nodes[elsewhere].mqtt, "rover");
+    assert!(present);
+
+    assert_eq!(
+        everything_delivered_to(&mut rover),
+        (0..MESSAGES)
+            .map(|nth| format!("message-{nth}"))
+            .collect::<Vec<_>>(),
+        "every acknowledged message, in order, from a node that never saw them"
+    );
+    assert_eq!(
+        cluster.nodes[elsewhere].counter("sdmqtt_migrated_messages_missing_total"),
+        Some(0)
+    );
+}
+
+/// Asynchronous mode's loss is bounded by the lag metric.
+///
+/// **Asserted against the number, not against "some arrived".** The
+/// follower is held back, the owner's lag is read, the owner is
+/// killed, and what did not arrive has to be within what the metric
+/// said — and the metric has to have said something, because a lag of
+/// zero on a stalled follower is a metric reading nothing. A build
+/// with no replication at all delivers nothing and reads a lag of
+/// zero, and fails on the first assertion.
+///
+/// Published on the owner, for the reason the synchronous test gives:
+/// the lag is the owner's position against its follower's, and a
+/// publish forwarded from another node is not at the owner yet when
+/// that node answers, so a count of answers overstates what the lag
+/// could know about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn asynchronous_loss_is_bounded_by_the_lag_metric() {
+    const FILTER: &str = "fleet/+/telemetry";
+    const TOPIC: &str = "fleet/0042/telemetry";
+    /// Published while the follower is stalled.
+    const BEHIND: usize = 6;
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let mut cluster = Cluster::start(directory.path()).await;
+    cluster.settle();
+
+    let (mut rover, _) = Client::resuming(cluster.nodes[0].mqtt, "rover");
+    rover.subscribe(FILTER);
+    drop(rover);
+    assert_eq!(cluster.nodes[0].publish_reaching(TOPIC, "message-0"), 1);
+    until("the first message has a copy somewhere", || {
+        (1..NODES)
+            .any(|at| cluster.nodes[at].counter("sdmqtt_replica_changes_applied_total") == Some(1))
+    });
+    let holder = (1..NODES)
+        .find(|at| cluster.nodes[*at].counter("sdmqtt_replica_changes_applied_total") == Some(1))
+        .expect("the wait above found one");
+    let elsewhere = (1..NODES).find(|at| *at != holder).expect("three nodes");
+
+    // ---- the follower is held back, and the owner keeps taking ----
+    cluster.gates[&(0, holder)].stall(Direction::Forward);
+    for nth in 1..=BEHIND {
+        assert_eq!(
+            cluster.nodes[0].publish_reaching(TOPIC, &format!("message-{nth}")),
+            1
+        );
+    }
+    until("alpha reports the copy behind", || {
+        cluster.nodes[0]
+            .counter("sdmqtt_replication_lag")
+            .is_some_and(|lag| lag > 0)
+    });
+    let lag = cluster.nodes[0]
+        .counter("sdmqtt_replication_lag")
+        .expect("read a moment ago");
+    assert!(
+        lag as usize <= BEHIND,
+        "a lag of {lag} is more than was published while stalled; the metric overstates"
+    );
+
+    // ---- the owner dies with that lag outstanding ----
+    let alpha = cluster.nodes[0].kill();
+    until("the survivors declare alpha dead", || {
+        (1..NODES).all(|at| cluster.nodes[at].how(&alpha).as_deref() == Some("down"))
+    });
+    let (mut rover, present) = Client::resuming(cluster.nodes[elsewhere].mqtt, "rover");
+    assert!(present, "the session was found: pulled from the copy");
+    let got = everything_delivered_to(&mut rover);
+
+    let published = BEHIND + 1;
+    let lost = published - got.len();
+    assert!(
+        lost <= lag as usize,
+        "{lost} of {published} messages were lost and the lag metric said at most {lag}"
+    );
+    assert_eq!(
+        got,
+        (0..got.len())
+            .map(|nth| format!("message-{nth}"))
+            .collect::<Vec<_>>(),
+        "what arrived is a prefix: the loss is the tail, not holes"
+    );
+    assert!(
+        !got.is_empty(),
+        "the message copied before the stall has to be there, or nothing was replicated"
     );
 }

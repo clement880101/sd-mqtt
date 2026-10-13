@@ -154,6 +154,21 @@ struct ClusterView {
     /// tell them apart from the number, because three nodes that met
     /// each other and a configured three look identical.
     expected_configured: bool,
+    /// Section 8.6, on a node that replicates. `null` otherwise.
+    replication: Option<ReplicationView>,
+}
+
+/// [`crate::Replication`] with the one number the trait cannot
+/// supply, because it is this process's counter and not the table's.
+#[derive(Debug, Serialize)]
+struct ReplicationView {
+    #[serde(flatten)]
+    copies: crate::Replication,
+    /// Durable publishes acknowledged in synchronous mode that no
+    /// follower confirmed, ever. Section 8.6 says an operator who asked
+    /// for synchronous mode must be able to see when they are not
+    /// getting it; the page is where they look.
+    unconfirmed: u64,
 }
 
 /// Whether this process is running.
@@ -219,6 +234,7 @@ async fn cluster(State(state): State<AdminState>) -> Json<ClusterView> {
             // A node that does not cluster is a cluster of one, and
             // that is not a number anybody configured.
             expected_configured: false,
+            replication: None,
         });
     };
     let peers = cluster.peers();
@@ -234,6 +250,10 @@ async fn cluster(State(state): State<AdminState>) -> Json<ClusterView> {
         members,
         expected,
         expected_configured: configured.is_some(),
+        replication: cluster.replication().map(|copies| ReplicationView {
+            copies,
+            unconfirmed: state.shared.metrics().publish_unconfirmed().get(),
+        }),
     })
 }
 
@@ -362,6 +382,98 @@ mod tests {
         running.shutdown().await;
     }
 
+    /// Section 8.6 on the cluster document: this node's copies, and
+    /// the one counter the table does not hold.
+    ///
+    /// Two doubles, because `null` and a block of zeros must be told
+    /// apart on the page: a node that does not replicate shows no
+    /// block, and a node that does and is idle shows zeros.
+    #[tokio::test]
+    async fn the_cluster_endpoint_carries_this_nodes_copies() {
+        #[derive(Debug)]
+        struct Copies(Option<crate::Replication>);
+        impl crate::Cluster for Copies {
+            fn peers(&self) -> Vec<crate::ClusterPeer> {
+                Vec::new()
+            }
+            fn expected(&self) -> Option<usize> {
+                None
+            }
+            fn forget(&self, _: &str) -> crate::Forgotten {
+                crate::Forgotten::NotMet
+            }
+            fn replication(&self) -> Option<crate::Replication> {
+                self.0.clone()
+            }
+        }
+        async fn serving(copies: Option<crate::Replication>) -> crate::AdminRunning {
+            let config = AdminConfig {
+                address: "127.0.0.1:0"
+                    .parse::<SocketAddr>()
+                    .expect("a valid address"),
+                ..AdminConfig::default()
+            };
+            let shared = Arc::new(Shared::new(BrokerConfig::default()));
+            // The counter is the process's, read beside the table's
+            // numbers; a document that carried the table alone would
+            // have no way to say synchronous mode is not being honoured.
+            shared.metrics().publish_unconfirmed().inc();
+            shared.metrics().publish_unconfirmed().inc();
+            let state = AdminState::new(shared)
+                .with_cluster(Some(Arc::new(Copies(copies)) as Arc<dyn crate::Cluster>));
+            AdminServer::bind(&config, state)
+                .await
+                .expect("loopback needs no token")
+        }
+
+        let replicating = serving(Some(crate::Replication {
+            mode: "sync",
+            streaming: 12,
+            holding: 7,
+            lag: 3,
+            repairs_pending: 2,
+            repairs_done: 40,
+            peers: vec![crate::PeerReplication {
+                id: "aaaaaaaa-0000-7000-8000-000000000000".to_owned(),
+                confirmed: 12,
+                behind: 3,
+                held: 7,
+            }],
+        }))
+        .await;
+        let response = testing::get(replicating.address(), "/health/cluster").await;
+        let document: serde_json::Value =
+            serde_json::from_str(&response.body).expect("the document is JSON");
+        let copies = &document["replication"];
+        assert_eq!(copies["mode"], "sync", "{}", response.body);
+        assert_eq!(copies["streaming"], 12);
+        assert_eq!(copies["holding"], 7);
+        assert_eq!(copies["lag"], 3);
+        assert_eq!(copies["repairs_pending"], 2);
+        assert_eq!(copies["repairs_done"], 40);
+        assert_eq!(
+            copies["unconfirmed"], 2,
+            "the counter rides beside the table"
+        );
+        assert_eq!(
+            copies["peers"][0]["id"],
+            "aaaaaaaa-0000-7000-8000-000000000000"
+        );
+        assert_eq!(copies["peers"][0]["confirmed"], 12);
+        assert_eq!(copies["peers"][0]["behind"], 3);
+        assert_eq!(copies["peers"][0]["held"], 7);
+        replicating.shutdown().await;
+
+        let alone = serving(None).await;
+        let response = testing::get(alone.address(), "/health/cluster").await;
+        assert!(
+            response.body.contains("\"replication\":null"),
+            "a node that does not replicate says so with null, not zeros: {}",
+            response.body
+        );
+        alone.shutdown().await;
+    }
+
     /// A node that clusters reports what it can see, and says
     /// incomplete when it cannot see all of it.
     ///
@@ -381,6 +493,9 @@ mod tests {
             }
             fn forget(&self, _: &str) -> crate::Forgotten {
                 crate::Forgotten::NotMet
+            }
+            fn replication(&self) -> Option<crate::Replication> {
+                None
             }
         }
         fn peer(state: &'static str) -> crate::ClusterPeer {
