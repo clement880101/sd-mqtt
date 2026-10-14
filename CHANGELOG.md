@@ -63,6 +63,18 @@ the milestone you are moving to.** Everything else is description.
   node with a WebSocket listener. `tokio-tungstenite` and
   `futures-util` are new direct dependencies.
 
+- **The conformance suite runs over TLS and WebSocket as well**, which
+  is section 16's exit criterion for milestone 7's listeners. Paho's
+  suite speaks plain TCP and nothing else, so `conformance/via.py` — a
+  forwarder in the Python standard library, a TLS client on one side
+  and an RFC 6455 client on the other — carries it through each layer,
+  and the runner compares each pass against the baseline under its own
+  label. The failures under TLS and WebSocket are exactly the plain
+  pass's. Two defects in the forwarder itself were found by the suite
+  and fixed: an SSL socket read and written from two threads at once,
+  which hung most first connects, and a close that dropped the
+  DISCONNECT the broker had just sent.
+
 ## Unreleased — milestone 6: queue replication
 
 ### Before you upgrade: a store written before this milestone is refused
