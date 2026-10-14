@@ -208,6 +208,11 @@ pub struct ConnectionConfig {
     /// accepting the connect and quietly dropping the flag would arm a
     /// will the client believes is retained.
     pub retain_available: bool,
+    /// Section 8.6's durability mode for publishes on this listener, or
+    /// `None` for the node's. A listener carrying commands can be
+    /// synchronous while one carrying telemetry is not; the timeout is
+    /// the node's in both cases.
+    pub durability: Option<cluster::Durability>,
 }
 
 impl Default for ConnectionConfig {
@@ -233,6 +238,7 @@ impl Default for ConnectionConfig {
             mountpoint: Arc::from(""),
             max_qos: QoS::ExactlyOnce,
             retain_available: true,
+            durability: None,
         }
     }
 }
@@ -695,6 +701,7 @@ where
         topic_alias_maximum: config.topic_alias_maximum,
         max_qos: config.max_qos,
         retain_available: config.retain_available,
+        durability: config.durability,
     };
 
     // A takeover addresses two connections by one handle, and the
@@ -1009,6 +1016,8 @@ struct Attached {
     max_qos: QoS,
     /// See [`ConnectionConfig::retain_available`].
     retain_available: bool,
+    /// See [`ConnectionConfig::durability`].
+    durability: Option<cluster::Durability>,
 }
 
 impl Attached {
@@ -1153,7 +1162,8 @@ impl Attached {
             // decided from what came out beside them, under the same
             // lock. The wait is here, after the lock is gone and
             // before a single action is delivered.
-            let ((outcome, actions), committed) = self.shared.with_broker_committed(
+            let ((outcome, actions), committed) = self.shared.with_broker_committed_as(
+                self.durability,
                 |broker| {
                     let mut out = Vec::new();
                     let outcome = broker.handle(self.subscriber, &packet, &mut out);
@@ -4655,6 +4665,61 @@ mod tests {
         // The first client was disconnected for its retained publish and
         // the second was never registered: nobody is connected.
         assert_eq!(shared.with_broker(|broker| broker.connected_count()), 0);
+    }
+
+    /// Two listeners on one broker, one synchronous and one not, with
+    /// the node's mode `async`: the publisher on the synchronous one
+    /// waits for the follower, and the publisher on the other does not.
+    /// Section 8.6's per-listener override.
+    #[tokio::test]
+    async fn a_listener_s_own_durability_overrides_the_node_s() {
+        let (shared, copies) = replicating(cluster::Durability::Async, Duration::from_secs(30));
+        a_queued_session(&shared, "sensor", "site/+/temp").await;
+        let session = SessionKey::new("", "sensor");
+        copies.install_followers(|_| {
+            vec![cluster::Placed {
+                node: [0xaa; 16],
+                reachable: true,
+            }]
+        });
+        copies.marked(session.clone(), [0xaa; 16], 0);
+
+        // The node's listener: answered without the follower.
+        let mut relaxed = serve_one(Arc::clone(&shared));
+        connected_as(&mut relaxed, Version::V5, "relaxed").await;
+        let ack = tokio::time::timeout(
+            Duration::from_secs(2),
+            publish_once(&mut relaxed, "site/1/temp"),
+        )
+        .await
+        .expect("asynchronous mode does not wait for the follower");
+        assert_eq!(ack.reason, ReasonCode::Success);
+
+        // The synchronous listener: waits until the follower confirms.
+        let mut strict = serve_one_with_config(
+            Arc::clone(&shared),
+            ConnectionConfig {
+                durability: Some(cluster::Durability::Sync),
+                ..ConnectionConfig::default()
+            },
+        );
+        connected_as(&mut strict, Version::V5, "strict").await;
+        let releasing = Arc::clone(&copies);
+        let told = session.clone();
+        let confirmed_at = Arc::new(std::sync::Mutex::new(None));
+        let noted = Arc::clone(&confirmed_at);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            *noted.lock().expect("a lock") = Some(std::time::Instant::now());
+            releasing.marked(told, [0xaa; 16], u64::MAX);
+        });
+        let ack = publish_once(&mut strict, "site/1/temp").await;
+        let acknowledged_at = std::time::Instant::now();
+        assert_eq!(ack.reason, ReasonCode::Success);
+        let confirmed = confirmed_at.lock().expect("a lock").expect(
+            "the acknowledgement arrived before the follower confirmed, so it did not wait",
+        );
+        assert!(acknowledged_at >= confirmed);
     }
 
     /// Over 3.1.1 there is no code to send: the socket closes, for the

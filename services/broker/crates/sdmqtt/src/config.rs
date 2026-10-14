@@ -275,6 +275,10 @@ pub struct Listener {
     /// A retained publish on a listener that does not is a protocol
     /// error, and a retained will refuses the connect.
     pub retain_available: bool,
+    /// Section 8.6's durability mode for publishes on this listener,
+    /// `"async"` or `"sync"`; absent takes `cluster.durability`. The
+    /// wait is bounded by `cluster.sync_timeout_ms` in both cases.
+    pub durability: Option<Durability>,
 }
 
 impl Default for Listener {
@@ -285,6 +289,7 @@ impl Default for Listener {
             mountpoint: String::new(),
             max_qos: 2,
             retain_available: true,
+            durability: None,
         }
     }
 }
@@ -1355,6 +1360,19 @@ impl Config {
                           would be refused. Set cluster.address, or leave the flag out",
                 });
             }
+            // The same shape for a listener that asks to wait: on a node
+            // with no follower it would count every publish unconfirmed
+            // and wait the timeout for each.
+            if self.listener.durability == Some(Durability::Sync) {
+                return Err(ConfigError::Unusable {
+                    key: "listener.durability",
+                    value: "sync".to_owned(),
+                    why: "this node does not cluster, because cluster.address is unset, so \
+                          it has no follower to confirm anything and every durable publish \
+                          on this listener would wait for nobody. Set cluster.address, or \
+                          leave the key out",
+                });
+            }
             if let Some(expected) = self.cluster.expected_size {
                 return Err(ConfigError::Unusable {
                     key: "cluster.expected_size",
@@ -1529,6 +1547,19 @@ impl Config {
         if let Some(value) = lookup("SDMQTT_RETAIN_AVAILABLE") {
             self.listener.retain_available =
                 parse("SDMQTT_RETAIN_AVAILABLE", &value, "true or false")?;
+        }
+        if let Some(value) = lookup("SDMQTT_LISTENER_DURABILITY") {
+            self.listener.durability = Some(match value.as_str() {
+                "async" => Durability::Async,
+                "sync" => Durability::Sync,
+                _ => {
+                    return Err(ConfigError::Environment {
+                        variable: "SDMQTT_LISTENER_DURABILITY",
+                        value,
+                        expected: "async or sync",
+                    })
+                }
+            });
         }
         if let Some(value) = lookup("SDMQTT_STORAGE_DIRECTORY") {
             // An empty value turns the store off rather than naming a
@@ -1761,6 +1792,7 @@ impl Config {
                 mountpoint: Arc::from(self.listener.mountpoint.as_str()),
                 max_qos: self.listener.max_qos(),
                 retain_available: self.listener.retain_available,
+                durability: self.listener.durability,
                 // Derived from the bounds it drains rather than left a
                 // constant, so raising the queue raises the channel the
                 // queue empties into. `validate` refuses a configuration
@@ -3028,6 +3060,56 @@ mod tests {
             .expect("both read");
         assert_eq!(from_env.listener.max_qos, 0);
         assert!(!from_env.listener.retain_available);
+    }
+
+    /// Section 8.6's per-listener durability: read, passed through, and
+    /// refused where it could only ever wait for nobody.
+    #[test]
+    fn a_listener_durability_is_read_and_refused_on_a_node_that_does_not_cluster() {
+        let alone =
+            Config::from_toml("[listener]\ndurability = \"sync\"\n").expect("the key is known");
+        assert_eq!(alone.listener.durability, Some(Durability::Sync));
+        let why = alone
+            .validate()
+            .expect_err("a listener that waits for a follower on a node with none");
+        assert!(why.to_string().contains("listener.durability"), "{why}");
+
+        let clustered = Config::from_toml(
+            r#"
+            [listener]
+            durability = "sync"
+
+            [storage]
+            directory = "/tmp/a-store-for-the-test"
+
+            [cluster]
+            address = "127.0.0.1:7700"
+            secret = "a-secret"
+        "#,
+        )
+        .expect("every key is known");
+        clustered
+            .validate()
+            .expect("a clustering node may have a waiting listener");
+        assert_eq!(
+            clustered.server().connection.durability,
+            Some(Durability::Sync)
+        );
+
+        let mut from_env = Config::default();
+        from_env
+            .apply_env(|name| (name == "SDMQTT_LISTENER_DURABILITY").then(|| "async".to_owned()))
+            .expect("read");
+        assert_eq!(from_env.listener.durability, Some(Durability::Async));
+        let refused = Config::default()
+            .apply_env(|name| {
+                (name == "SDMQTT_LISTENER_DURABILITY").then(|| "eventually".to_owned())
+            })
+            .expect_err("not a mode");
+        assert!(
+            refused.to_string().contains("SDMQTT_LISTENER_DURABILITY"),
+            "{refused}"
+        );
     }
 
     #[test]

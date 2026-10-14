@@ -22,6 +22,14 @@ the milestone you are moving to.** Everything else is description.
   client asked for. The defaults advertise nothing and refuse nothing,
   so the conformance baseline is unchanged.
 
+- **A durability mode per listener**, section 8.6's override, deferred
+  from milestone 6. `listener.durability = "sync"` makes publishes on
+  that listener wait for a follower while the node's mode stays
+  `async`, or the reverse. The timeout is the node's in both cases: a
+  second timeout would be a second answer to "how long is too long" on
+  one node. Refused at startup on a node that does not cluster, as the
+  strict flag is, because it would wait for nobody on every publish.
+
 ## Unreleased — milestone 6: queue replication
 
 ### Before you upgrade: a store written before this milestone is refused

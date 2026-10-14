@@ -621,6 +621,13 @@ the ordinary case, gets exactly it.
 `SDMQTT_CLUSTER_DURABILITY`, `SDMQTT_CLUSTER_SYNC_TIMEOUT_MS` and
 `SDMQTT_CLUSTER_STRICT_UNCONFIRMED` set the same three.
 
+Per listener: `listener.durability = "sync"` (or `"async"`) overrides
+the node's mode for publishes arriving on that listener, so a listener
+carrying commands can wait for a copy while one carrying telemetry does
+not. The timeout is the node's in both cases. A listener set to `sync`
+on a node that does not cluster is refused at startup, for the reason
+the strict flag is. `SDMQTT_LISTENER_DURABILITY` sets it.
+
 ### When a node is gone for good
 
 ```toml

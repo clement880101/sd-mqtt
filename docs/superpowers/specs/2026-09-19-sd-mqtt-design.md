@@ -737,13 +737,12 @@ tagged with the session sequence number. Followers apply operations in order
 and report their high-water mark. Message bodies travel once and are
 reference counted on the follower exactly as on the owner.
 
-**Durability modes.** Configurable globally. **The per-listener override
-is deferred to milestone 7**, found by convention 8's walk at the close of
-milestone 6: nothing in this milestone's tasks carried a listener's mode
-into the commit path, and milestone 7 is where a listener gains its other
-per-listener settings (TLS, WebSocket, a maximum quality of service), so
-the override belongs with them rather than as one more field bolted on
-here. Until then every listener has the global mode.
+**Durability modes.** Configurable globally, and overridable per listener
+since milestone 7: `listener.durability` names the mode for publishes on
+that listener, and the node's `sync_timeout_ms` bounds the wait in both.
+(Milestone 6 shipped the global mode alone; convention 8's walk at its
+close found the override unbuilt and deferred it to where a listener gains
+its other per-listener settings.)
 
 - `async`, the default. The publisher is acknowledged as soon as the owner
   has the message durably. Replication proceeds in the background. The loss
