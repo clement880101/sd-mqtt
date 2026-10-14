@@ -757,6 +757,55 @@ impl Default for AuthConfig {
     }
 }
 
+/// One access control rule written in the file, `[[acl]]`. Section
+/// 12.1.
+///
+/// The same shape the API takes, so a rule can be moved between the
+/// two by copying it. Rules in the file and rules written through the
+/// API are consulted together, by `order`; the file's are not
+/// replicated — they are this node's configuration, and every node's
+/// file says what that node enforces.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AclSpec {
+    /// What an operator calls it.
+    pub id: String,
+    /// Lower is consulted first. 100 by default.
+    #[serde(default = "default_acl_order")]
+    pub order: u32,
+    /// `anyone`, `user:<name>` or `client:<id>`.
+    pub subject: String,
+    /// The topic filter, with MQTT wildcards.
+    pub filter: String,
+    /// Whether publishing to a matching topic is allowed, when the rule
+    /// has an opinion.
+    #[serde(default)]
+    pub publish: Option<bool>,
+    /// Whether subscribing to a matching filter is allowed, when the
+    /// rule has an opinion.
+    #[serde(default)]
+    pub subscribe: Option<bool>,
+}
+
+fn default_acl_order() -> u32 {
+    100
+}
+
+impl AclSpec {
+    /// The rule as the directory consults it.
+    #[must_use]
+    pub fn to_record(&self) -> storage::record::AclRecord {
+        storage::record::AclRecord {
+            id: self.id.clone(),
+            order: self.order,
+            subject: self.subject.clone(),
+            filter: self.filter.clone(),
+            publish: self.publish,
+            subscribe: self.subscribe,
+        }
+    }
+}
+
 /// The log section.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -1122,6 +1171,10 @@ pub struct Config {
     /// it, so a typo in a key would silently create a second rule.
     #[serde(default)]
     pub rules: Vec<RuleSpec>,
+    /// Section 12.1's access control rules written in the file,
+    /// `[[acl]]` tables. A list for the reason `rules` is.
+    #[serde(default)]
+    pub acl: Vec<AclSpec>,
 }
 
 /// What the command line says, where it says anything.
@@ -1230,6 +1283,21 @@ impl Config {
             });
         }
         self.validate_listeners()?;
+        let mut acl_ids = BTreeMap::new();
+        for rule in &self.acl {
+            directory::check_rule(&rule.to_record()).map_err(|why| ConfigError::Unusable {
+                key: leak(format!("acl[{}]", rule.id)),
+                value: rule.id.clone(),
+                why: leak(why.to_string()),
+            })?;
+            if acl_ids.insert(rule.id.clone(), ()).is_some() {
+                return Err(ConfigError::Unusable {
+                    key: leak(format!("acl[{}]", rule.id)),
+                    value: rule.id.clone(),
+                    why: "two access control rules share this identifier; each needs its own",
+                });
+            }
+        }
         if self.auth.scram_iterations < 1000 {
             return Err(ConfigError::Unusable {
                 key: "auth.scram_iterations",
@@ -3337,6 +3405,61 @@ mod tests {
             .expect("both read");
         assert_eq!(from_env.listener.max_qos, 0);
         assert!(!from_env.listener.retain_available);
+    }
+
+    /// `[[acl]]` tables are read as rules, and a rule that is not one
+    /// is refused by name.
+    #[test]
+    fn acl_tables_are_read_and_a_bad_one_is_refused() {
+        let config = Config::from_toml(
+            r##"
+            [[acl]]
+            id = "all"
+            subject = "anyone"
+            filter = "#"
+            publish = true
+            subscribe = true
+
+            [[acl]]
+            id = "no-sub"
+            order = 10
+            subject = "anyone"
+            filter = "test/nosubscribe"
+            subscribe = false
+        "##,
+        )
+        .expect("every key is known");
+        config.validate().expect("two usable rules");
+        assert_eq!(config.acl.len(), 2);
+        assert_eq!(config.acl[0].order, 100, "the default order");
+        assert_eq!(config.acl[1].to_record().subscribe, Some(false));
+
+        let bad_subject = Config::from_toml(
+            "[[acl]]\nid = \"x\"\nsubject = \"everyone\"\nfilter = \"#\"\npublish = true\n",
+        )
+        .expect("parses");
+        let why = bad_subject
+            .validate()
+            .expect_err("not a subject")
+            .to_string();
+        assert!(why.contains("acl[x]") && why.contains("subject"), "{why}");
+
+        let no_opinion =
+            Config::from_toml("[[acl]]\nid = \"x\"\nsubject = \"anyone\"\nfilter = \"#\"\n")
+                .expect("parses");
+        let why = no_opinion
+            .validate()
+            .expect_err("decides nothing")
+            .to_string();
+        assert!(why.contains("publish"), "{why}");
+
+        let twice = Config::from_toml(
+            "[[acl]]\nid = \"x\"\nsubject = \"anyone\"\nfilter = \"#\"\npublish = true\n\
+             [[acl]]\nid = \"x\"\nsubject = \"anyone\"\nfilter = \"a\"\npublish = true\n",
+        )
+        .expect("parses");
+        let why = twice.validate().expect_err("x twice").to_string();
+        assert!(why.contains("share this identifier"), "{why}");
     }
 
     /// Section 12.1's switches are read, and a cheap verifier refused.

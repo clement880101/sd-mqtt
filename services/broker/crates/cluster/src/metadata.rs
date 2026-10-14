@@ -96,8 +96,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use storage::{
-    MetadataKeyRecord, MetadataRecord, MetadataValueRecord, Record, Restored, RetainedRecord,
-    RuleRecord, SeenRecord, SessionKey, StampRecord, UserRecord,
+    AclRecord, MetadataKeyRecord, MetadataRecord, MetadataValueRecord, Record, Restored,
+    RetainedRecord, RuleRecord, SeenRecord, SessionKey, StampRecord, UserRecord,
 };
 
 use crate::clock::HybridClock;
@@ -173,6 +173,11 @@ pub enum MetadataKey {
         /// The name.
         name: String,
     },
+    /// An access control rule, by identifier. Section 12.1.
+    Acl {
+        /// The identifier.
+        id: String,
+    },
 }
 
 impl MetadataKey {
@@ -201,6 +206,7 @@ impl MetadataKey {
                 filter: filter.clone(),
             },
             Self::User { name } => MetadataKeyRecord::User { name: name.clone() },
+            Self::Acl { id } => MetadataKeyRecord::Acl { id: id.clone() },
         }
     }
 
@@ -225,6 +231,7 @@ impl MetadataKey {
                 filter,
             },
             MetadataKeyRecord::User { name } => Self::User { name },
+            MetadataKeyRecord::Acl { id } => Self::Acl { id },
         }
     }
 
@@ -238,6 +245,7 @@ impl MetadataKey {
             Self::SessionOwner { .. } => "a session owner",
             Self::NodeGroup { .. } => "a shared group membership",
             Self::User { .. } => "a user",
+            Self::Acl { .. } => "an access control rule",
         }
     }
 }
@@ -284,6 +292,8 @@ pub enum MetadataValue {
     NodeGroup,
     /// A user, whole. Boxed for the reason a rule is.
     User(Box<UserRecord>),
+    /// An access control rule, whole.
+    Acl(Box<AclRecord>),
 }
 
 impl MetadataValue {
@@ -300,6 +310,7 @@ impl MetadataValue {
             },
             Self::NodeGroup => MetadataValueRecord::NodeGroup,
             Self::User(user) => MetadataValueRecord::User(user.clone()),
+            Self::Acl(rule) => MetadataValueRecord::Acl(rule.clone()),
         }
     }
 
@@ -316,6 +327,7 @@ impl MetadataValue {
             },
             MetadataValueRecord::NodeGroup => Self::NodeGroup,
             MetadataValueRecord::User(user) => Self::User(user),
+            MetadataValueRecord::Acl(rule) => Self::Acl(rule),
         }
     }
 
@@ -329,6 +341,7 @@ impl MetadataValue {
             Self::SessionOwner { .. } => "a session owner",
             Self::NodeGroup => "a shared group membership",
             Self::User(_) => "a user",
+            Self::Acl(_) => "an access control rule",
         }
     }
 
@@ -342,6 +355,7 @@ impl MetadataValue {
                 | (MetadataKey::SessionOwner { .. }, Self::SessionOwner { .. })
                 | (MetadataKey::NodeGroup { .. }, Self::NodeGroup)
                 | (MetadataKey::User { .. }, Self::User(_))
+                | (MetadataKey::Acl { .. }, Self::Acl(_))
         )
     }
 }
@@ -639,7 +653,8 @@ fn index(
         MetadataKey::Retained { .. }
         | MetadataKey::Rule { .. }
         | MetadataKey::SessionOwner { .. }
-        | MetadataKey::User { .. } => {}
+        | MetadataKey::User { .. }
+        | MetadataKey::Acl { .. } => {}
     }
 }
 
@@ -1301,6 +1316,21 @@ impl Replicated {
             },
             None,
         )
+    }
+
+    /// An access control rule was written, whole. Section 12.1.
+    pub fn acl(&self, rule: AclRecord) -> MetadataWrite {
+        let mut state = self.held();
+        let key = MetadataKey::Acl {
+            id: rule.id.clone(),
+        };
+        self.write(&mut state, key, Some(MetadataValue::Acl(Box::new(rule))))
+    }
+
+    /// An access control rule was removed.
+    pub fn acl_removed(&self, id: &str) -> MetadataWrite {
+        let mut state = self.held();
+        self.write(&mut state, MetadataKey::Acl { id: id.to_owned() }, None)
     }
 
     /// Who owns `session`, and at what epoch. Section 8.4.

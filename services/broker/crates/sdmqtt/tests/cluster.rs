@@ -623,6 +623,29 @@ impl Client {
         Self::opened(address, client_id, true, 0).0
     }
 
+    /// SUBSCRIBE to `filter`, and what the acknowledgement said.
+    fn subscribe_reasons(&mut self, filter: &str) -> Vec<ReasonCode> {
+        let packet_id = self.next_packet_id();
+        self.send(&Packet::Subscribe(Subscribe {
+            packet_id,
+            filters: vec![SubscriptionOptions {
+                filter: filter.to_owned(),
+                qos: QoS::AtLeastOnce,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: RetainHandling::SendAlways,
+            }],
+            properties: Properties::default(),
+        }));
+        loop {
+            match self.next() {
+                Some(Packet::SubAck(ack)) => return ack.reasons,
+                Some(_) => continue,
+                None => panic!("the broker closed before acknowledging the subscribe"),
+            }
+        }
+    }
+
     /// CONNECT through section 12.2's exchange as `username` with
     /// `password`, and the acknowledgement's reason — with the server's
     /// final message verified when the reason is success, so a success
@@ -2908,6 +2931,27 @@ async fn a_user_created_on_one_node_connects_on_another() {
     assert_eq!(
         Client::connect_scram(cluster.nodes[1].mqtt, "alice-scram", "alice", "wrong"),
         Some(ReasonCode::NotAuthorized)
+    );
+
+    // An access control rule written on alpha refuses on beta, in
+    // time: the first rule flips the default, so the second allows
+    // everything else.
+    cluster.nodes[0].post(
+        "/api/v1/acl",
+        r#"{"id":"no-secret","order":10,"subject":"anyone","filter":"secret/#","subscribe":false}"#,
+    );
+    cluster.nodes[0].post(
+        "/api/v1/acl",
+        r##"{"id":"all","subject":"anyone","filter":"#","publish":true,"subscribe":true}"##,
+    );
+    until("the rules have replicated to beta", || {
+        let (mut probe, _) = Client::resuming(cluster.nodes[1].mqtt, "acl-probe");
+        probe.subscribe_reasons("secret/plans") == vec![ReasonCode::NotAuthorized]
+    });
+    let (mut probe, _) = Client::resuming(cluster.nodes[1].mqtt, "acl-probe");
+    assert_eq!(
+        probe.subscribe_reasons("fleet/+/telemetry"),
+        vec![ReasonCode::GrantedQos1]
     );
 
     // A delete on gamma refuses on alpha, in time.

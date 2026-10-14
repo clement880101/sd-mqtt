@@ -409,9 +409,13 @@ pub async fn applying(
         // Section 12.1's users go to the directory, which writes them
         // the way the rule registry writes a rule: the register and the
         // record in one batch, stamped by nobody here.
-        let (for_directory, for_broker): (Vec<MetadataWrite>, Vec<MetadataWrite>) = rest
-            .into_iter()
-            .partition(|write| matches!(write.key(), MetadataKey::User { .. }));
+        let (for_directory, for_broker): (Vec<MetadataWrite>, Vec<MetadataWrite>) =
+            rest.into_iter().partition(|write| {
+                matches!(
+                    write.key(),
+                    MetadataKey::User { .. } | MetadataKey::Acl { .. }
+                )
+            });
 
         // **The registers go to the store whatever they mean here**, and in
         // one batch with the local effect. A node holds every register,

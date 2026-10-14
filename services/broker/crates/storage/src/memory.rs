@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, PoisonError};
 
 use crate::record::{
-    BodyRecord, ClockRecord, InflightRecord, LoggedRecord, MessageId, MetadataKeyRecord,
+    AclRecord, BodyRecord, ClockRecord, InflightRecord, LoggedRecord, MessageId, MetadataKeyRecord,
     MetadataRecord, NodeIdentityRecord, OutboxRecord, QueueEntry, Record, RetainedRecord,
     RuleRecord, SeenRecord, SessionKey, SessionRecord, SubscriptionRecord, UserRecord,
 };
@@ -81,6 +81,8 @@ struct State {
     rules: BTreeMap<String, RuleRecord>,
     /// Users by name, ordered for the same reason. Section 12.1.
     users: BTreeMap<String, UserRecord>,
+    /// Access control rules by identifier. Section 12.1.
+    acl: BTreeMap<String, AclRecord>,
     /// Sessions this node holds a copy of rather than owns, section
     /// 8.6: the owning node's sixteen bytes and how far the stream has
     /// been applied.
@@ -364,6 +366,12 @@ impl State {
             Record::UserDeleted { name } => {
                 self.users.remove(name);
             }
+            Record::AclPut(rule) => {
+                self.acl.insert(rule.id.clone(), (**rule).clone());
+            }
+            Record::AclDeleted { id } => {
+                self.acl.remove(id);
+            }
             Record::ReplicaFollows {
                 session,
                 owner,
@@ -581,6 +589,7 @@ impl Storage for MemoryStorage {
                 .collect::<HashMap<_, _>>(),
             rules: state.rules.values().cloned().collect(),
             users: state.users.values().cloned().collect(),
+            acl: state.acl.values().cloned().collect(),
             node: state.node.clone(),
             clock: state.clock,
             metadata: state.metadata.values().cloned().collect(),

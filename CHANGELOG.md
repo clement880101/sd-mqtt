@@ -59,6 +59,29 @@ rejoin and be repaired before the next.
   0x87. The user name a SCRAM client proves is what the session
   remembers, whatever the CONNECT's username field said.
 
+- **Access control rules**, section 12.1, deny by default once one
+  exists. `[[acl]]` tables in the file and `POST /api/v1/acl` through
+  the API take the same shape — identifier, order, subject (`anyone`,
+  `user:<name>`, `client:<id>`), filter, and an opinion on publishing
+  and on subscribing — and are consulted together by order, first
+  match deciding; the API's replicate as registers, the file's are the
+  node's own. Filters match the way subscriptions do, through the topic
+  crate, and a shared subscription is judged by the filter it shares. A
+  refused subscribe is 0x87 (0x80 on 3.1.1), a refused publish 0x87 on
+  its acknowledgement, and an at-most-once publish that was refused —
+  by a rule or by the reserved namespace — is now dropped and counted
+  as `refused`, where before nothing counted it. Paho's
+  `test_subscribe_failure` passes on 3.1.1 now that the runner
+  configures the rule it needs; on version 5 it stays in the baseline
+  as an assumption, because the suite asserts 0x80 where the protocol
+  lists 0x87.
+
+- **A client cannot publish into the dollar namespace**, section
+  12.3's other half, deferred since milestone 3. Judged in the broker
+  before the authorizing chain and told to the hooks as a `reserved`
+  refusal; 0x87 on an acknowledged publish, dropped and counted
+  otherwise. Only the first level is reserved.
+
 - **A listener's maximum QoS and retain availability**, section 5.4's
   two deferred properties. `listener.max_qos` (0, 1 or 2) is advertised
   to version 5 clients and enforced on every publish: above the cap is

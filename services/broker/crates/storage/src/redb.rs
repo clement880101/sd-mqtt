@@ -123,6 +123,8 @@ const RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("rules");
 /// User name, to [`UserRecord`]. Section 12.1. A user belongs to the
 /// node like a rule does, and is keyed the same way.
 const USERS: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
+/// Rule identifier, to [`AclRecord`]. Section 12.1.
+const ACL: TableDefinition<&str, &[u8]> = TableDefinition::new("acl");
 /// Rule identifier and big-endian sequence, to [`OutboxRecord`].
 ///
 /// Keyed like a queue and for the same reasons. The identifier is
@@ -361,6 +363,11 @@ impl Storage for RedbStorage {
             Err(::redb::TableError::TableDoesNotExist(_)) => None,
             Err(error) => return Err(StorageError::from(error)),
         };
+        let acl = match transaction.open_table(ACL) {
+            Ok(table) => Some(table),
+            Err(::redb::TableError::TableDoesNotExist(_)) => None,
+            Err(error) => return Err(StorageError::from(error)),
+        };
         let metadata = open_read(&transaction, METADATA)?;
         let oplog = open_read(&transaction, OPLOG)?;
         let metadata_seen = open_read(&transaction, METADATA_SEEN)?;
@@ -451,6 +458,12 @@ impl Storage for RedbStorage {
             for entry in users.iter().map_err(StorageError::from)? {
                 let (_, value) = entry.map_err(StorageError::from)?;
                 restored.users.push(decode(value.value())?);
+            }
+        }
+        if let Some(acl) = &acl {
+            for entry in acl.iter().map_err(StorageError::from)? {
+                let (_, value) = entry.map_err(StorageError::from)?;
+                restored.acl.push(decode(value.value())?);
             }
         }
         restored.node = match meta.get(NODE_KEY).map_err(StorageError::from)? {
@@ -599,6 +612,7 @@ struct Tables<'txn> {
     retained: Table<'txn, &'static str, &'static [u8]>,
     rules: Table<'txn, &'static str, &'static [u8]>,
     users: Table<'txn, &'static str, &'static [u8]>,
+    acl: Table<'txn, &'static str, &'static [u8]>,
     outboxes: ByteTable<'txn>,
     outbox_state: ByteTable<'txn>,
     metadata: ByteTable<'txn>,
@@ -638,6 +652,7 @@ impl<'txn> Tables<'txn> {
                 .map_err(StorageError::from)?,
             rules: transaction.open_table(RULES).map_err(StorageError::from)?,
             users: transaction.open_table(USERS).map_err(StorageError::from)?,
+            acl: transaction.open_table(ACL).map_err(StorageError::from)?,
             outboxes: transaction
                 .open_table(OUTBOXES)
                 .map_err(StorageError::from)?,
@@ -918,6 +933,14 @@ impl<'txn> Tables<'txn> {
                 self.users
                     .remove(name.as_str())
                     .map_err(StorageError::from)?;
+            }
+            Record::AclPut(rule) => {
+                self.acl
+                    .insert(rule.id.as_str(), encode(rule.as_ref()).as_slice())
+                    .map_err(StorageError::from)?;
+            }
+            Record::AclDeleted { id } => {
+                self.acl.remove(id.as_str()).map_err(StorageError::from)?;
             }
             Record::ReplicaFollows {
                 session,
@@ -1397,6 +1420,10 @@ fn metadata_key(key: &MetadataKeyRecord) -> Vec<u8> {
         MetadataKeyRecord::User { name } => {
             out.push(5);
             push_component(&mut out, name);
+        }
+        MetadataKeyRecord::Acl { id } => {
+            out.push(6);
+            push_component(&mut out, id);
         }
     }
     out

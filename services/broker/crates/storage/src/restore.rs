@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use crate::record::{
-    BodyRecord, ClockRecord, InflightRecord, LoggedRecord, MessageId, MetadataRecord,
+    AclRecord, BodyRecord, ClockRecord, InflightRecord, LoggedRecord, MessageId, MetadataRecord,
     NodeIdentityRecord, QueueEntry, RetainedRecord, RuleRecord, SeenRecord, SessionRecord,
     SubscriptionRecord, UserRecord,
 };
@@ -109,6 +109,8 @@ pub struct Restored {
     /// Every user the node holds, in name order. Section 12.1, durable
     /// metadata like a rule, and ordered for the same reason.
     pub users: Vec<UserRecord>,
+    /// Every access control rule the node holds, in identifier order.
+    pub acl: Vec<AclRecord>,
     /// Who this node is, if the store has ever been told.
     ///
     /// `None` for a store that has never held an identity, which is a

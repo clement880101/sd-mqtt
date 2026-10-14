@@ -131,6 +131,19 @@ fn every_kind(me: NodeId) -> Vec<(MetadataKey, MetadataValue)> {
                 created_at: 1,
             })),
         ),
+        (
+            MetadataKey::Acl {
+                id: "fleet".to_owned(),
+            },
+            MetadataValue::Acl(Box::new(storage::record::AclRecord {
+                id: "fleet".to_owned(),
+                order: 10,
+                subject: "user:alice".to_owned(),
+                filter: "fleet/#".to_owned(),
+                publish: Some(true),
+                subscribe: Some(true),
+            })),
+        ),
     ]
 }
 
@@ -243,6 +256,7 @@ fn every_kind_survives_a_restart() {
                 .group_joined("workers", "jobs/+")
                 .expect("the first member writes a register"),
             MetadataValue::User(held) => before.user(*held),
+            MetadataValue::Acl(held) => before.acl(*held),
         });
     }
     // And a tombstone, which is the last unsubscribe: the register that

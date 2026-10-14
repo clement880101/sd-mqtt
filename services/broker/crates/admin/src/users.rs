@@ -58,6 +58,9 @@ fn refusal(error: DirectoryError) -> ApiError {
         }
         DirectoryError::NoSuchUser { .. } => ApiError::not_found(error.to_string()),
         DirectoryError::Storage { .. } => ApiError::new(ErrorCode::Internal, error.to_string()),
+        // The access control variants are the acl resource's; one
+        // reaching here is this crate's fault.
+        other => ApiError::new(ErrorCode::Internal, other.to_string()),
     }
 }
 
@@ -169,6 +172,7 @@ mod tests {
             Arc::clone(&shared),
             replicated,
             directory::Settings::default(),
+            Vec::new(),
             Vec::new(),
         );
         let config = AdminConfig {

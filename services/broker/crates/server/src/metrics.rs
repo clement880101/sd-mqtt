@@ -474,6 +474,7 @@ reason_table!(DropReason, ALL_DROP_REASONS, drop_label, drop_index, {
     Migrated => "migrated",
     RejectedByPeer => "rejected_by_peer",
     TooLargeForPeer => "too_large_for_peer",
+    Refused => "refused",
 });
 
 /// Why the shell discarded something, where `broker-core` cannot see

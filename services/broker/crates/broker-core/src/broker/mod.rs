@@ -1604,6 +1604,21 @@ impl Broker {
                 Verdict::Dropped => Some(0),
                 Verdict::Refused => {
                     refused = true;
+                    // An acknowledged publish is told no on its
+                    // acknowledgement, which the shell counts by
+                    // reason. An at-most-once publish has none, so
+                    // this is the one place its refusal can be seen.
+                    if received.owed.is_none() {
+                        out.push((
+                            from,
+                            Action::Dropped {
+                                id: message.id,
+                                reason: DropReason::Refused,
+                                qos: publish.qos,
+                                topic: Arc::clone(&message.topic),
+                            },
+                        ));
+                    }
                     None
                 }
             }
@@ -1632,6 +1647,28 @@ impl Broker {
     /// rewrite applied afterwards would route by the old topic and
     /// deliver the new one.
     fn judge(&mut self, from: SubscriberId, message: &mut Message) -> Verdict {
+        // Section 12.3: the dollar-prefixed namespace is the broker's
+        // and no client publishes into it, whatever the chain would
+        // say. Judged before the chain and told to it as a refusal, so
+        // a hook that counts refusals counts this one. The first level
+        // only: `a/$b` is an ordinary topic.
+        if message.topic.starts_with('$') {
+            if let Some(identity) = self.client_of(from).cloned() {
+                let username = self.username_of(from);
+                self.hooks.message_refused(
+                    &ClientInfo {
+                        subscriber: Some(from),
+                        mountpoint: &identity.mountpoint,
+                        client_id: &identity.client_id,
+                        username: username.as_deref(),
+                    },
+                    &message.topic,
+                    message.qos,
+                    crate::hooks::Refusal::Reserved,
+                );
+            }
+            return Verdict::Refused;
+        }
         if self.hooks.is_empty() {
             // The common case, and it must not pay for a clone of the
             // identity. With no hooks installed the only thing left

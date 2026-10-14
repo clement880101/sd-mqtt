@@ -436,10 +436,12 @@ gate, and ticked here as it lands:
 - [x] **Task 2** — SCRAM-SHA-256 over MQTT 5's AUTH exchange, including
   re-authentication; pinned by RFC 7677's test vector; a wrong method is
   0x8C; names with `,` or `=` are escaped per RFC 5802.
-- [ ] **Task 3** — access control rules, deny by default once one exists,
+- [x] **Task 3** — access control rules, deny by default once one exists,
   through the two authorize hooks with the topic crate's matching; the
   dollar-topic refusal on connections; `test_subscribe_failure` leaves the
-  conformance baseline and `test_dollar_topics` joins it as `assumption`.
+  conformance baseline on 3.1.1 and stays on version 5 as an `assumption`
+  (the suite asserts 0x80 where 3.9.3 lists 0x87); `test_dollar_topics`
+  still passes, since it only asserts that nothing is delivered.
 - [ ] **Task 4** — API keys with `read`, `write` and `admin` scopes,
   hashed at rest and shown once; the configured token stays as a bootstrap
   key with admin scope; revocation replicates as a tombstone.

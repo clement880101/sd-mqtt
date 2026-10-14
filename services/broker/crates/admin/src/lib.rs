@@ -33,6 +33,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
+pub mod acl;
 pub mod assets;
 pub mod config;
 pub mod error;
@@ -717,6 +718,7 @@ fn router(state: AdminState, extra: Router<AdminState>) -> Router {
         .merge(resources::routes())
         .merge(rules::routes())
         .merge(users::routes())
+        .merge(acl::routes())
         .merge(events::routes())
         .merge(taps::routes())
         // Whatever the caller asked to be served here as well, inside

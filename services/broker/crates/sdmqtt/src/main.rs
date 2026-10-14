@@ -603,6 +603,8 @@ struct Rebuilt {
     /// Section 12.1's users, as the store held them, for the directory
     /// to start from.
     users: Vec<storage::record::UserRecord>,
+    /// And its access control rules.
+    acl: Vec<storage::record::AclRecord>,
 }
 
 /// The same, against a store somebody else opened.
@@ -802,6 +804,7 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, Sta
         copies,
         replicated,
         users: restored.users.clone(),
+        acl: restored.acl.clone(),
     })
 }
 
@@ -1015,6 +1018,7 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
                 scram_iterations: config.auth.scram_iterations,
             },
             rebuilt.users.clone(),
+            rebuilt.acl.clone(),
         );
         shared.with_broker(|broker| broker.hooks_mut().install(directory.hook()));
         shared
@@ -1026,6 +1030,22 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         );
         directory
     });
+    // Section 12.1's access control, on every node: the file's rules,
+    // and the directory's where there is one. Installed whether or not
+    // any rule exists yet, because a rule written through the API later
+    // must take effect without a restart.
+    let rules_in_force = directory::RulesInForce::new(
+        config.acl.iter().map(config::AclSpec::to_record).collect(),
+        directory.clone(),
+    );
+    shared.with_broker(|broker| broker.hooks_mut().install(rules_in_force.hook()));
+    if !config.acl.is_empty() {
+        tracing::info!(
+            rules = config.acl.len(),
+            "access control rules from the configuration are in force; everything they do \
+             not allow is refused"
+        );
+    }
 
     // **Before anything binds.** A rule half installed is a message
     // that fires nothing, and the first thing a client does after a

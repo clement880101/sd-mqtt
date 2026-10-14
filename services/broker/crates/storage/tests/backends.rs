@@ -2403,6 +2403,42 @@ mod contract {
         );
     }
 
+    /// An access control rule is held, replaced and removed like a
+    /// user, and comes back in identifier order.
+    pub fn acl_rules_are_held_replaced_and_removed<S: Storage>(new: impl Fn() -> S) {
+        fn rule(id: &str, order: u32) -> storage::record::AclRecord {
+            storage::record::AclRecord {
+                id: id.to_owned(),
+                order,
+                subject: "anyone".to_owned(),
+                filter: "fleet/#".to_owned(),
+                publish: Some(true),
+                subscribe: Some(false),
+            }
+        }
+        let store = new();
+        assert!(restore(&store).acl.is_empty());
+        apply(
+            &store,
+            &[
+                Record::AclPut(Box::new(rule("b", 2))),
+                Record::AclPut(Box::new(rule("a", 1))),
+            ],
+        );
+        assert_eq!(restore(&store).acl, vec![rule("a", 1), rule("b", 2)]);
+        apply(&store, &[Record::AclPut(Box::new(rule("a", 9)))]);
+        assert_eq!(restore(&store).acl, vec![rule("a", 9), rule("b", 2)]);
+        apply(&store, &[Record::AclDeleted { id: "a".to_owned() }]);
+        assert_eq!(restore(&store).acl, vec![rule("b", 2)]);
+        apply(
+            &store,
+            &[Record::AclDeleted {
+                id: "never".to_owned(),
+            }],
+        );
+        assert_eq!(restore(&store).acl, vec![rule("b", 2)]);
+    }
+
     /// A rule belongs to the node, not to a session.
     ///
     /// The mistake this guards is filing rules under whatever structure
@@ -3163,6 +3199,7 @@ macro_rules! every_contract_test {
             a_pop_does_not_release_the_body_it_named,
             rules_are_held_replaced_and_removed,
             users_are_held_replaced_and_removed,
+            acl_rules_are_held_replaced_and_removed,
             a_rule_survives_the_session_that_was_there_when_it_was_made,
             an_outbox_holds_an_envelope_with_every_field_and_counts_it,
             an_attempt_moves_the_stored_count_and_the_next_time,

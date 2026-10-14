@@ -1216,6 +1216,41 @@ mod golden {
     }
 
     #[test]
+    fn acl_put() {
+        // id "r1", order 5, subject "anyone", filter "a/#", publish
+        // Some(true), subscribe None.
+        pins(
+            &Record::AclPut(Box::new(crate::record::AclRecord {
+                id: "r1".to_owned(),
+                order: 5,
+                subject: "anyone".to_owned(),
+                filter: "a/#".to_owned(),
+                publish: Some(true),
+                subscribe: None,
+            })),
+            &[
+                0x1f, // Record::AclPut is variant 31
+                0x02, b'r', b'1', // id
+                0x05, // order
+                0x06, b'a', b'n', b'y', b'o', b'n', b'e', // subject
+                0x03, b'a', b'/', b'#', // filter
+                0x01, 0x01, // publish: Some(true)
+                0x00, // subscribe: None
+            ],
+        );
+    }
+
+    #[test]
+    fn acl_deleted() {
+        pins(
+            &Record::AclDeleted {
+                id: "r1".to_owned(),
+            },
+            &[0x20, 0x02, b'r', b'1'], // variant 32, then the identifier
+        );
+    }
+
+    #[test]
     fn replica_dropped() {
         pins(
             &Record::ReplicaDropped { session: key() },

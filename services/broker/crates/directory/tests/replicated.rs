@@ -40,6 +40,7 @@ fn node() -> (Arc<Directory>, Arc<Replicated>, Arc<MemoryStorage>) {
         Arc::clone(&replicated),
         Settings::default(),
         Vec::new(),
+        Vec::new(),
     );
     (directory, replicated, store)
 }

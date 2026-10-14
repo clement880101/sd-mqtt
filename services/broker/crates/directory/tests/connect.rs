@@ -43,6 +43,7 @@ fn broker_with(settings: Settings) -> (Arc<Shared>, Arc<Directory>) {
         replicated,
         settings,
         Vec::new(),
+        Vec::new(),
     );
     shared.with_broker(|broker| broker.hooks_mut().install(directory.hook()));
     (shared, directory)

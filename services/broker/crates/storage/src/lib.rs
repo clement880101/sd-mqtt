@@ -30,12 +30,13 @@ pub use self::redb::RedbStorage;
 pub use memory::MemoryStorage;
 
 pub use record::{
-    ActionRecord, BodyRecord, ClockRecord, DeliveryRecord, FormatError, FormatMarker, HttpInRecord,
-    HttpOutRecord, InflightRecord, InflightState, LoggedRecord, MessageId, MetadataKeyRecord,
-    MetadataRecord, MetadataValueRecord, NodeIdentityRecord, OutboxRecord, ProtocolVersion, Qos,
-    QueueEntry, Record, RetainHandling, RetainedRecord, RuleRecord, ScramVerifierRecord, Secret,
-    SeenRecord, SessionKey, SessionRecord, StampRecord, SubscriptionRecord, TopicFromRecord,
-    TopicFromRequestRecord, TriggerRecord, UserRecord, WillRecord, FORMAT_MAGIC, FORMAT_VERSION,
+    AclRecord, ActionRecord, BodyRecord, ClockRecord, DeliveryRecord, FormatError, FormatMarker,
+    HttpInRecord, HttpOutRecord, InflightRecord, InflightState, LoggedRecord, MessageId,
+    MetadataKeyRecord, MetadataRecord, MetadataValueRecord, NodeIdentityRecord, OutboxRecord,
+    ProtocolVersion, Qos, QueueEntry, Record, RetainHandling, RetainedRecord, RuleRecord,
+    ScramVerifierRecord, Secret, SeenRecord, SessionKey, SessionRecord, StampRecord,
+    SubscriptionRecord, TopicFromRecord, TopicFromRequestRecord, TriggerRecord, UserRecord,
+    WillRecord, FORMAT_MAGIC, FORMAT_VERSION,
 };
 pub use restore::{Restored, RestoredSession};
 pub use writer::{Applied, Durable, NotDurable, Writer, WriterConfig, WriterStopped};

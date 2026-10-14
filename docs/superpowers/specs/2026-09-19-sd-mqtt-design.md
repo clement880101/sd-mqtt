@@ -1392,8 +1392,12 @@ they cannot reach logs or crash output. Repeated authentication failures from
 one address are slowed by the limiter in section 10.3. Dollar-prefixed topics
 are not publishable by clients.
 
-**Half of that last sentence is true, and the half that is not is deferred to
-milestone 7.** The admin publish endpoint refuses a dollar-prefixed topic,
+**Both halves of that last sentence are true since milestone 7.** The
+MQTT connection's half is judged in the broker before the authorizing
+chain: 0x87 on an acknowledged publish, a counted drop on an at-most-once
+one, and the hooks told of a `reserved` refusal. What follows is the note
+as it stood while the half was deferred, kept because it records why.
+The admin publish endpoint refuses a dollar-prefixed topic,
 because milestone 3 added it and it is a new way to write a *retained* one,
 which stays in the broker until somebody finds it. An MQTT connection is
 still allowed to publish one. That is older than this milestone and is

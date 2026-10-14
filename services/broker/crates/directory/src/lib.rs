@@ -28,10 +28,13 @@ use broker_core::hooks::{Credentials, Decision, Hook};
 use cluster::{MetadataKey, MetadataValue, MetadataWrite, Replicated};
 use sdmqtt_server::shared::Shared;
 use storage::record::{ScramVerifierRecord, Secret, UserRecord};
+
 use storage::{Record, Writer};
 
+pub mod acl;
 pub mod user;
 
+pub use storage::record::AclRecord;
 pub use user::UserView;
 
 /// How the directory behaves beyond its tables.
@@ -68,6 +71,20 @@ pub enum DirectoryError {
         /// The name asked for.
         name: String,
     },
+    /// An access control rule that is not one.
+    #[error("the rule's {field} is not usable: {why}")]
+    BadRule {
+        /// Which field.
+        field: &'static str,
+        /// Why.
+        why: String,
+    },
+    /// No such rule.
+    #[error("there is no access control rule named {id}")]
+    NoSuchRule {
+        /// The identifier asked for.
+        id: String,
+    },
     /// The store would not take it.
     #[error("the store refused the change: {why}")]
     Storage {
@@ -83,6 +100,9 @@ pub struct Directory {
     replicated: Arc<Replicated>,
     settings: Settings,
     users: RwLock<BTreeMap<String, UserRecord>>,
+    /// Section 12.1's access control rules, by identifier; consulted in
+    /// order through [`Directory::acl`].
+    acl: RwLock<BTreeMap<String, AclRecord>>,
     /// One change at a time, so two puts of one name cannot interleave
     /// their records and their registers.
     changing: tokio::sync::Mutex<()>,
@@ -106,6 +126,7 @@ impl Directory {
         replicated: Arc<Replicated>,
         settings: Settings,
         restored: Vec<UserRecord>,
+        restored_acl: Vec<AclRecord>,
     ) -> Arc<Self> {
         Arc::new(Self {
             writer,
@@ -118,8 +139,75 @@ impl Directory {
                     .map(|user| (user.name.clone(), user))
                     .collect(),
             ),
+            acl: RwLock::new(
+                restored_acl
+                    .into_iter()
+                    .map(|rule| (rule.id.clone(), rule))
+                    .collect(),
+            ),
             changing: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Every access control rule, in consultation order.
+    #[must_use]
+    pub fn acl(&self) -> Vec<AclRecord> {
+        let mut rules: Vec<AclRecord> = self
+            .acl
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        acl::in_order(&mut rules);
+        rules
+    }
+
+    /// Create or replace an access control rule, whole.
+    ///
+    /// # Errors
+    ///
+    /// A rule that is not one — an empty identifier, a subject that is
+    /// none of the three forms, a filter that is not a filter, or no
+    /// opinion on either operation — or a store that refused.
+    pub async fn put_acl(&self, rule: AclRecord) -> Result<AclRecord, DirectoryError> {
+        check_rule(&rule)?;
+        let _changing = self.changing.lock().await;
+        let write = self.replicated.acl(rule.clone());
+        let mut records = vec![Record::AclPut(Box::new(rule.clone()))];
+        records.extend(self.replicated.records(&write));
+        self.durable(records, Some(write)).await?;
+        self.acl
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(rule.id.clone(), rule.clone());
+        Ok(rule)
+    }
+
+    /// Remove an access control rule. A tombstone replicates the removal.
+    ///
+    /// # Errors
+    ///
+    /// No such rule, or a store that refused.
+    pub async fn delete_acl(&self, id: &str) -> Result<(), DirectoryError> {
+        let _changing = self.changing.lock().await;
+        if !self
+            .acl
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(id)
+        {
+            return Err(DirectoryError::NoSuchRule { id: id.to_owned() });
+        }
+        let write = self.replicated.acl_removed(id);
+        let mut records = vec![Record::AclDeleted { id: id.to_owned() }];
+        records.extend(self.replicated.records(&write));
+        self.durable(records, Some(write)).await?;
+        self.acl
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+        Ok(())
     }
 
     /// The settings this directory runs with.
@@ -245,12 +333,17 @@ impl Directory {
     ///
     /// A store that refused.
     pub async fn apply_replicated(&self, write: &MetadataWrite) -> Result<(), DirectoryError> {
-        let MetadataKey::User { name } = write.key() else {
-            tracing::error!(
-                kind = write.key().kind(),
-                "a register that is not a user reached the directory"
-            );
-            return Ok(());
+        let name = match write.key() {
+            MetadataKey::User { name } => name,
+            MetadataKey::Acl { id } => return self.apply_replicated_acl(id, write).await,
+            other => {
+                tracing::error!(
+                    kind = other.kind(),
+                    "a register that is neither a user nor an access control rule reached \
+                     the directory"
+                );
+                return Ok(());
+            }
         };
         let _changing = self.changing.lock().await;
         // The register itself is stored by whoever hands the write over,
@@ -279,6 +372,40 @@ impl Directory {
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(name);
+            }
+        }
+        Ok(())
+    }
+
+    /// A peer's access control rule, applied the way a peer's user is.
+    async fn apply_replicated_acl(
+        &self,
+        id: &str,
+        write: &MetadataWrite,
+    ) -> Result<(), DirectoryError> {
+        let _changing = self.changing.lock().await;
+        match write.register().value() {
+            Some(MetadataValue::Acl(rule)) => {
+                self.durable(vec![Record::AclPut(rule.clone())], None)
+                    .await?;
+                self.acl
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(id.to_owned(), (**rule).clone());
+            }
+            Some(other) => {
+                tracing::error!(
+                    kind = other.kind(),
+                    "an access control rule's register carried something that is not one"
+                );
+            }
+            None => {
+                self.durable(vec![Record::AclDeleted { id: id.to_owned() }], None)
+                    .await?;
+                self.acl
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(id);
             }
         }
         Ok(())
@@ -314,6 +441,81 @@ impl Directory {
         Arc::new(DirectoryHook {
             directory: Arc::clone(self),
         })
+    }
+}
+
+/// Whether `rule` is one this broker can consult. Section 12.1.
+///
+/// # Errors
+///
+/// Names the field, for the configuration and the API alike.
+pub fn check_rule(rule: &AclRecord) -> Result<(), DirectoryError> {
+    if rule.id.is_empty() || rule.id.chars().any(char::is_control) {
+        return Err(DirectoryError::BadRule {
+            field: "id",
+            why: "an identifier cannot be empty or contain a control character".to_owned(),
+        });
+    }
+    acl::Subject::parse(&rule.subject).map_err(|why| DirectoryError::BadRule {
+        field: "subject",
+        why,
+    })?;
+    mqtt_codec::topic::validate_filter(&rule.filter, &mqtt_codec::Limits::default()).map_err(
+        |why| DirectoryError::BadRule {
+            field: "filter",
+            why: why.to_string(),
+        },
+    )?;
+    if rule.publish.is_none() && rule.subscribe.is_none() {
+        return Err(DirectoryError::BadRule {
+            field: "publish",
+            why: "a rule with no opinion on publishing or subscribing decides nothing; set \
+                  at least one"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// The rules in force on this node: the configured ones and, on a node
+/// with a store, the directory's, consulted together in one order.
+///
+/// One order rather than "the file first", because `order` is the one
+/// knob an operator has and it has to mean what it says wherever the
+/// rule was written: a narrow deny in the API at order 10 must sit
+/// above a broad allow in the file at order 100.
+#[derive(Debug)]
+pub struct RulesInForce {
+    configured: Vec<AclRecord>,
+    directory: Option<Arc<Directory>>,
+}
+
+impl RulesInForce {
+    /// Over `configured` and, when the node has one, `directory`.
+    #[must_use]
+    pub fn new(mut configured: Vec<AclRecord>, directory: Option<Arc<Directory>>) -> Arc<Self> {
+        acl::in_order(&mut configured);
+        Arc::new(Self {
+            configured,
+            directory,
+        })
+    }
+
+    /// The access control hook over these rules.
+    #[must_use]
+    pub fn hook(self: &Arc<Self>) -> Arc<dyn Hook> {
+        acl::AclHook::over(Arc::clone(self) as Arc<dyn acl::RuleSource>)
+    }
+}
+
+impl acl::RuleSource for RulesInForce {
+    fn rules(&self) -> Vec<AclRecord> {
+        let mut rules = self.configured.clone();
+        if let Some(directory) = &self.directory {
+            rules.extend(directory.acl());
+        }
+        acl::in_order(&mut rules);
+        rules
     }
 }
 

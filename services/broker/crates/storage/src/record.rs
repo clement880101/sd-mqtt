@@ -1032,6 +1032,11 @@ pub enum MetadataKeyRecord {
         /// The name.
         name: String,
     },
+    /// An access control rule, by identifier.
+    Acl {
+        /// The identifier.
+        id: String,
+    },
 }
 
 /// What a replicated register holds, section 8.2.
@@ -1083,6 +1088,8 @@ pub enum MetadataValueRecord {
     NodeGroup,
     /// A user, whole. Boxed for the reason a rule is.
     User(Box<UserRecord>),
+    /// An access control rule, whole.
+    Acl(Box<AclRecord>),
 }
 
 /// One replicated register, as a store holds it.
@@ -1539,6 +1546,38 @@ pub enum Record {
         /// Its name.
         name: String,
     },
+    /// An access control rule exists, or changed. Section 12.1.
+    AclPut(Box<AclRecord>),
+    /// An access control rule is gone.
+    AclDeleted {
+        /// Its identifier.
+        id: String,
+    },
+}
+
+/// One access control rule, as stored. Section 12.1.
+///
+/// Rules are consulted in `order`, then by identifier, and the first
+/// one whose subject and filter match decides the operation it has an
+/// answer for; a rule with `None` for an operation says nothing about
+/// it and the next is asked. With no rule matching, and any rule at
+/// all existing, the answer is no.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AclRecord {
+    /// What an operator calls it. Compared exactly.
+    pub id: String,
+    /// Lower is consulted first.
+    pub order: u32,
+    /// Whom it is about: `anyone`, `user:<name>` or `client:<id>`.
+    pub subject: String,
+    /// The topic filter it is about, with MQTT wildcards.
+    pub filter: String,
+    /// Whether publishing to a matching topic is allowed, when this rule
+    /// has an opinion.
+    pub publish: Option<bool>,
+    /// Whether subscribing to a matching filter is allowed, when this
+    /// rule has an opinion.
+    pub subscribe: Option<bool>,
 }
 
 /// A user, as stored. Sections 12.1 and 12.2.
@@ -1698,6 +1737,8 @@ impl Record {
             Self::RuleRemoved { id } => id.len(),
             Self::UserPut(user) => weigh_user(user),
             Self::UserDeleted { name } => name.len(),
+            Self::AclPut(rule) => weigh_acl(rule),
+            Self::AclDeleted { id } => id.len(),
             // The client identifier is a peer's, and the rule
             // identifier an operator's. The payload is not counted
             // because it is not here: the `BodyPut` beside this record
@@ -1755,6 +1796,7 @@ fn weigh_metadata(entry: &MetadataRecord) -> usize {
                 - std::mem::size_of::<Record>()
         }
         Some(MetadataValueRecord::User(user)) => weigh_user(user),
+        Some(MetadataValueRecord::Acl(rule)) => weigh_acl(rule),
     };
     weigh_metadata_key(&entry.key) + value
 }
@@ -1768,7 +1810,13 @@ fn weigh_metadata_key(key: &MetadataKeyRecord) -> usize {
         MetadataKeyRecord::SessionOwner { session } => weigh_key(session),
         MetadataKeyRecord::NodeGroup { group, filter, .. } => group.len() + filter.len(),
         MetadataKeyRecord::User { name } => name.len(),
+        MetadataKeyRecord::Acl { id } => id.len(),
     }
+}
+
+/// What a rule's record holds beyond its own footprint.
+fn weigh_acl(rule: &AclRecord) -> usize {
+    rule.id.len() + rule.subject.len() + rule.filter.len()
 }
 
 /// What a user's record holds beyond its own footprint: the name, the
