@@ -389,6 +389,9 @@ pub struct Shared {
     /// the reading before anything is installed — a node still
     /// starting must not refuse.
     refuse_unconfirmed: AtomicBool,
+    /// Whether a listener has taken charge of the one-second tick. See
+    /// [`Shared::claim_ticker`].
+    ticker_claimed: AtomicBool,
 }
 
 impl Shared {
@@ -451,7 +454,20 @@ impl Shared {
             copies: OnceLock::new(),
             durability: OnceLock::new(),
             refuse_unconfirmed: AtomicBool::new(false),
+            ticker_claimed: AtomicBool::new(false),
         }
+    }
+
+    /// Take charge of the one-second tick, once.
+    ///
+    /// Several listeners share one broker, and the tick — expiries,
+    /// wills, keep-alives — is the broker's, not a listener's. The first
+    /// listener bound on this `Shared` gets `true` and spawns the ticker;
+    /// every later one gets `false` and spawns nothing, so a node with
+    /// three listeners does not sweep its sessions three times a second
+    /// and age a keep-alive three times as fast.
+    pub fn claim_ticker(&self) -> bool {
+        !self.ticker_claimed.swap(true, Ordering::Relaxed)
     }
 
     /// Claim sessions through `migrator`, section 8.4.

@@ -30,6 +30,17 @@ the milestone you are moving to.** Everything else is description.
   one node. Refused at startup on a node that does not cluster, as the
   strict flag is, because it would wait for nobody on every publish.
 
+- **Several listeners on one broker.** `[listener]` stays the default
+  and is named `mqtt`; each `[[listeners]]` entry is one more, named,
+  with its own address, mountpoint and policy over the same sessions,
+  subscriptions and store. Two on one address are refused at startup
+  by name, rather than the second failing to bind after the first is
+  already serving. `GET /api/v1/listeners` lists each with its
+  `max_qos`, `retain_available` and `durability`. **One clock:** the
+  first listener bound drives the node's one-second tick and the rest
+  do not, so a node with three listeners does not age its keep-alives
+  three times as fast.
+
 ## Unreleased — milestone 6: queue replication
 
 ### Before you upgrade: a store written before this milestone is refused

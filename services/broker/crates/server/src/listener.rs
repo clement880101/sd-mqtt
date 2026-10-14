@@ -46,11 +46,26 @@ const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 /// process still needs the file descriptors to go with it.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 100_000;
 
+/// What wraps an accepted socket before MQTT. Section 12.1.
+///
+/// Plain TCP is the only kind today; TLS and WebSocket are the next two
+/// tasks of the listeners plan and arrive as variants here, each a
+/// function from one `AsyncRead + AsyncWrite` to another in front of
+/// the same [`serve`].
+#[derive(Debug, Clone, Default)]
+pub enum Kind {
+    /// MQTT straight over the socket.
+    #[default]
+    Tcp,
+}
+
 /// How a listener is configured.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Where to bind.
     pub address: SocketAddr,
+    /// What this listener speaks under MQTT.
+    pub kind: Kind,
     /// How the broker behind the socket is configured.
     pub broker: BrokerConfig,
     /// How each accepted connection is configured.
@@ -67,6 +82,7 @@ impl Default for ServerConfig {
             // container, where a broker on the loopback is a broker
             // nothing can reach.
             address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT),
+            kind: Kind::Tcp,
             broker: BrokerConfig::default(),
             connection: ConnectionConfig::default(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -128,7 +144,13 @@ impl Server {
         shared.metrics().watch(&shared);
 
         let (shutdown, _) = broadcast::channel(1);
-        let ticker = spawn_ticker(Arc::clone(&shared), shutdown.subscribe());
+        // **One tick per node, not per listener.** The first listener
+        // bound on this broker drives the clock; see
+        // `Shared::claim_ticker`. Stopping that listener stops the
+        // clock, which is why a node stops its listeners together.
+        let ticker = shared
+            .claim_ticker()
+            .then(|| spawn_ticker(Arc::clone(&shared), shutdown.subscribe()));
         let permits = Arc::new(Semaphore::new(config.max_connections));
         // Subscribed here rather than inside the task, because a
         // broadcast receiver only hears what is sent after it exists. A
@@ -137,6 +159,7 @@ impl Server {
         let stop = shutdown.subscribe();
         let accept = tokio::spawn(accept_loop(
             listener,
+            config.kind.clone(),
             Arc::clone(&shared),
             config.connection.clone(),
             permits,
@@ -155,13 +178,15 @@ impl Server {
     }
 }
 
-/// A bound listener, its accept loop and its ticker.
+/// A bound listener, its accept loop and, on the first listener bound
+/// over a broker, the broker's ticker.
 pub struct Running {
     address: SocketAddr,
     shared: Arc<Shared>,
     shutdown: broadcast::Sender<()>,
     accept: JoinHandle<()>,
-    ticker: JoinHandle<()>,
+    /// `Some` on the listener that drives the node's clock.
+    ticker: Option<JoinHandle<()>>,
 }
 
 impl Running {
@@ -188,7 +213,16 @@ impl Running {
         // the state we are asking for.
         let _ = self.shutdown.send(());
         let _ = self.accept.await;
-        let _ = self.ticker.await;
+        if let Some(ticker) = self.ticker {
+            let _ = ticker.await;
+        }
+    }
+
+    /// Whether this listener's shutdown stops the node's clock: true on
+    /// the first listener bound over a `Shared`, false on every later
+    /// one.
+    pub fn drives_the_clock(&self) -> bool {
+        self.ticker.is_some()
     }
 }
 
@@ -200,6 +234,7 @@ impl Running {
 /// [`affects_one_connection`] decides.
 async fn accept_loop(
     listener: TcpListener,
+    kind: Kind,
     shared: Arc<Shared>,
     config: ConnectionConfig,
     permits: Arc<Semaphore>,
@@ -257,20 +292,24 @@ async fn accept_loop(
         let shared = Arc::clone(&shared);
         let config = config.clone();
         let mut stop = shutdown.subscribe();
-        tokio::spawn(async move {
-            tokio::select! {
-                served = serve(socket, shared, config) => {
-                    if let Err(error) = served {
-                        tracing::debug!(%peer, %error, "a connection ended");
+        match &kind {
+            Kind::Tcp => {
+                tokio::spawn(async move {
+                    tokio::select! {
+                        served = serve(socket, shared, config) => {
+                            if let Err(error) = served {
+                                tracing::debug!(%peer, %error, "a connection ended");
+                            }
+                        }
+                        // Dropping the `serve` future drops the value that owes
+                        // the broker a disconnect, which is how the obligation
+                        // is discharged on this path too.
+                        _ = stop.recv() => tracing::debug!(%peer, "a connection was stopped by shutdown"),
                     }
-                }
-                // Dropping the `serve` future drops the value that owes
-                // the broker a disconnect, which is how the obligation
-                // is discharged on this path too.
-                _ = stop.recv() => tracing::debug!(%peer, "a connection was stopped by shutdown"),
+                    drop(permit);
+                });
             }
-            drop(permit);
-        });
+        }
     }
 }
 
@@ -405,5 +444,25 @@ mod tests {
             "the clock did not advance: {before} then {after}"
         );
         running.shutdown().await;
+    }
+
+    /// Two listeners on one broker drive one clock, not two.
+    ///
+    /// A node with three listeners that ticked three times a second
+    /// would expire sessions and age keep-alives three times as fast;
+    /// the first listener bound takes the tick and the rest do not.
+    #[tokio::test]
+    async fn the_first_listener_bound_drives_the_clock_and_the_second_does_not() {
+        let first = Server::bind(ServerConfig::ephemeral())
+            .await
+            .expect("binds");
+        let second = Server::bind_shared(ServerConfig::ephemeral(), Arc::clone(first.shared()))
+            .await
+            .expect("binds beside it");
+        assert!(first.drives_the_clock());
+        assert!(!second.drives_the_clock(), "one broker, one tick");
+        assert_ne!(first.address(), second.address());
+        second.shutdown().await;
+        first.shutdown().await;
     }
 }

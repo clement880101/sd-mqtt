@@ -654,6 +654,9 @@ impl AdminServer {
             // connection limit of its own.
             mountpoint: String::new(),
             max_connections: None,
+            max_qos: None,
+            retain_available: None,
+            durability: None,
         });
 
         let events = Arc::clone(&state.events);

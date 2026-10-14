@@ -392,6 +392,23 @@ max_qos = 2                       # 0, 1 or 2; advertised to version 5 clients
 retain_available = true           # false refuses retained messages
 ```
 
+`[listener]` is the default listener and is named `mqtt`. More
+listeners share the same broker — the same sessions, subscriptions,
+retained messages and store — and each carries its own policy:
+
+```toml
+[[listeners]]
+name = "tenant-b"                 # required; shown on the Cluster and Settings pages
+address = "0.0.0.0:1884"
+mountpoint = "tenant-b"
+max_qos = 1
+```
+
+Two listeners on one address, a nameless entry, and a name the admin
+API already uses for its own rows (`mqtt`, `admin`, `cluster`,
+`ingest`) are refused at startup. `[[listeners]]` is file-only; the
+environment variables below reach `[listener]` alone.
+
 `max_qos` caps what the listener serves. A version 5 client is told the
 cap in the connect acknowledgement; a publish above it is a protocol
 error either way — version 5 is disconnected with reason 0x9B, 3.1.1 is
