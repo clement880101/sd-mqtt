@@ -810,6 +810,8 @@ pub struct Metrics {
     /// Section 12.1's TLS series, registered on the first TLS listener
     /// and absent, not zero, on a node with none. See [`Metrics::tls`].
     tls: OnceLock<Arc<TlsCounters>>,
+    /// Refused WebSocket upgrades, by reason; the same rule.
+    websocket_refused: OnceLock<Family<[(&'static str, &'static str); 1], Counter>>,
 }
 
 /// What a running cluster can be asked for, once there is one.
@@ -1164,6 +1166,7 @@ impl Metrics {
             watched: AtomicBool::new(false),
             watching_cluster: AtomicBool::new(false),
             tls: OnceLock::new(),
+            websocket_refused: OnceLock::new(),
         }
     }
 
@@ -1209,6 +1212,22 @@ impl Metrics {
             );
             counters
         }))
+    }
+
+    /// A WebSocket upgrade refused for `reason`, registered on first
+    /// use for the reason [`Metrics::tls`] is.
+    pub fn websocket_refused(&self, reason: &'static str) -> Counter {
+        self.websocket_refused
+            .get_or_init(|| {
+                let family = Family::default();
+                self.registry.lock().register(
+                    "websocket_upgrades_refused",
+                    "WebSocket upgrades not served, by why",
+                    family.clone(),
+                );
+                family
+            })
+            .get_or_create_owned(&[("reason", reason)])
     }
 
     /// Register section 11.3's cluster numbers, read from the mesh

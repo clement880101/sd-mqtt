@@ -583,6 +583,10 @@ pub enum ListenerProtocol {
     Mqtt,
     /// MQTT over TLS. Section 12.1.
     MqttTls,
+    /// MQTT over WebSocket.
+    MqttWs,
+    /// MQTT over WebSocket over TLS.
+    MqttWss,
     /// This API.
     Admin,
     /// Section 9.2's ingest endpoint, on a listener of its own.

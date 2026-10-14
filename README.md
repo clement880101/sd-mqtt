@@ -435,6 +435,24 @@ are not asked for. `sdmqtt_tls_handshakes_failed_total` and
 `sdmqtt_tls_certificate_reloads_total{outcome}` count what happened,
 and exist only on a node with a TLS listener.
 
+And WebSocket, plain or over TLS:
+
+```toml
+[[listeners]]
+name = "web"
+kind = "ws"                                 # or "wss", with a [listeners.tls] table
+address = "0.0.0.0:8080"
+```
+
+A client upgrades on any path — libraries default to `/mqtt`, `/ws`
+and `/`, and refusing all but one would be wrong in every tutorial —
+and must offer the `mqtt` subprotocol, which the broker confirms. MQTT
+travels in binary frames; a text frame closes the connection with
+1003, and pings are answered underneath. One frame may carry part of a
+packet or several packets, as the standard allows. A refused upgrade is
+counted on `sdmqtt_websocket_upgrades_refused_total{reason}`, which
+exists only on a node with a WebSocket listener.
+
 `max_qos` caps what the listener serves. A version 5 client is told the
 cap in the connect acknowledgement; a publish above it is a protocol
 error either way — version 5 is disconnected with reason 0x9B, 3.1.1 is

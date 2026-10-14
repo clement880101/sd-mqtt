@@ -1025,6 +1025,10 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         let (protocol, over) = match &server.kind {
             sdmqtt_server::listener::Kind::Tcp => (ListenerProtocol::Mqtt, "TCP"),
             sdmqtt_server::listener::Kind::Tls(_) => (ListenerProtocol::MqttTls, "TLS"),
+            sdmqtt_server::listener::Kind::Ws => (ListenerProtocol::MqttWs, "WebSocket"),
+            sdmqtt_server::listener::Kind::Wss(_) => {
+                (ListenerProtocol::MqttWss, "WebSocket over TLS")
+            }
         };
         let running = Server::bind_shared(server, Arc::clone(&shared)).await?;
         tracing::info!(

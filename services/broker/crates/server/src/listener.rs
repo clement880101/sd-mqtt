@@ -25,6 +25,7 @@ use crate::connection::{serve, ConnectionConfig};
 use crate::shared::Shared;
 use crate::ticker::spawn_ticker;
 use crate::tls;
+use crate::websocket;
 
 /// The port MQTT over plain TCP is registered on.
 pub const DEFAULT_PORT: u16 = 1883;
@@ -61,6 +62,10 @@ pub enum Kind {
     /// A TLS handshake first, with the certificate these settings name
     /// and re-read. Section 12.1.
     Tls(tls::Settings),
+    /// An HTTP upgrade to WebSocket first, then MQTT in binary frames.
+    Ws,
+    /// Both: TLS, then the upgrade, then MQTT.
+    Wss(tls::Settings),
 }
 
 /// How a listener is configured.
@@ -142,10 +147,17 @@ impl Server {
         // configuration already checked the files at startup; this is
         // the read that keeps them.
         let acceptor = match &config.kind {
-            Kind::Tcp => None,
-            Kind::Tls(settings) => Some(Arc::new(
+            Kind::Tcp | Kind::Ws => None,
+            Kind::Tls(settings) | Kind::Wss(settings) => Some(Arc::new(
                 tls::Acceptor::load(settings, shared.metrics().tls()).map_err(io::Error::other)?,
             )),
+        };
+        let accepting = match (&config.kind, acceptor.clone()) {
+            (Kind::Tcp, _) => Accepting::Plain,
+            (Kind::Ws, _) => Accepting::Ws,
+            (Kind::Tls(_), Some(acceptor)) => Accepting::Tls(acceptor),
+            (Kind::Wss(_), Some(acceptor)) => Accepting::Wss(acceptor),
+            (Kind::Tls(_) | Kind::Wss(_), None) => unreachable!("loaded just above"),
         };
         let listener = TcpListener::bind(config.address).await?;
         let address = listener.local_addr()?;
@@ -173,7 +185,7 @@ impl Server {
         let stop = shutdown.subscribe();
         let accept = tokio::spawn(accept_loop(
             listener,
-            acceptor.clone().map_or(Accepting::Plain, Accepting::Tls),
+            accepting,
             Arc::clone(&shared),
             config.connection.clone(),
             permits,
@@ -273,6 +285,8 @@ impl Running {
 enum Accepting {
     Plain,
     Tls(Arc<tls::Acceptor>),
+    Ws,
+    Wss(Arc<tls::Acceptor>),
 }
 
 async fn accept_loop(
@@ -342,29 +356,91 @@ async fn accept_loop(
             Accepting::Tls(acceptor) => {
                 let acceptor = Arc::clone(acceptor);
                 tokio::spawn(async move {
-                    // Bounded by the same timeout the CONNECT is: a peer
-                    // that opens a socket and never finishes a handshake
-                    // is the peer that never sends CONNECT.
-                    let handshake =
-                        tokio::time::timeout(config.connect_timeout, acceptor.accept(socket)).await;
-                    match handshake {
-                        Ok(Ok(stream)) => serving(stream, peer, shared, config, stop, permit).await,
-                        Ok(Err(error)) => {
-                            shared.metrics().tls().handshakes_failed.inc();
-                            tracing::debug!(%peer, %error, "a TLS handshake failed");
-                            drop(permit);
-                        }
-                        Err(_) => {
-                            shared.metrics().tls().handshakes_failed.inc();
-                            tracing::debug!(
-                                %peer,
-                                "a TLS handshake did not finish within the connect timeout"
-                            );
-                            drop(permit);
-                        }
+                    match handshaken(&acceptor, socket, peer, &shared, &config).await {
+                        Some(stream) => serving(stream, peer, shared, config, stop, permit).await,
+                        None => drop(permit),
                     }
                 });
             }
+            Accepting::Ws => {
+                tokio::spawn(async move {
+                    match upgraded(socket, peer, &shared, &config).await {
+                        Some(stream) => serving(stream, peer, shared, config, stop, permit).await,
+                        None => drop(permit),
+                    }
+                });
+            }
+            Accepting::Wss(acceptor) => {
+                let acceptor = Arc::clone(acceptor);
+                tokio::spawn(async move {
+                    // One connect timeout covers both layers, not one
+                    // each: what is being bounded is how long a socket
+                    // may be open without MQTT on it.
+                    let started = tokio::time::Instant::now();
+                    let Some(stream) = handshaken(&acceptor, socket, peer, &shared, &config).await
+                    else {
+                        drop(permit);
+                        return;
+                    };
+                    let remaining = config.connect_timeout.saturating_sub(started.elapsed());
+                    let config = ConnectionConfig {
+                        connect_timeout: remaining,
+                        ..config
+                    };
+                    match upgraded(stream, peer, &shared, &config).await {
+                        Some(stream) => serving(stream, peer, shared, config, stop, permit).await,
+                        None => drop(permit),
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// The TLS handshake, bounded by the connect timeout and counted when
+/// it fails: a peer that opens a socket and never finishes a handshake
+/// is the peer that never sends CONNECT.
+async fn handshaken<S>(
+    acceptor: &tls::Acceptor,
+    socket: S,
+    peer: SocketAddr,
+    shared: &Shared,
+    config: &ConnectionConfig,
+) -> Option<tokio_rustls::server::TlsStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(config.connect_timeout, acceptor.accept(socket)).await {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(error)) => {
+            shared.metrics().tls().handshakes_failed.inc();
+            tracing::debug!(%peer, %error, "a TLS handshake failed");
+            None
+        }
+        Err(_) => {
+            shared.metrics().tls().handshakes_failed.inc();
+            tracing::debug!(%peer, "a TLS handshake did not finish within the connect timeout");
+            None
+        }
+    }
+}
+
+/// The WebSocket upgrade, bounded and counted the same way.
+async fn upgraded<S>(
+    socket: S,
+    peer: SocketAddr,
+    shared: &Shared,
+    config: &ConnectionConfig,
+) -> Option<websocket::Bytes<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match websocket::upgrade(socket, config.connect_timeout).await {
+        Ok(stream) => Some(stream),
+        Err(refused) => {
+            shared.metrics().websocket_refused(refused.label()).inc();
+            tracing::debug!(%peer, %refused, "a WebSocket upgrade was not served");
+            None
         }
     }
 }

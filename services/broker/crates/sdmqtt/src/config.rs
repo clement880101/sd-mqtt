@@ -258,9 +258,6 @@ impl std::str::FromStr for LogLevel {
 
 /// What a listener speaks under MQTT. Section 12.1.
 ///
-/// `ws` and `wss` arrive with the next task of the listeners plan, and
-/// until they do a file naming one is refused by the parser as an
-/// unknown variant, which is the honest answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ListenerKind {
@@ -269,12 +266,16 @@ pub enum ListenerKind {
     Tcp,
     /// A TLS handshake first; `tls` names the certificate and key.
     Tls,
+    /// An HTTP upgrade to WebSocket first, then MQTT in binary frames.
+    Ws,
+    /// Both: TLS, then the upgrade. `tls` names the certificate and key.
+    Wss,
 }
 
 impl ListenerKind {
     /// Whether this kind needs a certificate.
     fn encrypted(self) -> bool {
-        matches!(self, Self::Tls)
+        matches!(self, Self::Tls | Self::Wss)
     }
 }
 
@@ -1989,9 +1990,16 @@ impl Config {
                 (ListenerKind::Tls, Some(tls)) => {
                     sdmqtt_server::listener::Kind::Tls(tls.settings())
                 }
-                // `validate` refuses a TLS listener without a table, so
-                // the fallback is unreachable on anything `load` returns.
-                _ => sdmqtt_server::listener::Kind::Tcp,
+                (ListenerKind::Wss, Some(tls)) => {
+                    sdmqtt_server::listener::Kind::Wss(tls.settings())
+                }
+                (ListenerKind::Ws, _) => sdmqtt_server::listener::Kind::Ws,
+                // `validate` refuses an encrypted listener without a
+                // table, so the fallback is unreachable on anything
+                // `load` returns.
+                (ListenerKind::Tcp | ListenerKind::Tls | ListenerKind::Wss, _) => {
+                    sdmqtt_server::listener::Kind::Tcp
+                }
             },
             broker: BrokerConfig {
                 limits,
@@ -3437,6 +3445,32 @@ mod tests {
         std::fs::remove_file(&certificate).expect("removed");
         let why = good.validate().expect_err("no such file").to_string();
         assert!(why.contains("could not be read"), "{why}");
+    }
+
+    /// `ws` needs no certificate and `wss` does; each maps to its kind.
+    #[test]
+    fn websocket_kinds_map_and_wss_needs_a_certificate() {
+        let plain = Config::from_toml(
+            "[[listeners]]\nname = \"web\"\nkind = \"ws\"\naddress = \"127.0.0.1:8080\"\n",
+        )
+        .expect("parses");
+        plain
+            .validate()
+            .expect("a plain WebSocket listener needs nothing more");
+        assert!(matches!(
+            plain.servers()[1].1.kind,
+            sdmqtt_server::listener::Kind::Ws
+        ));
+
+        let bare = Config::from_toml(
+            "[[listeners]]\nname = \"web\"\nkind = \"wss\"\naddress = \"127.0.0.1:8443\"\n",
+        )
+        .expect("parses");
+        let why = bare
+            .validate()
+            .expect_err("wss without a certificate")
+            .to_string();
+        assert!(why.contains("listeners[0].tls"), "{why}");
     }
 
     /// A certificate on a plain listener is a listener somebody believes

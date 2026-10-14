@@ -52,6 +52,17 @@ the milestone you are moving to.** Everything else is description.
   already linked; `rustls`, `rustls-pki-types` and `tokio-rustls`
   become direct dependencies of the server crate.
 
+- **MQTT over WebSocket**, `kind = "ws"`, and over TLS, `"wss"`. The
+  `mqtt` subprotocol is required and confirmed, every path upgrades,
+  MQTT travels in binary frames and a text frame is closed with 1003.
+  The connection shell never learns there was a frame: the adapter
+  reads binary frames as bytes and writes each burst as one frame,
+  flushing inside the write, because tungstenite queues a frame until
+  flushed and the shell flushes only at the end of a burst. Refused
+  upgrades are counted by reason, on a series that exists only on a
+  node with a WebSocket listener. `tokio-tungstenite` and
+  `futures-util` are new direct dependencies.
+
 ## Unreleased — milestone 6: queue replication
 
 ### Before you upgrade: a store written before this milestone is refused
