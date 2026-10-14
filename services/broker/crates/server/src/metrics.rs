@@ -391,18 +391,38 @@ fn outcome_index(outcome: SocketOutcome) -> usize {
 
 /// How an authentication ended.
 ///
-/// Authentication itself is milestone 7. The outcomes are registered
-/// now and are **deliberately zero rather than missing**, so that the
-/// dashboard and the alerting rule an operator writes against this
-/// broker today keep working unchanged when it arrives. A family with
-/// no series is skipped by the encoder entirely, which is why the
-/// handles are resolved here like every other.
+/// Registered before authentication existed, at zero rather than
+/// missing, so a dashboard written against an earlier build kept
+/// working; since milestone 7 both move. A family with no series is
+/// skipped by the encoder entirely, which is why the handles are
+/// resolved here like every other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthOutcome {
     /// The client proved who it said it was.
     Success,
     /// It did not, and was refused.
     Failure,
+}
+
+/// Which of section 10.3's limiters turned something away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limiter {
+    /// A session's publish cap: the connection was closed with 0x96.
+    Publish,
+    /// An address's authentication failures: a CONNECT was refused
+    /// before its credentials were looked at.
+    Authentication,
+}
+
+/// Every limiter, in the order the handles are indexed in.
+const LIMITERS: [Limiter; 2] = [Limiter::Publish, Limiter::Authentication];
+
+/// The label value for a limiter.
+fn limiter_label(limiter: Limiter) -> &'static str {
+    match limiter {
+        Limiter::Publish => "publish",
+        Limiter::Authentication => "authentication",
+    }
 }
 
 /// Every authentication outcome, in the order the handles are indexed
@@ -786,9 +806,14 @@ pub struct Metrics {
     sockets_closed: [Counter; SOCKET_OUTCOMES.len()],
     /// Indexed by [`REASON_KINDS`] then by [`ALL_REASONS`].
     reasons_sent: [[Counter; ALL_REASONS.len()]; REASON_KINDS.len()],
-    /// Registered and never incremented until milestone 7. See
-    /// [`AUTH_OUTCOMES`].
+    /// Indexed by [`AUTH_OUTCOMES`].
     authentications: [Counter; AUTH_OUTCOMES.len()],
+    /// Section 10.3: what each limiter turned away. Indexed by
+    /// [`LIMITERS`].
+    rate_limited: [Counter; LIMITERS.len()],
+    /// How many addresses the authentication limiter is holding, as of
+    /// the last sweep.
+    auth_failure_addresses: Gauge,
     /// Section 11.3: a message never disappears without being
     /// counted. One family, two tables — the broker's own reasons and
     /// the shell's — because an operator wants one number for
@@ -1106,6 +1131,22 @@ impl Metrics {
             auth.get_or_create_owned(&[("outcome", auth_label(AUTH_OUTCOMES[at]))])
         });
 
+        let limited = Family::<[(&'static str, &'static str); 1], Counter>::default();
+        registry.register(
+            "rate_limited",
+            "What section 10.3's limiters turned away, by limiter",
+            limited.clone(),
+        );
+        let rate_limited = std::array::from_fn(|at| {
+            limited.get_or_create_owned(&[("limiter", limiter_label(LIMITERS[at]))])
+        });
+        let auth_failure_addresses = Gauge::default();
+        registry.register(
+            "auth_failure_addresses",
+            "Addresses the authentication failure limiter is holding",
+            auth_failure_addresses.clone(),
+        );
+
         let dropped = Family::<[(&'static str, &'static str); 1], Counter>::default();
         registry.register(
             "messages_dropped",
@@ -1157,6 +1198,8 @@ impl Metrics {
             sockets_closed,
             reasons_sent,
             authentications,
+            rate_limited,
+            auth_failure_addresses,
             admin_events_dropped,
             publications_refused,
             dropped_by_queue,
@@ -1360,12 +1403,25 @@ impl Metrics {
         &self.reasons_sent[at][reason_index(reason)]
     }
 
-    /// An authentication attempt, by outcome.
-    ///
-    /// Nothing calls this yet and that is the point: see
-    /// [`AuthOutcome`]. Milestone 7 is where it starts moving.
+    /// An authentication decision, by outcome: a CONNECT admitted or
+    /// refused by the authenticate chain or the enhanced exchange, and
+    /// a re-authentication. A connect turned away by the limiter is not
+    /// one; it is [`Metrics::rate_limited`].
     pub fn authentication(&self, outcome: AuthOutcome) -> &Counter {
         &self.authentications[auth_index(outcome)]
+    }
+
+    /// Something a section 10.3 limiter turned away.
+    pub fn rate_limited(&self, limiter: Limiter) -> &Counter {
+        &self.rate_limited[match limiter {
+            Limiter::Publish => 0,
+            Limiter::Authentication => 1,
+        }]
+    }
+
+    /// How many addresses the authentication limiter holds.
+    pub fn auth_failure_addresses(&self) -> &Gauge {
+        &self.auth_failure_addresses
     }
 
     /// A message the broker discarded, by the reason it reported.

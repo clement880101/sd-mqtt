@@ -82,6 +82,19 @@ rejoin and be repaired before the next.
   refusal; 0x87 on an acknowledged publish, dropped and counted
   otherwise. Only the first level is reserved.
 
+- **Two rate limiters**, section 10.3, both the generic cell rate
+  algorithm on the broker's coarse clock. **Repeated authentication
+  failures from one address are slowed**: after
+  `auth.max_failures_per_minute` (10 by default) a connect from it is
+  refused with 0x9F before its credentials are read, until the minute
+  drains; IPv6 is counted by /64, and the tick sweeps the map. A
+  listener's `max_publish_rate` and `publish_burst` cap one session's
+  publishes, off by default; over it, version 5 is disconnected with
+  0x96 and 3.1.1 closed. `sdmqtt_authentications_total{outcome}`, a
+  series registered at zero since milestone 3, now moves;
+  `sdmqtt_rate_limited_total{limiter}` and
+  `sdmqtt_auth_failure_addresses` are new.
+
 - **API keys**, section 11.1, with `read`, `write` and `admin` scopes.
   `POST /api/v1/keys` mints one and shows it once; the broker stores a
   SHA-256 digest; `DELETE /api/v1/keys/{id}` revokes, and keys and

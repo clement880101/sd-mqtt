@@ -445,7 +445,7 @@ gate, and ticked here as it lands:
 - [x] **Task 4** — API keys with `read`, `write` and `admin` scopes,
   hashed at rest and shown once; the configured token stays as a bootstrap
   key with admin scope; revocation replicates as a tombstone.
-- [ ] **Task 5** — section 10.3's two limiters: the per-session publish
+- [x] **Task 5** — section 10.3's two limiters: the per-session publish
   rate (a cell-rate field in the session, 0x96 on v5, a close on 3.1.1)
   and the per-address authentication-failure limiter swept by the tick.
 - [ ] **Task 6** — the Settings page: users, access control rules, API

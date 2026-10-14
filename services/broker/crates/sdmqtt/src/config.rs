@@ -344,6 +344,15 @@ pub struct Listener {
     /// `"async"` or `"sync"`; absent takes `cluster.durability`. The
     /// wait is bounded by `cluster.sync_timeout_ms` in both cases.
     pub durability: Option<Durability>,
+    /// Section 10.3: how many PUBLISH packets a second one session on
+    /// this listener may send. Zero, the default, is no cap. Over it, a
+    /// version 5 client is disconnected with 0x96 and a 3.1.1 client
+    /// is closed.
+    pub max_publish_rate: u32,
+    /// How many of them may come at once. Raised to the rate if set
+    /// below it, because the clock this is measured on moves a whole
+    /// second at a time. Zero takes the rate.
+    pub publish_burst: u32,
 }
 
 impl Default for Listener {
@@ -358,6 +367,8 @@ impl Default for Listener {
             max_qos: 2,
             retain_available: true,
             durability: None,
+            max_publish_rate: 0,
+            publish_burst: 0,
         }
     }
 }
@@ -746,6 +757,11 @@ pub struct AuthConfig {
     /// client's connect time. 4096 is RFC 7677's example and the
     /// common floor.
     pub scram_iterations: u32,
+    /// Section 10.3: failed authentications a minute from one address —
+    /// one IPv4 address, or one IPv6 /64 — before its connects are
+    /// refused unread, with 0x9F (3 on 3.1.1), until the minute drains.
+    /// Zero is no limit.
+    pub max_failures_per_minute: u32,
 }
 
 impl Default for AuthConfig {
@@ -753,6 +769,7 @@ impl Default for AuthConfig {
         Self {
             anonymous: true,
             scram_iterations: 4096,
+            max_failures_per_minute: sdmqtt_server::shared::DEFAULT_AUTH_FAILURES_PER_MINUTE,
         }
     }
 }
@@ -1740,6 +1757,16 @@ impl Config {
         if let Some(value) = lookup("SDMQTT_AUTH_SCRAM_ITERATIONS") {
             self.auth.scram_iterations = parse("SDMQTT_AUTH_SCRAM_ITERATIONS", &value, "count")?;
         }
+        if let Some(value) = lookup("SDMQTT_AUTH_MAX_FAILURES_PER_MINUTE") {
+            self.auth.max_failures_per_minute =
+                parse("SDMQTT_AUTH_MAX_FAILURES_PER_MINUTE", &value, "count")?;
+        }
+        if let Some(value) = lookup("SDMQTT_MAX_PUBLISH_RATE") {
+            self.listener.max_publish_rate = parse("SDMQTT_MAX_PUBLISH_RATE", &value, "count")?;
+        }
+        if let Some(value) = lookup("SDMQTT_PUBLISH_BURST") {
+            self.listener.publish_burst = parse("SDMQTT_PUBLISH_BURST", &value, "count")?;
+        }
         if let Some(value) = lookup("SDMQTT_LISTENER_DURABILITY") {
             self.listener.durability = Some(match value.as_str() {
                 "async" => Durability::Async,
@@ -2131,6 +2158,8 @@ impl Config {
                 max_qos: listener.max_qos(),
                 retain_available: listener.retain_available,
                 durability: listener.durability,
+                max_publish_rate: listener.max_publish_rate,
+                publish_burst: listener.publish_burst,
                 // Derived from the bounds it drains rather than left a
                 // constant, so raising the queue raises the channel the
                 // queue empties into. `validate` refuses a configuration
@@ -3460,6 +3489,45 @@ mod tests {
         .expect("parses");
         let why = twice.validate().expect_err("x twice").to_string();
         assert!(why.contains("share this identifier"), "{why}");
+    }
+
+    /// Section 10.3's two limits are read from the file and the
+    /// environment, and reach what the listener and the node are given.
+    #[test]
+    fn the_rate_limits_are_read_and_reach_the_connection() {
+        let defaults = Config::default();
+        assert_eq!(defaults.auth.max_failures_per_minute, 10);
+        assert_eq!(defaults.server().connection.max_publish_rate, 0, "no cap");
+
+        let config = Config::from_toml(
+            r#"
+            [auth]
+            max_failures_per_minute = 3
+
+            [listener]
+            max_publish_rate = 100
+            publish_burst = 500
+        "#,
+        )
+        .expect("the keys are known");
+        config.validate().expect("valid");
+        assert_eq!(config.auth.max_failures_per_minute, 3);
+        let server = config.server();
+        assert_eq!(server.connection.max_publish_rate, 100);
+        assert_eq!(server.connection.publish_burst, 500);
+
+        let mut from_env = Config::default();
+        from_env
+            .apply_env(|name| match name {
+                "SDMQTT_AUTH_MAX_FAILURES_PER_MINUTE" => Some("0".to_owned()),
+                "SDMQTT_MAX_PUBLISH_RATE" => Some("50".to_owned()),
+                "SDMQTT_PUBLISH_BURST" => Some("60".to_owned()),
+                _ => None,
+            })
+            .expect("all three read");
+        assert_eq!(from_env.auth.max_failures_per_minute, 0);
+        assert_eq!(from_env.listener.max_publish_rate, 50);
+        assert_eq!(from_env.listener.publish_burst, 60);
     }
 
     /// Section 12.1's switches are read, and a cheap verifier refused.

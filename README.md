@@ -387,6 +387,7 @@ keeps the outbox.
 [auth]
 anonymous = true                  # false refuses a client with no username
 scram_iterations = 4096           # PBKDF2 rounds for a new SCRAM-SHA-256 verifier
+max_failures_per_minute = 10      # failed logins from one address before it waits; 0 is no limit
 ```
 
 Users are not in the file. They are durable metadata, written through
@@ -408,6 +409,19 @@ nobody can learn which names exist by trying. `anonymous` is a switch
 and nothing else: creating the first user does not flip it. A node with
 no store holds no users and admits by the default alone.
 `SDMQTT_AUTH_ANONYMOUS` and `SDMQTT_AUTH_SCRAM_ITERATIONS` set the two.
+
+**Repeated failures from one address are slowed.** After
+`max_failures_per_minute` failed logins — a wrong password, an unknown
+name, a failed SCRAM proof or re-authentication — a connect from that
+address is refused before its credentials are looked at, with 0x9F
+(`3`, server unavailable, on 3.1.1), until enough of the minute has
+passed for one more try. An IPv6 address is counted by its /64, which
+is what one host is usually given. The broker tracks at most 65,536
+addresses and logs a warning when that is full.
+`sdmqtt_authentications_total{outcome}` counts every decision,
+`sdmqtt_rate_limited_total{limiter="authentication"}` the connects
+turned away, and `sdmqtt_auth_failure_addresses` how many addresses are
+held. `SDMQTT_AUTH_MAX_FAILURES_PER_MINUTE` sets it.
 
 A version 5 client can authenticate without sending its password at all,
 with **SCRAM-SHA-256** over the AUTH exchange (RFC 7677): it names the
@@ -497,7 +511,18 @@ max_connections = 100000
 mountpoint = ""                   # a namespace; two mountpoints are two sets of sessions
 max_qos = 2                       # 0, 1 or 2; advertised to version 5 clients
 retain_available = true           # false refuses retained messages
+max_publish_rate = 0              # PUBLISH packets a second per session; 0 is no cap
+publish_burst = 0                 # how many at once; never less than the rate
 ```
+
+A session over `max_publish_rate` is disconnected, with 0x96 (message
+rate too high) on version 5 and a bare close on 3.1.1, because neither
+version can refuse one publication for rate and keep the connection.
+Each is counted on `sdmqtt_rate_limited_total{limiter="publish"}`. The
+rate is measured on the broker's one-second clock, which is why the
+burst is never less than one second's worth.
+`SDMQTT_MAX_PUBLISH_RATE` and `SDMQTT_PUBLISH_BURST` set the two on
+`[listener]`.
 
 `[listener]` is the default listener and is named `mqtt`. More
 listeners share the same broker — the same sessions, subscriptions,

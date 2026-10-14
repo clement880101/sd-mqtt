@@ -1058,6 +1058,21 @@ The per-address authentication failure limiter is a mutex-guarded map swept
 by the one-second task, dropping entries older than the window. Authentication
 failures are rare, so a single mutex is adequate.
 
+**As built in milestone 7.** The publish cap's field is on the attached
+connection, the shell's per-session state, rather than in `broker-core`'s
+session: it is checked with the listener's other policies before the broker
+lock is taken, and a reconnect starts it afresh, which costs a client a whole
+CONNECT. It is per listener, `max_publish_rate` and `publish_burst`, off by
+default; over it, version 5 is told DISCONNECT 0x96 and 3.1.1 is closed,
+since neither can refuse one publication for rate. The burst is never below
+one second's worth of the rate, because the coarse clock moves a whole second
+at a time and a smaller burst would cap below the rate. The failure limiter
+is `auth.max_failures_per_minute`, ten by default: only a failure charges it,
+an address over it is refused with 0x9F (3 on 3.1.1) **before its
+credentials are read**, an IPv6 address is counted by its /64, and the map
+holds at most 65,536 addresses, tracking no new one when full and warning
+once a sweep, because memory is the broker's to protect first.
+
 ### 10.4 Memory
 
 mimalloc is the global allocator on every non-Windows target, enabled by

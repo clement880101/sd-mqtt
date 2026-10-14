@@ -1005,6 +1005,11 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         None => Arc::new(Shared::new(config.server().broker)),
     };
 
+    // Section 10.3's authentication failure limiter, before anything
+    // binds, on every node: a node with no store authenticates through
+    // its hooks and is guessed at just the same.
+    shared.limit_authentication_failures(config.auth.max_failures_per_minute);
+
     // Section 12.1's directory, **before anything binds**, for the
     // reason the rules are: the first packet after a listener comes up
     // is a CONNECT, and a connect that found no authenticator installed

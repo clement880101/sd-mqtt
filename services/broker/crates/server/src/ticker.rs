@@ -50,6 +50,9 @@ pub fn spawn_ticker(shared: Arc<Shared>, mut shutdown: broadcast::Receiver<()>) 
                     // cannot keep up, and an operator needs both.
                     shared.report_rejections();
                     shared.report_pacing();
+                    // Section 10.3: the authentication limiter's
+                    // drained addresses go, after the clock moved.
+                    shared.sweep_authentication_failures();
                 }
                 _ = shutdown.recv() => return,
             }
@@ -92,6 +95,29 @@ mod tests {
             now, 4,
             "four ticks in four and a half seconds: one a second, and none at zero"
         );
+
+        drop(shutdown);
+        let _ = handle.await;
+    }
+
+    /// Section 10.3: the tick is what forgets an address whose
+    /// failures have drained, and what keeps the gauge honest.
+    #[tokio::test(start_paused = true)]
+    async fn the_tick_sweeps_the_authentication_failure_limiter() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let guesser: std::net::IpAddr = "192.0.2.9".parse().expect("an address");
+        shared.authentication_failed(guesser);
+        let (shutdown, _) = tokio::sync::broadcast::channel(1);
+        let handle = spawn_ticker(Arc::clone(&shared), shutdown.subscribe());
+
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(
+            shared.metrics().auth_failure_addresses().get(),
+            1,
+            "one failure at ten a minute drains in six seconds"
+        );
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(shared.metrics().auth_failure_addresses().get(), 0);
 
         drop(shutdown);
         let _ = handle.await;

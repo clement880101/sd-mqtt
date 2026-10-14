@@ -221,6 +221,12 @@ impl Committed {
     }
 }
 
+/// Section 10.3's default: ten failed authentications a minute from
+/// one address, all ten at once if they come together. Enough for a
+/// person mistyping and a device retrying with a stale password, and
+/// a slow crawl for a guesser.
+pub const DEFAULT_AUTH_FAILURES_PER_MINUTE: u32 = 10;
+
 /// The broker, and where to send what it produces.
 ///
 /// The broker's methods take an exclusive reference, so every packet in
@@ -396,6 +402,12 @@ pub struct Shared {
     /// Installed by the node from its directory; absent on a node with
     /// no store, where the exchange is refused as a bad method.
     verifiers: OnceLock<Arc<dyn crate::scram::Verifiers>>,
+    /// Section 10.3's per-address authentication failure limiter. One
+    /// mutex: failures are rare. Swept by the tick.
+    auth_failures: parking_lot::Mutex<crate::rate::AuthFailures>,
+    /// The broker's coarse clock, held here too so the limiters read
+    /// it without taking the broker's lock.
+    clock: Arc<broker_core::clock::CoarseClock>,
 }
 
 impl Shared {
@@ -442,7 +454,12 @@ impl Shared {
             }
             None => (None, None),
         };
+        let clock = Arc::clone(broker.clock());
         Self {
+            clock,
+            auth_failures: parking_lot::Mutex::new(crate::rate::AuthFailures::new(
+                DEFAULT_AUTH_FAILURES_PER_MINUTE,
+            )),
             broker: Mutex::new(broker),
             writer,
             replicated,
@@ -461,6 +478,47 @@ impl Shared {
             ticker_claimed: AtomicBool::new(false),
             verifiers: OnceLock::new(),
         }
+    }
+
+    /// Section 10.3: how many authentication failures a minute one
+    /// address may have before its connects are refused unread. Zero
+    /// is no limit. Set by the node before anything binds; what it
+    /// replaces is the default, holding nothing.
+    pub fn limit_authentication_failures(&self, per_minute: u32) {
+        *self.auth_failures.lock() = crate::rate::AuthFailures::new(per_minute);
+    }
+
+    /// Whether `peer` is over its authentication failure limit now.
+    #[must_use]
+    pub fn authentication_limited(&self, peer: std::net::IpAddr) -> bool {
+        self.auth_failures.lock().limited(peer, self.clock.now())
+    }
+
+    /// `peer` failed to authenticate now.
+    pub fn authentication_failed(&self, peer: std::net::IpAddr) {
+        self.auth_failures.lock().failed(peer, self.clock.now());
+    }
+
+    /// Forget every address that has drained, and report the rest.
+    /// The tick's, once a second.
+    pub fn sweep_authentication_failures(&self) {
+        let (held, overflowed) = self.auth_failures.lock().sweep(self.clock.now());
+        self.metrics
+            .auth_failure_addresses()
+            .set(i64::try_from(held).unwrap_or(i64::MAX));
+        if overflowed {
+            tracing::warn!(
+                held,
+                "the authentication failure limiter is full; failures from addresses it does \
+                 not already hold are not being limited"
+            );
+        }
+    }
+
+    /// The broker's coarse clock, read without its lock.
+    #[must_use]
+    pub fn clock(&self) -> &Arc<broker_core::clock::CoarseClock> {
+        &self.clock
     }
 
     /// Where SCRAM verifiers come from, section 12.2. Once.

@@ -45,7 +45,8 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::framing::{FrameError, FrameReader};
-use crate::metrics::{Metrics, ShellDrop, SocketOutcome};
+use crate::metrics::{AuthOutcome, Limiter, Metrics, ShellDrop, SocketOutcome};
+use crate::rate::PublishLimit;
 use crate::scram;
 use crate::shared::{promises_durability, Shared};
 use storage::SessionKey;
@@ -214,6 +215,18 @@ pub struct ConnectionConfig {
     /// synchronous while one carrying telemetry is not; the timeout is
     /// the node's in both cases.
     pub durability: Option<cluster::Durability>,
+    /// Section 10.3: how many PUBLISH packets a second one session may
+    /// send, zero for no cap. Over it, a version 5 client is told
+    /// DISCONNECT 0x96 and a 3.1.1 one is closed.
+    pub max_publish_rate: u32,
+    /// How many of them may come at once. Never less than the rate:
+    /// see [`crate::rate`].
+    pub publish_burst: u32,
+    /// Who connected, set by the listener on each accepted socket so
+    /// section 10.3's authentication failure limiter can count by
+    /// address. `None` for a connection served without one, which no
+    /// limiter counts.
+    pub peer: Option<std::net::IpAddr>,
 }
 
 impl Default for ConnectionConfig {
@@ -240,6 +253,9 @@ impl Default for ConnectionConfig {
             max_qos: QoS::ExactlyOnce,
             retain_available: true,
             durability: None,
+            max_publish_rate: 0,
+            publish_burst: 0,
+            peer: None,
         }
     }
 }
@@ -523,13 +539,35 @@ where
         }
     }
 
+    // Section 10.3: an address over its authentication failure limit is
+    // refused before its credentials are looked at, so a guesser learns
+    // nothing from the attempts the limiter turned away. 0x9F on version
+    // 5; 3.1.1 has no such code, and its CONNACK says 3, "server
+    // unavailable", which is true of this address for now and invites
+    // the retry later that is wanted.
+    if let Some(peer) = config.peer {
+        if shared.authentication_limited(peer) {
+            metrics.rate_limited(Limiter::Authentication).inc();
+            refuse(
+                &mut write_half,
+                version,
+                ReasonCode::ConnectionRateExceeded,
+                &metrics,
+            )
+            .await?;
+            return Err(ConnectionError::Protocol(
+                ReasonCode::ConnectionRateExceeded,
+            ));
+        }
+    }
+
     // Section 12.2's enhanced authentication, before the claim and
     // before the chain: a CONNECT naming a method is answered with AUTH
     // packets until the client has proved who it is, and only then is
     // anybody asked to connect it. The name it proved is what the
     // session remembers, whatever the CONNECT's own username field
     // said.
-    let exchanged = enhanced_authentication(
+    let exchanged = match enhanced_authentication(
         &mut reader,
         &mut write_half,
         &mut connect,
@@ -538,7 +576,14 @@ where
         &config,
         &metrics,
     )
-    .await?;
+    .await
+    {
+        Err(ConnectionError::Protocol(ReasonCode::NotAuthorized)) => {
+            authentication_failed(&shared, config.peer, &metrics);
+            return Err(ConnectionError::Protocol(ReasonCode::NotAuthorized));
+        }
+        other => other?,
+    };
     let proved = exchanged.as_ref().map(|(token, _)| *token);
 
     let claimed = if connect.client_id.is_empty() || shared.migrator().is_none() {
@@ -549,6 +594,7 @@ where
             None => shared.with_broker(|broker| broker.authenticates(&config.mountpoint, &connect)),
         };
         let Some(authenticated) = authenticated else {
+            authentication_failed(&shared, config.peer, &metrics);
             refuse(
                 &mut write_half,
                 version,
@@ -709,10 +755,17 @@ where
     let (registration, actions, assigned) = match outcome {
         Ok(accepted) => accepted,
         Err(reason) => {
+            if matches!(
+                reason,
+                ReasonCode::NotAuthorized | ReasonCode::BadUserNameOrPassword
+            ) {
+                authentication_failed(&shared, config.peer, &metrics);
+            }
             refuse(&mut write_half, version, reason, &metrics).await?;
             return Err(ConnectionError::Protocol(reason));
         }
     };
+    metrics.authentication(AuthOutcome::Success).inc();
 
     let attached = Attached {
         shared: Arc::clone(&shared),
@@ -727,6 +780,8 @@ where
         max_qos: config.max_qos,
         retain_available: config.retain_available,
         durability: config.durability,
+        publish_limit: PublishLimit::new(config.max_publish_rate, config.publish_burst),
+        peer: config.peer,
     };
 
     // A takeover addresses two connections by one handle, and the
@@ -774,6 +829,15 @@ where
     // `await` into an `await?`, and that the obligation's own test could
     // not see it happen.
     attached.run(&mut reader, write_half, ack, outbox).await
+}
+
+/// A CONNECT or a re-authentication was refused for who it said it
+/// was: counted, and charged to its address.
+fn authentication_failed(shared: &Shared, peer: Option<std::net::IpAddr>, metrics: &Metrics) {
+    metrics.authentication(AuthOutcome::Failure).inc();
+    if let Some(peer) = peer {
+        shared.authentication_failed(peer);
+    }
 }
 
 /// What the client is told when the exchange does not complete.
@@ -1200,6 +1264,12 @@ struct Attached {
     /// across awaits on a multi-threaded runtime; it is taken for a
     /// moment, twice per exchange, and never contended.
     reauthenticating: parking_lot::Mutex<Option<scram::Server>>,
+    /// Section 10.3's publish cap: one field of state, none when the
+    /// listener sets no rate.
+    publish_limit: Option<PublishLimit>,
+    /// Who connected, for the authentication failure limiter when a
+    /// re-authentication fails.
+    peer: Option<std::net::IpAddr>,
 }
 
 impl Attached {
@@ -1595,10 +1665,18 @@ impl Attached {
                 }
             }
             (ReasonCode::ContinueAuthentication, Some(server)) => {
-                let (name, server_final) = server.finish(data).map_err(reason_for)?;
+                let (name, server_final) = server.finish(data).map_err(|refusal| {
+                    let reason = reason_for(refusal);
+                    if reason == ReasonCode::NotAuthorized {
+                        authentication_failed(&self.shared, self.peer, &self.metrics);
+                    }
+                    reason
+                })?;
                 if self.username.as_deref() != Some(name.as_str()) {
+                    authentication_failed(&self.shared, self.peer, &self.metrics);
                     return Err(ReasonCode::NotAuthorized);
                 }
+                self.metrics.authentication(AuthOutcome::Success).inc();
                 mqtt_codec::packet::Auth {
                     reason: ReasonCode::Success,
                     properties: Properties {
@@ -1627,6 +1705,15 @@ impl Attached {
                 }
                 if publish.retain && !self.retain_available {
                     return Err(ReasonCode::RetainNotSupported);
+                }
+                // Section 10.3, after the protocol checks, so a publish
+                // that was going to be refused anyway is not also
+                // counted against the rate.
+                if let Some(limit) = &self.publish_limit {
+                    if !limit.admit(self.shared.clock().now()) {
+                        self.metrics.rate_limited(Limiter::Publish).inc();
+                        return Err(ReasonCode::MessageRateTooHigh);
+                    }
                 }
             }
             Packet::Subscribe(request) => {
@@ -4743,6 +4830,269 @@ mod tests {
     /// Connect, and say what came back.
     async fn connected(client: &mut tokio::io::DuplexStream, version: Version) -> ConnAck {
         connected_as(client, version, "sensor").await
+    }
+
+    // -----------------------------------------------------------
+    // Section 10.3: the two rate limiters.
+    // -----------------------------------------------------------
+
+    /// A plain QoS 0 publish for the rate tests.
+    fn telemetry() -> Packet {
+        Packet::Publish(mqtt_codec::packet::Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: "site/1/temp".into(),
+            packet_id: None,
+            payload: bytes::Bytes::from_static(b"21"),
+            properties: Properties::default(),
+        })
+    }
+
+    /// Whether the socket has closed, within a second.
+    async fn closed(client: &mut tokio::io::DuplexStream) -> bool {
+        let mut buf = [0u8; 64];
+        matches!(
+            tokio::time::timeout(Duration::from_secs(1), client.read(&mut buf)).await,
+            Ok(Ok(0))
+        )
+    }
+
+    /// The burst is taken, the next publish in the same second is told
+    /// 0x96 and the connection closes; on 3.1.1 it just closes. Each is
+    /// counted. A tick later the rate is available again to a client
+    /// that reconnects.
+    #[tokio::test]
+    async fn a_session_over_its_publish_rate_is_disconnected_with_0x96() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let config = ConnectionConfig {
+            max_publish_rate: 5,
+            publish_burst: 5,
+            ..ConnectionConfig::default()
+        };
+        let limited = || shared.metrics().rate_limited(Limiter::Publish).get();
+
+        let mut client = serve_one_with_config(Arc::clone(&shared), config.clone());
+        assert_eq!(
+            connected(&mut client, Version::V5).await.reason,
+            ReasonCode::Success
+        );
+        for _ in 0..5 {
+            write(&mut client, &telemetry(), Version::V5).await;
+        }
+        assert_eq!(limited(), 0, "the burst is within the cap");
+        write(&mut client, &telemetry(), Version::V5).await;
+        match read(&mut client, Version::V5).await {
+            Packet::Disconnect(gone) => assert_eq!(gone.reason, ReasonCode::MessageRateTooHigh),
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
+        assert!(closed(&mut client).await, "and the socket closes");
+        assert_eq!(limited(), 1);
+
+        let mut old = serve_one_with_config(Arc::clone(&shared), config);
+        assert_eq!(
+            connected_as(&mut old, Version::V311, "old").await.reason,
+            ReasonCode::Success
+        );
+        for _ in 0..6 {
+            write(&mut old, &telemetry(), Version::V311).await;
+        }
+        assert!(closed(&mut old).await, "3.1.1 has no code to say it with");
+        assert_eq!(limited(), 2);
+    }
+
+    /// The default sets no cap: a hundred at once are a hundred.
+    #[tokio::test]
+    async fn by_default_there_is_no_publish_cap() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected(&mut client, Version::V5).await.reason,
+            ReasonCode::Success
+        );
+        for _ in 0..100 {
+            write(&mut client, &telemetry(), Version::V5).await;
+        }
+        // A ping answered after them is every publish already read.
+        write(&mut client, &Packet::PingReq, Version::V5).await;
+        assert_eq!(read(&mut client, Version::V5).await, Packet::PingResp);
+        assert_eq!(shared.metrics().rate_limited(Limiter::Publish).get(), 0);
+    }
+
+    /// Refuses every password.
+    #[derive(Debug)]
+    struct Nobody;
+
+    impl broker_core::hooks::Hook for Nobody {
+        fn name(&self) -> &str {
+            "nobody"
+        }
+        fn authenticate(
+            &self,
+            _credentials: &broker_core::hooks::Credentials<'_>,
+        ) -> broker_core::hooks::Decision {
+            broker_core::hooks::Decision::Deny
+        }
+    }
+
+    /// Connect once from `peer` with a password, answering the code.
+    async fn try_password(
+        shared: &Arc<Shared>,
+        peer: std::net::IpAddr,
+        version: Version,
+    ) -> ReasonCode {
+        let config = ConnectionConfig {
+            peer: Some(peer),
+            ..ConnectionConfig::default()
+        };
+        let mut client = serve_one_with_config(Arc::clone(shared), config);
+        let mut connect = connect("guesser", 0);
+        connect.version = version;
+        connect.username = Some("alice".to_owned());
+        connect.password = Some(bytes::Bytes::from_static(b"guess"));
+        write(&mut client, &Packet::Connect(Box::new(connect)), version).await;
+        match read(&mut client, version).await {
+            Packet::ConnAck(ack) => ack.reason,
+            other => panic!("expected an acknowledgement, got {other:?}"),
+        }
+    }
+
+    /// Ten failures from one address and the eleventh connect is refused
+    /// unread, 0x9F, without the chain being asked; another address is
+    /// not; a minute later the address may try again. Every decision is
+    /// counted by outcome.
+    #[tokio::test]
+    async fn an_address_that_keeps_failing_is_refused_before_its_password_is_read() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        shared.with_broker(|broker| broker.hooks_mut().install(Arc::new(Nobody)));
+        let guesser: std::net::IpAddr = "198.51.100.7".parse().expect("an address");
+        let bystander: std::net::IpAddr = "198.51.100.8".parse().expect("an address");
+        let metrics = shared.metrics();
+
+        for at in 0..crate::shared::DEFAULT_AUTH_FAILURES_PER_MINUTE {
+            assert_eq!(
+                try_password(&shared, guesser, Version::V5).await,
+                ReasonCode::NotAuthorized,
+                "failure {at}"
+            );
+        }
+        assert_eq!(
+            metrics.authentication(AuthOutcome::Failure).get(),
+            u64::from(crate::shared::DEFAULT_AUTH_FAILURES_PER_MINUTE)
+        );
+        assert_eq!(
+            try_password(&shared, guesser, Version::V5).await,
+            ReasonCode::ConnectionRateExceeded
+        );
+        assert_eq!(
+            metrics.authentication(AuthOutcome::Failure).get(),
+            u64::from(crate::shared::DEFAULT_AUTH_FAILURES_PER_MINUTE),
+            "refused unread: not another failure"
+        );
+        assert_eq!(metrics.rate_limited(Limiter::Authentication).get(), 1);
+        assert_eq!(
+            try_password(&shared, guesser, Version::V311).await,
+            ReasonCode::ServerUnavailable,
+            "3.1.1's CONNACK return code 3"
+        );
+        assert_eq!(
+            try_password(&shared, bystander, Version::V5).await,
+            ReasonCode::NotAuthorized,
+            "another address is judged on its password"
+        );
+
+        shared.sweep_authentication_failures();
+        assert_eq!(
+            metrics.auth_failure_addresses().get(),
+            2,
+            "the guesser and the bystander"
+        );
+        // A minute on, by the clock the limiter reads, and swept: both
+        // have drained, so neither is held.
+        advance(&shared, 60);
+        shared.sweep_authentication_failures();
+        assert_eq!(metrics.auth_failure_addresses().get(), 0);
+        assert_eq!(
+            try_password(&shared, guesser, Version::V5).await,
+            ReasonCode::NotAuthorized
+        );
+    }
+
+    /// An admitted connect is a success; a connection without an
+    /// address is never limited, however often it fails.
+    #[tokio::test]
+    async fn successes_are_counted_and_a_connection_without_an_address_is_never_limited() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected(&mut client, Version::V5).await.reason,
+            ReasonCode::Success
+        );
+        assert_eq!(
+            shared.metrics().authentication(AuthOutcome::Success).get(),
+            1
+        );
+
+        shared.with_broker(|broker| broker.hooks_mut().install(Arc::new(Nobody)));
+        for _ in 0..20 {
+            let mut client = serve_one(Arc::clone(&shared));
+            let mut connect = connect("nowhere", 0);
+            connect.username = Some("alice".to_owned());
+            connect.password = Some(bytes::Bytes::from_static(b"guess"));
+            write(
+                &mut client,
+                &Packet::Connect(Box::new(connect)),
+                Version::V5,
+            )
+            .await;
+            match read(&mut client, Version::V5).await {
+                Packet::ConnAck(ack) => assert_eq!(ack.reason, ReasonCode::NotAuthorized),
+                other => panic!("expected an acknowledgement, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            shared.metrics().rate_limited(Limiter::Authentication).get(),
+            0
+        );
+    }
+
+    /// A wrong SCRAM proof is a failure charged to the address too.
+    #[tokio::test]
+    async fn a_failed_scram_exchange_is_charged_to_the_address() {
+        let shared = with_scram_user("alice", b"hunter2");
+        let guesser: std::net::IpAddr = "2001:db8::7".parse().expect("an address");
+        for _ in 0..crate::shared::DEFAULT_AUTH_FAILURES_PER_MINUTE {
+            let config = ConnectionConfig {
+                peer: Some(guesser),
+                ..ConnectionConfig::default()
+            };
+            let mut client = serve_one_with_config(Arc::clone(&shared), config);
+            let (ack, _) = connect_with_scram(&mut client, "alice", b"wrong").await;
+            assert_eq!(ack.reason, ReasonCode::NotAuthorized);
+        }
+        // The same /64, another address in it: the same host.
+        let neighbour: std::net::IpAddr = "2001:db8::8".parse().expect("an address");
+        let config = ConnectionConfig {
+            peer: Some(neighbour),
+            ..ConnectionConfig::default()
+        };
+        let mut client = serve_one_with_config(Arc::clone(&shared), config);
+        let (scram, first) = crate::scram::Client::first("alice", "client-nonce-0001");
+        drop(scram);
+        write(
+            &mut client,
+            &Packet::Connect(Box::new(scram_connect(
+                "secure",
+                crate::scram::METHOD,
+                first,
+            ))),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::ConnAck(ack) => assert_eq!(ack.reason, ReasonCode::ConnectionRateExceeded),
+            other => panic!("refused before the exchange began, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------
