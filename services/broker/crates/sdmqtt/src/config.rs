@@ -68,6 +68,7 @@ use cluster::{
     ClusterSettings, Durability, Factor, Policy, Strict, DEFAULT_CLUSTER_NAME, DEFAULT_FACTOR,
 };
 use mqtt_codec::Limits;
+use mqtt_codec::QoS;
 use sdmqtt_admin::config::{AdminConfig, AdminStartError, Token};
 use sdmqtt_server::connection::{outbox_depth_for, ConnectionConfig};
 use sdmqtt_server::listener::{ServerConfig, DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT};
@@ -266,6 +267,14 @@ pub struct Listener {
     /// The namespace this listener's clients live in. Two clients with
     /// the same identifier on two mountpoints are two sessions.
     pub mountpoint: String,
+    /// The highest quality of service this listener serves: 0, 1 or 2.
+    /// Section 5.4. Advertised to version 5 clients and enforced on
+    /// every publish; a subscription above it is granted at it.
+    pub max_qos: u8,
+    /// Whether this listener accepts retained messages. Section 5.4.
+    /// A retained publish on a listener that does not is a protocol
+    /// error, and a retained will refuses the connect.
+    pub retain_available: bool,
 }
 
 impl Default for Listener {
@@ -274,6 +283,22 @@ impl Default for Listener {
             address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             mountpoint: String::new(),
+            max_qos: 2,
+            retain_available: true,
+        }
+    }
+}
+
+impl Listener {
+    /// The maximum as the connection reads it.
+    ///
+    /// `validate` refuses anything above two, so the catch-all is the
+    /// value an operator wrote when it is not zero or one.
+    fn max_qos(&self) -> QoS {
+        match self.max_qos {
+            0 => QoS::AtMostOnce,
+            1 => QoS::AtLeastOnce,
+            _ => QoS::ExactlyOnce,
         }
     }
 }
@@ -1086,6 +1111,13 @@ impl Config {
                       leave the key out to take the default",
             });
         }
+        if self.listener.max_qos > 2 {
+            return Err(ConfigError::Unusable {
+                key: "listener.max_qos",
+                value: self.listener.max_qos.to_string(),
+                why: "a quality of service is 0, 1 or 2",
+            });
+        }
         if self.broker.max_inflight == 0 {
             return Err(ConfigError::Unusable {
                 key: "broker.max_inflight",
@@ -1491,6 +1523,13 @@ impl Config {
         if let Some(value) = lookup("SDMQTT_MOUNTPOINT") {
             self.listener.mountpoint = value;
         }
+        if let Some(value) = lookup("SDMQTT_MAX_QOS") {
+            self.listener.max_qos = parse("SDMQTT_MAX_QOS", &value, "quality of service")?;
+        }
+        if let Some(value) = lookup("SDMQTT_RETAIN_AVAILABLE") {
+            self.listener.retain_available =
+                parse("SDMQTT_RETAIN_AVAILABLE", &value, "true or false")?;
+        }
         if let Some(value) = lookup("SDMQTT_STORAGE_DIRECTORY") {
             // An empty value turns the store off rather than naming a
             // directory called "". It is the only way an environment
@@ -1720,6 +1759,8 @@ impl Config {
             connection: ConnectionConfig {
                 limits,
                 mountpoint: Arc::from(self.listener.mountpoint.as_str()),
+                max_qos: self.listener.max_qos(),
+                retain_available: self.listener.retain_available,
                 // Derived from the bounds it drains rather than left a
                 // constant, so raising the queue raises the channel the
                 // queue empties into. `validate` refuses a configuration
@@ -2950,6 +2991,43 @@ mod tests {
         assert_eq!(server.broker.max_queue_messages, 5);
         assert_eq!(server.broker.max_queue_bytes, 8192);
         assert_eq!(server.connection.limits, server.broker.limits);
+    }
+
+    /// Section 5.4's two listener policies are read, mapped, and a
+    /// level that is not one is refused by name.
+    #[test]
+    fn a_listener_policy_is_read_and_a_bad_qos_is_refused() {
+        let config = Config::from_toml(
+            r#"
+            [listener]
+            max_qos = 1
+            retain_available = false
+        "#,
+        )
+        .expect("both keys are known");
+        assert_eq!(config.listener.max_qos, 1);
+        assert!(!config.listener.retain_available);
+        let server = config.server();
+        assert_eq!(server.connection.max_qos, QoS::AtLeastOnce);
+        assert!(!server.connection.retain_available);
+
+        let bad =
+            Config::from_toml("[listener]\nmax_qos = 3\n").expect("parses; validation refuses");
+        let why = bad
+            .validate()
+            .expect_err("three is not a quality of service");
+        assert!(why.to_string().contains("listener.max_qos"), "{why}");
+
+        let mut from_env = Config::default();
+        from_env
+            .apply_env(|name| match name {
+                "SDMQTT_MAX_QOS" => Some("0".to_owned()),
+                "SDMQTT_RETAIN_AVAILABLE" => Some("false".to_owned()),
+                _ => None,
+            })
+            .expect("both read");
+        assert_eq!(from_env.listener.max_qos, 0);
+        assert!(!from_env.listener.retain_available);
     }
 
     #[test]

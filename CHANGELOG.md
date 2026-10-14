@@ -7,6 +7,21 @@ milestones, which is what this project actually ships in.
 **The one thing to read before upgrading is "Before you upgrade" under
 the milestone you are moving to.** Everything else is description.
 
+## Unreleased — milestone 7: hardening
+
+### Added
+
+- **A listener's maximum QoS and retain availability**, section 5.4's
+  two deferred properties. `listener.max_qos` (0, 1 or 2) is advertised
+  to version 5 clients and enforced on every publish: above the cap is
+  a protocol error, 0x9B on version 5 and a closed socket on 3.1.1,
+  which has no code for it. A subscription above the cap is granted at
+  the cap, as 3.8.4 allows. `listener.retain_available = false` refuses
+  a retained publish with 0x9A and refuses the connect of a client whose
+  will is retained, rather than accepting it and dropping the flag the
+  client asked for. The defaults advertise nothing and refuse nothing,
+  so the conformance baseline is unchanged.
+
 ## Unreleased — milestone 6: queue replication
 
 ### Before you upgrade: a store written before this milestone is refused

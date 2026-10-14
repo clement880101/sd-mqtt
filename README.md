@@ -381,6 +381,27 @@ broker told somebody it had accepted. Turning a connector off while an
 endpoint is down is `enabled = false`, or the disable button, which
 keeps the outbox.
 
+### What a listener accepts
+
+```toml
+[listener]
+address = "0.0.0.0:1883"
+max_connections = 100000
+mountpoint = ""                   # a namespace; two mountpoints are two sets of sessions
+max_qos = 2                       # 0, 1 or 2; advertised to version 5 clients
+retain_available = true           # false refuses retained messages
+```
+
+`max_qos` caps what the listener serves. A version 5 client is told the
+cap in the connect acknowledgement; a publish above it is a protocol
+error either way — version 5 is disconnected with reason 0x9B, 3.1.1 is
+closed, because it has no code for it — and a subscription above it is
+granted at the cap, which the acknowledgement says. `retain_available =
+false` refuses a retained publish the same way (0x9A) and refuses the
+connect of a client whose will is retained, rather than accepting the
+connect and quietly dropping the flag. `SDMQTT_MAX_QOS` and
+`SDMQTT_RETAIN_AVAILABLE` set the same two.
+
 ### What this node is called, and what identifies it
 
 ```toml
