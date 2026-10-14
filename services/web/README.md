@@ -2,9 +2,13 @@
 
 Preact 10 with signals, routed by preact-iso, bundled by Vite 8, styled
 with hand-written CSS over Open Props tokens. Section 11.2 of the
-design says what it is for. Four of its six pages are built —
-Overview, Clients, Topics and Rules — over the shell and the pipeline
-that carries them.
+design says what it is for. All six of its pages are built —
+Overview, Clients, Topics, Rules, Cluster and Settings — over the
+shell and the pipeline that carries them.
+
+Every request carries the API key pasted on the Settings page, kept
+in session storage for the tab's life (`src/credential.ts`). Against a
+loopback admin listener with no token configured, none is needed.
 
 ## Running it
 

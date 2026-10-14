@@ -632,6 +632,13 @@ pub struct ListenerView {
     /// Section 8.6's mode for publishes on an MQTT listener: `async`,
     /// `sync`, or `node` for the node's own. `null` on every other row.
     pub durability: Option<&'static str>,
+    /// Section 10.3's publish cap per session, on an MQTT listener:
+    /// PUBLISH packets a second, zero for none. `null` on every other
+    /// row.
+    pub max_publish_rate: Option<u32>,
+    /// How many of them may come at once, as configured; the broker
+    /// never uses less than the rate.
+    pub publish_burst: Option<u32>,
 }
 
 async fn listeners(State(state): State<AdminState>, paging: Paging) -> Json<Page<ListenerView>> {
@@ -1933,6 +1940,8 @@ mod tests {
             max_qos: Some(1),
             retain_available: Some(false),
             durability: Some("sync"),
+            max_publish_rate: Some(100),
+            publish_burst: Some(0),
         }];
         let admin = admin_over(Arc::clone(mqtt.shared()), described).await;
 
@@ -1958,7 +1967,8 @@ mod tests {
         assert!(
             response.body.contains("\"max_qos\":1")
                 && response.body.contains("\"retain_available\":false")
-                && response.body.contains("\"durability\":\"sync\""),
+                && response.body.contains("\"durability\":\"sync\"")
+                && response.body.contains("\"max_publish_rate\":100"),
             "{}",
             response.body
         );

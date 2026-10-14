@@ -1384,6 +1384,8 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
                 Some(cluster::Durability::Async) => "async",
                 Some(cluster::Durability::Sync) => "sync",
             }),
+            max_publish_rate: Some(listener.max_publish_rate),
+            publish_burst: Some(listener.publish_burst),
         })
         .collect();
     if let (Some(mesh), Some(address)) = (&mesh, config.cluster.address) {
@@ -1402,6 +1404,8 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             max_qos: None,
             retain_available: None,
             durability: None,
+            max_publish_rate: None,
+            publish_burst: None,
         });
     }
     let listeners = listener_list(bound);

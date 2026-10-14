@@ -448,7 +448,7 @@ gate, and ticked here as it lands:
 - [x] **Task 5** — section 10.3's two limiters: the per-session publish
   rate (a cell-rate field in the session, 0x96 on v5, a close on 3.1.1)
   and the per-address authentication-failure limiter swept by the tick.
-- [ ] **Task 6** — the Settings page: users, access control rules, API
+- [x] **Task 6** — the Settings page: users, access control rules, API
   keys and listeners, checked against a real broker.
 - [ ] **Task 7** — the closing walk of sections 12, 10.3, 11.1 and 11.2;
   README, CHANGELOG and spec say what shipped.

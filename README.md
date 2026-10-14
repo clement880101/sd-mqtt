@@ -457,6 +457,11 @@ like a user's removal. A real key that is too narrow is answered `403`
 with both scopes named; a wrong one is `401`. A node with no store
 holds no keys, and the token is then the only credential.
 
+The **Settings** page does all of this in a browser: paste a key or the
+token at the top — it is kept for that tab and forgotten when it
+closes — and manage users, access control rules and keys below it. It
+also lists this node's listeners, which stay in the file.
+
 ### Who may publish and subscribe where
 
 ```toml

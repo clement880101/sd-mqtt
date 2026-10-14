@@ -1185,6 +1185,15 @@ Rules with a per-action form editor and per-rule statistics and dead letters,
 Cluster with member and link health, and Settings for users, access control,
 API keys and listeners.
 
+**Settings is built in milestone 7, and it is a client of the API like any
+other.** The operator pastes a key or the token at the top; the tab keeps it
+in session storage, so a reload keeps it and closing the tab forgets it, and
+every request the interface makes carries it. A key's text is shown once,
+with a warning, and the panel is withdrawn if that key is revoked. Rules
+from the configuration file are consulted with the API's but are not listed,
+and the page says so. Listeners are read-only: they are this process's
+configuration, not replicated metadata.
+
 **Link health on the Cluster page is the per-peer state**, `up`, `suspect` or
 `down`, which is what this node's failure detector has decided about the link
 to each peer. Bytes sent, received and dropped are *not* on it: the mesh

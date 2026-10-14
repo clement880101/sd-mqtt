@@ -95,6 +95,12 @@ rejoin and be repaired before the next.
   `sdmqtt_rate_limited_total{limiter}` and
   `sdmqtt_auth_failure_addresses` are new.
 
+- **The Settings page**, section 11.2's last: paste a key, then manage
+  users, access control rules and API keys, and read this node's
+  listeners, publish cap included. The key is kept in session storage
+  for the tab's life and sent with every request the interface makes.
+  `GET /api/v1/listeners` gains `max_publish_rate` and `publish_burst`.
+
 - **API keys**, section 11.1, with `read`, `write` and `admin` scopes.
   `POST /api/v1/keys` mints one and shows it once; the broker stores a
   SHA-256 digest; `DELETE /api/v1/keys/{id}` revokes, and keys and
