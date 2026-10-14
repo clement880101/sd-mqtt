@@ -409,6 +409,32 @@ API already uses for its own rows (`mqtt`, `admin`, `cluster`,
 `ingest`) are refused at startup. `[[listeners]]` is file-only; the
 environment variables below reach `[listener]` alone.
 
+A listener can speak TLS:
+
+```toml
+[[listeners]]
+name = "secure"
+kind = "tls"
+address = "0.0.0.0:8883"
+
+[listeners.tls]
+certificate = "/etc/sdmqtt/fullchain.pem"   # PEM, leaf first
+key = "/etc/sdmqtt/privkey.pem"             # PEM, unencrypted
+reload_ms = 60000                           # how often a renewal is looked for
+```
+
+Both files are read at startup — a listener whose certificate is
+missing, not PEM, or issued for a different key refuses to start,
+naming the file — and re-read every `reload_ms`, so a renewal tool
+that rewrites them needs no restart: the next handshake serves the new
+pair. A renewal half-written, with one file new and the other old or
+empty, keeps the previous pair and logs once. `kind = "tls"` without a
+`tls` table, or a `tls` table on a plain listener, is refused. An
+encrypted key is not supported; decrypt it first. Client certificates
+are not asked for. `sdmqtt_tls_handshakes_failed_total` and
+`sdmqtt_tls_certificate_reloads_total{outcome}` count what happened,
+and exist only on a node with a TLS listener.
+
 `max_qos` caps what the listener serves. A version 5 client is told the
 cap in the connect acknowledgement; a publish above it is a protocol
 error either way — version 5 is disconnected with reason 0x9B, 3.1.1 is

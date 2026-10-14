@@ -581,6 +581,8 @@ async fn nodes(State(state): State<AdminState>, paging: Paging) -> Json<Page<Nod
 pub enum ListenerProtocol {
     /// MQTT over TCP.
     Mqtt,
+    /// MQTT over TLS. Section 12.1.
+    MqttTls,
     /// This API.
     Admin,
     /// Section 9.2's ingest endpoint, on a listener of its own.

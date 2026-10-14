@@ -1022,17 +1022,21 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     for (name, server) in config.servers() {
         let mountpoint = server.connection.mountpoint.clone();
         let max_connections = server.max_connections;
+        let (protocol, over) = match &server.kind {
+            sdmqtt_server::listener::Kind::Tcp => (ListenerProtocol::Mqtt, "TCP"),
+            sdmqtt_server::listener::Kind::Tls(_) => (ListenerProtocol::MqttTls, "TLS"),
+        };
         let running = Server::bind_shared(server, Arc::clone(&shared)).await?;
         tracing::info!(
             listener = %name,
             address = %running.address(),
             mountpoint = %mountpoint,
             max_connections,
-            "sdmqtt is serving MQTT over TCP"
+            "sdmqtt is serving MQTT over {over}"
         );
-        servers.push((name, running));
+        servers.push((name, protocol, running));
     }
-    let running = &servers[0].1;
+    let running = &servers[0].2;
 
     // Section 8.1's mesh, after the store has been read and after the
     // listener clients use is up. Binding this one last means a cluster
@@ -1294,9 +1298,9 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     let mut bound: Vec<ListenerView> = config
         .each_listener_config()
         .zip(servers.iter())
-        .map(|(listener, (name, running))| ListenerView {
+        .map(|(listener, (name, protocol, running))| ListenerView {
             name: name.clone(),
-            protocol: ListenerProtocol::Mqtt,
+            protocol: *protocol,
             address: running.address(),
             mountpoint: listener.mountpoint.clone(),
             max_connections: Some(listener.max_connections),
@@ -1403,7 +1407,7 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     }
     // In reverse, so the first listener — the one driving the clock —
     // is the last to stop.
-    for (_, running) in servers.into_iter().rev() {
+    for (_, _, running) in servers.into_iter().rev() {
         running.shutdown().await;
     }
     // Section 8.2's tasks, after the listener and before the pumps: a

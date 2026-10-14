@@ -40,7 +40,7 @@
 //! surprise in somebody's dashboard.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
 use prometheus_client::collector::Collector;
@@ -726,6 +726,37 @@ impl PacketCounters {
     }
 }
 
+/// Section 12.1's TLS counters. See [`Metrics::tls`].
+#[derive(Debug)]
+pub struct TlsCounters {
+    /// Handshakes that did not complete, by error or by the connect
+    /// timeout.
+    pub handshakes_failed: Counter,
+    reloads: Family<[(&'static str, &'static str); 1], Counter>,
+}
+
+impl TlsCounters {
+    /// Counters nothing renders: for a test, and for [`Metrics::tls`]
+    /// to register.
+    #[must_use]
+    pub fn detached() -> Arc<Self> {
+        Arc::new(Self {
+            handshakes_failed: Counter::default(),
+            reloads: Family::default(),
+        })
+    }
+
+    /// A certificate pair re-read and taken.
+    pub fn reloaded(&self) -> Counter {
+        self.reloads.get_or_create_owned(&[("outcome", "reloaded")])
+    }
+
+    /// A certificate pair that could not be taken, the old one kept.
+    pub fn reload_failed(&self) -> Counter {
+        self.reloads.get_or_create_owned(&[("outcome", "failed")])
+    }
+}
+
 /// Every counter and gauge this broker publishes.
 #[derive(Debug)]
 pub struct Metrics {
@@ -776,6 +807,9 @@ pub struct Metrics {
     watched: AtomicBool,
     /// The same, for [`Metrics::watch_cluster`].
     watching_cluster: AtomicBool,
+    /// Section 12.1's TLS series, registered on the first TLS listener
+    /// and absent, not zero, on a node with none. See [`Metrics::tls`].
+    tls: OnceLock<Arc<TlsCounters>>,
 }
 
 /// What a running cluster can be asked for, once there is one.
@@ -1129,6 +1163,7 @@ impl Metrics {
             rule_waiting,
             watched: AtomicBool::new(false),
             watching_cluster: AtomicBool::new(false),
+            tls: OnceLock::new(),
         }
     }
 
@@ -1150,6 +1185,30 @@ impl Metrics {
         self.registry
             .lock()
             .register_collector(Box::new(Live(Arc::downgrade(shared))));
+    }
+
+    /// Section 12.1's TLS counters, registered on first use.
+    ///
+    /// A node with no TLS listener never asks, and its exposition has
+    /// no TLS series — absent rather than zero, the cluster series'
+    /// rule: a zero would read as "handshakes are fine" on a node that
+    /// has none.
+    pub fn tls(&self) -> Arc<TlsCounters> {
+        Arc::clone(self.tls.get_or_init(|| {
+            let counters = TlsCounters::detached();
+            let mut registry = self.registry.lock();
+            registry.register(
+                "tls_handshakes_failed",
+                "TLS handshakes that did not complete, by error or by the connect timeout",
+                counters.handshakes_failed.clone(),
+            );
+            registry.register(
+                "tls_certificate_reloads",
+                "Certificate reloads, by whether the new pair was taken or the old one kept",
+                counters.reloads.clone(),
+            );
+            counters
+        }))
     }
 
     /// Register section 11.3's cluster numbers, read from the mesh

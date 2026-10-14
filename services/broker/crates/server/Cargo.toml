@@ -50,8 +50,12 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # nothing here wants them. Three crates in total, measured by diffing
 # the lock file: itself, its encode derive, and `dtoa`.
 prometheus-client = "0.25"
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+rustls-pki-types = { version = "1", features = ["std"] }
 
 [dev-dependencies]
+rcgen = "0.14"
 # The redb backend, for `tests/throughput.rs` alone. What a store costs
 # the broker is a question about a real device, and the in-memory
 # backend this crate's other tests use answers it with a number from a

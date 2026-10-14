@@ -15,3 +15,4 @@ pub mod metrics;
 pub mod publish;
 pub mod shared;
 pub mod ticker;
+pub mod tls;

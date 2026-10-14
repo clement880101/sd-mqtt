@@ -258,8 +258,7 @@ impl std::str::FromStr for LogLevel {
 
 /// What a listener speaks under MQTT. Section 12.1.
 ///
-/// Plain TCP is the only kind the configuration knows today; `tls`,
-/// `ws` and `wss` arrive with the next tasks of the listeners plan, and
+/// `ws` and `wss` arrive with the next task of the listeners plan, and
 /// until they do a file naming one is refused by the parser as an
 /// unknown variant, which is the honest answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -268,6 +267,26 @@ pub enum ListenerKind {
     /// MQTT straight over the socket. The default.
     #[default]
     Tcp,
+    /// A TLS handshake first; `tls` names the certificate and key.
+    Tls,
+}
+
+impl ListenerKind {
+    /// Whether this kind needs a certificate.
+    fn encrypted(self) -> bool {
+        matches!(self, Self::Tls)
+    }
+}
+
+impl TlsSettings {
+    /// What the listener keeps.
+    fn settings(&self) -> sdmqtt_server::tls::Settings {
+        sdmqtt_server::tls::Settings {
+            certificate: self.certificate.clone(),
+            key: self.key.clone(),
+            reload: Duration::from_millis(self.reload_ms),
+        }
+    }
 }
 
 /// Section 12.1's certificate and key, for a listener that needs them.
@@ -1838,14 +1857,46 @@ impl Config {
                     why: "a quality of service is 0, 1 or 2",
                 });
             }
-            if listener.tls.is_some() && matches!(listener.kind, ListenerKind::Tcp) {
-                return Err(ConfigError::Unusable {
-                    key: leak(format!("{prefix}.tls")),
-                    value: "set".to_owned(),
-                    why: "tls is set on a listener whose kind does not use it; a plain \
-                          listener with a certificate is a listener somebody believes is \
-                          encrypted. Change the kind, or remove the tls table",
-                });
+            match (&listener.tls, listener.kind.encrypted()) {
+                (Some(_), false) => {
+                    return Err(ConfigError::Unusable {
+                        key: leak(format!("{prefix}.tls")),
+                        value: "set".to_owned(),
+                        why: "tls is set on a listener whose kind does not use it; a plain \
+                              listener with a certificate is a listener somebody believes \
+                              is encrypted. Change the kind, or remove the tls table",
+                    });
+                }
+                (None, true) => {
+                    return Err(ConfigError::Unusable {
+                        key: leak(format!("{prefix}.tls")),
+                        value: String::new(),
+                        why: "this kind of listener needs a certificate: add a tls table \
+                              with certificate and key",
+                    });
+                }
+                (Some(tls), true) => {
+                    if tls.reload_ms == 0 {
+                        return Err(ConfigError::Unusable {
+                            key: leak(format!("{prefix}.tls.reload_ms")),
+                            value: "0".to_owned(),
+                            why: "a reload every zero milliseconds is a loop that reads the \
+                                  files and nothing else; write how often a renewal should \
+                                  be noticed, or leave the key out for a minute",
+                        });
+                    }
+                    // Read now, so a listener whose files are wrong
+                    // refuses to start rather than failing every
+                    // handshake after the node has said it is serving.
+                    if let Err(why) = sdmqtt_server::tls::check(&tls.settings()) {
+                        return Err(ConfigError::Unusable {
+                            key: leak(format!("{prefix}.tls")),
+                            value: tls.certificate.display().to_string(),
+                            why: leak(why.to_string()),
+                        });
+                    }
+                }
+                (None, false) => {}
             }
         }
         let mut names: Vec<&str> = Vec::new();
@@ -1934,8 +1985,13 @@ impl Config {
         };
         ServerConfig {
             address: listener.address,
-            kind: match listener.kind {
-                ListenerKind::Tcp => sdmqtt_server::listener::Kind::Tcp,
+            kind: match (listener.kind, &listener.tls) {
+                (ListenerKind::Tls, Some(tls)) => {
+                    sdmqtt_server::listener::Kind::Tls(tls.settings())
+                }
+                // `validate` refuses a TLS listener without a table, so
+                // the fallback is unreachable on anything `load` returns.
+                _ => sdmqtt_server::listener::Kind::Tcp,
             },
             broker: BrokerConfig {
                 limits,
@@ -3320,6 +3376,67 @@ mod tests {
         .expect_err("udp is not a kind")
         .to_string();
         assert!(why.contains("udp") || why.contains("kind"), "{why}");
+    }
+
+    /// A TLS listener without a certificate, with a key that does not
+    /// match, or with files that are not there, is refused at startup
+    /// naming the listener and the file; a good pair is accepted and
+    /// reaches the server configuration.
+    #[test]
+    fn a_tls_listener_s_files_are_checked_at_startup() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let minted = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("rcgen mints a certificate");
+        let certificate = directory.path().join("cert.pem");
+        let key = directory.path().join("key.pem");
+        std::fs::write(&certificate, minted.cert.pem()).expect("written");
+        std::fs::write(&key, minted.signing_key.serialize_pem()).expect("written");
+
+        let bare = Config::from_toml(
+            "[[listeners]]\nname = \"secure\"\nkind = \"tls\"\naddress = \"127.0.0.1:8883\"\n",
+        )
+        .expect("parses");
+        let why = bare.validate().expect_err("no certificate").to_string();
+        assert!(why.contains("listeners[0].tls"), "{why}");
+
+        let good = Config::from_toml(&format!(
+            r#"
+            [[listeners]]
+            name = "secure"
+            kind = "tls"
+            address = "127.0.0.1:8883"
+
+            [listeners.tls]
+            certificate = "{}"
+            key = "{}"
+            reload_ms = 500
+        "#,
+            certificate.display(),
+            key.display()
+        ))
+        .expect("parses");
+        good.validate().expect("a good pair loads");
+        let servers = good.servers();
+        match &servers[1].1.kind {
+            sdmqtt_server::listener::Kind::Tls(settings) => {
+                assert_eq!(settings.certificate, certificate);
+                assert_eq!(settings.reload, Duration::from_millis(500));
+            }
+            other => panic!("a tls listener, got {other:?}"),
+        }
+
+        let other =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("a second key");
+        std::fs::write(&key, other.signing_key.serialize_pem()).expect("swapped");
+        let why = good
+            .validate()
+            .expect_err("the key no longer matches")
+            .to_string();
+        assert!(why.contains("does not match"), "{why}");
+
+        std::fs::remove_file(&certificate).expect("removed");
+        let why = good.validate().expect_err("no such file").to_string();
+        assert!(why.contains("could not be read"), "{why}");
     }
 
     /// A certificate on a plain listener is a listener somebody believes

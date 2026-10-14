@@ -41,6 +41,17 @@ the milestone you are moving to.** Everything else is description.
   do not, so a node with three listeners does not age its keep-alives
   three times as fast.
 
+- **TLS listeners, with a certificate that renews without a restart.**
+  `kind = "tls"` and a `tls` table naming the certificate and key. The
+  pair is read at startup — wrong files refuse to start, naming the
+  file — and re-read every `reload_ms`; a renewal is served by the next
+  handshake, and a renewal half-written keeps the previous pair and
+  logs once. The handshake is bounded by the connect timeout, failures
+  are counted, and the two TLS series exist only on a node with a TLS
+  listener. rustls with aws-lc-rs, which the rules crate's clients
+  already linked; `rustls`, `rustls-pki-types` and `tokio-rustls`
+  become direct dependencies of the server crate.
+
 ## Unreleased — milestone 6: queue replication
 
 ### Before you upgrade: a store written before this milestone is refused
