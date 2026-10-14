@@ -187,11 +187,15 @@ retain-as-published, all three retain-handling values, server keep-alive,
 receive maximum in both directions, maximum packet size, assigned client
 identifier, and reason codes on every acknowledgement.
 
-**Maximum QoS and Retain Availability move to milestone 7.** The broker
-always supports quality of service 2 and always accepts a retained
-message, advertising neither property, which is conformant. Capping either
-is an operator policy and belongs with authorization rather than on its
-own.
+**Maximum QoS and Retain Availability are per listener, since milestone
+7.** `listener.max_qos` is advertised to version 5 clients and enforced on
+every publish — above it is a protocol error, 0x9B on version 5 and a
+closed socket on 3.1.1 — and a subscription above it is granted at it.
+`listener.retain_available = false` is advertised as zero, refuses a
+retained publish with 0x9A, and refuses the connect of a client whose will
+is retained, rather than accepting the connect and dropping the flag.
+The defaults advertise nothing and refuse nothing, which is what the
+broker did through milestone 6 and is conformant.
 
 **Reason strings are not sent in v1.** The codec carries them and nothing
 produces one. The reason code is the contract; a string is a convenience
@@ -1339,6 +1343,18 @@ and PHC-formatted storage, or SCRAM-SHA-256. Access control rules map a user or 
 to topic filters with publish and subscribe permissions, deny by default once
 any rule exists. TLS and WebSocket listeners are supported, with certificate
 hot reload through a certificate resolver so renewal needs no restart.
+
+**Listeners, since milestone 7.** `[listener]` is the default and is named
+`mqtt`; each `[[listeners]]` entry is one more, of kind `tcp`, `tls`, `ws`
+or `wss`, over the one broker, each with its own address, mountpoint,
+maximum QoS, retain availability and durability mode. The certificate is
+served through a resolver that re-reads the two files every `reload_ms`
+and swaps the pair in when both parse and match; a half-written renewal
+keeps the previous pair. WebSocket requires the `mqtt` subprotocol,
+upgrades on any path, carries MQTT in binary frames and closes a text
+frame with 1003. Client certificates are not asked for, an encrypted key
+is refused, and the certificate's expiry is not a metric because reading
+it would need an X.509 parser this build does not otherwise carry.
 
 ### 12.2 Enhanced authentication
 

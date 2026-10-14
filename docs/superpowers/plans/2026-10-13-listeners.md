@@ -154,7 +154,7 @@ files a minute costs nothing measurable.
   `listener.max_qos` (0, 1 or 2) and `listener.retain_available` (bool);
   environment `SDMQTT_MAX_QOS` and `SDMQTT_RETAIN_AVAILABLE`.
 
-- [ ] **Step 1: Write the failing connection tests**
+- [x] **Step 1: Write the failing connection tests**
 
 In `crates/server/src/connection.rs`'s test module, beside
 `serve_one_with_config`:
@@ -343,12 +343,12 @@ name, use the outcome the existing protocol-error path counts under — find
 it by searching `connection.rs` for `MalformedPacket` handling — and do not
 add a new one.
 
-- [ ] **Step 2: Run them to see them fail**
+- [x] **Step 2: Run them to see them fail**
 
 Run: `cargo test -p sdmqtt-server --lib a_listener_capped the_default_listener a_subscription_above a_listener_without a_v311_publish_above`
 Expected: compile errors on `max_qos` and `retain_available`.
 
-- [ ] **Step 3: Add the two fields and advertise them**
+- [x] **Step 3: Add the two fields and advertise them**
 
 In `ConnectionConfig`:
 
@@ -378,7 +378,7 @@ with `max_qos: QoS::ExactlyOnce` and `retain_available: true` in
             retain_available: if config.retain_available { None } else { Some(0) },
 ```
 
-- [ ] **Step 4: Enforce on the publish, the subscribe and the will**
+- [x] **Step 4: Enforce on the publish, the subscribe and the will**
 
 On the inbound publish path (near line 908), before the packet reaches the
 broker:
@@ -416,12 +416,12 @@ using the existing refuse-at-connect helper (the one that answers
 `NotAuthorized`); for 3.1.1 that helper already closes the socket, which is
 what section 13 wants.
 
-- [ ] **Step 5: Run the tests to see them pass**
+- [x] **Step 5: Run the tests to see them pass**
 
 Run: `cargo test -p sdmqtt-server --lib connection::`
 Expected: all pass, the five new ones included.
 
-- [ ] **Step 6: Prove each can fail**
+- [x] **Step 6: Prove each can fail**
 
 Back up `connection.rs` with `cp`. One at a time: delete the publish QoS
 check (the first and fifth tests fail); delete the will check (the fourth
@@ -429,7 +429,7 @@ fails); replace the clamp with nothing (the third fails); replace the
 `maximum_qos` match with `None` (the first fails on the advertise). Restore
 with `cp` and `touch`. Report which test failed under each, by name.
 
-- [ ] **Step 7: Configuration**
+- [x] **Step 7: Configuration**
 
 In `crates/sdmqtt/src/config.rs`, `Listener` gains:
 
@@ -481,7 +481,7 @@ retain_available = false
 using whatever helper the config tests already use to parse a string (look
 for how the test at line 2918 builds its `Config`).
 
-- [ ] **Step 8: Docs and commit**
+- [x] **Step 8: Docs and commit**
 
 README, under the listener section (search for `max_connections` in the
 `[listener]` block; if the block has no prose, add it beside the other
@@ -526,7 +526,7 @@ git add -A && git commit -m "feat(listener): a maximum QoS and retain availabili
   promised) -> (T, Committed)`; config key `listener.durability` with
   values `"async"`, `"sync"` or absent; environment `SDMQTT_LISTENER_DURABILITY`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Beside milestone 6's `synchronous_mode_waits_for_a_follower_and_then_acknowledges`
 in `connection.rs`:
@@ -587,12 +587,12 @@ in `connection.rs`:
     }
 ```
 
-- [ ] **Step 2: Run it to see it fail**
+- [x] **Step 2: Run it to see it fail**
 
 Run: `cargo test -p sdmqtt-server --lib a_listener_s_own_durability`
 Expected: compile error on `durability`.
 
-- [ ] **Step 3: Thread the override**
+- [x] **Step 3: Thread the override**
 
 `ConnectionConfig` gains:
 
@@ -644,17 +644,17 @@ The patience is the node's `cluster.sync_timeout_ms` in both cases: the
 override picks the mode, not the timeout, because a second timeout would
 be a second answer to "how long is too long" on one node.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p sdmqtt-server --lib`
 Expected: all pass.
 
-- [ ] **Step 5: Prove it can fail**
+- [x] **Step 5: Prove it can fail**
 
 Back up `shared.rs`; replace `mode.unwrap_or(installed)` with `installed`;
 the new test fails on "did not wait". Restore with `cp` and `touch`.
 
-- [ ] **Step 6: Configuration, docs, spec, commit**
+- [x] **Step 6: Configuration, docs, spec, commit**
 
 `Listener` gains `pub durability: Option<cluster::Durability>` (serde
 already reads `"async"`/`"sync"` for the cluster key; reuse the type).
@@ -708,7 +708,7 @@ git add -A && git commit -m "feat(listener): a durability mode per listener"
   Ingest, Cluster}` and `ListenerView { max_qos: Option<u8>,
   retain_available: Option<bool>, durability: Option<&'static str>, .. }`.
 
-- [ ] **Step 1: Write the failing config tests**
+- [x] **Step 1: Write the failing config tests**
 
 ```rust
     #[test]
@@ -770,12 +770,12 @@ address = "127.0.0.1:1883"
 where `parse_toml_err` returns the parse error's text; add it beside
 `parse_toml` if there is nothing like it.
 
-- [ ] **Step 2: Run them to see them fail**
+- [x] **Step 2: Run them to see them fail**
 
 Run: `cargo test -p sdmqtt --lib config::tests::extra_listeners config::tests::two_listeners config::tests::a_listener_without config::tests::an_unknown_listener_kind`
 Expected: compile errors on `listeners`, `servers`, `kind`.
 
-- [ ] **Step 3: The configuration**
+- [x] **Step 3: The configuration**
 
 ```rust
 /// What a listener speaks under MQTT.
@@ -824,7 +824,7 @@ it"). `ListenerKind` maps to `listener::Kind` in `servers`. Only
 `[listener]` has environment variables; `[[listeners]]` is file-only, and
 the README says so.
 
-- [ ] **Step 4: Bind each**
+- [x] **Step 4: Bind each**
 
 In `listener.rs`, `ServerConfig` gains `pub kind: Kind` with
 
@@ -852,7 +852,7 @@ once. Add a unit test in `listener.rs` asserting that two `bind_shared`
 calls on one `Shared` leave one ticker running — count via a metric the
 tick already moves, or by adding `Shared::ticks() -> u64` if there is none.
 
-- [ ] **Step 5: The integration test**
+- [x] **Step 5: The integration test**
 
 `crates/sdmqtt/tests/listeners.rs`, modelled on `tests/cluster.rs`'s
 `spawn` and `wait_until_listening` but one process:
@@ -880,7 +880,7 @@ and a `tests/common` module is the right fix only when a third test wants
 them. Ephemeral ports: bind `TcpListener` to port 0 and release, as
 `cluster.rs` does.
 
-- [ ] **Step 6: Run everything, prove, commit**
+- [x] **Step 6: Run everything, prove, commit**
 
 Run: `cargo test -p sdmqtt --test listeners` then the whole workspace.
 Prove: comment out the `servers()` loop's second iteration (bind only the
@@ -921,7 +921,7 @@ git add -A && git commit -m "feat(listener): several listeners on one broker"
   counters; `tls::Error::{Unreadable { path, why }, NotPem { path },
   NoCertificate { path }, NoKey { path }, Mismatch, Encrypted { path }}`.
 
-- [ ] **Step 1: Write the failing unit tests**
+- [x] **Step 1: Write the failing unit tests**
 
 `crates/server/src/tls.rs` test module. Mint certificates with `rcgen`:
 
@@ -1006,12 +1006,12 @@ git add -A && git commit -m "feat(listener): several listeners on one broker"
 `certificate_der()` returns the leaf's DER bytes, for tests and for the
 admin resource later; add it to the interface.
 
-- [ ] **Step 2: Run them to see them fail**
+- [x] **Step 2: Run them to see them fail**
 
 Run: `cargo test -p sdmqtt-server --lib tls::`
 Expected: compile error, no module.
 
-- [ ] **Step 3: Write `tls.rs`**
+- [x] **Step 3: Write `tls.rs`**
 
 ```rust
 //! Section 12.1's TLS listener, and the certificate that renews without
@@ -1224,7 +1224,7 @@ Add to `Cargo.toml` of the server crate: `tokio-rustls = { version =
 count rises by one for it as well; `scripts/budgets.sh` says what it
 counts.
 
-- [ ] **Step 4: Wire the kind into the accept loop**
+- [x] **Step 4: Wire the kind into the accept loop**
 
 `listener::Kind::Tls(Arc<tls::Acceptor>)`. In `accept_loop`, after the
 permit is taken, before `serve`:
@@ -1268,7 +1268,7 @@ otherwise — the cluster series' rule). The reload counters live on the
 `ClusterMetrics` does, or the acceptor increments metric counters it is
 handed at `load` — choose the second; it is less machinery.
 
-- [ ] **Step 5: The over-TLS integration test**
+- [x] **Step 5: The over-TLS integration test**
 
 `crates/server/tests/over_tls.rs`, modelled on `over_tcp.rs`:
 
@@ -1293,7 +1293,7 @@ async fn a_client_connects_over_tls_and_sees_the_renewed_certificate_after_a_rel
 Write it out in full. `rcgen` certificates carry `localhost` as a SAN
 when minted with that name; the client verifies against it.
 
-- [ ] **Step 6: Run, prove, configure, commit**
+- [x] **Step 6: Run, prove, configure, commit**
 
 Run: `cargo test -p sdmqtt-server`. Prove: in `reloading`, replace the swap
 with a no-op; the unit reload test and the integration test fail. Restore.
@@ -1343,7 +1343,7 @@ git add -A && git commit -m "feat(listener): TLS, with a certificate that renews
   as one binary frame; `Refused::{NotAnUpgrade, NoMqttSubprotocol,
   Handshake(..)}`.
 
-- [ ] **Step 1: Write the failing unit tests**
+- [x] **Step 1: Write the failing unit tests**
 
 In `websocket.rs`'s test module, over `tokio::io::duplex`, using
 `tokio_tungstenite::client_async` with a request carrying
@@ -1384,12 +1384,12 @@ frames of unequal length. For the text test send `Message::Text` and
 assert the next message is `Message::Close(Some(CloseFrame { code:
 CloseCode::Unsupported, .. }))`.
 
-- [ ] **Step 2: Run them to see them fail**
+- [x] **Step 2: Run them to see them fail**
 
 Run: `cargo test -p sdmqtt-server --lib websocket::`
 Expected: compile error, no module.
 
-- [ ] **Step 3: Write `websocket.rs`**
+- [x] **Step 3: Write `websocket.rs`**
 
 ```rust
 //! MQTT over WebSocket, section 12.1.
@@ -1533,7 +1533,7 @@ The connection's own write batching means one `poll_write` is often
 several packets; that is allowed by the clause ("a frame may contain
 multiple MQTT control packets") and is cheaper than one frame per packet.
 
-- [ ] **Step 4: Wire the two kinds**
+- [x] **Step 4: Wire the two kinds**
 
 `Kind::Ws` and `Kind::Wss(Arc<tls::Acceptor>)`. The accept loop: `Ws`
 upgrades then serves; `Wss` handshakes, upgrades, serves — both bounded
@@ -1542,7 +1542,7 @@ by `connect_timeout` together, not each. A refused upgrade is counted on
 `handshake` and `timed_out`, registered only when a WebSocket listener
 exists. `ListenerProtocol::MqttWs` and `MqttWss`.
 
-- [ ] **Step 5: The integration test and the proof**
+- [x] **Step 5: The integration test and the proof**
 
 `crates/server/tests/over_websocket.rs`: bind a `Kind::Ws` server on an
 ephemeral port, connect with `tokio_tungstenite::connect_async` to
@@ -1555,7 +1555,7 @@ Prove: delete the subprotocol check; the "without the subprotocol" tests
 fail. Replace `self.unread = data.into()` with dropping the data; the
 reassembly test and the integration test fail. Restore.
 
-- [ ] **Step 6: Configuration, docs, commit**
+- [x] **Step 6: Configuration, docs, commit**
 
 `kind = "ws"` and `"wss"` are already parsed by task 3; `main` builds the
 kinds. README: a `[[listeners]]` example for each, the sentence that the
@@ -1584,7 +1584,7 @@ git add -A && git commit -m "feat(listener): MQTT over WebSocket, plain and over
   suite's plain-TCP client connects through; runner labels `v5-tls`,
   `v311-tls`, `v5-ws`, `v311-ws` beside `v5` and `v311`.
 
-- [ ] **Step 1: The forwarder**
+- [x] **Step 1: The forwarder**
 
 `conformance/via.py`, Python 3 standard library only (`socket`, `ssl`,
 `threading`, `base64`, `os`, `struct`): listens on a plain TCP port, and
@@ -1599,7 +1599,7 @@ reassembled (the broker sends none, but the forwarder must not assume
 it). Write it in full, about 150 lines; test it by hand against the
 broker from task 5 before wiring the runner.
 
-- [ ] **Step 2: The runner**
+- [x] **Step 2: The runner**
 
 `run.sh` mints a certificate for the run if `openssl` is on the path
 (`openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes
@@ -1616,7 +1616,7 @@ label, so `known-failures.txt` gains the two deferred lines per new label
 (`v5-tls:test_subscribe_failure deferred ...` and so on), and nothing
 else — the point of the task is that nothing else is needed.
 
-- [ ] **Step 3: Run it, and CI**
+- [x] **Step 3: Run it, and CI**
 
 Run: `services/broker/conformance/run.sh` locally; expected: six passes,
 the same failures per label as the plain pass has, and the runner green.
@@ -1636,7 +1636,7 @@ git add -A && git commit -m "test: the conformance suite over TLS and WebSocket"
 **Files:**
 - Modify: `README.md`, `CHANGELOG.md`, the spec (12.1, 5.4, 11.1), this plan
 
-- [ ] **Step 1: Budgets and the full gate**
+- [x] **Step 1: Budgets and the full gate**
 
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
@@ -1648,7 +1648,7 @@ cargo deny --config ../../deny.toml check
 All green; note the binary size and dependency count in the CHANGELOG
 entry if either moved by more than a megabyte or a dependency.
 
-- [ ] **Step 2: The walk (convention 8)**
+- [x] **Step 2: The walk (convention 8)**
 
 Section 12.1's listener sentence, 5.4's maximum-QoS paragraph, 8.6's
 per-listener paragraph and 11.1's listeners resource, each sentence named
@@ -1658,7 +1658,7 @@ the end of this plan. Say out loud what is deferred: client certificates
 need an X.509 parser; a dependency this plan declined), per-listener
 `max_connections` was already there.
 
-- [ ] **Step 3: Docs and commit**
+- [x] **Step 3: Docs and commit**
 
 Spec 5.4: replace "**Maximum QoS and Retain Availability move to milestone
 7.**" paragraph's content with the shipped behaviour in two sentences.
@@ -1674,4 +1674,49 @@ git add -A && git commit -m "docs: milestone 7's listeners, walked against the s
 
 ## Closing walk
 
-Written by task 7.
+Section 12.1's listener sentence, 5.4's maximum-QoS paragraph, 8.6's
+per-listener paragraph and 11.1's listeners resource, read against the
+code at the close (convention 8):
+
+- **"TLS and WebSocket listeners are supported"**: tasks 4 and 5,
+  `kind = "tls" | "ws" | "wss"`, each a layer in front of the same
+  `serve`. Checked by the Paho suite through `via.py` in task 6, where
+  the failures under each layer are exactly the plain pass's.
+- **"certificate hot reload through a certificate resolver so renewal
+  needs no restart"**: task 4, `tls::Acceptor::reloading`, a poll of two
+  files' modification times; a half-written renewal keeps the old pair.
+- **5.4, "Maximum QoS and Retain Availability move to milestone 7"**:
+  task 1, `listener.max_qos` and `listener.retain_available`, advertised
+  and enforced, with the 3.1.1 refusal a closed socket as section 13
+  wants. The spec paragraph now says what shipped.
+- **8.6, the per-listener durability override**: task 2,
+  `listener.durability`, the node's timeout in both modes; the milestone
+  6 walk's deferral is closed.
+- **11.1's listeners resource**: task 3, one row per listener with its
+  protocol and policy.
+- **16's exit criterion, "the full conformance suite green including TLS
+  and WebSocket"**: task 6, six passes, one baseline keyed by label.
+
+Deferred, said out loud:
+
+- **Client certificates.** Not in the spec's sentence; a listener that
+  asked for one needs a trust store and a meaning for the name in it,
+  which is authorization work, and milestone 7's second plan is where
+  authorization lives.
+- **The certificate's not-after as a metric.** Would need an X.509
+  parser this build does not otherwise carry; the budget was spent on
+  `tokio-tungstenite` and `futures-util` instead (29 of 35).
+- **One frame per packet on WebSocket.** The clause allows several per
+  frame and this adapter sends a burst as one; a client that wanted
+  otherwise was promised nothing by the standard.
+
+Found on the way, each by a test refusing to pass:
+
+- A WebSocket frame sat queued until the next write, because
+  tungstenite writes on flush and the connection shell flushes only at
+  the end of a burst (task 5). The adapter now flushes inside the write.
+- The forwarder read and wrote an SSL socket from two threads, which
+  OpenSSL does not allow, and dropped the broker's DISCONNECT on close
+  (task 6). Both found by the suite and fixed in the forwarder.
+- Two listeners would have ticked the broker twice a second (task 3).
+  The first listener bound drives the clock.

@@ -769,6 +769,15 @@ The name is the one thing the attack cannot forge. If you reach the
 listener through a name of your own, put it in the list; the refusal
 says so.
 
+## Conformance
+
+`services/broker/conformance/run.sh` runs Eclipse Paho's interoperability
+suite against a release build, over plain TCP, over WebSocket and — when
+`openssl` is on the path to mint a certificate for the run — over TLS,
+for both protocol versions, and fails on any difference from
+`conformance/known-failures.txt` in either direction. `CONFORMANCE_MODES="tls"`
+runs one layer while working on it.
+
 ## Development containers
 
 Everything builds and tests in a **single container**. The per-service
