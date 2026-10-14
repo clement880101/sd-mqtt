@@ -13,7 +13,13 @@ use storage::record::{ScramVerifierRecord, Secret, UserRecord};
 /// Bytes of salt, for both forms.
 const SALT_LEN: usize = 16;
 
-/// Build a user with `password`, hashing it both ways.
+/// Build a user with `password`: an argon2 hash always, and a SCRAM
+/// verifier when `scram` says the user is enrolled.
+///
+/// Section 12.2: a verifier is a weaker secret at rest than the hash —
+/// whoever holds its stored key can impersonate the user — so it exists
+/// only for users explicitly enrolled, and is made here or never, since
+/// it cannot be derived later from the hash.
 ///
 /// # Panics
 ///
@@ -25,6 +31,7 @@ pub fn with_password(
     password: &Secret,
     iterations: u32,
     created_at: u64,
+    scram: bool,
 ) -> UserRecord {
     let mut salt = [0u8; SALT_LEN];
     rand::fill(&mut salt).expect("the random source answers");
@@ -32,12 +39,15 @@ pub fn with_password(
         .hash_password_with_salt(password.expose().as_bytes(), &salt)
         .expect("argon2 hashes any password with a sixteen-byte salt")
         .to_string();
-    let mut scram_salt = [0u8; SALT_LEN];
-    rand::fill(&mut scram_salt).expect("the random source answers");
+    let scram = scram.then(|| {
+        let mut scram_salt = [0u8; SALT_LEN];
+        rand::fill(&mut scram_salt).expect("the random source answers");
+        verifier(password.expose(), &scram_salt, iterations)
+    });
     UserRecord {
         name: name.to_owned(),
         password: Some(Secret::new(hash)),
-        scram: Some(verifier(password.expose(), &scram_salt, iterations)),
+        scram,
         created_at,
     }
 }
@@ -99,7 +109,7 @@ mod tests {
     /// A password set is an argon2 string and a verifier, and checks.
     #[test]
     fn a_password_set_checks_and_the_wrong_one_does_not() {
-        let user = with_password("alice", &Secret::new("hunter2"), 4096, 7);
+        let user = with_password("alice", &Secret::new("hunter2"), 4096, 7, true);
         assert!(user
             .password
             .as_ref()
@@ -118,8 +128,8 @@ mod tests {
     /// user, for both forms.
     #[test]
     fn two_users_with_one_password_share_nothing_stored() {
-        let one = with_password("alice", &Secret::new("same"), 4096, 1);
-        let two = with_password("bob", &Secret::new("same"), 4096, 1);
+        let one = with_password("alice", &Secret::new("same"), 4096, 1, true);
+        let two = with_password("bob", &Secret::new("same"), 4096, 1, true);
         assert_ne!(one.password, two.password);
         let (a, b) = (one.scram.unwrap(), two.scram.unwrap());
         assert_ne!(a.salt, b.salt);
@@ -130,7 +140,7 @@ mod tests {
     /// A user without a password form is not a password login.
     #[test]
     fn a_user_without_a_password_refuses_every_password() {
-        let mut user = with_password("alice", &Secret::new("hunter2"), 4096, 1);
+        let mut user = with_password("alice", &Secret::new("hunter2"), 4096, 1, true);
         user.password = None;
         assert!(!check_password(&user, b"hunter2"));
     }
@@ -138,16 +148,28 @@ mod tests {
     /// The record's Debug says nothing about either secret.
     #[test]
     fn a_user_record_debugs_without_its_secrets() {
-        let user = with_password("alice", &Secret::new("hunter2"), 4096, 1);
+        let user = with_password("alice", &Secret::new("hunter2"), 4096, 1, true);
         let printed = format!("{user:?}");
         assert!(!printed.contains("argon2"), "{printed}");
         assert!(printed.contains("<redacted>"), "{printed}");
     }
 
+    /// Section 12.2: a verifier exists only for a user enrolled in
+    /// SCRAM. Not enrolled is a password login and nothing else.
+    #[test]
+    fn a_verifier_is_made_only_for_a_user_enrolled_in_scram() {
+        let plain = with_password("alice", &Secret::new("hunter2"), 4096, 1, false);
+        assert!(plain.scram.is_none());
+        assert!(check_password(&plain, b"hunter2"));
+        let enrolled = with_password("alice", &Secret::new("hunter2"), 4096, 1, true);
+        assert!(enrolled.scram.is_some());
+        assert!(!UserView::from(&plain).scram && UserView::from(&enrolled).scram);
+    }
+
     /// A view carries no secret, only whether each form is set.
     #[test]
     fn a_view_says_which_credentials_exist_and_shows_neither() {
-        let user = with_password("alice", &Secret::new("hunter2"), 4096, 1);
+        let user = with_password("alice", &Secret::new("hunter2"), 4096, 1, true);
         let view = UserView::from(&user);
         assert_eq!(view.name, "alice");
         assert!(view.has_password && view.scram);

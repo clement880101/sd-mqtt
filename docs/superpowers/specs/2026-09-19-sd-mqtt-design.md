@@ -1294,7 +1294,8 @@ this binary would be untrue in the other direction. See section 3.
 
 Counters for packets by type, version and reason code; queue events by
 reason including drops and expiries; socket lifecycle; bytes in and out;
-authentication outcomes; cluster bytes sent, received and dropped; and
+authentication outcomes, and what section 10.3's limiters turned away;
+cluster bytes sent, received and dropped; and
 router matches split local and remote. Gauges for connections, sessions,
 subscriptions, retained messages, queue depth and cluster members.
 
@@ -1397,6 +1398,19 @@ frame with 1003. Client certificates are not asked for, an encrypted key
 is refused, and the certificate's expiry is not a metric because reading
 it would need an X.509 parser this build does not otherwise carry.
 
+**Users and rules, as built in milestone 7.** Users live in a directory
+crate behind section 9.3's `authenticate` hook and replicate as section 8.2
+registers; the broker's connect path does not know users exist. A rule's
+subject is `anyone`, `user:<name>` or `client:<id>`, and the "pattern" this
+section asks for is a name ending in `*`, meaning every name with that
+prefix: `client:sensor-*`, or `user:*` for every authenticated connection.
+A `*` anywhere else is refused rather than read as a second wildcard
+grammar. Rules in the file and rules written through the API are consulted
+together, in one order. A shared subscription is judged by the filter it
+shares. Deny by default once any rule exists is literal: one rule locks out
+everything it does not allow, and the README and the Settings page both say
+so above the table.
+
 ### 12.2 Enhanced authentication
 
 SCRAM-SHA-256 is implemented per the SASL SCRAM specification and its
@@ -1426,6 +1440,15 @@ by the API, and exist only for users explicitly enrolled in SCRAM.
 A client requesting any other mechanism receives the bad authentication
 method reason code.
 
+**Enrolment, as built in milestone 7, is asked for.** Setting a password
+always makes the argon2 hash, and makes the verifier only when the request
+says `"scram": true`; setting the password again without it withdraws the
+enrolment, because the old verifier is of the old password. A user who is
+not enrolled and attempts the exchange fails at the proof exactly as an
+unknown name does, so enrolment is not discoverable by trying. There is no
+mechanism list in MQTT to advertise; the unbound mechanism is the only one
+answered, and a client asking for `-PLUS` or any other method is told 0x8C.
+
 ### 12.3 Secret handling
 
 Passwords and tokens are held in a wrapper that refuses to print itself, so
@@ -1453,6 +1476,12 @@ means adding a classified line to `conformance/known-failures.txt`, which
 belongs with the authorization work in milestone 7 where
 `test_subscribe_failure` is already deferred, rather than beside a change
 that must leave the baseline alone.
+
+How it came out: `test_dollar_topics` still passes, because it asserts only
+that nothing is delivered and never looks at the acknowledgement.
+`test_subscribe_failure` passes on 3.1.1 now that the runner writes the rule
+it needs; on version 5 it is an `assumption`, because it asserts 0x80 where
+3.9.3 lists 0x87 for a refused subscription.
 
 ## 13. Error handling
 

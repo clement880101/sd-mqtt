@@ -398,11 +398,15 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
   -d '{"name":"alice","password":"hunter2"}' http://127.0.0.1:1884/api/v1/users
 ```
 
-The password is hashed with argon2id for a password login and derived
-into a SCRAM-SHA-256 verifier for the AUTH exchange, both at that
-moment, and neither is ever returned: `GET /api/v1/users` lists names
-and which credential forms exist. Posting the same name again changes
-the password. `DELETE /api/v1/users/{name}` removes the user, and the
+The password is hashed with argon2id for a password login. With
+`"scram": true` in the same request it is also derived into a
+SCRAM-SHA-256 verifier for the AUTH exchange, at that moment, since a
+verifier cannot be made later from the hash. Enrolment is asked for
+rather than automatic because a verifier is a secret equivalent to a
+private key. Neither form is ever returned: `GET /api/v1/users` lists
+names and which credential forms exist. Posting the same name again
+changes the password, and without `"scram": true` withdraws an
+enrolment. `DELETE /api/v1/users/{name}` removes the user, and the
 removal replicates as a tombstone. A client presenting a wrong password,
 or a name nobody has, is refused with 0x87; the two are one answer, so
 nobody can learn which names exist by trying. `anonymous` is a switch
@@ -423,8 +427,9 @@ addresses and logs a warning when that is full.
 turned away, and `sdmqtt_auth_failure_addresses` how many addresses are
 held. `SDMQTT_AUTH_MAX_FAILURES_PER_MINUTE` sets it.
 
-A version 5 client can authenticate without sending its password at all,
-with **SCRAM-SHA-256** over the AUTH exchange (RFC 7677): it names the
+A version 5 client of a user enrolled in SCRAM can authenticate without
+sending its password at all, with **SCRAM-SHA-256** over the AUTH
+exchange (RFC 7677): it names the
 method in CONNECT, the broker challenges, the client proves, and the
 connect acknowledgement carries the server's own proof back. The same
 exchange renews the credentials mid-session (`AUTH` with
@@ -453,7 +458,9 @@ The answer carries the key, `sdmqtt_<id>_<secret>`, **once**: the broker
 keeps a digest of it and nothing that would give it back. `GET
 /api/v1/keys` lists identifiers, names and scopes; `DELETE
 /api/v1/keys/{id}` revokes, and the revocation replicates to every node
-like a user's removal. A real key that is too narrow is answered `403`
+like a user's removal: at once on the node that revoked it, and on each
+other node as the register arrives, so a node partitioned from the rest
+keeps accepting the key until it hears. A real key that is too narrow is answered `403`
 with both scopes named; a wrong one is `401`. A node with no store
 holds no keys, and the token is then the only credential.
 
@@ -468,7 +475,7 @@ also lists this node's listeners, which stay in the file.
 [[acl]]
 id = "no-secrets"
 order = 10                        # lower is consulted first; 100 by default
-subject = "anyone"                # or "user:alice", or "client:gateway-1"
+subject = "anyone"                # or "user:alice", "client:gateway-1", "client:sensor-*", "user:*"
 filter = "secret/#"
 subscribe = false                 # an opinion on subscribing; publish is left unsaid
 
@@ -486,7 +493,11 @@ then on an operation is allowed only by a rule that says so, which is
 why the second rule above exists. Rules are consulted in `order`, then
 by identifier, and the first whose subject and filter match and that
 has an opinion on the operation decides; a rule with no opinion is
-skipped. A rule's filter matches a published topic the way a
+skipped. A subject's name may end in `*` to mean every name with that
+prefix: `client:sensor-*` is every client whose identifier starts
+`sensor-`, and `user:*` is every authenticated connection, which is how a
+rule tells a logged-in client from an anonymous one. A `*` anywhere else
+is refused. A rule's filter matches a published topic the way a
 subscription does, wildcards and all, and a requested subscription
 filter the way a topic name would; a shared subscription is judged by
 the filter it shares, so a rule about `fleet/#` covers

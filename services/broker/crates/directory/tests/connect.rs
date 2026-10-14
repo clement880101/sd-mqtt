@@ -92,7 +92,7 @@ async fn connect_as(
 async fn a_user_with_the_right_password_connects_and_the_wrong_one_is_refused() {
     let (shared, directory) = broker_with(Settings::default());
     directory
-        .put_user("alice", &Secret::new("hunter2"))
+        .put_user("alice", &Secret::new("hunter2"), false)
         .await
         .expect("created");
     assert_eq!(
@@ -122,7 +122,7 @@ async fn anonymous_is_admitted_by_the_switch_and_refused_without_it() {
     assert_eq!(connect_as(&open, None, None).await, ReasonCode::Success);
     // Creating a user does not flip the switch.
     directory
-        .put_user("alice", &Secret::new("hunter2"))
+        .put_user("alice", &Secret::new("hunter2"), false)
         .await
         .expect("created");
     assert_eq!(connect_as(&open, None, None).await, ReasonCode::Success);
@@ -142,7 +142,7 @@ async fn anonymous_is_admitted_by_the_switch_and_refused_without_it() {
 async fn a_deleted_user_is_refused() {
     let (shared, directory) = broker_with(Settings::default());
     directory
-        .put_user("alice", &Secret::new("hunter2"))
+        .put_user("alice", &Secret::new("hunter2"), false)
         .await
         .expect("created");
     directory.delete_user("alice").await.expect("deleted");

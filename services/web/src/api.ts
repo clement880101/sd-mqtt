@@ -601,12 +601,19 @@ export interface UserView {
   created_at: number;
 }
 
-/** Create a user, or set the password of one that exists. */
-export function putUser(name: string, password: string): Promise<UserView> {
+/**
+ * Create a user, or set the password of one that exists.
+ *
+ * `scram` enrols the user in SCRAM-SHA-256 as well. Off unless asked
+ * for: section 12.2 treats a verifier as a secret equivalent to a
+ * private key, so it exists only for users who need it, and setting
+ * the password again without it withdraws the enrolment.
+ */
+export function putUser(name: string, password: string, scram: boolean): Promise<UserView> {
   return request<UserView>('/api/v1/users', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name, password }),
+    body: JSON.stringify({ name, password, scram }),
   });
 }
 

@@ -233,25 +233,32 @@ function Users() {
   const { outcome, busy, run } = useChange(again);
   const name = useSignal('');
   const password = useSignal('');
+  const scram = useSignal(false);
   const rows = users.value?.rows ?? [];
   return (
     <section>
       <h2>Users</h2>
       <p class="hint">
-        A user connects with a password, or with SCRAM-SHA-256 on version 5. The password is
-        hashed when it is set and never shown again; setting it for a name that exists changes it.
+        A user connects with a password. The password is hashed when it is set and never shown
+        again; setting it for a name that exists changes it. Enrolling in SCRAM-SHA-256 lets a
+        version 5 client prove the password without sending it, and stores a verifier the broker
+        guards like a private key, so it is only made when asked for. Setting the password again
+        without it withdraws the enrolment.
       </p>
       <form
         class="fields"
         onSubmit={(event) => {
           event.preventDefault();
           const who = name.value.trim();
-          void run(`${who} can connect.`, () => putUser(who, password.value)).then((done) => {
-            if (done) {
-              name.value = '';
-              password.value = '';
-            }
-          });
+          void run(`${who} can connect.`, () => putUser(who, password.value, scram.value)).then(
+            (done) => {
+              if (done) {
+                name.value = '';
+                password.value = '';
+                scram.value = false;
+              }
+            },
+          );
         }}
       >
         <label>
@@ -271,6 +278,14 @@ function Users() {
             value={password.value}
             onInput={(event) => (password.value = event.currentTarget.value)}
           />
+        </label>
+        <label class="inline">
+          <input
+            type="checkbox"
+            checked={scram.value}
+            onChange={(event) => (scram.value = event.currentTarget.checked)}
+          />
+          Enrol in SCRAM-SHA-256
         </label>
         <button
           type="submit"
@@ -435,7 +450,7 @@ function AccessControl() {
       >
         {field('Identifier', 'id', 'The same one again replaces it.')}
         {field('Order', 'order', 'Lower first.')}
-        {field('Subject', 'subject', 'anyone, user:<name> or client:<id>')}
+        {field('Subject', 'subject', 'anyone, user:<name> or client:<id>; * ends a prefix')}
         {field('Topic filter', 'filter', 'Wildcards as in a subscription.')}
         {choice('Publish', 'publish')}
         {choice('Subscribe', 'subscribe')}
@@ -513,8 +528,9 @@ function Keys() {
     <section>
       <h2>API keys</h2>
       <p class="hint">
-        A key is shown once, when it is made: the broker keeps only a digest. Revoking one takes
-        effect on every node.
+        A key is shown once, when it is made: the broker keeps only a digest. Revoking one refuses
+        it on this node at once and on every other as the revocation reaches it, usually within a
+        second; a node cut off from this one keeps accepting the key until it hears.
       </p>
       <form
         class="fields"

@@ -30,10 +30,12 @@ rejoin and be repaired before the next.
 - **A directory of users**, section 12.1, in a crate of its own. A user
   is durable metadata like a rule: written through `POST /api/v1/users`
   on any node, replicated as a register to every other, removed by a
-  tombstone. The password is hashed with argon2id (PHC string) and
-  derived into a SCRAM-SHA-256 verifier at the one moment the password
-  is in hand, because a verifier cannot be made from an argon2 hash;
-  neither is ever returned by the API, and the record's `Debug` says
+  tombstone. The password is hashed with argon2id (PHC string) and,
+  when the request enrols the user with `"scram": true`, derived into a
+  SCRAM-SHA-256 verifier at the one moment the password is in hand,
+  because a verifier cannot be made from an argon2 hash. Enrolment is
+  opt-in because section 12.2 treats a verifier as a private key's
+  equal. Neither form is ever returned by the API, and the record's `Debug` says
   `<redacted>`. The directory is a section 9.3 hook — `authenticate` —
   and the broker's connect path does not know users exist. A wrong
   password and an unknown name are one answer. `auth.anonymous` is an
@@ -62,7 +64,8 @@ rejoin and be repaired before the next.
 - **Access control rules**, section 12.1, deny by default once one
   exists. `[[acl]]` tables in the file and `POST /api/v1/acl` through
   the API take the same shape — identifier, order, subject (`anyone`,
-  `user:<name>`, `client:<id>`), filter, and an opinion on publishing
+  `user:<name>`, `client:<id>`, where a name may end in `*` to cover a
+  prefix and `user:*` is every authenticated connection), filter, and an opinion on publishing
   and on subscribing — and are consulted together by order, first
   match deciding; the API's replicate as registers, the file's are the
   node's own. Filters match the way subscriptions do, through the topic

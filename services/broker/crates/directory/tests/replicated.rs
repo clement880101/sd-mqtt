@@ -52,7 +52,7 @@ async fn a_user_put_on_one_node_connects_on_another_and_a_delete_follows() {
     let (beta, _, beta_store) = node();
 
     alpha
-        .put_user("alice", &Secret::new("hunter2"))
+        .put_user("alice", &Secret::new("hunter2"), false)
         .await
         .expect("created");
     // The register alpha wrote, as a peer would receive it.

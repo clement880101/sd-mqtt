@@ -337,9 +337,12 @@ impl Directory {
             .map(UserView::from)
     }
 
-    /// Create a user, or set an existing one's password. Both
-    /// credential forms are derived now, because this is the one moment
-    /// the password is in hand (section 12.2).
+    /// Create a user, or set an existing one's password. The argon2
+    /// hash is made now, and the SCRAM verifier too when `scram` enrols
+    /// the user, because this is the one moment the password is in hand
+    /// (section 12.2). Setting the password again without `scram`
+    /// withdraws an enrolment: the verifier is of the old password and
+    /// a new one cannot be made without it.
     ///
     /// # Errors
     ///
@@ -348,6 +351,7 @@ impl Directory {
         &self,
         name: &str,
         password: &Secret,
+        scram: bool,
     ) -> Result<UserView, DirectoryError> {
         if name.is_empty() || name.chars().any(char::is_control) {
             return Err(DirectoryError::BadName);
@@ -362,8 +366,13 @@ impl Directory {
             .unwrap_or_else(PoisonError::into_inner)
             .get(name)
             .map_or_else(now, |existing| existing.created_at);
-        let record =
-            user::with_password(name, password, self.settings.scram_iterations, created_at);
+        let record = user::with_password(
+            name,
+            password,
+            self.settings.scram_iterations,
+            created_at,
+            scram,
+        );
         let write = self.replicated.user(record.clone());
         let mut records = vec![Record::UserPut(Box::new(record.clone()))];
         records.extend(self.replicated.records(&write));

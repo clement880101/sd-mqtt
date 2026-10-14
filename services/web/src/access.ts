@@ -47,16 +47,27 @@ export interface AclRule {
   subscribe?: boolean;
 }
 
+/** One kind of name, exact or a prefix ending in `*`, in words. */
+function named(kind: 'User' | 'Client', name: string): string {
+  if (name === '*') {
+    return kind === 'User' ? 'Any authenticated user' : 'Any client';
+  }
+  if (name.endsWith('*')) {
+    return `${kind}s starting ${name.slice(0, -1)}`;
+  }
+  return `${kind} ${name}`;
+}
+
 /** Who a subject names, in words. */
 function whom(subject: string): string {
   if (subject === 'anyone') {
     return 'Anyone';
   }
   if (subject.startsWith('user:')) {
-    return `User ${subject.slice('user:'.length)}`;
+    return named('User', subject.slice('user:'.length));
   }
   if (subject.startsWith('client:')) {
-    return `Client ${subject.slice('client:'.length)}`;
+    return named('Client', subject.slice('client:'.length));
   }
   return subject;
 }
@@ -97,9 +108,10 @@ export function ruleProblems(rule: AclRule): Problems {
   if (rule.id.trim() === '') {
     problems.id = 'A rule needs an identifier.';
   }
-  const named = /^(user|client):.+$/.test(rule.subject);
-  if (rule.subject !== 'anyone' && !named) {
-    problems.subject = 'anyone, user:<name> or client:<identifier>.';
+  // A name, or a prefix ending in the one `*` the broker accepts.
+  const nameOrPrefix = /^(user|client):([^*]+\*?|\*)$/.test(rule.subject);
+  if (rule.subject !== 'anyone' && !nameOrPrefix) {
+    problems.subject = 'anyone, user:<name> or client:<identifier>; a name may end in *.';
   }
   if (rule.filter === '') {
     problems.filter = 'A rule needs a topic filter; # is every topic.';

@@ -2,13 +2,15 @@
 //!
 //! # A password goes in and nothing comes out
 //!
-//! `POST /api/v1/users` takes a name and a password and answers with the
-//! view: the name, which credential forms exist, when it was made. The
-//! argon2 string and the SCRAM verifier are never returned — section
-//! 12.2 says a verifier is a secret equivalent to a private key — and
-//! there is no endpoint that reads them. Setting a password again is
-//! the same request to the same path: a put over a held name replaces
-//! both forms, because both are derived from the one password.
+//! `POST /api/v1/users` takes a name, a password and, optionally,
+//! `"scram": true`, and answers with the view: the name, which
+//! credential forms exist, when it was made. The argon2 string is
+//! always made and the SCRAM verifier only when asked for — section
+//! 12.2 says a verifier is a secret equivalent to a private key, to
+//! exist only for users explicitly enrolled — and neither is ever
+//! returned. Setting a password again is the same request to the same
+//! path: a put over a held name replaces whatever forms it had, because
+//! every form is derived from the one password.
 //!
 //! # Guarded like every mutation
 //!
@@ -36,6 +38,11 @@ pub struct UserSpec {
     /// The password. Hashed before it is stored and never echoed; the
     /// wrapper keeps it out of any log line this handler could write.
     pub password: Secret,
+    /// Enrol the user in SCRAM-SHA-256 as well. Section 12.2: off
+    /// unless asked for, because a verifier is a secret equivalent to
+    /// a private key and should exist only for users who need it.
+    #[serde(default)]
+    pub scram: bool,
 }
 
 fn directory(state: &AdminState) -> Result<&std::sync::Arc<Directory>, ApiError> {
@@ -99,7 +106,7 @@ async fn create(
         ))
     })?;
     let view = directory(&state)?
-        .put_user(&spec.name, &spec.password)
+        .put_user(&spec.name, &spec.password, spec.scram)
         .await
         .map_err(refusal)?;
     Ok(Json(view))
@@ -209,7 +216,12 @@ mod tests {
             "{}",
             created.body
         );
-        assert!(created.body.contains("\"scram\":true"), "{}", created.body);
+        assert!(
+            created.body.contains("\"scram\":false"),
+            "SCRAM is opt-in: {}",
+            created.body
+        );
+        assert!(directory.verifier("alice").is_none(), "no verifier unasked");
         assert!(
             !created.body.contains("hunter2") && !created.body.contains("argon2"),
             "the answer carries no secret: {}",
@@ -225,15 +237,18 @@ mod tests {
         let missing = testing::get(admin.address(), "/api/v1/users/nobody").await;
         assert_eq!(missing.status, 404);
 
-        // A second put is a password change, not a second user.
+        // A second put is a password change, not a second user; this
+        // one enrols the user in SCRAM.
         let changed = testing::post_json(
             admin.address(),
             "/api/v1/users",
             None,
-            r#"{"name":"alice","password":"hunter3"}"#,
+            r#"{"name":"alice","password":"hunter3","scram":true}"#,
         )
         .await;
         assert_eq!(changed.status, 200, "{}", changed.body);
+        assert!(changed.body.contains("\"scram\":true"), "{}", changed.body);
+        assert!(directory.verifier("alice").is_some());
         assert!(directory.check_password("alice", b"hunter3"));
         assert!(!directory.check_password("alice", b"hunter2"));
         let listed = testing::get(admin.address(), "/api/v1/users").await;

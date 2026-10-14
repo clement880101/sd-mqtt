@@ -5516,11 +5516,19 @@ mod tests {
     }
 
     /// Re-authentication: the same exchange mid-session, answered with
-    /// AUTH packets and a final `Success`; a wrong proof disconnects.
+    /// AUTH packets and a final `Success`; a wrong proof disconnects,
+    /// and is a failure charged to the address like one at connect.
     #[tokio::test]
     async fn a_client_re_authenticates_mid_session_and_a_wrong_proof_disconnects_it() {
         let shared = with_scram_user("alice", b"pencil");
-        let mut client = serve_one(Arc::clone(&shared));
+        let peer: std::net::IpAddr = "192.0.2.44".parse().expect("an address");
+        let mut client = serve_one_with_config(
+            Arc::clone(&shared),
+            ConnectionConfig {
+                peer: Some(peer),
+                ..ConnectionConfig::default()
+            },
+        );
         let (ack, _) = connect_with_scram(&mut client, "alice", b"pencil").await;
         assert_eq!(ack.reason, ReasonCode::Success);
 
@@ -5587,6 +5595,19 @@ mod tests {
             Packet::Disconnect(gone) => assert_eq!(gone.reason, ReasonCode::NotAuthorized),
             other => panic!("expected a disconnect, got {other:?}"),
         }
+        let metrics = shared.metrics();
+        assert_eq!(
+            metrics.authentication(AuthOutcome::Success).get(),
+            2,
+            "the connect and the first renewal"
+        );
+        assert_eq!(metrics.authentication(AuthOutcome::Failure).get(), 1);
+        shared.sweep_authentication_failures();
+        assert_eq!(
+            metrics.auth_failure_addresses().get(),
+            1,
+            "the failed renewal is held against the address"
+        );
     }
 
     /// An AUTH that continues nothing, or re-authenticates as somebody

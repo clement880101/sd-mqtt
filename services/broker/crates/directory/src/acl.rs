@@ -26,6 +26,16 @@
 //! against the rule's filter as a topic name would be — `fleet/+/temp`
 //! is covered by a rule for `fleet/#`, and a request for `#` is covered
 //! by a rule for `#` and by nothing narrower.
+//!
+//! # Subjects are names or prefixes
+//!
+//! Section 12.1 maps "a user or client pattern" to filters. The pattern
+//! is a name, or a prefix ending in `*`: `client:sensor-*` is every
+//! client whose identifier starts `sensor-`, and `user:*` is every
+//! authenticated connection — which is the one way to tell a logged-in
+//! client from an anonymous one in a rule. A `*` anywhere else is
+//! refused rather than read as something: two kinds of wildcard in one
+//! word is a grammar an operator has to guess at.
 
 use broker_core::hooks::{ClientInfo, Decision, Hook};
 use broker_core::session::message::Message;
@@ -33,19 +43,59 @@ use mqtt_codec::QoS;
 use std::sync::Arc;
 use storage::record::AclRecord;
 
+/// A name, or every name with a prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pattern {
+    /// Exactly this.
+    Exactly(String),
+    /// Anything that starts with this, including this.
+    Prefix(String),
+}
+
+impl Pattern {
+    fn parse(text: &str, what: &str) -> Result<Self, String> {
+        if text.is_empty() {
+            return Err(format!("{what} needs a name after the colon"));
+        }
+        let (stem, open) = match text.strip_suffix('*') {
+            Some(stem) => (stem, true),
+            None => (text, false),
+        };
+        if stem.contains('*') {
+            return Err(format!(
+                "{what} takes a `*` only at the end, meaning any name that starts with what \
+                 comes before it"
+            ));
+        }
+        Ok(if open {
+            Self::Prefix(stem.to_owned())
+        } else {
+            Self::Exactly(stem.to_owned())
+        })
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::Exactly(exact) => name == exact,
+            Self::Prefix(prefix) => name.starts_with(prefix.as_str()),
+        }
+    }
+}
+
 /// Whom a rule is about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Subject {
     /// Every connection.
     Anyone,
-    /// Connections authenticated as this user.
-    User(String),
-    /// Connections with this client identifier.
-    Client(String),
+    /// Connections authenticated as a user the pattern names.
+    User(Pattern),
+    /// Connections whose client identifier the pattern names.
+    Client(Pattern),
 }
 
 impl Subject {
-    /// Parse the stored form: `anyone`, `user:<name>` or `client:<id>`.
+    /// Parse the stored form: `anyone`, `user:<name>` or `client:<id>`,
+    /// where a name may end in `*`.
     ///
     /// # Errors
     ///
@@ -55,25 +105,22 @@ impl Subject {
             return Ok(Self::Anyone);
         }
         if let Some(name) = text.strip_prefix("user:") {
-            if name.is_empty() {
-                return Err("user: needs a name after the colon".to_owned());
-            }
-            return Ok(Self::User(name.to_owned()));
+            return Pattern::parse(name, "user:").map(Self::User);
         }
         if let Some(id) = text.strip_prefix("client:") {
-            if id.is_empty() {
-                return Err("client: needs an identifier after the colon".to_owned());
-            }
-            return Ok(Self::Client(id.to_owned()));
+            return Pattern::parse(id, "client:").map(Self::Client);
         }
-        Err("a subject is `anyone`, `user:<name>` or `client:<id>`".to_owned())
+        Err(
+            "a subject is `anyone`, `user:<name>` or `client:<id>`, and a name may end in `*`"
+                .to_owned(),
+        )
     }
 
     fn covers(&self, client: &ClientInfo<'_>) -> bool {
         match self {
             Self::Anyone => true,
-            Self::User(name) => client.username == Some(name.as_str()),
-            Self::Client(id) => client.client_id == id,
+            Self::User(pattern) => client.username.is_some_and(|name| pattern.matches(name)),
+            Self::Client(pattern) => pattern.matches(client.client_id),
         }
     }
 }
@@ -343,16 +390,52 @@ mod tests {
         );
     }
 
+    /// Section 12.1's patterns: a trailing `*` matches every name with
+    /// that prefix, `user:*` is every authenticated connection and not
+    /// an anonymous one, and a `*` anywhere else is refused rather than
+    /// guessed at.
+    #[test]
+    fn a_trailing_star_covers_every_name_with_that_prefix() {
+        let rules = [
+            rule("sensors", 1, "client:sensor-*", "fleet/#", Some(true), None),
+            rule("members", 2, "user:*", "members/#", Some(true), None),
+        ];
+        let cases = [
+            (client("sensor-7", None), "fleet/7", Some(true)),
+            (client("sensor-", None), "fleet/7", Some(true)),
+            (client("sensor", None), "fleet/7", Some(false)),
+            (client("gateway-1", None), "fleet/7", Some(false)),
+            (client("x", Some("alice")), "members/news", Some(true)),
+            (client("x", None), "members/news", Some(false)),
+        ];
+        for (who, topic, expected) in cases {
+            assert_eq!(
+                decide(&rules, &who, Operation::Publish, topic),
+                expected,
+                "{} as {:?} on {topic}",
+                who.client_id,
+                who.username
+            );
+        }
+        assert!(Subject::parse("client:sen*sor").is_err());
+        assert!(Subject::parse("user:**").is_err());
+        assert!(Subject::parse("client:*").is_ok());
+    }
+
     #[test]
     fn subjects_parse_and_refuse_the_rest() {
         assert_eq!(Subject::parse("anyone"), Ok(Subject::Anyone));
         assert_eq!(
             Subject::parse("user:alice"),
-            Ok(Subject::User("alice".to_owned()))
+            Ok(Subject::User(Pattern::Exactly("alice".to_owned())))
         );
         assert_eq!(
             Subject::parse("client:gw"),
-            Ok(Subject::Client("gw".to_owned()))
+            Ok(Subject::Client(Pattern::Exactly("gw".to_owned())))
+        );
+        assert_eq!(
+            Subject::parse("client:gw-*"),
+            Ok(Subject::Client(Pattern::Prefix("gw-".to_owned())))
         );
         assert!(Subject::parse("user:").is_err());
         assert!(Subject::parse("everyone").is_err());

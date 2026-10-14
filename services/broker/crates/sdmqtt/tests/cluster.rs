@@ -2901,8 +2901,10 @@ async fn a_user_created_on_one_node_connects_on_another() {
     let cluster = Cluster::start(directory.path()).await;
     cluster.settle();
 
-    let answered =
-        cluster.nodes[0].post("/api/v1/users", r#"{"name":"alice","password":"hunter2"}"#);
+    let answered = cluster.nodes[0].post(
+        "/api/v1/users",
+        r#"{"name":"alice","password":"hunter2","scram":true}"#,
+    );
     assert!(answered.contains("\"name\":\"alice\""), "{answered}");
     assert!(
         !answered.contains("hunter2"),

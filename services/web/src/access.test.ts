@@ -53,6 +53,14 @@ test('a rule reads as a sentence with as many clauses as opinions', () => {
     describeRule({ id: 'c', order: 1, subject: 'client:gw-1', filter: 'fleet/+', publish: true }),
     'Client gw-1 may publish to fleet/+',
   );
+  assert.equal(
+    describeRule({ id: 'd', order: 1, subject: 'user:*', filter: 'members/#', subscribe: true }),
+    'Any authenticated user may subscribe to members/#',
+  );
+  assert.equal(
+    describeRule({ id: 'e', order: 1, subject: 'client:sensor-*', filter: 'fleet/#', publish: true }),
+    'Clients starting sensor- may publish to fleet/#',
+  );
 });
 
 test('the form refuses what the broker would', () => {
@@ -62,6 +70,10 @@ test('the form refuses what the broker would', () => {
   assert.ok(ruleProblems({ ...good, subject: 'everyone' }).subject);
   assert.ok(ruleProblems({ ...good, subject: 'user:' }).subject);
   assert.deepEqual(ruleProblems({ ...good, subject: 'client:gw-1' }), {});
+  assert.deepEqual(ruleProblems({ ...good, subject: 'client:gw-*' }), {});
+  assert.deepEqual(ruleProblems({ ...good, subject: 'user:*' }), {});
+  assert.ok(ruleProblems({ ...good, subject: 'client:g*w' }).subject, 'a star only at the end');
+  assert.ok(ruleProblems({ ...good, subject: 'user:**' }).subject);
   assert.ok(ruleProblems({ ...good, filter: '' }).filter);
   assert.ok(ruleProblems({ ...good, order: -1 }).order);
   assert.ok(ruleProblems({ ...good, order: 1.5 }).order);

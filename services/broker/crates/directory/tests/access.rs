@@ -295,7 +295,7 @@ async fn a_users_rule_covers_that_user_and_a_directory_rule_takes_effect_at_once
         Some(true),
     )]);
     directory
-        .put_user("alice", &storage::record::Secret::new("hunter2"))
+        .put_user("alice", &storage::record::Secret::new("hunter2"), false)
         .await
         .expect("created");
     directory

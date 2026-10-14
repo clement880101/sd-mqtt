@@ -450,5 +450,33 @@ gate, and ticked here as it lands:
   and the per-address authentication-failure limiter swept by the tick.
 - [x] **Task 6** — the Settings page: users, access control rules, API
   keys and listeners, checked against a real broker.
-- [ ] **Task 7** — the closing walk of sections 12, 10.3, 11.1 and 11.2;
+- [x] **Task 7** — the closing walk of sections 12, 10.3, 11.1 and 11.2;
   README, CHANGELOG and spec say what shipped.
+
+## Closing walk
+
+Sections 12, 10.3, 11.1 and 11.2 read against what shipped. Two gaps were
+built rather than recorded:
+
+- **12.1's "user or client pattern".** Subjects matched exact names only.
+  A name may now end in `*` to cover a prefix; `user:*` is every
+  authenticated connection. A `*` anywhere else is refused.
+- **12.2's "verifiers exist only for users explicitly enrolled".** Every
+  password made a verifier. Enrolment is now `"scram": true` on the user
+  request and a checkbox on the Settings page; setting the password again
+  without it withdraws the enrolment.
+
+Recorded as built, in the spec: the UI session cookie is not built (the
+page sends a pasted key); the publish cap's field is on the attached
+connection; the failure limiter keys IPv6 by /64 and caps its map; the
+conformance outcome (`test_dollar_topics` still passes, so the planned
+`assumption` line was not needed; `test_subscribe_failure` passes on 3.1.1
+and is an `assumption` on version 5).
+
+Review Focus, as it came out: (1) escaped names, task 2's tests; (2)
+wildcard filters, task 3's; (3) a wrong re-authentication proof
+disconnects with 0x87 — not authorized, which is what it is, rather than
+the 0x8C this plan guessed — and is charged to the address, pinned since
+the walk; (4) revocation is at once locally and eventual elsewhere, pinned
+by the cluster test and said on the page and in the README; (5) a QoS 0
+flood is disconnected with 0x96 or closed, and counted.
