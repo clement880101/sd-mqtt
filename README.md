@@ -381,6 +381,143 @@ broker told somebody it had accepted. Turning a connector off while an
 endpoint is down is `enabled = false`, or the disable button, which
 keeps the outbox.
 
+### Who may connect
+
+```toml
+[auth]
+anonymous = true                  # false refuses a client with no username
+scram_iterations = 4096           # PBKDF2 rounds for a new SCRAM-SHA-256 verifier
+max_failures_per_minute = 10      # failed logins from one address before it waits; 0 is no limit
+```
+
+Users are not in the file. They are durable metadata, written through
+the API and replicated to every node like a rule:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"alice","password":"hunter2"}' http://127.0.0.1:1884/api/v1/users
+```
+
+The password is hashed with argon2id for a password login. With
+`"scram": true` in the same request it is also derived into a
+SCRAM-SHA-256 verifier for the AUTH exchange, at that moment, since a
+verifier cannot be made later from the hash. Enrolment is asked for
+rather than automatic because a verifier is a secret equivalent to a
+private key. Neither form is ever returned: `GET /api/v1/users` lists
+names and which credential forms exist. Posting the same name again
+changes the password, and without `"scram": true` withdraws an
+enrolment. `DELETE /api/v1/users/{name}` removes the user, and the
+removal replicates as a tombstone. A client presenting a wrong password,
+or a name nobody has, is refused with 0x87; the two are one answer, so
+nobody can learn which names exist by trying. `anonymous` is a switch
+and nothing else: creating the first user does not flip it. A node with
+no store holds no users and admits by the default alone.
+`SDMQTT_AUTH_ANONYMOUS` and `SDMQTT_AUTH_SCRAM_ITERATIONS` set the two.
+
+**Repeated failures from one address are slowed.** After
+`max_failures_per_minute` failed logins — a wrong password, an unknown
+name, a failed SCRAM proof or re-authentication — a connect from that
+address is refused before its credentials are looked at, with 0x9F
+(`3`, server unavailable, on 3.1.1), until enough of the minute has
+passed for one more try. An IPv6 address is counted by its /64, which
+is what one host is usually given. The broker tracks at most 65,536
+addresses and logs a warning when that is full.
+`sdmqtt_authentications_total{outcome}` counts every decision,
+`sdmqtt_rate_limited_total{limiter="authentication"}` the connects
+turned away, and `sdmqtt_auth_failure_addresses` how many addresses are
+held. `SDMQTT_AUTH_MAX_FAILURES_PER_MINUTE` sets it.
+
+A version 5 client of a user enrolled in SCRAM can authenticate without
+sending its password at all, with **SCRAM-SHA-256** over the AUTH
+exchange (RFC 7677): it names the
+method in CONNECT, the broker challenges, the client proves, and the
+connect acknowledgement carries the server's own proof back. The same
+exchange renews the credentials mid-session (`AUTH` with
+re-authenticate), as the same user only. A wrong password and an unknown
+name are refused the same way at the same step, so nobody can learn
+which names exist by trying. The `-PLUS` channel-binding variant is not
+offered and a client asking for it is told `0x8C`, as is any other
+method. Passwords are taken as written: SASLprep is not applied, so a
+password that is plain ASCII behaves exactly as RFC 7677 describes and
+one that is not should be set through a client that normalises it.
+
+### Who may use the admin API
+
+Mutating requests to the admin listener need an **API key** with a scope
+that covers them: `read` opens taps, `write` also publishes and writes
+rules, `admin` also manages users, access control rules, keys and nodes.
+The configured `admin.token` is a key with `admin` scope, which is how
+the first key is minted:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"ci","scope":"write"}' http://127.0.0.1:1884/api/v1/keys
+```
+
+The answer carries the key, `sdmqtt_<id>_<secret>`, **once**: the broker
+keeps a digest of it and nothing that would give it back. `GET
+/api/v1/keys` lists identifiers, names and scopes; `DELETE
+/api/v1/keys/{id}` revokes, and the revocation replicates to every node
+like a user's removal: at once on the node that revoked it, and on each
+other node as the register arrives, so a node partitioned from the rest
+keeps accepting the key until it hears. A real key that is too narrow is answered `403`
+with both scopes named; a wrong one is `401`. A node with no store
+holds no keys, and the token is then the only credential.
+
+The **Settings** page does all of this in a browser: paste a key or the
+token at the top — it is kept for that tab and forgotten when it
+closes — and manage users, access control rules and keys below it. It
+also lists this node's listeners, which stay in the file.
+
+### Who may publish and subscribe where
+
+```toml
+[[acl]]
+id = "no-secrets"
+order = 10                        # lower is consulted first; 100 by default
+subject = "anyone"                # or "user:alice", "client:gateway-1", "client:sensor-*", "user:*"
+filter = "secret/#"
+subscribe = false                 # an opinion on subscribing; publish is left unsaid
+
+[[acl]]
+id = "everything-else"
+subject = "anyone"
+filter = "#"
+publish = true
+subscribe = true
+```
+
+With no rule at all, every publish and subscribe is allowed, as it was
+through milestone 6. **The first rule flips the default to deny**: from
+then on an operation is allowed only by a rule that says so, which is
+why the second rule above exists. Rules are consulted in `order`, then
+by identifier, and the first whose subject and filter match and that
+has an opinion on the operation decides; a rule with no opinion is
+skipped. A subject's name may end in `*` to mean every name with that
+prefix: `client:sensor-*` is every client whose identifier starts
+`sensor-`, and `user:*` is every authenticated connection, which is how a
+rule tells a logged-in client from an anonymous one. A `*` anywhere else
+is refused. A rule's filter matches a published topic the way a
+subscription does, wildcards and all, and a requested subscription
+filter the way a topic name would; a shared subscription is judged by
+the filter it shares, so a rule about `fleet/#` covers
+`$share/workers/fleet/#` too. A refused subscribe is answered
+`0x87` on version 5 and `0x80` on 3.1.1; a refused publish is `0x87` on
+its acknowledgement, and an at-most-once publish, which has none, is
+dropped and counted on `sdmqtt_messages_dropped_total{reason="refused"}`.
+
+Rules in the file are this node's configuration. Rules written through
+the API — `POST /api/v1/acl` with the same fields, `GET /api/v1/acl` in
+consultation order, `DELETE /api/v1/acl/{id}` — are durable metadata
+and replicate to every node like a user; both sets are consulted
+together by `order`.
+
+A client never publishes into the dollar-prefixed namespace, rules or
+no rules: `$SYS/...` and the like are the broker's, and a client's
+publish there is refused with `0x87` (or dropped and counted at
+at-most-once). Only the first level is reserved; `a/$b` is an ordinary
+topic.
+
 ### What a listener accepts
 
 ```toml
@@ -390,7 +527,18 @@ max_connections = 100000
 mountpoint = ""                   # a namespace; two mountpoints are two sets of sessions
 max_qos = 2                       # 0, 1 or 2; advertised to version 5 clients
 retain_available = true           # false refuses retained messages
+max_publish_rate = 0              # PUBLISH packets a second per session; 0 is no cap
+publish_burst = 0                 # how many at once; never less than the rate
 ```
+
+A session over `max_publish_rate` is disconnected, with 0x96 (message
+rate too high) on version 5 and a bare close on 3.1.1, because neither
+version can refuse one publication for rate and keep the connection.
+Each is counted on `sdmqtt_rate_limited_total{limiter="publish"}`. The
+rate is measured on the broker's one-second clock, which is why the
+burst is never less than one second's worth.
+`SDMQTT_MAX_PUBLISH_RATE` and `SDMQTT_PUBLISH_BURST` set the two on
+`[listener]`.
 
 `[listener]` is the default listener and is named `mqtt`. More
 listeners share the same broker — the same sessions, subscriptions,
@@ -756,7 +904,9 @@ allowed_hosts = ["broker.internal"]   # only if you reach it through a name
 
 The admin listener is bound to loopback by default, and binding it
 further with no `admin.token` set is refused at startup rather than
-warned about: the API publishes.
+warned about: the API publishes. On loopback with no token, a mutating
+request that presents nothing is still answered; one that presents a
+key is judged by it.
 
 It also checks the name a request was made under. An **address** is
 always answered — by a browser, a probe, a scraper, `curl` — and so is

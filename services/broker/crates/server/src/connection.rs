@@ -45,7 +45,9 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::framing::{FrameError, FrameReader};
-use crate::metrics::{Metrics, ShellDrop, SocketOutcome};
+use crate::metrics::{AuthOutcome, Limiter, Metrics, ShellDrop, SocketOutcome};
+use crate::rate::PublishLimit;
+use crate::scram;
 use crate::shared::{promises_durability, Shared};
 use storage::SessionKey;
 
@@ -213,6 +215,18 @@ pub struct ConnectionConfig {
     /// synchronous while one carrying telemetry is not; the timeout is
     /// the node's in both cases.
     pub durability: Option<cluster::Durability>,
+    /// Section 10.3: how many PUBLISH packets a second one session may
+    /// send, zero for no cap. Over it, a version 5 client is told
+    /// DISCONNECT 0x96 and a 3.1.1 one is closed.
+    pub max_publish_rate: u32,
+    /// How many of them may come at once. Never less than the rate:
+    /// see [`crate::rate`].
+    pub publish_burst: u32,
+    /// Who connected, set by the listener on each accepted socket so
+    /// section 10.3's authentication failure limiter can count by
+    /// address. `None` for a connection served without one, which no
+    /// limiter counts.
+    pub peer: Option<std::net::IpAddr>,
 }
 
 impl Default for ConnectionConfig {
@@ -239,6 +253,9 @@ impl Default for ConnectionConfig {
             max_qos: QoS::ExactlyOnce,
             retain_available: true,
             durability: None,
+            max_publish_rate: 0,
+            publish_burst: 0,
+            peer: None,
         }
     }
 }
@@ -522,12 +539,62 @@ where
         }
     }
 
+    // Section 10.3: an address over its authentication failure limit is
+    // refused before its credentials are looked at, so a guesser learns
+    // nothing from the attempts the limiter turned away. 0x9F on version
+    // 5; 3.1.1 has no such code, and its CONNACK says 3, "server
+    // unavailable", which is true of this address for now and invites
+    // the retry later that is wanted.
+    if let Some(peer) = config.peer {
+        if shared.authentication_limited(peer) {
+            metrics.rate_limited(Limiter::Authentication).inc();
+            refuse(
+                &mut write_half,
+                version,
+                ReasonCode::ConnectionRateExceeded,
+                &metrics,
+            )
+            .await?;
+            return Err(ConnectionError::Protocol(
+                ReasonCode::ConnectionRateExceeded,
+            ));
+        }
+    }
+
+    // Section 12.2's enhanced authentication, before the claim and
+    // before the chain: a CONNECT naming a method is answered with AUTH
+    // packets until the client has proved who it is, and only then is
+    // anybody asked to connect it. The name it proved is what the
+    // session remembers, whatever the CONNECT's own username field
+    // said.
+    let exchanged = match enhanced_authentication(
+        &mut reader,
+        &mut write_half,
+        &mut connect,
+        version,
+        &shared,
+        &config,
+        &metrics,
+    )
+    .await
+    {
+        Err(ConnectionError::Protocol(ReasonCode::NotAuthorized)) => {
+            authentication_failed(&shared, config.peer, &metrics);
+            return Err(ConnectionError::Protocol(ReasonCode::NotAuthorized));
+        }
+        other => other?,
+    };
+    let proved = exchanged.as_ref().map(|(token, _)| *token);
+
     let claimed = if connect.client_id.is_empty() || shared.migrator().is_none() {
         None
     } else {
-        let authenticated =
-            shared.with_broker(|broker| broker.authenticates(&config.mountpoint, &connect));
+        let authenticated = match proved {
+            Some(token) => Some(token),
+            None => shared.with_broker(|broker| broker.authenticates(&config.mountpoint, &connect)),
+        };
         let Some(authenticated) = authenticated else {
+            authentication_failed(&shared, config.peer, &metrics);
             refuse(
                 &mut write_half,
                 version,
@@ -598,8 +665,10 @@ where
             // A node that does not cluster, or a client whose identifier
             // was assigned. Zero is what `Registry::register` passes and
             // the epoch is then the session's own count of how many
-            // times it has been claimed here.
-            None => (0, None),
+            // times it has been claimed here. The token is the
+            // exchange's when there was one, so the chain is not asked
+            // to judge a password a SCRAM client never sent.
+            None => (0, proved),
         };
         let mut registration = match broker.connect_claimed(
             &config.mountpoint,
@@ -686,10 +755,17 @@ where
     let (registration, actions, assigned) = match outcome {
         Ok(accepted) => accepted,
         Err(reason) => {
+            if matches!(
+                reason,
+                ReasonCode::NotAuthorized | ReasonCode::BadUserNameOrPassword
+            ) {
+                authentication_failed(&shared, config.peer, &metrics);
+            }
             refuse(&mut write_half, version, reason, &metrics).await?;
             return Err(ConnectionError::Protocol(reason));
         }
     };
+    metrics.authentication(AuthOutcome::Success).inc();
 
     let attached = Attached {
         shared: Arc::clone(&shared),
@@ -697,11 +773,15 @@ where
         subscriber: registration.subscriber,
         epoch: registration.epoch,
         version,
+        username: connect.username.clone(),
+        reauthenticating: parking_lot::Mutex::new(None),
         maximum_packet_size,
         topic_alias_maximum: config.topic_alias_maximum,
         max_qos: config.max_qos,
         retain_available: config.retain_available,
         durability: config.durability,
+        publish_limit: PublishLimit::new(config.max_publish_rate, config.publish_burst),
+        peer: config.peer,
     };
 
     // A takeover addresses two connections by one handle, and the
@@ -734,7 +814,14 @@ where
     // must still parse and act on.
     let server_keep_alive =
         (connect.keep_alive != proposed_keep_alive).then_some(connect.keep_alive);
-    let ack = acknowledgement(&registration, assigned, &config, server_keep_alive);
+    let mut ack = acknowledgement(&registration, assigned, &config, server_keep_alive);
+    if let Some((_, server_final)) = &exchanged {
+        // 4.12: the CONNACK that completes the exchange carries the
+        // method and the server's final message, so the client can
+        // verify the server knew its key too.
+        ack.properties.authentication_method = Some(scram::METHOD.to_owned());
+        ack.properties.authentication_data = Some(server_final.clone());
+    }
     // The inherited obligation is discharged by dropping `attached`,
     // which happens on every path out of here including a panic. It is
     // deliberately not a call at the end of this function: the mutation
@@ -742,6 +829,155 @@ where
     // `await` into an `await?`, and that the obligation's own test could
     // not see it happen.
     attached.run(&mut reader, write_half, ack, outbox).await
+}
+
+/// A CONNECT or a re-authentication was refused for who it said it
+/// was: counted, and charged to its address.
+fn authentication_failed(shared: &Shared, peer: Option<std::net::IpAddr>, metrics: &Metrics) {
+    metrics.authentication(AuthOutcome::Failure).inc();
+    if let Some(peer) = peer {
+        shared.authentication_failed(peer);
+    }
+}
+
+/// What the client is told when the exchange does not complete.
+fn reason_for(refusal: scram::Refusal) -> ReasonCode {
+    match refusal {
+        scram::Refusal::Malformed => ReasonCode::ProtocolError,
+        scram::Refusal::ChannelBinding => ReasonCode::BadAuthenticationMethod,
+        scram::Refusal::NotAuthorized => ReasonCode::NotAuthorized,
+    }
+}
+
+/// Section 12.2's exchange at connect, when the CONNECT names a method.
+///
+/// `Ok(None)` is a CONNECT with no method: nothing happened and the
+/// chain decides. `Ok(Some(..))` is a client that proved a name, with
+/// the token that says so and the server's final message for the
+/// acknowledgement; `connect.username` has been set to the proved name.
+/// A refusal has already been answered with a CONNACK carrying the
+/// code, and returns the error the caller propagates.
+///
+/// Before the claim and before the chain, because a client that has
+/// not proved anything yet must not be registered, drained for, or
+/// judged on a password it never sent.
+async fn enhanced_authentication<R, W>(
+    reader: &mut FrameReader<R>,
+    writer: &mut W,
+    connect: &mut Connect,
+    version: Version,
+    shared: &Shared,
+    config: &ConnectionConfig,
+    metrics: &Metrics,
+) -> Result<Option<(broker_core::handover::Authenticated, bytes::Bytes)>, ConnectionError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let Some(method) = connect.properties.authentication_method.clone() else {
+        return Ok(None);
+    };
+    // A refusal, answered before anything else: the client is told the
+    // code in a CONNACK and the connection ends, 4.12.
+    async fn refused<W: AsyncWrite + Unpin>(
+        writer: &mut W,
+        version: Version,
+        reason: ReasonCode,
+        metrics: &Metrics,
+    ) -> Result<Option<(broker_core::handover::Authenticated, bytes::Bytes)>, ConnectionError> {
+        refuse(writer, version, reason, metrics).await?;
+        Err(ConnectionError::Protocol(reason))
+    }
+    if method != scram::METHOD {
+        // 4.12: "If the Server does not support the Authentication
+        // Method supplied by the Client, it MAY send a CONNACK with a
+        // Reason Code of 0x8C (Bad authentication method)".
+        return refused(
+            writer,
+            version,
+            ReasonCode::BadAuthenticationMethod,
+            metrics,
+        )
+        .await;
+    }
+    let Some(verifiers) = shared.verifiers() else {
+        // No directory: a node with no store knows no verifier, so the
+        // method is one it cannot serve.
+        return refused(
+            writer,
+            version,
+            ReasonCode::BadAuthenticationMethod,
+            metrics,
+        )
+        .await;
+    };
+    let first = connect
+        .properties
+        .authentication_data
+        .as_deref()
+        .unwrap_or(&[]);
+    let (server, server_first) = match scram::Server::start(first, verifiers.as_ref(), None) {
+        Ok(started) => started,
+        Err(refusal) => return refused(writer, version, reason_for(refusal), metrics).await,
+    };
+    let challenge = Packet::Auth(mqtt_codec::packet::Auth {
+        reason: ReasonCode::ContinueAuthentication,
+        properties: Properties {
+            authentication_method: Some(scram::METHOD.to_owned()),
+            authentication_data: Some(server_first.into()),
+            ..Properties::default()
+        },
+    });
+    send_before_session(writer, &challenge, version, metrics).await?;
+
+    // The client's final message, within the connect timeout: a peer
+    // that opens an exchange and never finishes it is the peer that
+    // never sends CONNECT.
+    let answer = tokio::time::timeout(config.connect_timeout, reader.next(version))
+        .await
+        .map_err(|_| ConnectionError::ConnectTimeout(config.connect_timeout))??;
+    let Some(Packet::Auth(auth)) = answer else {
+        // Closed, or something that is not the exchange's next step.
+        return refused(writer, version, ReasonCode::ProtocolError, metrics).await;
+    };
+    metrics.packet_received(version, PacketKind::Auth).inc();
+    if auth.reason != ReasonCode::ContinueAuthentication
+        || auth.properties.authentication_method.as_deref() != Some(scram::METHOD)
+    {
+        return refused(writer, version, ReasonCode::ProtocolError, metrics).await;
+    }
+    let client_final = auth
+        .properties
+        .authentication_data
+        .as_deref()
+        .unwrap_or(&[]);
+    match server.finish(client_final) {
+        Ok((name, server_final)) => {
+            connect.username = Some(name);
+            Ok(Some((
+                broker_core::handover::Authenticated::by_enhanced_exchange(),
+                bytes::Bytes::from(server_final),
+            )))
+        }
+        Err(refusal) => refused(writer, version, reason_for(refusal), metrics).await,
+    }
+}
+
+/// Write one packet to a client that has no session yet, counted the
+/// way [`refuse`] counts: there is no outbox for it to go through.
+async fn send_before_session<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    packet: &Packet,
+    version: Version,
+    metrics: &Metrics,
+) -> Result<(), ConnectionError> {
+    let mut buf = BytesMut::new();
+    encode(packet, version, &mut buf)?;
+    writer.write_all(&buf).await?;
+    writer.flush().await?;
+    metrics.bytes_sent().inc_by(buf.len() as u64);
+    metrics.packet_sent(version, packet.kind()).inc();
+    Ok(())
 }
 
 /// Read the connect packet, or decide there will not be one.
@@ -1018,6 +1254,22 @@ struct Attached {
     retain_available: bool,
     /// See [`ConnectionConfig::durability`].
     durability: Option<cluster::Durability>,
+    /// The name this connection authenticated as, which a
+    /// re-authentication must prove again: 4.12.1 lets a client renew
+    /// its credentials, not become somebody else.
+    username: Option<String>,
+    /// A re-authentication in progress: the server's half of the
+    /// exchange between the client's first and final messages. Behind
+    /// a lock rather than a `Cell` because the packet loop holds `&self`
+    /// across awaits on a multi-threaded runtime; it is taken for a
+    /// moment, twice per exchange, and never contended.
+    reauthenticating: parking_lot::Mutex<Option<scram::Server>>,
+    /// Section 10.3's publish cap: one field of state, none when the
+    /// listener sets no rate.
+    publish_limit: Option<PublishLimit>,
+    /// Who connected, for the authentication failure limiter when a
+    /// re-authentication fails.
+    peer: Option<std::net::IpAddr>,
 }
 
 impl Attached {
@@ -1114,6 +1366,16 @@ impl Attached {
                 // now, so it is told why before the socket closes.
                 self.close_with(ReasonCode::ProtocolError);
                 return Err(ConnectionError::Protocol(ReasonCode::ProtocolError));
+            }
+            // Section 12.2's re-authentication, 4.12.1: the same
+            // exchange as at connect, carried in AUTH packets, and
+            // never seen by the broker.
+            if let Packet::Auth(auth) = &packet {
+                if let Err(reason) = self.reauthenticate(auth) {
+                    self.close_with(reason);
+                    return Err(ConnectionError::Protocol(reason));
+                }
+                continue;
             }
             // Before the broker sees it, so that nothing below this
             // shell ever meets an alias. Refused by the same
@@ -1363,6 +1625,74 @@ impl Attached {
             .deliver(vec![(self.subscriber, Action::Close(reason))]);
     }
 
+    /// One AUTH packet from the client, mid-session. Section 12.2.
+    ///
+    /// `ReAuthenticate` starts an exchange and is answered with
+    /// `ContinueAuthentication`; the client's `ContinueAuthentication`
+    /// finishes it and is answered with `Success` carrying the server's
+    /// final message. Anything else is a protocol error. The name the
+    /// client proves must be the one it connected as: 4.12.1 renews
+    /// credentials, it does not change hands.
+    fn reauthenticate(&self, auth: &mqtt_codec::packet::Auth) -> Result<(), ReasonCode> {
+        let method = auth.properties.authentication_method.as_deref();
+        if method != Some(scram::METHOD) {
+            return Err(ReasonCode::BadAuthenticationMethod);
+        }
+        let data = auth
+            .properties
+            .authentication_data
+            .as_deref()
+            .unwrap_or(&[]);
+        // Taken out before the match, so the guard is gone before the
+        // arm that stores the next state takes the lock again.
+        let pending = self.reauthenticating.lock().take();
+        let answer = match (auth.reason, pending) {
+            (ReasonCode::ReAuthenticate, _) => {
+                let verifiers = self
+                    .shared
+                    .verifiers()
+                    .ok_or(ReasonCode::BadAuthenticationMethod)?;
+                let (server, server_first) =
+                    scram::Server::start(data, verifiers.as_ref(), None).map_err(reason_for)?;
+                *self.reauthenticating.lock() = Some(server);
+                mqtt_codec::packet::Auth {
+                    reason: ReasonCode::ContinueAuthentication,
+                    properties: Properties {
+                        authentication_method: Some(scram::METHOD.to_owned()),
+                        authentication_data: Some(server_first.into()),
+                        ..Properties::default()
+                    },
+                }
+            }
+            (ReasonCode::ContinueAuthentication, Some(server)) => {
+                let (name, server_final) = server.finish(data).map_err(|refusal| {
+                    let reason = reason_for(refusal);
+                    if reason == ReasonCode::NotAuthorized {
+                        authentication_failed(&self.shared, self.peer, &self.metrics);
+                    }
+                    reason
+                })?;
+                if self.username.as_deref() != Some(name.as_str()) {
+                    authentication_failed(&self.shared, self.peer, &self.metrics);
+                    return Err(ReasonCode::NotAuthorized);
+                }
+                self.metrics.authentication(AuthOutcome::Success).inc();
+                mqtt_codec::packet::Auth {
+                    reason: ReasonCode::Success,
+                    properties: Properties {
+                        authentication_method: Some(scram::METHOD.to_owned()),
+                        authentication_data: Some(server_final.into()),
+                        ..Properties::default()
+                    },
+                }
+            }
+            _ => return Err(ReasonCode::ProtocolError),
+        };
+        self.shared
+            .deliver(vec![(self.subscriber, Action::Send(Packet::Auth(answer)))]);
+        Ok(())
+    }
+
     /// Hold an inbound packet to this listener's policy. Section 5.4.
     ///
     /// A subscription is clamped rather than refused: the granted level
@@ -1375,6 +1705,15 @@ impl Attached {
                 }
                 if publish.retain && !self.retain_available {
                     return Err(ReasonCode::RetainNotSupported);
+                }
+                // Section 10.3, after the protocol checks, so a publish
+                // that was going to be refused anyway is not also
+                // counted against the rate.
+                if let Some(limit) = &self.publish_limit {
+                    if !limit.admit(self.shared.clock().now()) {
+                        self.metrics.rate_limited(Limiter::Publish).inc();
+                        return Err(ReasonCode::MessageRateTooHigh);
+                    }
                 }
             }
             Packet::Subscribe(request) => {
@@ -4494,6 +4833,269 @@ mod tests {
     }
 
     // -----------------------------------------------------------
+    // Section 10.3: the two rate limiters.
+    // -----------------------------------------------------------
+
+    /// A plain QoS 0 publish for the rate tests.
+    fn telemetry() -> Packet {
+        Packet::Publish(mqtt_codec::packet::Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: "site/1/temp".into(),
+            packet_id: None,
+            payload: bytes::Bytes::from_static(b"21"),
+            properties: Properties::default(),
+        })
+    }
+
+    /// Whether the socket has closed, within a second.
+    async fn closed(client: &mut tokio::io::DuplexStream) -> bool {
+        let mut buf = [0u8; 64];
+        matches!(
+            tokio::time::timeout(Duration::from_secs(1), client.read(&mut buf)).await,
+            Ok(Ok(0))
+        )
+    }
+
+    /// The burst is taken, the next publish in the same second is told
+    /// 0x96 and the connection closes; on 3.1.1 it just closes. Each is
+    /// counted. A tick later the rate is available again to a client
+    /// that reconnects.
+    #[tokio::test]
+    async fn a_session_over_its_publish_rate_is_disconnected_with_0x96() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let config = ConnectionConfig {
+            max_publish_rate: 5,
+            publish_burst: 5,
+            ..ConnectionConfig::default()
+        };
+        let limited = || shared.metrics().rate_limited(Limiter::Publish).get();
+
+        let mut client = serve_one_with_config(Arc::clone(&shared), config.clone());
+        assert_eq!(
+            connected(&mut client, Version::V5).await.reason,
+            ReasonCode::Success
+        );
+        for _ in 0..5 {
+            write(&mut client, &telemetry(), Version::V5).await;
+        }
+        assert_eq!(limited(), 0, "the burst is within the cap");
+        write(&mut client, &telemetry(), Version::V5).await;
+        match read(&mut client, Version::V5).await {
+            Packet::Disconnect(gone) => assert_eq!(gone.reason, ReasonCode::MessageRateTooHigh),
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
+        assert!(closed(&mut client).await, "and the socket closes");
+        assert_eq!(limited(), 1);
+
+        let mut old = serve_one_with_config(Arc::clone(&shared), config);
+        assert_eq!(
+            connected_as(&mut old, Version::V311, "old").await.reason,
+            ReasonCode::Success
+        );
+        for _ in 0..6 {
+            write(&mut old, &telemetry(), Version::V311).await;
+        }
+        assert!(closed(&mut old).await, "3.1.1 has no code to say it with");
+        assert_eq!(limited(), 2);
+    }
+
+    /// The default sets no cap: a hundred at once are a hundred.
+    #[tokio::test]
+    async fn by_default_there_is_no_publish_cap() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected(&mut client, Version::V5).await.reason,
+            ReasonCode::Success
+        );
+        for _ in 0..100 {
+            write(&mut client, &telemetry(), Version::V5).await;
+        }
+        // A ping answered after them is every publish already read.
+        write(&mut client, &Packet::PingReq, Version::V5).await;
+        assert_eq!(read(&mut client, Version::V5).await, Packet::PingResp);
+        assert_eq!(shared.metrics().rate_limited(Limiter::Publish).get(), 0);
+    }
+
+    /// Refuses every password.
+    #[derive(Debug)]
+    struct Nobody;
+
+    impl broker_core::hooks::Hook for Nobody {
+        fn name(&self) -> &str {
+            "nobody"
+        }
+        fn authenticate(
+            &self,
+            _credentials: &broker_core::hooks::Credentials<'_>,
+        ) -> broker_core::hooks::Decision {
+            broker_core::hooks::Decision::Deny
+        }
+    }
+
+    /// Connect once from `peer` with a password, answering the code.
+    async fn try_password(
+        shared: &Arc<Shared>,
+        peer: std::net::IpAddr,
+        version: Version,
+    ) -> ReasonCode {
+        let config = ConnectionConfig {
+            peer: Some(peer),
+            ..ConnectionConfig::default()
+        };
+        let mut client = serve_one_with_config(Arc::clone(shared), config);
+        let mut connect = connect("guesser", 0);
+        connect.version = version;
+        connect.username = Some("alice".to_owned());
+        connect.password = Some(bytes::Bytes::from_static(b"guess"));
+        write(&mut client, &Packet::Connect(Box::new(connect)), version).await;
+        match read(&mut client, version).await {
+            Packet::ConnAck(ack) => ack.reason,
+            other => panic!("expected an acknowledgement, got {other:?}"),
+        }
+    }
+
+    /// Ten failures from one address and the eleventh connect is refused
+    /// unread, 0x9F, without the chain being asked; another address is
+    /// not; a minute later the address may try again. Every decision is
+    /// counted by outcome.
+    #[tokio::test]
+    async fn an_address_that_keeps_failing_is_refused_before_its_password_is_read() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        shared.with_broker(|broker| broker.hooks_mut().install(Arc::new(Nobody)));
+        let guesser: std::net::IpAddr = "198.51.100.7".parse().expect("an address");
+        let bystander: std::net::IpAddr = "198.51.100.8".parse().expect("an address");
+        let metrics = shared.metrics();
+
+        for at in 0..crate::shared::DEFAULT_AUTH_FAILURES_PER_MINUTE {
+            assert_eq!(
+                try_password(&shared, guesser, Version::V5).await,
+                ReasonCode::NotAuthorized,
+                "failure {at}"
+            );
+        }
+        assert_eq!(
+            metrics.authentication(AuthOutcome::Failure).get(),
+            u64::from(crate::shared::DEFAULT_AUTH_FAILURES_PER_MINUTE)
+        );
+        assert_eq!(
+            try_password(&shared, guesser, Version::V5).await,
+            ReasonCode::ConnectionRateExceeded
+        );
+        assert_eq!(
+            metrics.authentication(AuthOutcome::Failure).get(),
+            u64::from(crate::shared::DEFAULT_AUTH_FAILURES_PER_MINUTE),
+            "refused unread: not another failure"
+        );
+        assert_eq!(metrics.rate_limited(Limiter::Authentication).get(), 1);
+        assert_eq!(
+            try_password(&shared, guesser, Version::V311).await,
+            ReasonCode::ServerUnavailable,
+            "3.1.1's CONNACK return code 3"
+        );
+        assert_eq!(
+            try_password(&shared, bystander, Version::V5).await,
+            ReasonCode::NotAuthorized,
+            "another address is judged on its password"
+        );
+
+        shared.sweep_authentication_failures();
+        assert_eq!(
+            metrics.auth_failure_addresses().get(),
+            2,
+            "the guesser and the bystander"
+        );
+        // A minute on, by the clock the limiter reads, and swept: both
+        // have drained, so neither is held.
+        advance(&shared, 60);
+        shared.sweep_authentication_failures();
+        assert_eq!(metrics.auth_failure_addresses().get(), 0);
+        assert_eq!(
+            try_password(&shared, guesser, Version::V5).await,
+            ReasonCode::NotAuthorized
+        );
+    }
+
+    /// An admitted connect is a success; a connection without an
+    /// address is never limited, however often it fails.
+    #[tokio::test]
+    async fn successes_are_counted_and_a_connection_without_an_address_is_never_limited() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(Arc::clone(&shared));
+        assert_eq!(
+            connected(&mut client, Version::V5).await.reason,
+            ReasonCode::Success
+        );
+        assert_eq!(
+            shared.metrics().authentication(AuthOutcome::Success).get(),
+            1
+        );
+
+        shared.with_broker(|broker| broker.hooks_mut().install(Arc::new(Nobody)));
+        for _ in 0..20 {
+            let mut client = serve_one(Arc::clone(&shared));
+            let mut connect = connect("nowhere", 0);
+            connect.username = Some("alice".to_owned());
+            connect.password = Some(bytes::Bytes::from_static(b"guess"));
+            write(
+                &mut client,
+                &Packet::Connect(Box::new(connect)),
+                Version::V5,
+            )
+            .await;
+            match read(&mut client, Version::V5).await {
+                Packet::ConnAck(ack) => assert_eq!(ack.reason, ReasonCode::NotAuthorized),
+                other => panic!("expected an acknowledgement, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            shared.metrics().rate_limited(Limiter::Authentication).get(),
+            0
+        );
+    }
+
+    /// A wrong SCRAM proof is a failure charged to the address too.
+    #[tokio::test]
+    async fn a_failed_scram_exchange_is_charged_to_the_address() {
+        let shared = with_scram_user("alice", b"hunter2");
+        let guesser: std::net::IpAddr = "2001:db8::7".parse().expect("an address");
+        for _ in 0..crate::shared::DEFAULT_AUTH_FAILURES_PER_MINUTE {
+            let config = ConnectionConfig {
+                peer: Some(guesser),
+                ..ConnectionConfig::default()
+            };
+            let mut client = serve_one_with_config(Arc::clone(&shared), config);
+            let (ack, _) = connect_with_scram(&mut client, "alice", b"wrong").await;
+            assert_eq!(ack.reason, ReasonCode::NotAuthorized);
+        }
+        // The same /64, another address in it: the same host.
+        let neighbour: std::net::IpAddr = "2001:db8::8".parse().expect("an address");
+        let config = ConnectionConfig {
+            peer: Some(neighbour),
+            ..ConnectionConfig::default()
+        };
+        let mut client = serve_one_with_config(Arc::clone(&shared), config);
+        let (scram, first) = crate::scram::Client::first("alice", "client-nonce-0001");
+        drop(scram);
+        write(
+            &mut client,
+            &Packet::Connect(Box::new(scram_connect(
+                "secure",
+                crate::scram::METHOD,
+                first,
+            ))),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::ConnAck(ack) => assert_eq!(ack.reason, ReasonCode::ConnectionRateExceeded),
+            other => panic!("refused before the exchange began, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------
     // Section 5.4: a listener's maximum QoS and retain availability.
     // -----------------------------------------------------------
 
@@ -4720,6 +5322,353 @@ mod tests {
             "the acknowledgement arrived before the follower confirmed, so it did not wait",
         );
         assert!(acknowledged_at >= confirmed);
+    }
+
+    // -----------------------------------------------------------
+    // Section 12.2: SCRAM-SHA-256 over AUTH.
+    // -----------------------------------------------------------
+
+    /// One user, by name, for the verifier seam.
+    #[derive(Debug)]
+    struct OneUser {
+        name: &'static str,
+        verifier: storage::record::ScramVerifierRecord,
+    }
+
+    impl crate::scram::Verifiers for OneUser {
+        fn verifier(&self, name: &str) -> Option<storage::record::ScramVerifierRecord> {
+            (name == self.name).then(|| self.verifier.clone())
+        }
+    }
+
+    /// A broker that knows `name` with `password`, for SCRAM.
+    fn with_scram_user(name: &'static str, password: &[u8]) -> Arc<Shared> {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        shared.install_verifiers(Arc::new(OneUser {
+            name,
+            verifier: crate::scram::verifier(password, b"sixteen-byte-salt", 4096),
+        }));
+        shared
+    }
+
+    /// A CONNECT naming the method and carrying `data`.
+    fn scram_connect(client_id: &str, method: &str, data: Vec<u8>) -> Connect {
+        let mut connect = connect(client_id, 0);
+        connect.properties.authentication_method = Some(method.to_owned());
+        connect.properties.authentication_data = Some(data.into());
+        connect
+    }
+
+    /// An AUTH packet continuing the exchange with `data`.
+    fn auth_packet(reason: ReasonCode, data: Vec<u8>) -> Packet {
+        Packet::Auth(mqtt_codec::packet::Auth {
+            reason,
+            properties: Properties {
+                authentication_method: Some(crate::scram::METHOD.to_owned()),
+                authentication_data: Some(data.into()),
+                ..Properties::default()
+            },
+        })
+    }
+
+    /// Run the whole exchange at connect, returning the CONNACK and
+    /// whether the server's final message verified.
+    async fn connect_with_scram(
+        client: &mut tokio::io::DuplexStream,
+        username: &str,
+        password: &[u8],
+    ) -> (ConnAck, bool) {
+        let (scram, first) = crate::scram::Client::first(username, "client-nonce-0001");
+        write(
+            client,
+            &Packet::Connect(Box::new(scram_connect(
+                "secure",
+                crate::scram::METHOD,
+                first,
+            ))),
+            Version::V5,
+        )
+        .await;
+        let server_first = match read(client, Version::V5).await {
+            Packet::Auth(auth) => {
+                assert_eq!(auth.reason, ReasonCode::ContinueAuthentication);
+                assert_eq!(
+                    auth.properties.authentication_method.as_deref(),
+                    Some(crate::scram::METHOD)
+                );
+                auth.properties
+                    .authentication_data
+                    .expect("the server's first message")
+            }
+            other => panic!("expected the server's first message, got {other:?}"),
+        };
+        let (scram, client_final) = scram
+            .finish(&server_first, password)
+            .expect("a well-formed server-first");
+        write(
+            client,
+            &auth_packet(ReasonCode::ContinueAuthentication, client_final),
+            Version::V5,
+        )
+        .await;
+        match read(client, Version::V5).await {
+            Packet::ConnAck(ack) => {
+                let verified = ack
+                    .properties
+                    .authentication_data
+                    .as_deref()
+                    .is_some_and(|server_final| scram.verify(server_final));
+                (ack, verified)
+            }
+            other => panic!("expected a connack, got {other:?}"),
+        }
+    }
+
+    /// The exchange completes, the connack carries the server's final
+    /// message, and it verifies: the client knows the server knew too.
+    #[tokio::test]
+    async fn a_scram_client_authenticates_and_the_server_proves_itself_back() {
+        let shared = with_scram_user("alice", b"pencil");
+        let mut client = serve_one(Arc::clone(&shared));
+        let (ack, verified) = connect_with_scram(&mut client, "alice", b"pencil").await;
+        assert_eq!(ack.reason, ReasonCode::Success);
+        assert!(verified, "the server's final message must verify");
+        assert_eq!(
+            ack.properties.authentication_method.as_deref(),
+            Some(crate::scram::METHOD)
+        );
+        // And it is a working connection, as the proved user.
+        assert_eq!(
+            publish_once(&mut client, "site/1/temp").await.reason,
+            ReasonCode::NoMatchingSubscribers
+        );
+    }
+
+    /// A wrong password and an unknown name are refused the same way,
+    /// at the same step: a connack with 0x87 after the client's final
+    /// message, never a refusal at the first.
+    #[tokio::test]
+    async fn a_wrong_scram_password_and_an_unknown_name_are_refused_alike() {
+        let shared = with_scram_user("alice", b"pencil");
+        let mut client = serve_one(Arc::clone(&shared));
+        let (ack, _) = connect_with_scram(&mut client, "alice", b"pen").await;
+        assert_eq!(ack.reason, ReasonCode::NotAuthorized);
+        let mut client = serve_one(Arc::clone(&shared));
+        let (ack, _) = connect_with_scram(&mut client, "nobody", b"pencil").await;
+        assert_eq!(ack.reason, ReasonCode::NotAuthorized);
+        assert_eq!(shared.with_broker(|broker| broker.connected_count()), 0);
+    }
+
+    /// A method this broker does not speak is 0x8C, and so is a
+    /// channel binding it did not offer; a broker with no directory
+    /// speaks none.
+    #[tokio::test]
+    async fn an_unknown_method_and_a_channel_binding_are_bad_authentication_methods() {
+        let shared = with_scram_user("alice", b"pencil");
+        let mut client = serve_one(Arc::clone(&shared));
+        write(
+            &mut client,
+            &Packet::Connect(Box::new(scram_connect("x", "GS2-KRB5", Vec::new()))),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::ConnAck(ack) => assert_eq!(ack.reason, ReasonCode::BadAuthenticationMethod),
+            other => panic!("expected a connack, got {other:?}"),
+        }
+
+        let mut client = serve_one(Arc::clone(&shared));
+        write(
+            &mut client,
+            &Packet::Connect(Box::new(scram_connect(
+                "x",
+                crate::scram::METHOD,
+                b"p=tls-unique,,n=alice,r=abc".to_vec(),
+            ))),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::ConnAck(ack) => assert_eq!(ack.reason, ReasonCode::BadAuthenticationMethod),
+            other => panic!("expected a connack, got {other:?}"),
+        }
+
+        let bare = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(bare);
+        write(
+            &mut client,
+            &Packet::Connect(Box::new(scram_connect(
+                "x",
+                crate::scram::METHOD,
+                b"n,,n=alice,r=abc".to_vec(),
+            ))),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::ConnAck(ack) => assert_eq!(
+                ack.reason,
+                ReasonCode::BadAuthenticationMethod,
+                "a node with no directory has no verifier to speak the method with"
+            ),
+            other => panic!("expected a connack, got {other:?}"),
+        }
+    }
+
+    /// Re-authentication: the same exchange mid-session, answered with
+    /// AUTH packets and a final `Success`; a wrong proof disconnects,
+    /// and is a failure charged to the address like one at connect.
+    #[tokio::test]
+    async fn a_client_re_authenticates_mid_session_and_a_wrong_proof_disconnects_it() {
+        let shared = with_scram_user("alice", b"pencil");
+        let peer: std::net::IpAddr = "192.0.2.44".parse().expect("an address");
+        let mut client = serve_one_with_config(
+            Arc::clone(&shared),
+            ConnectionConfig {
+                peer: Some(peer),
+                ..ConnectionConfig::default()
+            },
+        );
+        let (ack, _) = connect_with_scram(&mut client, "alice", b"pencil").await;
+        assert_eq!(ack.reason, ReasonCode::Success);
+
+        let (scram, first) = crate::scram::Client::first("alice", "client-nonce-0002");
+        write(
+            &mut client,
+            &auth_packet(ReasonCode::ReAuthenticate, first),
+            Version::V5,
+        )
+        .await;
+        let server_first = match read(&mut client, Version::V5).await {
+            Packet::Auth(auth) => {
+                assert_eq!(auth.reason, ReasonCode::ContinueAuthentication);
+                auth.properties
+                    .authentication_data
+                    .expect("the server's first message")
+            }
+            other => panic!("expected the server's first message, got {other:?}"),
+        };
+        let (scram, client_final) = scram.finish(&server_first, b"pencil").expect("finishes");
+        write(
+            &mut client,
+            &auth_packet(ReasonCode::ContinueAuthentication, client_final),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::Auth(auth) => {
+                assert_eq!(auth.reason, ReasonCode::Success);
+                let server_final = auth
+                    .properties
+                    .authentication_data
+                    .expect("the server's final");
+                assert!(scram.verify(&server_final));
+            }
+            other => panic!("expected a successful AUTH, got {other:?}"),
+        }
+        // Still connected, still working.
+        assert_eq!(
+            publish_once(&mut client, "site/1/temp").await.reason,
+            ReasonCode::NoMatchingSubscribers
+        );
+
+        // The same again, with the wrong password: disconnected, 0x87.
+        let (scram, first) = crate::scram::Client::first("alice", "client-nonce-0003");
+        write(
+            &mut client,
+            &auth_packet(ReasonCode::ReAuthenticate, first),
+            Version::V5,
+        )
+        .await;
+        let server_first = match read(&mut client, Version::V5).await {
+            Packet::Auth(auth) => auth.properties.authentication_data.expect("first"),
+            other => panic!("expected the server's first message, got {other:?}"),
+        };
+        let (_, client_final) = scram.finish(&server_first, b"pen").expect("finishes");
+        write(
+            &mut client,
+            &auth_packet(ReasonCode::ContinueAuthentication, client_final),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::Disconnect(gone) => assert_eq!(gone.reason, ReasonCode::NotAuthorized),
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
+        let metrics = shared.metrics();
+        assert_eq!(
+            metrics.authentication(AuthOutcome::Success).get(),
+            2,
+            "the connect and the first renewal"
+        );
+        assert_eq!(metrics.authentication(AuthOutcome::Failure).get(), 1);
+        shared.sweep_authentication_failures();
+        assert_eq!(
+            metrics.auth_failure_addresses().get(),
+            1,
+            "the failed renewal is held against the address"
+        );
+    }
+
+    /// An AUTH that continues nothing, or re-authenticates as somebody
+    /// else, is refused.
+    #[tokio::test]
+    async fn an_auth_out_of_sequence_or_as_another_user_is_refused() {
+        let shared = with_scram_user("alice", b"pencil");
+        let mut client = serve_one(Arc::clone(&shared));
+        let (ack, _) = connect_with_scram(&mut client, "alice", b"pencil").await;
+        assert_eq!(ack.reason, ReasonCode::Success);
+        write(
+            &mut client,
+            &auth_packet(
+                ReasonCode::ContinueAuthentication,
+                b"c=biws,r=x,p=AAAA".to_vec(),
+            ),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::Disconnect(gone) => assert_eq!(gone.reason, ReasonCode::ProtocolError),
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
+
+        // Connected by password as alice, then re-authenticating as bob
+        // (whom the directory also knows) is not a renewal.
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        #[derive(Debug)]
+        struct Both;
+        impl crate::scram::Verifiers for Both {
+            fn verifier(&self, name: &str) -> Option<storage::record::ScramVerifierRecord> {
+                (name == "alice" || name == "bob")
+                    .then(|| crate::scram::verifier(b"pencil", b"sixteen-byte-salt", 4096))
+            }
+        }
+        shared.install_verifiers(Arc::new(Both));
+        let mut client = serve_one(Arc::clone(&shared));
+        let (ack, _) = connect_with_scram(&mut client, "alice", b"pencil").await;
+        assert_eq!(ack.reason, ReasonCode::Success);
+        let (scram, first) = crate::scram::Client::first("bob", "client-nonce-0004");
+        write(
+            &mut client,
+            &auth_packet(ReasonCode::ReAuthenticate, first),
+            Version::V5,
+        )
+        .await;
+        let server_first = match read(&mut client, Version::V5).await {
+            Packet::Auth(auth) => auth.properties.authentication_data.expect("first"),
+            other => panic!("expected the server's first message, got {other:?}"),
+        };
+        let (_, client_final) = scram.finish(&server_first, b"pencil").expect("finishes");
+        write(
+            &mut client,
+            &auth_packet(ReasonCode::ContinueAuthentication, client_final),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::Disconnect(gone) => assert_eq!(gone.reason, ReasonCode::NotAuthorized),
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
     }
 
     /// Over 3.1.1 there is no code to send: the socket closes, for the

@@ -136,7 +136,7 @@ mod golden {
         // how a silent misread happens.
         let expected: &[u8] = &[
             b's', b'd', b'm', b'q', b't', b't', b's', b't', // magic "sdmqttst"
-            0x0a, // version 10
+            0x0b, // version 11
         ];
         assert_eq!(FormatMarker::current().encode(), expected);
         assert_eq!(
@@ -1170,6 +1170,114 @@ mod golden {
                 at: 300,
             },
             &keyed(0x1c, &[0xac, 0x02]), // variant 28
+        );
+    }
+
+    #[test]
+    fn user_put() {
+        // Name "bob"; no password; a verifier with a two-byte salt, 4096
+        // rounds (4096 = 32 * 128 + 0, so 0x80 then 0x20), one-byte keys;
+        // created at 7. A `Box` is transparent on the wire and a
+        // `Secret` is its string.
+        pins(
+            &Record::UserPut(Box::new(crate::record::UserRecord {
+                name: "bob".to_owned(),
+                password: None,
+                scram: Some(crate::record::ScramVerifierRecord {
+                    salt: vec![1, 2],
+                    iterations: 4096,
+                    stored_key: crate::record::Secret::new("c"),
+                    server_key: crate::record::Secret::new("s"),
+                }),
+                created_at: 7,
+            })),
+            &[
+                0x1d, // Record::UserPut is variant 29
+                0x03, b'b', b'o', b'b', // name
+                0x00, // password: None
+                0x01, // scram: Some
+                0x02, 0x01, 0x02, // salt, two bytes
+                0x80, 0x20, // iterations 4096
+                0x01, b'c', // stored_key
+                0x01, b's', // server_key
+                0x07, // created_at
+            ],
+        );
+    }
+
+    #[test]
+    fn user_deleted() {
+        pins(
+            &Record::UserDeleted {
+                name: "bob".to_owned(),
+            },
+            &[0x1e, 0x03, b'b', b'o', b'b'], // variant 30, then the name
+        );
+    }
+
+    #[test]
+    fn acl_put() {
+        // id "r1", order 5, subject "anyone", filter "a/#", publish
+        // Some(true), subscribe None.
+        pins(
+            &Record::AclPut(Box::new(crate::record::AclRecord {
+                id: "r1".to_owned(),
+                order: 5,
+                subject: "anyone".to_owned(),
+                filter: "a/#".to_owned(),
+                publish: Some(true),
+                subscribe: None,
+            })),
+            &[
+                0x1f, // Record::AclPut is variant 31
+                0x02, b'r', b'1', // id
+                0x05, // order
+                0x06, b'a', b'n', b'y', b'o', b'n', b'e', // subject
+                0x03, b'a', b'/', b'#', // filter
+                0x01, 0x01, // publish: Some(true)
+                0x00, // subscribe: None
+            ],
+        );
+    }
+
+    #[test]
+    fn acl_deleted() {
+        pins(
+            &Record::AclDeleted {
+                id: "r1".to_owned(),
+            },
+            &[0x20, 0x02, b'r', b'1'], // variant 32, then the identifier
+        );
+    }
+
+    #[test]
+    fn api_key_put() {
+        pins(
+            &Record::ApiKeyPut(Box::new(crate::record::ApiKeyRecord {
+                id: "k1".to_owned(),
+                name: "ci".to_owned(),
+                scope: "write".to_owned(),
+                digest: crate::record::Secret::new("d"),
+                created_at: 3,
+            })),
+            &[
+                0x21, // Record::ApiKeyPut is variant 33
+                0x02, b'k', b'1', // id
+                0x02, b'c', b'i', // name
+                0x05, b'w', b'r', b'i', b't', b'e', // scope
+                0x01, b'd', // digest
+                0x03, // created_at
+            ],
+        );
+    }
+
+    #[test]
+    fn api_key_deleted() {
+        pins(
+            &Record::ApiKeyDeleted {
+                id: "k1".to_owned(),
+            },
+            &[0x22, 0x02, b'k', b'1'], // variant 34, then the identifier
         );
     }
 

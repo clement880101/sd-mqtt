@@ -120,3 +120,15 @@ impl Handover {
 /// client on the listener.
 #[derive(Debug, Clone, Copy)]
 pub struct Authenticated(pub(crate) ());
+
+impl Authenticated {
+    /// The one way out of this crate to say "authenticated": section
+    /// 12.2's enhanced exchange, which the connection shell runs
+    /// against the directory's verifier before the broker is asked to
+    /// connect anybody. Named for what it means so that a caller
+    /// cannot reach for it without saying so.
+    #[must_use]
+    pub fn by_enhanced_exchange() -> Self {
+        Self(())
+    }
+}

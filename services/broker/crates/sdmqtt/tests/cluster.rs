@@ -379,13 +379,18 @@ impl Node {
 
     /// The body of a `POST` of JSON, without its head.
     fn post(&self, path: &str, body: &str) -> String {
+        self.post_as(path, body, TOKEN).1
+    }
+
+    /// A `POST` of JSON presenting `bearer`: the status code and the body.
+    fn post_as(&self, path: &str, body: &str, bearer: &str) -> (u16, String) {
         let mut socket =
             TcpStream::connect_timeout(&self.admin, REPLY).expect("the listener accepts");
         socket
             .set_read_timeout(Some(REPLY))
             .expect("a read deadline");
         let head = format!(
-            "POST {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {TOKEN}\r\n\
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {bearer}\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\n\
              Connection: close\r\n\r\n",
             self.admin,
@@ -399,8 +404,13 @@ impl Node {
         let mut raw = Vec::new();
         socket.read_to_end(&mut raw).expect("the response ends");
         let text = String::from_utf8_lossy(&raw).into_owned();
+        let code = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status in {text:?}"));
         match text.split_once("\r\n\r\n") {
-            Some((_head, body)) => body.to_owned(),
+            Some((_head, body)) => (code, body.to_owned()),
             None => panic!("no body in {text:?}"),
         }
     }
@@ -621,6 +631,130 @@ impl Client {
     /// Connect to `address` with a session that goes when it does.
     fn connect(address: SocketAddr, client_id: &str) -> Self {
         Self::opened(address, client_id, true, 0).0
+    }
+
+    /// SUBSCRIBE to `filter`, and what the acknowledgement said.
+    fn subscribe_reasons(&mut self, filter: &str) -> Vec<ReasonCode> {
+        let packet_id = self.next_packet_id();
+        self.send(&Packet::Subscribe(Subscribe {
+            packet_id,
+            filters: vec![SubscriptionOptions {
+                filter: filter.to_owned(),
+                qos: QoS::AtLeastOnce,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: RetainHandling::SendAlways,
+            }],
+            properties: Properties::default(),
+        }));
+        loop {
+            match self.next() {
+                Some(Packet::SubAck(ack)) => return ack.reasons,
+                Some(_) => continue,
+                None => panic!("the broker closed before acknowledging the subscribe"),
+            }
+        }
+    }
+
+    /// CONNECT through section 12.2's exchange as `username` with
+    /// `password`, and the acknowledgement's reason — with the server's
+    /// final message verified when the reason is success, so a success
+    /// here is mutual.
+    fn connect_scram(
+        address: SocketAddr,
+        client_id: &str,
+        username: &str,
+        password: &str,
+    ) -> Option<ReasonCode> {
+        use sdmqtt_server::scram;
+        let stream = TcpStream::connect_timeout(&address, REPLY).expect("the broker accepts");
+        stream
+            .set_read_timeout(Some(REPLY))
+            .expect("a read deadline");
+        let mut client = Self {
+            stream,
+            buf: BytesMut::new(),
+            packets: 0,
+            pending: Vec::new(),
+        };
+        let (exchange, first) = scram::Client::first(username, "a-test-nonce-0001");
+        client.send(&Packet::Connect(Box::new(Connect {
+            version: Version::V5,
+            client_id: client_id.to_owned(),
+            clean_start: true,
+            keep_alive: 0,
+            username: None,
+            password: None,
+            will: None,
+            properties: Properties {
+                authentication_method: Some(scram::METHOD.to_owned()),
+                authentication_data: Some(Bytes::from(first)),
+                ..Properties::default()
+            },
+        })));
+        let server_first = match client.next()? {
+            Packet::Auth(auth) => auth.properties.authentication_data?,
+            Packet::ConnAck(ack) => return Some(ack.reason),
+            _ => return None,
+        };
+        let (exchange, client_final) = exchange
+            .finish(&server_first, password.as_bytes())
+            .expect("a well-formed server-first");
+        client.send(&Packet::Auth(mqtt_codec::packet::Auth {
+            reason: ReasonCode::ContinueAuthentication,
+            properties: Properties {
+                authentication_method: Some(scram::METHOD.to_owned()),
+                authentication_data: Some(Bytes::from(client_final)),
+                ..Properties::default()
+            },
+        }));
+        match client.next()? {
+            Packet::ConnAck(ack) if ack.reason == ReasonCode::Success => {
+                let verified = ack
+                    .properties
+                    .authentication_data
+                    .as_deref()
+                    .is_some_and(|server_final| exchange.verify(server_final));
+                assert!(verified, "the server's final message must verify");
+                Some(ReasonCode::Success)
+            }
+            Packet::ConnAck(ack) => Some(ack.reason),
+            _ => None,
+        }
+    }
+
+    /// CONNECT as `username` with `password`, and the acknowledgement's
+    /// reason: `None` when the broker closed without one.
+    fn connect_with(
+        address: SocketAddr,
+        client_id: &str,
+        username: &str,
+        password: &str,
+    ) -> Option<ReasonCode> {
+        let stream = TcpStream::connect_timeout(&address, REPLY).expect("the broker accepts");
+        stream
+            .set_read_timeout(Some(REPLY))
+            .expect("a read deadline");
+        let mut client = Self {
+            stream,
+            buf: BytesMut::new(),
+            packets: 0,
+            pending: Vec::new(),
+        };
+        client.send(&Packet::Connect(Box::new(Connect {
+            version: Version::V5,
+            client_id: client_id.to_owned(),
+            clean_start: true,
+            keep_alive: 0,
+            username: Some(username.to_owned()),
+            password: Some(Bytes::from(password.to_owned())),
+            will: None,
+            properties: Properties::default(),
+        })));
+        match client.next() {
+            Some(Packet::ConnAck(ack)) => Some(ack.reason),
+            _ => None,
+        }
     }
 
     /// Connect asking to resume, with a session that survives the
@@ -2752,4 +2886,119 @@ async fn asynchronous_loss_is_bounded_by_the_lag_metric() {
         !got.is_empty(),
         "the message copied before the stall has to be there, or nothing was replicated"
     );
+}
+
+// -------------------------------------------------------------------
+// Section 12.1: a user is replicated metadata.
+// -------------------------------------------------------------------
+
+/// A user created on one node connects on another, and a delete on one
+/// refuses on another. Section 8.2 lists users among what replicates;
+/// this is the sentence against three processes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_user_created_on_one_node_connects_on_another() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cluster = Cluster::start(directory.path()).await;
+    cluster.settle();
+
+    let answered = cluster.nodes[0].post(
+        "/api/v1/users",
+        r#"{"name":"alice","password":"hunter2","scram":true}"#,
+    );
+    assert!(answered.contains("\"name\":\"alice\""), "{answered}");
+    assert!(
+        !answered.contains("hunter2"),
+        "the answer carries no secret: {answered}"
+    );
+
+    // On the node it was made on, at once.
+    assert_eq!(
+        Client::connect_with(cluster.nodes[0].mqtt, "alice-at-alpha", "alice", "hunter2"),
+        Some(ReasonCode::Success)
+    );
+    assert_eq!(
+        Client::connect_with(cluster.nodes[0].mqtt, "alice-at-alpha", "alice", "wrong"),
+        Some(ReasonCode::NotAuthorized)
+    );
+    // On the others, once the register has arrived.
+    for at in 1..NODES {
+        until("the user has replicated", || {
+            Client::connect_with(
+                cluster.nodes[at].mqtt,
+                "alice-elsewhere",
+                "alice",
+                "hunter2",
+            ) == Some(ReasonCode::Success)
+        });
+        let listed = cluster.nodes[at].get("/api/v1/users");
+        assert!(listed.contains("\"name\":\"alice\""), "{listed}");
+    }
+
+    // And through section 12.2's exchange, on a node the user was not
+    // made on: the verifier replicated with the hash.
+    assert_eq!(
+        Client::connect_scram(cluster.nodes[1].mqtt, "alice-scram", "alice", "hunter2"),
+        Some(ReasonCode::Success)
+    );
+    assert_eq!(
+        Client::connect_scram(cluster.nodes[1].mqtt, "alice-scram", "alice", "wrong"),
+        Some(ReasonCode::NotAuthorized)
+    );
+
+    // An access control rule written on alpha refuses on beta, in
+    // time: the first rule flips the default, so the second allows
+    // everything else.
+    cluster.nodes[0].post(
+        "/api/v1/acl",
+        r#"{"id":"no-secret","order":10,"subject":"anyone","filter":"secret/#","subscribe":false}"#,
+    );
+    cluster.nodes[0].post(
+        "/api/v1/acl",
+        r##"{"id":"all","subject":"anyone","filter":"#","publish":true,"subscribe":true}"##,
+    );
+    until("the rules have replicated to beta", || {
+        let (mut probe, _) = Client::resuming(cluster.nodes[1].mqtt, "acl-probe");
+        probe.subscribe_reasons("secret/plans") == vec![ReasonCode::NotAuthorized]
+    });
+    let (mut probe, _) = Client::resuming(cluster.nodes[1].mqtt, "acl-probe");
+    assert_eq!(
+        probe.subscribe_reasons("fleet/+/telemetry"),
+        vec![ReasonCode::GrantedQos1]
+    );
+
+    // A delete on gamma refuses on alpha, in time.
+    let (code, _) = cluster.nodes[2].delete("/api/v1/users/alice");
+    assert_eq!(code, 200);
+    until("the delete has replicated", || {
+        Client::connect_with(cluster.nodes[0].mqtt, "alice-at-alpha", "alice", "hunter2")
+            == Some(ReasonCode::NotAuthorized)
+    });
+
+    // Section 11.1: an API key minted on alpha is a key on beta, with
+    // its scope and no more; revoked on gamma, it is nothing on beta.
+    let minted = cluster.nodes[0].post("/api/v1/keys", r#"{"name":"ci","scope":"write"}"#);
+    let minted: serde_json::Value = serde_json::from_str(&minted).expect("JSON");
+    let key = minted["key"].as_str().expect("the key, once").to_owned();
+    let id = minted["id"].as_str().expect("its identifier").to_owned();
+    let publication = r#"{"topic":"fleet/ci/build","payload":"ok","qos":1}"#;
+    until("the key has replicated to beta", || {
+        cluster.nodes[1]
+            .post_as("/api/v1/publish", publication, &key)
+            .0
+            == 200
+    });
+    let (code, body) = cluster.nodes[1].post_as(
+        "/api/v1/users",
+        r#"{"name":"carol","password":"hunter2"}"#,
+        &key,
+    );
+    assert_eq!(code, 403, "{body}");
+    let (code, _) = cluster.nodes[2].delete(&format!("/api/v1/keys/{id}"));
+    assert_eq!(code, 200);
+    until("the revocation has replicated to beta", || {
+        cluster.nodes[1]
+            .post_as("/api/v1/publish", publication, &key)
+            .0
+            == 401
+    });
 }

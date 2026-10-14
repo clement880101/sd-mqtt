@@ -113,6 +113,38 @@ else
   echo "conformance: openssl is not on the path, so the TLS passes are SKIPPED"
   tls_pass=0
 fi
+# Section 12.1's access control, for the suite's `test_subscribe_failure`:
+# a subscription to `test/nosubscribe` is refused for everyone and
+# everything else is allowed. Written as `[[acl]]` tables because the
+# suite's broker has no store and so no API-managed rules; the first
+# rule flips the default to deny, which is why the second exists.
+acl_tables='
+[[acl]]
+id = "no-subscribe"
+order = 10
+subject = "anyone"
+filter = "test/nosubscribe"
+subscribe = false
+
+[[acl]]
+id = "everything-else"
+order = 100
+subject = "anyone"
+filter = "#"
+publish = true
+subscribe = true
+'
+cat > "$work/plain.toml" <<EOF
+[listener]
+address = "127.0.0.1:$PORT"
+
+[admin]
+enabled = false
+
+[log]
+level = "warn"
+$acl_tables
+EOF
 cat > "$work/listeners.toml" <<EOF
 [listener]
 address = "127.0.0.1:$((PORT + 1))"
@@ -136,6 +168,7 @@ enabled = false
 
 [log]
 level = "warn"
+$acl_tables
 EOF
 if [ "$tls_pass" = 0 ]; then
   # Without a certificate the file cannot name a TLS listener.
@@ -175,8 +208,7 @@ run_one() {
   local via_pid=""
   case "$mode" in
     plain)
-      "$SDMQTT" serve --address "127.0.0.1:$PORT" --log-level warn \
-        > "$work/broker.log" 2>&1 &
+      "$SDMQTT" serve --config "$work/plain.toml" > "$work/broker.log" 2>&1 &
       local pid=$!
       listening "$PORT" || fail "the broker did not listen on $PORT: $(cat "$work/broker.log")"
       ;;

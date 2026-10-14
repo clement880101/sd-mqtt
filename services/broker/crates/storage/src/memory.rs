@@ -30,9 +30,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, PoisonError};
 
 use crate::record::{
-    BodyRecord, ClockRecord, InflightRecord, LoggedRecord, MessageId, MetadataKeyRecord,
-    MetadataRecord, NodeIdentityRecord, OutboxRecord, QueueEntry, Record, RetainedRecord,
-    RuleRecord, SeenRecord, SessionKey, SessionRecord, SubscriptionRecord,
+    AclRecord, ApiKeyRecord, BodyRecord, ClockRecord, InflightRecord, LoggedRecord, MessageId,
+    MetadataKeyRecord, MetadataRecord, NodeIdentityRecord, OutboxRecord, QueueEntry, Record,
+    RetainedRecord, RuleRecord, SeenRecord, SessionKey, SessionRecord, SubscriptionRecord,
+    UserRecord,
 };
 use crate::restore::{Restored, RestoredReplica, RestoredSession};
 use crate::{Rejection, Storage, StorageError};
@@ -79,6 +80,12 @@ struct State {
     retained: BTreeMap<String, RetainedRecord>,
     /// Rules by identifier, ordered so that restore is deterministic.
     rules: BTreeMap<String, RuleRecord>,
+    /// Users by name, ordered for the same reason. Section 12.1.
+    users: BTreeMap<String, UserRecord>,
+    /// Access control rules by identifier. Section 12.1.
+    acl: BTreeMap<String, AclRecord>,
+    /// API keys by identifier. Section 11.1.
+    api_keys: BTreeMap<String, ApiKeyRecord>,
     /// Sessions this node holds a copy of rather than owns, section
     /// 8.6: the owning node's sixteen bytes and how far the stream has
     /// been applied.
@@ -356,6 +363,24 @@ impl State {
             Record::RulePut { rule } => {
                 self.rules.insert(rule.id.clone(), rule.clone());
             }
+            Record::UserPut(user) => {
+                self.users.insert(user.name.clone(), (**user).clone());
+            }
+            Record::UserDeleted { name } => {
+                self.users.remove(name);
+            }
+            Record::AclPut(rule) => {
+                self.acl.insert(rule.id.clone(), (**rule).clone());
+            }
+            Record::AclDeleted { id } => {
+                self.acl.remove(id);
+            }
+            Record::ApiKeyPut(key) => {
+                self.api_keys.insert(key.id.clone(), (**key).clone());
+            }
+            Record::ApiKeyDeleted { id } => {
+                self.api_keys.remove(id);
+            }
             Record::ReplicaFollows {
                 session,
                 owner,
@@ -572,6 +597,9 @@ impl Storage for MemoryStorage {
                 .map(|(id, held)| (*id, held.body.clone()))
                 .collect::<HashMap<_, _>>(),
             rules: state.rules.values().cloned().collect(),
+            users: state.users.values().cloned().collect(),
+            acl: state.acl.values().cloned().collect(),
+            api_keys: state.api_keys.values().cloned().collect(),
             node: state.node.clone(),
             clock: state.clock,
             metadata: state.metadata.values().cloned().collect(),

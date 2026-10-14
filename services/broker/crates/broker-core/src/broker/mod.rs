@@ -370,6 +370,18 @@ impl Broker {
         self.registry.get(subscriber).map(Session::id)
     }
 
+    /// What `subscriber`'s connection authenticated as, if anything.
+    ///
+    /// Owned rather than borrowed, because every caller builds a
+    /// `ClientInfo` beside a mutable use of the registry or the journal,
+    /// and a borrow here would hold the registry across it.
+    fn username_of(&self, subscriber: SubscriberId) -> Option<String> {
+        self.registry
+            .get(subscriber)
+            .and_then(Session::username)
+            .map(str::to_owned)
+    }
+
     /// Move a session's actions into the caller's list, telling the
     /// hooks about the ones they asked to hear.
     ///
@@ -380,10 +392,12 @@ impl Broker {
     fn emit(&self, subscriber: SubscriberId, actions: Vec<Action>, out: &mut Vec<Addressed>) {
         if !self.hooks.is_empty() {
             if let Some(id) = self.client_of(subscriber) {
+                let username = self.username_of(subscriber);
                 let client = ClientInfo {
                     subscriber: Some(subscriber),
                     mountpoint: &id.mountpoint,
                     client_id: &id.client_id,
+                    username: username.as_deref(),
                 };
                 tell_hooks(&self.hooks, &client, &actions);
             }
@@ -902,6 +916,7 @@ impl Broker {
             .get_mut(registration.subscriber)
             .expect("just registered");
         session.set_version(connect.version);
+        session.set_username(connect.username.clone());
         session.set_expiry_interval(expiry_interval(connect));
         session.set_will(connect.will.as_ref().map(|will| {
             // Section 3.1.3.2 splits the will properties in two: the
@@ -944,10 +959,12 @@ impl Broker {
     /// Tell the hooks a connection was accepted.
     fn tell_connected(&self, subscriber: SubscriberId) {
         if let Some(id) = self.client_of(subscriber) {
+            let username = self.username_of(subscriber);
             self.hooks.client_connected(&ClientInfo {
                 subscriber: Some(subscriber),
                 mountpoint: &id.mountpoint,
                 client_id: &id.client_id,
+                username: username.as_deref(),
             });
         }
     }
@@ -1056,10 +1073,12 @@ impl Broker {
             }
         };
 
+        let username = self.username_of(subscriber);
         let client = ClientInfo {
             subscriber: Some(subscriber),
             mountpoint: &client_id.mountpoint,
             client_id: &client_id.client_id,
+            username: username.as_deref(),
         };
         subscribe::remove_all(
             &self.subscriptions,
@@ -1334,10 +1353,12 @@ impl Broker {
             // Cloned because the hook chain is borrowed from `self`
             // beside it.
             if let Some(identity) = self.client_of(publisher).cloned() {
+                let username = self.username_of(publisher);
                 let client = ClientInfo {
                     subscriber: Some(publisher),
                     mountpoint: &identity.mountpoint,
                     client_id: &identity.client_id,
+                    username: username.as_deref(),
                 };
                 if self.hooks.message_received(&client, &mut message) == Disposition::Drop {
                     return;
@@ -1411,10 +1432,12 @@ impl Broker {
                     .map(Session::id)
                     .cloned()
                     .ok_or(ReasonCode::ProtocolError)?;
+                let username = self.username_of(subscriber);
                 let client = ClientInfo {
                     subscriber: Some(subscriber),
                     mountpoint: &identity.mountpoint,
                     client_id: &identity.client_id,
+                    username: username.as_deref(),
                 };
                 // Borrowed from the field rather than through `self`,
                 // because the session below is a mutable borrow of a
@@ -1581,6 +1604,21 @@ impl Broker {
                 Verdict::Dropped => Some(0),
                 Verdict::Refused => {
                     refused = true;
+                    // An acknowledged publish is told no on its
+                    // acknowledgement, which the shell counts by
+                    // reason. An at-most-once publish has none, so
+                    // this is the one place its refusal can be seen.
+                    if received.owed.is_none() {
+                        out.push((
+                            from,
+                            Action::Dropped {
+                                id: message.id,
+                                reason: DropReason::Refused,
+                                qos: publish.qos,
+                                topic: Arc::clone(&message.topic),
+                            },
+                        ));
+                    }
                     None
                 }
             }
@@ -1609,6 +1647,28 @@ impl Broker {
     /// rewrite applied afterwards would route by the old topic and
     /// deliver the new one.
     fn judge(&mut self, from: SubscriberId, message: &mut Message) -> Verdict {
+        // Section 12.3: the dollar-prefixed namespace is the broker's
+        // and no client publishes into it, whatever the chain would
+        // say. Judged before the chain and told to it as a refusal, so
+        // a hook that counts refusals counts this one. The first level
+        // only: `a/$b` is an ordinary topic.
+        if message.topic.starts_with('$') {
+            if let Some(identity) = self.client_of(from).cloned() {
+                let username = self.username_of(from);
+                self.hooks.message_refused(
+                    &ClientInfo {
+                        subscriber: Some(from),
+                        mountpoint: &identity.mountpoint,
+                        client_id: &identity.client_id,
+                        username: username.as_deref(),
+                    },
+                    &message.topic,
+                    message.qos,
+                    crate::hooks::Refusal::Reserved,
+                );
+            }
+            return Verdict::Refused;
+        }
         if self.hooks.is_empty() {
             // The common case, and it must not pay for a clone of the
             // identity. With no hooks installed the only thing left
@@ -1622,10 +1682,12 @@ impl Broker {
         let Some(identity) = self.client_of(from).cloned() else {
             return Verdict::Refused;
         };
+        let username = self.username_of(from);
         let client = ClientInfo {
             subscriber: Some(from),
             mountpoint: &identity.mountpoint,
             client_id: &identity.client_id,
+            username: username.as_deref(),
         };
         if !self.hooks.authorize_publish(&client, message) {
             return Verdict::Refused;
@@ -1754,6 +1816,7 @@ impl Broker {
             subscriber: None,
             mountpoint: "",
             client_id: origin,
+            username: None,
         };
         match self.hooks.message_received(&client, &mut message) {
             // Nobody received it, and it is not retained either: a hook
@@ -2072,10 +2135,12 @@ impl Broker {
         self.drain_session(subscriber);
         if departed {
             if let Some(id) = self.client_of(subscriber) {
+                let username = self.username_of(subscriber);
                 self.hooks.client_disconnected(&ClientInfo {
                     subscriber: Some(subscriber),
                     mountpoint: &id.mountpoint,
                     client_id: &id.client_id,
+                    username: username.as_deref(),
                 });
             }
         }
@@ -2140,10 +2205,12 @@ impl Broker {
             if let Some(mut session) = self.registry.remove(subscriber) {
                 let identity = session.id().clone();
                 let key = journal::key_of(&identity);
+                let username = session.username().map(str::to_owned);
                 let client = ClientInfo {
                     subscriber: Some(subscriber),
                     mountpoint: &identity.mountpoint,
                     client_id: &identity.client_id,
+                    username: username.as_deref(),
                 };
                 subscribe::remove_all(
                     &self.subscriptions,

@@ -13,6 +13,9 @@
  *   and nothing is read into it.
  */
 
+import { withBearer, type AclRule } from './access.js';
+import { key } from './credential.js';
+
 /** The one envelope all six read resources answer with. */
 export interface Page<T> {
   /** This page's rows, in the resource's order. */
@@ -30,6 +33,7 @@ export type ErrorCode =
   | 'method_not_allowed'
   | 'not_acceptable'
   | 'unauthorized'
+  | 'forbidden'
   | 'conflict'
   | 'resource_exhausted'
   | 'loop_detected'
@@ -197,7 +201,10 @@ function isFailure(body: unknown): body is { error: { code: ErrorCode; message: 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(path, init);
+    response = await fetch(path, {
+      ...init,
+      headers: withBearer({ ...(init?.headers as Record<string, string> | undefined) }, key.value),
+    });
   } catch (cause) {
     throw new ApiError('unreachable', `the broker did not answer: ${String(cause)}`);
   }
@@ -353,7 +360,11 @@ export function readTap(id: number, after: number | null): Promise<TapRead> {
  * swallowed: there is no page left to show it to.
  */
 export function closeTap(id: number): void {
-  void fetch(`/api/v1/taps/${id}`, { method: 'DELETE', keepalive: true }).catch(() => {});
+  void fetch(`/api/v1/taps/${id}`, {
+    method: 'DELETE',
+    keepalive: true,
+    headers: withBearer({}, key.value),
+  }).catch(() => {});
 }
 
 // ---------------------------------------------------------------
@@ -576,4 +587,97 @@ export function setRuleEnabled(id: string, enabled: boolean): Promise<RuleView> 
  */
 export function deleteRule(id: string): Promise<{ id: string }> {
   return request<{ id: string }>(`/api/v1/${rulePath(id)}`, { method: 'DELETE' });
+}
+
+// ---------------------------------------------------------------
+// Settings: users, access control, API keys, listeners
+// ---------------------------------------------------------------
+
+/** A user, without either credential. See `directory::UserView`. */
+export interface UserView {
+  name: string;
+  has_password: boolean;
+  scram: boolean;
+  created_at: number;
+}
+
+/**
+ * Create a user, or set the password of one that exists.
+ *
+ * `scram` enrols the user in SCRAM-SHA-256 as well. Off unless asked
+ * for: section 12.2 treats a verifier as a secret equivalent to a
+ * private key, so it exists only for users who need it, and setting
+ * the password again without it withdraws the enrolment.
+ */
+export function putUser(name: string, password: string, scram: boolean): Promise<UserView> {
+  return request<UserView>('/api/v1/users', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name, password, scram }),
+  });
+}
+
+/** Remove a user; the removal replicates. */
+export function deleteUser(name: string): Promise<{ name: string }> {
+  return request<{ name: string }>(`/api/v1/users/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  });
+}
+
+/** Write an access control rule, whole. See `admin::acl::AclSpec`. */
+export function putAcl(rule: AclRule): Promise<AclRule> {
+  return request<AclRule>('/api/v1/acl', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(rule),
+  });
+}
+
+/** Remove an access control rule. */
+export function deleteAcl(id: string): Promise<{ id: string }> {
+  return request<{ id: string }>(`/api/v1/acl/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+/** What a key may do. Ordered: each covers the ones before it. */
+export type Scope = 'read' | 'write' | 'admin';
+
+/** A key as listed: never the key itself. See `directory::ApiKeyView`. */
+export interface ApiKeyView {
+  id: string;
+  name: string;
+  scope: Scope;
+  created_at: number;
+}
+
+/** A key just minted: the view, and the key's text, this once. */
+export interface IssuedKey extends ApiKeyView {
+  key: string;
+}
+
+/** Mint a key. The answer is the only time its text is seen. */
+export function createKey(name: string, scope: Scope): Promise<IssuedKey> {
+  return request<IssuedKey>('/api/v1/keys', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name, scope }),
+  });
+}
+
+/** Revoke a key, everywhere. */
+export function revokeKey(id: string): Promise<{ id: string }> {
+  return request<{ id: string }>(`/api/v1/keys/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+/** A listener this process bound. See `admin::resources::ListenerView`. */
+export interface ListenerView {
+  name: string;
+  protocol: 'mqtt' | 'mqtt_tls' | 'mqtt_ws' | 'mqtt_wss' | 'admin' | 'ingest' | 'cluster';
+  address: string;
+  mountpoint: string;
+  max_connections: number | null;
+  max_qos: number | null;
+  retain_available: boolean | null;
+  durability: 'async' | 'sync' | 'node' | null;
+  max_publish_rate: number | null;
+  publish_burst: number | null;
 }

@@ -118,6 +118,44 @@ fn every_kind(me: NodeId) -> Vec<(MetadataKey, MetadataValue)> {
             },
             MetadataValue::NodeGroup,
         ),
+        (
+            MetadataKey::User {
+                name: "alice".to_owned(),
+            },
+            MetadataValue::User(Box::new(storage::record::UserRecord {
+                name: "alice".to_owned(),
+                password: Some(storage::record::Secret::new(
+                    "$argon2id$v=19$m=19456,t=2,p=1$x$y",
+                )),
+                scram: None,
+                created_at: 1,
+            })),
+        ),
+        (
+            MetadataKey::Acl {
+                id: "fleet".to_owned(),
+            },
+            MetadataValue::Acl(Box::new(storage::record::AclRecord {
+                id: "fleet".to_owned(),
+                order: 10,
+                subject: "user:alice".to_owned(),
+                filter: "fleet/#".to_owned(),
+                publish: Some(true),
+                subscribe: Some(true),
+            })),
+        ),
+        (
+            MetadataKey::ApiKey {
+                id: "k1".to_owned(),
+            },
+            MetadataValue::ApiKey(Box::new(storage::record::ApiKeyRecord {
+                id: "k1".to_owned(),
+                name: "ci".to_owned(),
+                scope: "write".to_owned(),
+                digest: storage::record::Secret::new("digest"),
+                created_at: 2,
+            })),
+        ),
     ]
 }
 
@@ -229,6 +267,9 @@ fn every_kind_survives_a_restart() {
             MetadataValue::NodeGroup => before
                 .group_joined("workers", "jobs/+")
                 .expect("the first member writes a register"),
+            MetadataValue::User(held) => before.user(*held),
+            MetadataValue::Acl(held) => before.acl(*held),
+            MetadataValue::ApiKey(held) => before.api_key(*held),
         });
     }
     // And a tombstone, which is the last unsubscribe: the register that

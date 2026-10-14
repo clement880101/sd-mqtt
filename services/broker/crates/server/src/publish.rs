@@ -239,6 +239,7 @@ pub fn refuse(shared: &Shared, origin: &str, topic: &str, qos: QoS, reason: Refu
                 subscriber: None,
                 mountpoint: "",
                 client_id: origin,
+                username: None,
             },
             topic,
             qos,

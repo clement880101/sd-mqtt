@@ -2341,6 +2341,137 @@ mod contract {
         assert_eq!(restore(&store).rules, vec![rule("b")]);
     }
 
+    /// A user is held, replaced whole and removed, like a rule, and
+    /// comes back in name order. Section 12.1.
+    pub fn users_are_held_replaced_and_removed<S: Storage>(new: impl Fn() -> S) {
+        fn user(name: &str, hash: &str) -> storage::record::UserRecord {
+            storage::record::UserRecord {
+                name: name.to_owned(),
+                password: Some(storage::record::Secret::new(hash)),
+                scram: Some(storage::record::ScramVerifierRecord {
+                    salt: vec![1, 2, 3],
+                    iterations: 4096,
+                    stored_key: storage::record::Secret::new("stored"),
+                    server_key: storage::record::Secret::new("server"),
+                }),
+                created_at: 9,
+            }
+        }
+        let store = new();
+        assert!(
+            restore(&store).users.is_empty(),
+            "an empty store holds no users"
+        );
+        apply(
+            &store,
+            &[
+                Record::UserPut(Box::new(user("bob", "$one"))),
+                Record::UserPut(Box::new(user("alice", "$two"))),
+            ],
+        );
+        assert_eq!(
+            restore(&store).users,
+            vec![user("alice", "$two"), user("bob", "$one")],
+            "both come back, in name order, verifier and all"
+        );
+        apply(
+            &store,
+            &[Record::UserPut(Box::new(user("alice", "$three")))],
+        );
+        assert_eq!(
+            restore(&store).users,
+            vec![user("alice", "$three"), user("bob", "$one")],
+            "a put over a held name replaces it whole"
+        );
+        apply(
+            &store,
+            &[Record::UserDeleted {
+                name: "alice".to_owned(),
+            }],
+        );
+        assert_eq!(restore(&store).users, vec![user("bob", "$one")]);
+        apply(
+            &store,
+            &[Record::UserDeleted {
+                name: "never".to_owned(),
+            }],
+        );
+        assert_eq!(
+            restore(&store).users,
+            vec![user("bob", "$one")],
+            "removing a name nobody has is a no-op, like every removal here"
+        );
+    }
+
+    /// An access control rule is held, replaced and removed like a
+    /// user, and comes back in identifier order.
+    pub fn acl_rules_are_held_replaced_and_removed<S: Storage>(new: impl Fn() -> S) {
+        fn rule(id: &str, order: u32) -> storage::record::AclRecord {
+            storage::record::AclRecord {
+                id: id.to_owned(),
+                order,
+                subject: "anyone".to_owned(),
+                filter: "fleet/#".to_owned(),
+                publish: Some(true),
+                subscribe: Some(false),
+            }
+        }
+        let store = new();
+        assert!(restore(&store).acl.is_empty());
+        apply(
+            &store,
+            &[
+                Record::AclPut(Box::new(rule("b", 2))),
+                Record::AclPut(Box::new(rule("a", 1))),
+            ],
+        );
+        assert_eq!(restore(&store).acl, vec![rule("a", 1), rule("b", 2)]);
+        apply(&store, &[Record::AclPut(Box::new(rule("a", 9)))]);
+        assert_eq!(restore(&store).acl, vec![rule("a", 9), rule("b", 2)]);
+        apply(&store, &[Record::AclDeleted { id: "a".to_owned() }]);
+        assert_eq!(restore(&store).acl, vec![rule("b", 2)]);
+        apply(
+            &store,
+            &[Record::AclDeleted {
+                id: "never".to_owned(),
+            }],
+        );
+        assert_eq!(restore(&store).acl, vec![rule("b", 2)]);
+    }
+
+    /// An API key is held, replaced and removed like a rule.
+    pub fn api_keys_are_held_replaced_and_removed<S: Storage>(new: impl Fn() -> S) {
+        fn key(id: &str, scope: &str) -> storage::record::ApiKeyRecord {
+            storage::record::ApiKeyRecord {
+                id: id.to_owned(),
+                name: "ci".to_owned(),
+                scope: scope.to_owned(),
+                digest: storage::record::Secret::new("digest"),
+                created_at: 4,
+            }
+        }
+        let store = new();
+        assert!(restore(&store).api_keys.is_empty());
+        apply(
+            &store,
+            &[
+                Record::ApiKeyPut(Box::new(key("b", "write"))),
+                Record::ApiKeyPut(Box::new(key("a", "read"))),
+            ],
+        );
+        assert_eq!(
+            restore(&store).api_keys,
+            vec![key("a", "read"), key("b", "write")]
+        );
+        apply(&store, &[Record::ApiKeyPut(Box::new(key("a", "admin")))]);
+        assert_eq!(
+            restore(&store).api_keys,
+            vec![key("a", "admin"), key("b", "write")]
+        );
+        apply(&store, &[Record::ApiKeyDeleted { id: "a".to_owned() }]);
+        assert_eq!(restore(&store).api_keys, vec![key("b", "write")]);
+    }
+
     /// A rule belongs to the node, not to a session.
     ///
     /// The mistake this guards is filing rules under whatever structure
@@ -3100,6 +3231,9 @@ macro_rules! every_contract_test {
             releasing_a_body_that_is_not_held_is_refused,
             a_pop_does_not_release_the_body_it_named,
             rules_are_held_replaced_and_removed,
+            users_are_held_replaced_and_removed,
+            acl_rules_are_held_replaced_and_removed,
+            api_keys_are_held_replaced_and_removed,
             a_rule_survives_the_session_that_was_there_when_it_was_made,
             an_outbox_holds_an_envelope_with_every_field_and_counts_it,
             an_attempt_moves_the_stored_count_and_the_next_time,

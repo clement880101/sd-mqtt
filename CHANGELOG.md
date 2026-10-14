@@ -9,7 +9,109 @@ the milestone you are moving to.** Everything else is description.
 
 ## Unreleased — milestone 7: hardening
 
+### Before you upgrade: a store written before this milestone is refused
+
+**A broker built from this milestone will not open a store written by
+milestone 6.** The format moved from 10 to 11 for the user records, and
+the refusal says so:
+
+```
+store format version 10 is not readable by this build, which reads version 11.
+```
+
+What to do is what every version move asks: stop the broker, move or
+delete the store directory, start the new build. What that throws away
+is the milestone 5 list plus, from milestone 6, the replica copies and
+stream positions. On a cluster, one store at a time, letting the node
+rejoin and be repaired before the next.
+
 ### Added
+
+- **A directory of users**, section 12.1, in a crate of its own. A user
+  is durable metadata like a rule: written through `POST /api/v1/users`
+  on any node, replicated as a register to every other, removed by a
+  tombstone. The password is hashed with argon2id (PHC string) and,
+  when the request enrols the user with `"scram": true`, derived into a
+  SCRAM-SHA-256 verifier at the one moment the password is in hand,
+  because a verifier cannot be made from an argon2 hash. Enrolment is
+  opt-in because section 12.2 treats a verifier as a private key's
+  equal. Neither form is ever returned by the API, and the record's `Debug` says
+  `<redacted>`. The directory is a section 9.3 hook — `authenticate` —
+  and the broker's connect path does not know users exist. A wrong
+  password and an unknown name are one answer. `auth.anonymous` is an
+  explicit switch, on by default, that creating a user does not flip;
+  `auth.scram_iterations` sets the verifier's rounds and refuses fewer
+  than a thousand. `ClientInfo` carries the authenticated username, for
+  the access control rules that follow. `argon2` is the one new direct
+  dependency.
+
+- **SCRAM-SHA-256 over the AUTH exchange**, section 12.2, with
+  re-authentication. The arithmetic is pure functions in the server
+  crate, pinned by RFC 7677's one published exchange byte for byte;
+  the connection shell runs it before the broker is asked to connect
+  anybody, and the CONNACK carries the server's final message so the
+  client can verify the server knew its key too. An unknown name gets a
+  challenge with a salt of its own and fails at the proof, the same
+  answer at the same step as a wrong password. `=2C` and `=3D` in a
+  name are unescaped per RFC 5802. Channel binding is not offered; a
+  client asking for it, or for any other method, is told 0x8C, and so
+  is one on a node with no directory. Re-authentication is the same
+  exchange in AUTH packets, answered with `Success` and the server's
+  final; a wrong proof, or a proof as another user, disconnects with
+  0x87. The user name a SCRAM client proves is what the session
+  remembers, whatever the CONNECT's username field said.
+
+- **Access control rules**, section 12.1, deny by default once one
+  exists. `[[acl]]` tables in the file and `POST /api/v1/acl` through
+  the API take the same shape — identifier, order, subject (`anyone`,
+  `user:<name>`, `client:<id>`, where a name may end in `*` to cover a
+  prefix and `user:*` is every authenticated connection), filter, and an opinion on publishing
+  and on subscribing — and are consulted together by order, first
+  match deciding; the API's replicate as registers, the file's are the
+  node's own. Filters match the way subscriptions do, through the topic
+  crate, and a shared subscription is judged by the filter it shares. A
+  refused subscribe is 0x87 (0x80 on 3.1.1), a refused publish 0x87 on
+  its acknowledgement, and an at-most-once publish that was refused —
+  by a rule or by the reserved namespace — is now dropped and counted
+  as `refused`, where before nothing counted it. Paho's
+  `test_subscribe_failure` passes on 3.1.1 now that the runner
+  configures the rule it needs; on version 5 it stays in the baseline
+  as an assumption, because the suite asserts 0x80 where the protocol
+  lists 0x87.
+
+- **A client cannot publish into the dollar namespace**, section
+  12.3's other half, deferred since milestone 3. Judged in the broker
+  before the authorizing chain and told to the hooks as a `reserved`
+  refusal; 0x87 on an acknowledged publish, dropped and counted
+  otherwise. Only the first level is reserved.
+
+- **Two rate limiters**, section 10.3, both the generic cell rate
+  algorithm on the broker's coarse clock. **Repeated authentication
+  failures from one address are slowed**: after
+  `auth.max_failures_per_minute` (10 by default) a connect from it is
+  refused with 0x9F before its credentials are read, until the minute
+  drains; IPv6 is counted by /64, and the tick sweeps the map. A
+  listener's `max_publish_rate` and `publish_burst` cap one session's
+  publishes, off by default; over it, version 5 is disconnected with
+  0x96 and 3.1.1 closed. `sdmqtt_authentications_total{outcome}`, a
+  series registered at zero since milestone 3, now moves;
+  `sdmqtt_rate_limited_total{limiter}` and
+  `sdmqtt_auth_failure_addresses` are new.
+
+- **The Settings page**, section 11.2's last: paste a key, then manage
+  users, access control rules and API keys, and read this node's
+  listeners, publish cap included. The key is kept in session storage
+  for the tab's life and sent with every request the interface makes.
+  `GET /api/v1/listeners` gains `max_publish_rate` and `publish_burst`.
+
+- **API keys**, section 11.1, with `read`, `write` and `admin` scopes.
+  `POST /api/v1/keys` mints one and shows it once; the broker stores a
+  SHA-256 digest; `DELETE /api/v1/keys/{id}` revokes, and keys and
+  revocations replicate as registers. Every mutating endpoint names the
+  scope it needs. The configured `admin.token` is now the bootstrap key
+  with `admin` scope. **A `write` key cannot manage users, access
+  control rules, keys or nodes**, and is answered with the new `forbidden`
+  error code and `403`.
 
 - **A listener's maximum QoS and retain availability**, section 5.4's
   two deferred properties. `listener.max_qos` (0, 1 or 2) is advertised

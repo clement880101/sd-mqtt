@@ -1058,6 +1058,21 @@ The per-address authentication failure limiter is a mutex-guarded map swept
 by the one-second task, dropping entries older than the window. Authentication
 failures are rare, so a single mutex is adequate.
 
+**As built in milestone 7.** The publish cap's field is on the attached
+connection, the shell's per-session state, rather than in `broker-core`'s
+session: it is checked with the listener's other policies before the broker
+lock is taken, and a reconnect starts it afresh, which costs a client a whole
+CONNECT. It is per listener, `max_publish_rate` and `publish_burst`, off by
+default; over it, version 5 is told DISCONNECT 0x96 and 3.1.1 is closed,
+since neither can refuse one publication for rate. The burst is never below
+one second's worth of the rate, because the coarse clock moves a whole second
+at a time and a smaller burst would cap below the rate. The failure limiter
+is `auth.max_failures_per_minute`, ten by default: only a failure charges it,
+an address over it is refused with 0x9F (3 on 3.1.1) **before its
+credentials are read**, an IPv6 address is counted by its /64, and the map
+holds at most 65,536 addresses, tracking no new one when full and warning
+once a sweep, because memory is the broker's to protect first.
+
 ### 10.4 Memory
 
 mimalloc is the global allocator on every non-Windows target, enabled by
@@ -1102,6 +1117,23 @@ unprotected, and the configuration documents it as temporary. An empty token
 is refused wherever it is written — the file and `SDMQTT_ADMIN_TOKEN` read it
 the same way, because one value meaning two things in one program is how an
 operator comes to believe a listener is guarded when it is not.
+
+**Since milestone 7 there are API keys, and the token is the first of
+them.** A key has a name and one of three scopes, ordered: `read` opens
+taps, `write` also publishes and writes rules, `admin` also writes users,
+access control rules and keys, and forgets nodes. A key is
+`sdmqtt_<id>_<secret>` with thirty-two random bytes of secret; it is shown
+once, in the answer that minted it, and stored as a SHA-256 digest, which
+needs no salt or work factor because nothing about it is guessable. Keys
+are durable metadata and replicate as section 8.2 registers; a revocation
+is a tombstone. The configured token stays as a bootstrap key with
+`admin` scope, so a cluster can mint its first key, and the startup
+refusal is unchanged: a non-loopback listener still needs it. A request
+presenting a real key that is too narrow is answered `403 forbidden`,
+naming both scopes; anything else wrong is `401 unauthorized`, in one
+sentence whichever it was. The read resources stay unguarded. The UI
+session cookie is not built: the Settings page sends a key the operator
+pastes, held for the tab's life.
 
 **Where it listens is an answer to another host, not to a browser on this
 one.** An ordinary cross-origin request is already stopped: every mutating
@@ -1152,6 +1184,15 @@ table, Topics with a retained browser and a live publish and subscribe tool,
 Rules with a per-action form editor and per-rule statistics and dead letters,
 Cluster with member and link health, and Settings for users, access control,
 API keys and listeners.
+
+**Settings is built in milestone 7, and it is a client of the API like any
+other.** The operator pastes a key or the token at the top; the tab keeps it
+in session storage, so a reload keeps it and closing the tab forgets it, and
+every request the interface makes carries it. A key's text is shown once,
+with a warning, and the panel is withdrawn if that key is revoked. Rules
+from the configuration file are consulted with the API's but are not listed,
+and the page says so. Listeners are read-only: they are this process's
+configuration, not replicated metadata.
 
 **Link health on the Cluster page is the per-peer state**, `up`, `suspect` or
 `down`, which is what this node's failure detector has decided about the link
@@ -1253,7 +1294,8 @@ this binary would be untrue in the other direction. See section 3.
 
 Counters for packets by type, version and reason code; queue events by
 reason including drops and expiries; socket lifecycle; bytes in and out;
-authentication outcomes; cluster bytes sent, received and dropped; and
+authentication outcomes, and what section 10.3's limiters turned away;
+cluster bytes sent, received and dropped; and
 router matches split local and remote. Gauges for connections, sessions,
 subscriptions, retained messages, queue depth and cluster members.
 
@@ -1356,6 +1398,19 @@ frame with 1003. Client certificates are not asked for, an encrypted key
 is refused, and the certificate's expiry is not a metric because reading
 it would need an X.509 parser this build does not otherwise carry.
 
+**Users and rules, as built in milestone 7.** Users live in a directory
+crate behind section 9.3's `authenticate` hook and replicate as section 8.2
+registers; the broker's connect path does not know users exist. A rule's
+subject is `anyone`, `user:<name>` or `client:<id>`, and the "pattern" this
+section asks for is a name ending in `*`, meaning every name with that
+prefix: `client:sensor-*`, or `user:*` for every authenticated connection.
+A `*` anywhere else is refused rather than read as a second wildcard
+grammar. Rules in the file and rules written through the API are consulted
+together, in one order. A shared subscription is judged by the filter it
+shares. Deny by default once any rule exists is literal: one rule locks out
+everything it does not allow, and the README and the Settings page both say
+so above the table.
+
 ### 12.2 Enhanced authentication
 
 SCRAM-SHA-256 is implemented per the SASL SCRAM specification and its
@@ -1385,6 +1440,15 @@ by the API, and exist only for users explicitly enrolled in SCRAM.
 A client requesting any other mechanism receives the bad authentication
 method reason code.
 
+**Enrolment, as built in milestone 7, is asked for.** Setting a password
+always makes the argon2 hash, and makes the verifier only when the request
+says `"scram": true`; setting the password again without it withdraws the
+enrolment, because the old verifier is of the old password. A user who is
+not enrolled and attempts the exchange fails at the proof exactly as an
+unknown name does, so enrolment is not discoverable by trying. There is no
+mechanism list in MQTT to advertise; the unbound mechanism is the only one
+answered, and a client asking for `-PLUS` or any other method is told 0x8C.
+
 ### 12.3 Secret handling
 
 Passwords and tokens are held in a wrapper that refuses to print itself, so
@@ -1392,8 +1456,12 @@ they cannot reach logs or crash output. Repeated authentication failures from
 one address are slowed by the limiter in section 10.3. Dollar-prefixed topics
 are not publishable by clients.
 
-**Half of that last sentence is true, and the half that is not is deferred to
-milestone 7.** The admin publish endpoint refuses a dollar-prefixed topic,
+**Both halves of that last sentence are true since milestone 7.** The
+MQTT connection's half is judged in the broker before the authorizing
+chain: 0x87 on an acknowledged publish, a counted drop on an at-most-once
+one, and the hooks told of a `reserved` refusal. What follows is the note
+as it stood while the half was deferred, kept because it records why.
+The admin publish endpoint refuses a dollar-prefixed topic,
 because milestone 3 added it and it is a new way to write a *retained* one,
 which stays in the broker until somebody finds it. An MQTT connection is
 still allowed to publish one. That is older than this milestone and is
@@ -1408,6 +1476,12 @@ means adding a classified line to `conformance/known-failures.txt`, which
 belongs with the authorization work in milestone 7 where
 `test_subscribe_failure` is already deferred, rather than beside a change
 that must leave the baseline alone.
+
+How it came out: `test_dollar_topics` still passes, because it asserts only
+that nothing is delivered and never looks at the acknowledgement.
+`test_subscribe_failure` passes on 3.1.1 now that the runner writes the rule
+it needs; on version 5 it is an `assumption`, because it asserts 0x80 where
+3.9.3 lists 0x87 for a refused subscription.
 
 ## 13. Error handling
 

@@ -597,3 +597,74 @@ input[aria-invalid='true'] {
 .state-down {
   color: var(--bad);
 }
+
+/* ------------------------------------------------------------------
+ * The Settings page: four short tables, each under its own form.
+ * ---------------------------------------------------------------- */
+
+.settings section + section {
+  margin-block-start: var(--size-6);
+}
+
+.settings .fields {
+  margin-block-end: var(--size-3);
+}
+
+.settings-table {
+  /* A narrow pane scrolls a table sideways rather than clipping a
+     column, as the Rules and Cluster tables do. */
+  overflow-x: auto;
+}
+
+.settings-table .row {
+  min-block-size: var(--size-7);
+}
+
+.settings-table .doing {
+  display: flex;
+  justify-content: flex-end;
+  overflow: visible;
+}
+
+.settings-table .doing button {
+  padding-inline: var(--size-2);
+  font-size: var(--font-size-00);
+}
+
+.settings-users .row {
+  grid-template-columns: minmax(8rem, 2fr) 5rem 5rem minmax(10rem, 1.5fr) 6rem;
+}
+
+.settings-acl .row {
+  grid-template-columns:
+    4rem minmax(6rem, 1fr) minmax(6rem, 1fr) minmax(7rem, 1.2fr) 5rem 5rem
+    minmax(12rem, 2.5fr) 6rem;
+}
+
+.settings-keys .row {
+  grid-template-columns: 9rem minmax(8rem, 2fr) 5rem minmax(10rem, 1.5fr) 6rem;
+}
+
+.settings-listeners .row {
+  grid-template-columns:
+    minmax(6rem, 1fr) minmax(8rem, 1.4fr) minmax(9rem, 1.4fr) minmax(6rem, 1fr) 4.5rem
+    4rem 6rem minmax(8rem, 1.2fr);
+}
+
+input[type='password'] {
+  padding: var(--size-1) var(--size-2);
+  border: var(--border-size-1) solid var(--edge);
+  border-radius: var(--radius-2);
+  background: var(--surface-raised);
+  color: var(--ink);
+  font: inherit;
+}
+
+.issued {
+  margin-block: var(--size-3);
+}
+
+.issued-key {
+  word-break: break-all;
+  user-select: all;
+}

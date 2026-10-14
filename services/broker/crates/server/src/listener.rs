@@ -457,6 +457,12 @@ async fn serving<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
+    // Section 10.3 counts authentication failures by address, and this
+    // is the one place that knows it.
+    let config = ConnectionConfig {
+        peer: Some(peer.ip()),
+        ..config
+    };
     tokio::select! {
         served = serve(socket, shared, config) => {
             if let Err(error) = served {

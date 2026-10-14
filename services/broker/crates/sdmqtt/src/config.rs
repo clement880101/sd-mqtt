@@ -23,9 +23,9 @@
 //! it in a wrapper that refuses to print; see
 //! [`sdmqtt_admin::Token`].
 //!
-//! The token is an interim that milestone 7 replaces with API keys.
-//! Until then the admin listener is protected by where it listens, and
-//! [`Config::validate`] refuses a configuration that binds it further
+//! Since milestone 7 the token is the bootstrap API key, with `admin`
+//! scope; the keys it mints are the directory's. [`Config::validate`]
+//! still refuses a configuration that binds the admin listener further
 //! than loopback with no token set.
 //!
 //! # No store directory means no store
@@ -344,6 +344,15 @@ pub struct Listener {
     /// `"async"` or `"sync"`; absent takes `cluster.durability`. The
     /// wait is bounded by `cluster.sync_timeout_ms` in both cases.
     pub durability: Option<Durability>,
+    /// Section 10.3: how many PUBLISH packets a second one session on
+    /// this listener may send. Zero, the default, is no cap. Over it, a
+    /// version 5 client is disconnected with 0x96 and a 3.1.1 client
+    /// is closed.
+    pub max_publish_rate: u32,
+    /// How many of them may come at once. Raised to the rate if set
+    /// below it, because the clock this is measured on moves a whole
+    /// second at a time. Zero takes the rate.
+    pub publish_burst: u32,
 }
 
 impl Default for Listener {
@@ -358,6 +367,8 @@ impl Default for Listener {
             max_qos: 2,
             retain_available: true,
             durability: None,
+            max_publish_rate: 0,
+            publish_burst: 0,
         }
     }
 }
@@ -726,6 +737,92 @@ impl Default for IngestConfig {
     }
 }
 
+/// The authentication section. Section 12.1.
+///
+/// Users themselves are not here: they are durable metadata, written
+/// through the API and replicated, and a file is the wrong place for a
+/// password. What is here is how the directory behaves.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AuthConfig {
+    /// Whether a client with no username is admitted. **A switch, not
+    /// an inference**: it does not flip itself when the first user is
+    /// created, because a setting that changes under an operator is
+    /// one they cannot reason about. On by default, which is what the
+    /// broker did through milestone 6.
+    pub anonymous: bool,
+    /// PBKDF2 rounds for a new SCRAM-SHA-256 verifier. Section 12.2:
+    /// a client performs the same derivation, so this trades the
+    /// server's resistance to an offline attack against a constrained
+    /// client's connect time. 4096 is RFC 7677's example and the
+    /// common floor.
+    pub scram_iterations: u32,
+    /// Section 10.3: failed authentications a minute from one address —
+    /// one IPv4 address, or one IPv6 /64 — before its connects are
+    /// refused unread, with 0x9F (3 on 3.1.1), until the minute drains.
+    /// Zero is no limit.
+    pub max_failures_per_minute: u32,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            anonymous: true,
+            scram_iterations: 4096,
+            max_failures_per_minute: sdmqtt_server::shared::DEFAULT_AUTH_FAILURES_PER_MINUTE,
+        }
+    }
+}
+
+/// One access control rule written in the file, `[[acl]]`. Section
+/// 12.1.
+///
+/// The same shape the API takes, so a rule can be moved between the
+/// two by copying it. Rules in the file and rules written through the
+/// API are consulted together, by `order`; the file's are not
+/// replicated — they are this node's configuration, and every node's
+/// file says what that node enforces.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AclSpec {
+    /// What an operator calls it.
+    pub id: String,
+    /// Lower is consulted first. 100 by default.
+    #[serde(default = "default_acl_order")]
+    pub order: u32,
+    /// `anyone`, `user:<name>` or `client:<id>`.
+    pub subject: String,
+    /// The topic filter, with MQTT wildcards.
+    pub filter: String,
+    /// Whether publishing to a matching topic is allowed, when the rule
+    /// has an opinion.
+    #[serde(default)]
+    pub publish: Option<bool>,
+    /// Whether subscribing to a matching filter is allowed, when the
+    /// rule has an opinion.
+    #[serde(default)]
+    pub subscribe: Option<bool>,
+}
+
+fn default_acl_order() -> u32 {
+    100
+}
+
+impl AclSpec {
+    /// The rule as the directory consults it.
+    #[must_use]
+    pub fn to_record(&self) -> storage::record::AclRecord {
+        storage::record::AclRecord {
+            id: self.id.clone(),
+            order: self.order,
+            subject: self.subject.clone(),
+            filter: self.filter.clone(),
+            publish: self.publish,
+            subscribe: self.subscribe,
+        }
+    }
+}
+
 /// The log section.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -1079,6 +1176,8 @@ pub struct Config {
     pub admin: AdminConfig,
     /// Where section 9.2's ingest endpoint is served.
     pub ingest: IngestConfig,
+    /// Section 12.1's switches.
+    pub auth: AuthConfig,
     /// The log section.
     pub log: Log,
     /// The rules this node holds, section 9.1.
@@ -1089,6 +1188,10 @@ pub struct Config {
     /// it, so a typo in a key would silently create a second rule.
     #[serde(default)]
     pub rules: Vec<RuleSpec>,
+    /// Section 12.1's access control rules written in the file,
+    /// `[[acl]]` tables. A list for the reason `rules` is.
+    #[serde(default)]
+    pub acl: Vec<AclSpec>,
 }
 
 /// What the command line says, where it says anything.
@@ -1197,6 +1300,29 @@ impl Config {
             });
         }
         self.validate_listeners()?;
+        let mut acl_ids = BTreeMap::new();
+        for rule in &self.acl {
+            directory::check_rule(&rule.to_record()).map_err(|why| ConfigError::Unusable {
+                key: leak(format!("acl[{}]", rule.id)),
+                value: rule.id.clone(),
+                why: leak(why.to_string()),
+            })?;
+            if acl_ids.insert(rule.id.clone(), ()).is_some() {
+                return Err(ConfigError::Unusable {
+                    key: leak(format!("acl[{}]", rule.id)),
+                    value: rule.id.clone(),
+                    why: "two access control rules share this identifier; each needs its own",
+                });
+            }
+        }
+        if self.auth.scram_iterations < 1000 {
+            return Err(ConfigError::Unusable {
+                key: "auth.scram_iterations",
+                value: self.auth.scram_iterations.to_string(),
+                why: "fewer than a thousand rounds makes a stored verifier cheap to attack \
+                      offline; RFC 7677 uses 4096, and leaving the key out takes that",
+            });
+        }
         if self.broker.max_inflight == 0 {
             return Err(ConfigError::Unusable {
                 key: "broker.max_inflight",
@@ -1625,6 +1751,22 @@ impl Config {
             self.listener.retain_available =
                 parse("SDMQTT_RETAIN_AVAILABLE", &value, "true or false")?;
         }
+        if let Some(value) = lookup("SDMQTT_AUTH_ANONYMOUS") {
+            self.auth.anonymous = parse("SDMQTT_AUTH_ANONYMOUS", &value, "true or false")?;
+        }
+        if let Some(value) = lookup("SDMQTT_AUTH_SCRAM_ITERATIONS") {
+            self.auth.scram_iterations = parse("SDMQTT_AUTH_SCRAM_ITERATIONS", &value, "count")?;
+        }
+        if let Some(value) = lookup("SDMQTT_AUTH_MAX_FAILURES_PER_MINUTE") {
+            self.auth.max_failures_per_minute =
+                parse("SDMQTT_AUTH_MAX_FAILURES_PER_MINUTE", &value, "count")?;
+        }
+        if let Some(value) = lookup("SDMQTT_MAX_PUBLISH_RATE") {
+            self.listener.max_publish_rate = parse("SDMQTT_MAX_PUBLISH_RATE", &value, "count")?;
+        }
+        if let Some(value) = lookup("SDMQTT_PUBLISH_BURST") {
+            self.listener.publish_burst = parse("SDMQTT_PUBLISH_BURST", &value, "count")?;
+        }
         if let Some(value) = lookup("SDMQTT_LISTENER_DURABILITY") {
             self.listener.durability = Some(match value.as_str() {
                 "async" => Durability::Async,
@@ -2016,6 +2158,8 @@ impl Config {
                 max_qos: listener.max_qos(),
                 retain_available: listener.retain_available,
                 durability: listener.durability,
+                max_publish_rate: listener.max_publish_rate,
+                publish_burst: listener.publish_burst,
                 // Derived from the bounds it drains rather than left a
                 // constant, so raising the queue raises the channel the
                 // queue empties into. `validate` refuses a configuration
@@ -3290,6 +3434,125 @@ mod tests {
             .expect("both read");
         assert_eq!(from_env.listener.max_qos, 0);
         assert!(!from_env.listener.retain_available);
+    }
+
+    /// `[[acl]]` tables are read as rules, and a rule that is not one
+    /// is refused by name.
+    #[test]
+    fn acl_tables_are_read_and_a_bad_one_is_refused() {
+        let config = Config::from_toml(
+            r##"
+            [[acl]]
+            id = "all"
+            subject = "anyone"
+            filter = "#"
+            publish = true
+            subscribe = true
+
+            [[acl]]
+            id = "no-sub"
+            order = 10
+            subject = "anyone"
+            filter = "test/nosubscribe"
+            subscribe = false
+        "##,
+        )
+        .expect("every key is known");
+        config.validate().expect("two usable rules");
+        assert_eq!(config.acl.len(), 2);
+        assert_eq!(config.acl[0].order, 100, "the default order");
+        assert_eq!(config.acl[1].to_record().subscribe, Some(false));
+
+        let bad_subject = Config::from_toml(
+            "[[acl]]\nid = \"x\"\nsubject = \"everyone\"\nfilter = \"#\"\npublish = true\n",
+        )
+        .expect("parses");
+        let why = bad_subject
+            .validate()
+            .expect_err("not a subject")
+            .to_string();
+        assert!(why.contains("acl[x]") && why.contains("subject"), "{why}");
+
+        let no_opinion =
+            Config::from_toml("[[acl]]\nid = \"x\"\nsubject = \"anyone\"\nfilter = \"#\"\n")
+                .expect("parses");
+        let why = no_opinion
+            .validate()
+            .expect_err("decides nothing")
+            .to_string();
+        assert!(why.contains("publish"), "{why}");
+
+        let twice = Config::from_toml(
+            "[[acl]]\nid = \"x\"\nsubject = \"anyone\"\nfilter = \"#\"\npublish = true\n\
+             [[acl]]\nid = \"x\"\nsubject = \"anyone\"\nfilter = \"a\"\npublish = true\n",
+        )
+        .expect("parses");
+        let why = twice.validate().expect_err("x twice").to_string();
+        assert!(why.contains("share this identifier"), "{why}");
+    }
+
+    /// Section 10.3's two limits are read from the file and the
+    /// environment, and reach what the listener and the node are given.
+    #[test]
+    fn the_rate_limits_are_read_and_reach_the_connection() {
+        let defaults = Config::default();
+        assert_eq!(defaults.auth.max_failures_per_minute, 10);
+        assert_eq!(defaults.server().connection.max_publish_rate, 0, "no cap");
+
+        let config = Config::from_toml(
+            r#"
+            [auth]
+            max_failures_per_minute = 3
+
+            [listener]
+            max_publish_rate = 100
+            publish_burst = 500
+        "#,
+        )
+        .expect("the keys are known");
+        config.validate().expect("valid");
+        assert_eq!(config.auth.max_failures_per_minute, 3);
+        let server = config.server();
+        assert_eq!(server.connection.max_publish_rate, 100);
+        assert_eq!(server.connection.publish_burst, 500);
+
+        let mut from_env = Config::default();
+        from_env
+            .apply_env(|name| match name {
+                "SDMQTT_AUTH_MAX_FAILURES_PER_MINUTE" => Some("0".to_owned()),
+                "SDMQTT_MAX_PUBLISH_RATE" => Some("50".to_owned()),
+                "SDMQTT_PUBLISH_BURST" => Some("60".to_owned()),
+                _ => None,
+            })
+            .expect("all three read");
+        assert_eq!(from_env.auth.max_failures_per_minute, 0);
+        assert_eq!(from_env.listener.max_publish_rate, 50);
+        assert_eq!(from_env.listener.publish_burst, 60);
+    }
+
+    /// Section 12.1's switches are read, and a cheap verifier refused.
+    #[test]
+    fn the_auth_section_is_read_and_a_cheap_verifier_is_refused() {
+        let config = Config::from_toml("[auth]\nanonymous = false\nscram_iterations = 8192\n")
+            .expect("both keys are known");
+        assert!(!config.auth.anonymous);
+        assert_eq!(config.auth.scram_iterations, 8192);
+        config.validate().expect("eight thousand rounds is fine");
+
+        let cheap = Config::from_toml("[auth]\nscram_iterations = 100\n").expect("parses");
+        let why = cheap.validate().expect_err("a hundred rounds").to_string();
+        assert!(why.contains("auth.scram_iterations"), "{why}");
+
+        let mut from_env = Config::default();
+        from_env
+            .apply_env(|name| match name {
+                "SDMQTT_AUTH_ANONYMOUS" => Some("false".to_owned()),
+                "SDMQTT_AUTH_SCRAM_ITERATIONS" => Some("5000".to_owned()),
+                _ => None,
+            })
+            .expect("both read");
+        assert!(!from_env.auth.anonymous);
+        assert_eq!(from_env.auth.scram_iterations, 5000);
     }
 
     /// `[[listeners]]` entries follow `[listener]`, in order, each with

@@ -75,6 +75,7 @@ tokio = { version = "1", default-features = false, features = [
     "macros",
 ] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+directory = { version = "0.1.0", path = "../directory" }
 
 # Build-time only, and so not distributed: these run to produce an
 # artifact and never reach a user. They are also invisible to the
@@ -119,6 +120,7 @@ storage = { path = "../storage", version = "0.1.0", default-features = false }
 # dev-dependency is not distributed, so this is invisible to the
 # direct-dependency budget of section 15.
 serde_json = "1"
+cluster = { path = "../cluster", version = "0.1.0" }
 
 [lints]
 workspace = true

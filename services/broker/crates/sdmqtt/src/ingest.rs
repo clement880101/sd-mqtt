@@ -222,6 +222,8 @@ impl IngestSocket {
             max_qos: None,
             retain_available: None,
             durability: None,
+            max_publish_rate: None,
+            publish_burst: None,
         });
         tracing::info!(
             %address,

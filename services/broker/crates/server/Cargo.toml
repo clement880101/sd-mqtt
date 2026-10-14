@@ -55,6 +55,8 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 rustls-pki-types = { version = "1", features = ["std"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 rcgen = "0.14"

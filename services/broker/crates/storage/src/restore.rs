@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 
 use crate::record::{
-    BodyRecord, ClockRecord, InflightRecord, LoggedRecord, MessageId, MetadataRecord,
-    NodeIdentityRecord, QueueEntry, RetainedRecord, RuleRecord, SeenRecord, SessionRecord,
-    SubscriptionRecord,
+    AclRecord, ApiKeyRecord, BodyRecord, ClockRecord, InflightRecord, LoggedRecord, MessageId,
+    MetadataRecord, NodeIdentityRecord, QueueEntry, RetainedRecord, RuleRecord, SeenRecord,
+    SessionRecord, SubscriptionRecord, UserRecord,
 };
 
 /// Everything needed to rebuild the broker, read once at startup.
@@ -106,6 +106,13 @@ pub struct Restored {
     /// hand back the same value and the restart property can compare them
     /// as one equality.
     pub rules: Vec<RuleRecord>,
+    /// Every user the node holds, in name order. Section 12.1, durable
+    /// metadata like a rule, and ordered for the same reason.
+    pub users: Vec<UserRecord>,
+    /// Every access control rule the node holds, in identifier order.
+    pub acl: Vec<AclRecord>,
+    /// Every API key the node holds, in identifier order. Section 11.1.
+    pub api_keys: Vec<ApiKeyRecord>,
     /// Who this node is, if the store has ever been told.
     ///
     /// `None` for a store that has never held an identity, which is a

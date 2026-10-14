@@ -16,6 +16,7 @@ import { Clients } from './pages/clients.js';
 import { Cluster } from './pages/cluster.js';
 import { Overview } from './pages/overview.js';
 import { Rules } from './pages/rules.js';
+import { Settings } from './pages/settings.js';
 import { Topics } from './pages/topics.js';
 
 /** The pages section 11.2 names, in the order the navigation shows them. */
@@ -25,6 +26,7 @@ const PAGES = [
   { path: '/topics', label: 'Topics' },
   { path: '/rules', label: 'Rules' },
   { path: '/cluster', label: 'Cluster' },
+  { path: '/settings', label: 'Settings' },
 ] as const;
 
 /** What the page at `path` is called, for the tab and the navigation. */
@@ -120,6 +122,7 @@ export function App() {
           <Route path="/topics" component={Topics} />
           <Route path="/rules" component={Rules} />
           <Route path="/cluster" component={Cluster} />
+          <Route path="/settings" component={Settings} />
           <Route default component={() => <Placeholder title="Not found" />} />
         </Router>
       </main>

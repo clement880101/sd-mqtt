@@ -150,7 +150,7 @@ use serde::{Deserialize, Serialize};
 /// operations as it had before the restart — a follower that quietly
 /// stops following, which is the failure replication exists to
 /// prevent.
-pub const FORMAT_VERSION: u16 = 10;
+pub const FORMAT_VERSION: u16 = 11;
 
 /// What every sd-mqtt store begins with, so a file that is not one is
 /// refused as such rather than as a corrupt store.
@@ -1027,6 +1027,21 @@ pub enum MetadataKeyRecord {
         /// because that is what a published topic is matched against.
         filter: String,
     },
+    /// A user, by name. Section 8.2 lists users among what replicates.
+    User {
+        /// The name.
+        name: String,
+    },
+    /// An access control rule, by identifier.
+    Acl {
+        /// The identifier.
+        id: String,
+    },
+    /// An API key, by identifier.
+    ApiKey {
+        /// The identifier.
+        id: String,
+    },
 }
 
 /// What a replicated register holds, section 8.2.
@@ -1076,6 +1091,12 @@ pub enum MetadataValueRecord {
     /// the part section 8.2 keeps on the node, as it does for a node
     /// subscription.
     NodeGroup,
+    /// A user, whole. Boxed for the reason a rule is.
+    User(Box<UserRecord>),
+    /// An access control rule, whole.
+    Acl(Box<AclRecord>),
+    /// An API key, whole.
+    ApiKey(Box<ApiKeyRecord>),
 }
 
 /// One replicated register, as a store holds it.
@@ -1519,6 +1540,112 @@ pub enum Record {
         /// The position of the last change sent.
         at: u64,
     },
+    /// A user exists, or its credentials changed. Section 12.1.
+    ///
+    /// Carries the argon2 string and the SCRAM verifier, never a
+    /// password: both are derived when the password is set, because a
+    /// verifier cannot be derived from an argon2 hash (section 12.2).
+    /// Boxed for the reason a rule is: the record is large and the
+    /// enum is sized by its largest variant.
+    UserPut(Box<UserRecord>),
+    /// A user is gone.
+    UserDeleted {
+        /// Its name.
+        name: String,
+    },
+    /// An access control rule exists, or changed. Section 12.1.
+    AclPut(Box<AclRecord>),
+    /// An access control rule is gone.
+    AclDeleted {
+        /// Its identifier.
+        id: String,
+    },
+    /// An API key exists. Section 11.1.
+    ApiKeyPut(Box<ApiKeyRecord>),
+    /// An API key is revoked.
+    ApiKeyDeleted {
+        /// Its identifier.
+        id: String,
+    },
+}
+
+/// An API key, as stored. Section 11.1.
+///
+/// The secret itself is shown once, at creation, and kept nowhere:
+/// what is stored is a digest of it. A key is thirty-two random bytes,
+/// so the digest need not be slow — there is nothing to guess — and a
+/// request can be checked in the time a hash takes rather than the
+/// time a password hash is made to take.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyRecord {
+    /// The identifier, which the presented key carries in clear so the
+    /// digest to compare against can be found without trying them all.
+    pub id: String,
+    /// What an operator calls it.
+    pub name: String,
+    /// `read`, `write` or `admin`.
+    pub scope: String,
+    /// Base64 of the SHA-256 of the secret.
+    pub digest: Secret,
+    /// Seconds since the epoch.
+    pub created_at: u64,
+}
+
+/// One access control rule, as stored. Section 12.1.
+///
+/// Rules are consulted in `order`, then by identifier, and the first
+/// one whose subject and filter match decides the operation it has an
+/// answer for; a rule with `None` for an operation says nothing about
+/// it and the next is asked. With no rule matching, and any rule at
+/// all existing, the answer is no.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AclRecord {
+    /// What an operator calls it. Compared exactly.
+    pub id: String,
+    /// Lower is consulted first.
+    pub order: u32,
+    /// Whom it is about: `anyone`, `user:<name>` or `client:<id>`.
+    pub subject: String,
+    /// The topic filter it is about, with MQTT wildcards.
+    pub filter: String,
+    /// Whether publishing to a matching topic is allowed, when this rule
+    /// has an opinion.
+    pub publish: Option<bool>,
+    /// Whether subscribing to a matching filter is allowed, when this
+    /// rule has an opinion.
+    pub subscribe: Option<bool>,
+}
+
+/// A user, as stored. Sections 12.1 and 12.2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserRecord {
+    /// The name a client presents. Compared exactly.
+    pub name: String,
+    /// The argon2id hash in PHC string form, when the user has a
+    /// password. `None` for a user enrolled in SCRAM alone.
+    pub password: Option<Secret>,
+    /// The SCRAM-SHA-256 verifier, when the user is enrolled.
+    pub scram: Option<ScramVerifierRecord>,
+    /// Seconds since the epoch, for the page.
+    pub created_at: u64,
+}
+
+/// What SCRAM-SHA-256 needs to verify a client without the password.
+///
+/// Section 12.2: "a weaker secret at rest than an argon2 hash, because
+/// possession of the stored key permits impersonating that client", so
+/// both keys are [`Secret`]s and the API never returns them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScramVerifierRecord {
+    /// Random, per user.
+    pub salt: Vec<u8>,
+    /// PBKDF2 rounds. Section 12.2: configurable, defaulting to a value
+    /// a constrained client can afford.
+    pub iterations: u32,
+    /// `H(ClientKey)`, base64.
+    pub stored_key: Secret,
+    /// `HMAC(SaltedPassword, "Server Key")`, base64.
+    pub server_key: Secret,
 }
 
 impl Record {
@@ -1644,6 +1771,12 @@ impl Record {
                     }
             }
             Self::RuleRemoved { id } => id.len(),
+            Self::UserPut(user) => weigh_user(user),
+            Self::UserDeleted { name } => name.len(),
+            Self::AclPut(rule) => weigh_acl(rule),
+            Self::AclDeleted { id } => id.len(),
+            Self::ApiKeyPut(key) => weigh_api_key(key),
+            Self::ApiKeyDeleted { id } => id.len(),
             // The client identifier is a peer's, and the rule
             // identifier an operator's. The payload is not counted
             // because it is not here: the `BodyPut` beside this record
@@ -1700,6 +1833,9 @@ fn weigh_metadata(entry: &MetadataRecord) -> usize {
             .weight()
                 - std::mem::size_of::<Record>()
         }
+        Some(MetadataValueRecord::User(user)) => weigh_user(user),
+        Some(MetadataValueRecord::Acl(rule)) => weigh_acl(rule),
+        Some(MetadataValueRecord::ApiKey(key)) => weigh_api_key(key),
     };
     weigh_metadata_key(&entry.key) + value
 }
@@ -1712,7 +1848,30 @@ fn weigh_metadata_key(key: &MetadataKeyRecord) -> usize {
         MetadataKeyRecord::Rule { id } => id.len(),
         MetadataKeyRecord::SessionOwner { session } => weigh_key(session),
         MetadataKeyRecord::NodeGroup { group, filter, .. } => group.len() + filter.len(),
+        MetadataKeyRecord::User { name } => name.len(),
+        MetadataKeyRecord::Acl { id } => id.len(),
+        MetadataKeyRecord::ApiKey { id } => id.len(),
     }
+}
+
+/// What a key's record holds beyond its own footprint.
+fn weigh_api_key(key: &ApiKeyRecord) -> usize {
+    key.id.len() + key.name.len() + key.scope.len() + key.digest.expose().len()
+}
+
+/// What a rule's record holds beyond its own footprint.
+fn weigh_acl(rule: &AclRecord) -> usize {
+    rule.id.len() + rule.subject.len() + rule.filter.len()
+}
+
+/// What a user's record holds beyond its own footprint: the name, the
+/// hash string and the verifier's three byte strings.
+fn weigh_user(user: &UserRecord) -> usize {
+    user.name.len()
+        + user.password.as_ref().map_or(0, |hash| hash.expose().len())
+        + user.scram.as_ref().map_or(0, |scram| {
+            scram.salt.len() + scram.stored_key.expose().len() + scram.server_key.expose().len()
+        })
 }
 
 /// What a session key's two strings hold.

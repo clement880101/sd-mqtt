@@ -428,6 +428,8 @@ struct Node<'a> {
     /// Section 8.5's policy, on the same nodes as the mesh: the two
     /// are made together and neither is useful without the other.
     gate: Option<&'a Arc<Gate>>,
+    /// Section 12.1's directory, on a node with a store.
+    directory: Option<&'a Arc<directory::Directory>>,
 }
 
 /// Start section 8.1's mesh, when this node clusters.
@@ -598,6 +600,13 @@ struct Rebuilt {
     /// ones it held, and a second restore would be a second answer to
     /// both.
     replicated: Arc<Replicated>,
+    /// Section 12.1's users, as the store held them, for the directory
+    /// to start from.
+    users: Vec<storage::record::UserRecord>,
+    /// And its access control rules.
+    acl: Vec<storage::record::AclRecord>,
+    /// And section 11.1's API keys, as digests.
+    api_keys: Vec<storage::record::ApiKeyRecord>,
 }
 
 /// The same, against a store somebody else opened.
@@ -796,6 +805,9 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, Sta
         identity: reconciled.identity,
         copies,
         replicated,
+        users: restored.users.clone(),
+        acl: restored.acl.clone(),
+        api_keys: restored.api_keys.clone(),
     })
 }
 
@@ -844,7 +856,8 @@ async fn start_admin(
         // Section 11.1 serves rules, and section 9.1 makes one
         // durable metadata, so a node with no store has none to
         // serve. See `sdmqtt_admin::rules`.
-        .with_rules(registry.map(Arc::clone));
+        .with_rules(registry.map(Arc::clone))
+        .with_directory(node.directory.map(Arc::clone));
     // **Section 8.1's identity, not the word `local`.** A node with no
     // store has none — its identity is a thing that is written down —
     // so it keeps the old answer, which is honest: it is the only node
@@ -991,6 +1004,57 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         Some(rebuilt) => Arc::clone(&rebuilt.shared),
         None => Arc::new(Shared::new(config.server().broker)),
     };
+
+    // Section 10.3's authentication failure limiter, before anything
+    // binds, on every node: a node with no store authenticates through
+    // its hooks and is guessed at just the same.
+    shared.limit_authentication_failures(config.auth.max_failures_per_minute);
+
+    // Section 12.1's directory, **before anything binds**, for the
+    // reason the rules are: the first packet after a listener comes up
+    // is a CONNECT, and a connect that found no authenticator installed
+    // would be admitted by the default. A node with no store has no
+    // directory — a user is durable metadata — and admits by the
+    // default alone.
+    let directory = rebuilt.as_ref().map(|rebuilt| {
+        let directory = directory::Directory::new(
+            Arc::clone(&rebuilt.writer),
+            Arc::clone(&shared),
+            Arc::clone(&rebuilt.replicated),
+            directory::Settings {
+                anonymous: config.auth.anonymous,
+                scram_iterations: config.auth.scram_iterations,
+            },
+            rebuilt.users.clone(),
+            rebuilt.acl.clone(),
+            rebuilt.api_keys.clone(),
+        );
+        shared.with_broker(|broker| broker.hooks_mut().install(directory.hook()));
+        shared
+            .install_verifiers(Arc::clone(&directory) as Arc<dyn sdmqtt_server::scram::Verifiers>);
+        tracing::info!(
+            users = directory.users().len(),
+            anonymous = config.auth.anonymous,
+            "the directory is installed"
+        );
+        directory
+    });
+    // Section 12.1's access control, on every node: the file's rules,
+    // and the directory's where there is one. Installed whether or not
+    // any rule exists yet, because a rule written through the API later
+    // must take effect without a restart.
+    let rules_in_force = directory::RulesInForce::new(
+        config.acl.iter().map(config::AclSpec::to_record).collect(),
+        directory.clone(),
+    );
+    shared.with_broker(|broker| broker.hooks_mut().install(rules_in_force.hook()));
+    if !config.acl.is_empty() {
+        tracing::info!(
+            rules = config.acl.len(),
+            "access control rules from the configuration are in force; everything they do \
+             not allow is refused"
+        );
+    }
 
     // **Before anything binds.** A rule half installed is a message
     // that fires nothing, and the first thing a client does after a
@@ -1239,6 +1303,11 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
                     applying,
                     Arc::clone(&rebuilt.shared),
                     Arc::clone(registry),
+                    Arc::clone(
+                        directory
+                            .as_ref()
+                            .expect("a node with a store has a directory"),
+                    ),
                 )));
             }
             replicating.push(tokio::spawn(replication::exchanging(
@@ -1315,6 +1384,8 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
                 Some(cluster::Durability::Async) => "async",
                 Some(cluster::Durability::Sync) => "sync",
             }),
+            max_publish_rate: Some(listener.max_publish_rate),
+            publish_burst: Some(listener.publish_burst),
         })
         .collect();
     if let (Some(mesh), Some(address)) = (&mesh, config.cluster.address) {
@@ -1333,6 +1404,8 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             max_qos: None,
             retain_available: None,
             durability: None,
+            max_publish_rate: None,
+            publish_burst: None,
         });
     }
     let listeners = listener_list(bound);
@@ -1356,6 +1429,7 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             migrations: &migrations,
             copies: copies.as_ref(),
             gate: gate.as_ref(),
+            directory: directory.as_ref(),
         },
     )
     .await?;

@@ -95,6 +95,11 @@ pub enum DropReason {
     /// [MQTT-3.1.2-25] says to behave as though it had been delivered,
     /// so this is the only record that it was not.
     TooLargeForPeer,
+    /// The authorizing chain, or section 12.3's reserved namespace,
+    /// refused the publish and there was no acknowledgement to say so
+    /// on: an at-most-once publish, which is otherwise the one refusal
+    /// nothing would count.
+    Refused,
 }
 
 impl Drop for Queue {

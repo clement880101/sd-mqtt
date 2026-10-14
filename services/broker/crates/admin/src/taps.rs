@@ -198,7 +198,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::error::{ApiError, ErrorCode};
-use crate::resources::{Authorized, MAX_INLINE_PAYLOAD};
+use crate::resources::{Authorized, ToRead, MAX_INLINE_PAYLOAD};
 use crate::AdminState;
 
 /// How many taps may exist at once. See the module documentation.
@@ -1235,7 +1235,7 @@ struct ReadQuery {
 /// Open a tap.
 async fn create(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToRead>,
     body: Result<Json<TapRequest>, JsonRejection>,
 ) -> Result<Json<TapOpened>, ApiError> {
     let Json(request) = body.map_err(|rejection| {
@@ -1252,7 +1252,7 @@ async fn create(
 }
 
 /// List the taps.
-async fn list(State(state): State<AdminState>, _authorized: Authorized) -> Json<TapList> {
+async fn list(State(state): State<AdminState>, _authorized: Authorized<ToRead>) -> Json<TapList> {
     let items = state.taps.list();
     Json(TapList {
         live: state.taps.live(),
@@ -1264,7 +1264,7 @@ async fn list(State(state): State<AdminState>, _authorized: Authorized) -> Json<
 /// Read one, and renew its lease.
 async fn read(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToRead>,
     id: Result<Path<u64>, PathRejection>,
     query: Result<Query<ReadQuery>, QueryRejection>,
 ) -> Result<Json<TapRead>, ApiError> {
@@ -1281,7 +1281,7 @@ async fn read(
 /// Close one.
 async fn close(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToRead>,
     id: Result<Path<u64>, PathRejection>,
 ) -> Result<Json<TapView>, ApiError> {
     let Path(id) = id.map_err(path_not_a_tap)?;
@@ -1657,30 +1657,40 @@ mod tests {
         both.stop().await;
     }
 
-    /// The `$` rule the tap gets for free, and the reason it goes
-    /// through the broker's matcher rather than a second one.
+    /// The dollar namespace, as a tap sees it.
     ///
-    /// [MQTT-4.7.2-1]: a filter beginning with a wildcard does not
-    /// match a topic beginning with `$`. Nothing in this module
-    /// implements that; deleting the rule from `broker-core` is what
-    /// would break this test, which is the point.
+    /// Section 12.3: no client publishes into it, since milestone 7.
+    /// So a tap on `#` does not see a client's `$SYS/...`, and neither
+    /// does a tap named for it: the publication is refused in the
+    /// broker before anything is routed, and counted as such. Before
+    /// the refusal this test showed [MQTT-4.7.2-1] instead, the leading
+    /// wildcard that does not match a dollar topic; that rule is
+    /// `broker-core`'s and pinned there.
     #[tokio::test]
-    async fn a_tap_on_everything_does_not_see_a_dollar_topic() {
+    async fn a_clients_dollar_topic_reaches_no_tap_even_one_named_for_it() {
         let both = Both::start().await;
         both.tap("#").await;
+        both.tap("$SYS/#").await;
+        let metrics = both.shared().metrics();
+        let refused_before = metrics
+            .message_dropped(broker_core::session::DropReason::Refused)
+            .get();
         let (mut client, _buf) = handshake(&both.mqtt, "publisher").await;
         send(&mut client, &publication("$SYS/broker/uptime", b"1", false)).await;
         send(&mut client, &publication("ordinary/topic", b"2", false)).await;
 
+        // The ordinary one arriving means the dollar one before it on
+        // the same connection was already judged.
         let read = both.until(1, |read| count(read) == 1).await;
         assert_eq!(topics(&read), vec!["ordinary/topic"]);
-
-        // Named explicitly, it is visible: the rule is about leading
-        // wildcards and not about `$` being unreachable.
-        both.tap("$SYS/#").await;
-        send(&mut client, &publication("$SYS/broker/uptime", b"3", false)).await;
-        let named = both.until(2, |read| count(read) == 1).await;
-        assert_eq!(topics(&named), vec!["$SYS/broker/uptime"]);
+        assert_eq!(count(&both.read(2, None).await), 0);
+        assert_eq!(
+            metrics
+                .message_dropped(broker_core::session::DropReason::Refused)
+                .get(),
+            refused_before + 1,
+            "the refusal is counted"
+        );
         both.stop().await;
     }
 

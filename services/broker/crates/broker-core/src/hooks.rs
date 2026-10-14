@@ -282,6 +282,12 @@ pub struct ClientInfo<'a> {
     pub mountpoint: &'a str,
     /// The identifier the session is keyed by.
     pub client_id: &'a str,
+    /// The name this connection authenticated as, if it presented one
+    /// and was accepted under it. Section 12.1's access control rules
+    /// match on it; a connection that authenticated anonymously has
+    /// none. `None` as well for a publication with no session behind
+    /// it.
+    pub username: Option<&'a str>,
 }
 
 /// Something the broker tells, or asks, at one of section 9.3's nine
@@ -729,6 +735,7 @@ mod tests {
             subscriber: Some(SubscriberId(1)),
             mountpoint: "",
             client_id: "c",
+            username: None,
         }
     }
 
