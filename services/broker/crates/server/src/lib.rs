@@ -13,6 +13,7 @@ pub mod framing;
 pub mod listener;
 pub mod metrics;
 pub mod publish;
+pub mod scram;
 pub mod shared;
 pub mod ticker;
 pub mod tls;

@@ -1017,6 +1017,8 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             rebuilt.users.clone(),
         );
         shared.with_broker(|broker| broker.hooks_mut().install(directory.hook()));
+        shared
+            .install_verifiers(Arc::clone(&directory) as Arc<dyn sdmqtt_server::scram::Verifiers>);
         tracing::info!(
             users = directory.users().len(),
             anonymous = config.auth.anonymous,

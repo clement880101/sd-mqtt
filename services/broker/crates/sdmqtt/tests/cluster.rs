@@ -623,6 +623,73 @@ impl Client {
         Self::opened(address, client_id, true, 0).0
     }
 
+    /// CONNECT through section 12.2's exchange as `username` with
+    /// `password`, and the acknowledgement's reason — with the server's
+    /// final message verified when the reason is success, so a success
+    /// here is mutual.
+    fn connect_scram(
+        address: SocketAddr,
+        client_id: &str,
+        username: &str,
+        password: &str,
+    ) -> Option<ReasonCode> {
+        use sdmqtt_server::scram;
+        let stream = TcpStream::connect_timeout(&address, REPLY).expect("the broker accepts");
+        stream
+            .set_read_timeout(Some(REPLY))
+            .expect("a read deadline");
+        let mut client = Self {
+            stream,
+            buf: BytesMut::new(),
+            packets: 0,
+            pending: Vec::new(),
+        };
+        let (exchange, first) = scram::Client::first(username, "a-test-nonce-0001");
+        client.send(&Packet::Connect(Box::new(Connect {
+            version: Version::V5,
+            client_id: client_id.to_owned(),
+            clean_start: true,
+            keep_alive: 0,
+            username: None,
+            password: None,
+            will: None,
+            properties: Properties {
+                authentication_method: Some(scram::METHOD.to_owned()),
+                authentication_data: Some(Bytes::from(first)),
+                ..Properties::default()
+            },
+        })));
+        let server_first = match client.next()? {
+            Packet::Auth(auth) => auth.properties.authentication_data?,
+            Packet::ConnAck(ack) => return Some(ack.reason),
+            _ => return None,
+        };
+        let (exchange, client_final) = exchange
+            .finish(&server_first, password.as_bytes())
+            .expect("a well-formed server-first");
+        client.send(&Packet::Auth(mqtt_codec::packet::Auth {
+            reason: ReasonCode::ContinueAuthentication,
+            properties: Properties {
+                authentication_method: Some(scram::METHOD.to_owned()),
+                authentication_data: Some(Bytes::from(client_final)),
+                ..Properties::default()
+            },
+        }));
+        match client.next()? {
+            Packet::ConnAck(ack) if ack.reason == ReasonCode::Success => {
+                let verified = ack
+                    .properties
+                    .authentication_data
+                    .as_deref()
+                    .is_some_and(|server_final| exchange.verify(server_final));
+                assert!(verified, "the server's final message must verify");
+                Some(ReasonCode::Success)
+            }
+            Packet::ConnAck(ack) => Some(ack.reason),
+            _ => None,
+        }
+    }
+
     /// CONNECT as `username` with `password`, and the acknowledgement's
     /// reason: `None` when the broker closed without one.
     fn connect_with(
@@ -2831,6 +2898,17 @@ async fn a_user_created_on_one_node_connects_on_another() {
         let listed = cluster.nodes[at].get("/api/v1/users");
         assert!(listed.contains("\"name\":\"alice\""), "{listed}");
     }
+
+    // And through section 12.2's exchange, on a node the user was not
+    // made on: the verifier replicated with the hash.
+    assert_eq!(
+        Client::connect_scram(cluster.nodes[1].mqtt, "alice-scram", "alice", "hunter2"),
+        Some(ReasonCode::Success)
+    );
+    assert_eq!(
+        Client::connect_scram(cluster.nodes[1].mqtt, "alice-scram", "alice", "wrong"),
+        Some(ReasonCode::NotAuthorized)
+    );
 
     // A delete on gamma refuses on alpha, in time.
     let (code, _) = cluster.nodes[2].delete("/api/v1/users/alice");

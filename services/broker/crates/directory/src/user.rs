@@ -5,12 +5,8 @@
 //! by neither: a verifier cannot be derived from an argon2 hash, so the
 //! one moment the password is in hand is the moment both are made.
 
-use std::num::NonZeroU32;
-
 use argon2::password_hash::{PasswordHasher as _, PasswordVerifier as _};
-use aws_lc_rs::{digest, hmac, pbkdf2, rand};
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
+use aws_lc_rs::rand;
 use serde::Serialize;
 use storage::record::{ScramVerifierRecord, Secret, UserRecord};
 
@@ -63,41 +59,12 @@ pub fn check_password(user: &UserRecord, password: &[u8]) -> bool {
         .is_ok()
 }
 
-/// RFC 5802 §3 with RFC 7677's hash: the two keys a server keeps.
-///
-/// `SaltedPassword := Hi(Normalize(password), salt, i)`, where `Hi` is
-/// PBKDF2 with HMAC-SHA-256; `ClientKey := HMAC(SaltedPassword, "Client
-/// Key")`; `StoredKey := H(ClientKey)`; `ServerKey :=
-/// HMAC(SaltedPassword, "Server Key")`. Normalisation is SASLprep in the
-/// RFC and the identity here, which the RFC permits for passwords that
-/// are already plain ASCII and which this broker documents.
+/// RFC 5802 §3's two keys, by the server crate's one implementation,
+/// so the derivation that makes a verifier and the one that checks a
+/// proof cannot drift apart.
 #[must_use]
 pub fn verifier(password: &str, salt: &[u8], iterations: u32) -> ScramVerifierRecord {
-    let salted = salted_password(password, salt, iterations);
-    let key = hmac::Key::new(hmac::HMAC_SHA256, &salted);
-    let client_key = hmac::sign(&key, b"Client Key");
-    let stored_key = digest::digest(&digest::SHA256, client_key.as_ref());
-    let server_key = hmac::sign(&key, b"Server Key");
-    ScramVerifierRecord {
-        salt: salt.to_vec(),
-        iterations,
-        stored_key: Secret::new(BASE64.encode(stored_key.as_ref())),
-        server_key: Secret::new(BASE64.encode(server_key.as_ref())),
-    }
-}
-
-/// `Hi(password, salt, i)`: PBKDF2-HMAC-SHA-256, 32 bytes.
-#[must_use]
-pub fn salted_password(password: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    pbkdf2::derive(
-        pbkdf2::PBKDF2_HMAC_SHA256,
-        NonZeroU32::new(iterations.max(1)).expect("at least one"),
-        salt,
-        password.as_bytes(),
-        &mut out,
-    );
-    out
+    sdmqtt_server::scram::verifier(password.as_bytes(), salt, iterations)
 }
 
 /// A user as the API and the page see it: which credentials exist, and
@@ -188,23 +155,6 @@ mod tests {
         assert!(
             !json.contains("argon2") && !json.contains("stored_key") && !json.contains("salt"),
             "{json}"
-        );
-    }
-
-    /// RFC 7677 §3's example — user "user", password "pencil", salt
-    /// `W22ZaJ0SNY7soEsUEjb6gQ==`, 4096 rounds — pins the derivation to
-    /// the standard rather than to this implementation. The salted
-    /// password is the intermediate every SCRAM implementation derives
-    /// for that vector.
-    #[test]
-    fn the_rfc_7677_vector_derives_the_known_salted_password() {
-        let salt = BASE64
-            .decode("W22ZaJ0SNY7soEsUEjb6gQ==")
-            .expect("the RFC's salt");
-        let salted = salted_password("pencil", &salt, 4096);
-        assert_eq!(
-            BASE64.encode(salted),
-            "xKSVEDI6tPlSysH6mUQZOeeOp01r6B3fcJbodRPcYV0=",
         );
     }
 }

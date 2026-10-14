@@ -409,6 +409,19 @@ and nothing else: creating the first user does not flip it. A node with
 no store holds no users and admits by the default alone.
 `SDMQTT_AUTH_ANONYMOUS` and `SDMQTT_AUTH_SCRAM_ITERATIONS` set the two.
 
+A version 5 client can authenticate without sending its password at all,
+with **SCRAM-SHA-256** over the AUTH exchange (RFC 7677): it names the
+method in CONNECT, the broker challenges, the client proves, and the
+connect acknowledgement carries the server's own proof back. The same
+exchange renews the credentials mid-session (`AUTH` with
+re-authenticate), as the same user only. A wrong password and an unknown
+name are refused the same way at the same step, so nobody can learn
+which names exist by trying. The `-PLUS` channel-binding variant is not
+offered and a client asking for it is told `0x8C`, as is any other
+method. Passwords are taken as written: SASLprep is not applied, so a
+password that is plain ASCII behaves exactly as RFC 7677 describes and
+one that is not should be set through a client that normalises it.
+
 ### What a listener accepts
 
 ```toml

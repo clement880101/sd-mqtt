@@ -317,6 +317,12 @@ impl Directory {
     }
 }
 
+impl sdmqtt_server::scram::Verifiers for Directory {
+    fn verifier(&self, name: &str) -> Option<ScramVerifierRecord> {
+        Directory::verifier(self, name)
+    }
+}
+
 /// Seconds since the epoch, for `created_at`.
 fn now() -> u64 {
     std::time::SystemTime::now()

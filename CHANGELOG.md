@@ -43,6 +43,22 @@ rejoin and be repaired before the next.
   the access control rules that follow. `argon2` is the one new direct
   dependency.
 
+- **SCRAM-SHA-256 over the AUTH exchange**, section 12.2, with
+  re-authentication. The arithmetic is pure functions in the server
+  crate, pinned by RFC 7677's one published exchange byte for byte;
+  the connection shell runs it before the broker is asked to connect
+  anybody, and the CONNACK carries the server's final message so the
+  client can verify the server knew its key too. An unknown name gets a
+  challenge with a salt of its own and fails at the proof, the same
+  answer at the same step as a wrong password. `=2C` and `=3D` in a
+  name are unescaped per RFC 5802. Channel binding is not offered; a
+  client asking for it, or for any other method, is told 0x8C, and so
+  is one on a node with no directory. Re-authentication is the same
+  exchange in AUTH packets, answered with `Success` and the server's
+  final; a wrong proof, or a proof as another user, disconnects with
+  0x87. The user name a SCRAM client proves is what the session
+  remembers, whatever the CONNECT's username field said.
+
 - **A listener's maximum QoS and retain availability**, section 5.4's
   two deferred properties. `listener.max_qos` (0, 1 or 2) is advertised
   to version 5 clients and enforced on every publish: above the cap is

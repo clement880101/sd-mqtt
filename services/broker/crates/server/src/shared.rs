@@ -392,6 +392,10 @@ pub struct Shared {
     /// Whether a listener has taken charge of the one-second tick. See
     /// [`Shared::claim_ticker`].
     ticker_claimed: AtomicBool,
+    /// Section 12.2: where a connection finds a user's SCRAM verifier.
+    /// Installed by the node from its directory; absent on a node with
+    /// no store, where the exchange is refused as a bad method.
+    verifiers: OnceLock<Arc<dyn crate::scram::Verifiers>>,
 }
 
 impl Shared {
@@ -455,7 +459,19 @@ impl Shared {
             durability: OnceLock::new(),
             refuse_unconfirmed: AtomicBool::new(false),
             ticker_claimed: AtomicBool::new(false),
+            verifiers: OnceLock::new(),
         }
+    }
+
+    /// Where SCRAM verifiers come from, section 12.2. Once.
+    pub fn install_verifiers(&self, verifiers: Arc<dyn crate::scram::Verifiers>) {
+        let _ = self.verifiers.set(verifiers);
+    }
+
+    /// The verifiers, on a node that has a directory.
+    #[must_use]
+    pub fn verifiers(&self) -> Option<&Arc<dyn crate::scram::Verifiers>> {
+        self.verifiers.get()
     }
 
     /// Take charge of the one-second tick, once.

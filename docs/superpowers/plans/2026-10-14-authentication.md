@@ -433,7 +433,7 @@ gate, and ticked here as it lands:
 - [x] **Task 1** — the directory crate: users with argon2 passwords and
   SCRAM verifiers, replicated as metadata, installed as the authenticate
   hook; `auth.anonymous`; `ClientInfo.username`; format version 11.
-- [ ] **Task 2** — SCRAM-SHA-256 over MQTT 5's AUTH exchange, including
+- [x] **Task 2** — SCRAM-SHA-256 over MQTT 5's AUTH exchange, including
   re-authentication; pinned by RFC 7677's test vector; a wrong method is
   0x8C; names with `,` or `=` are escaped per RFC 5802.
 - [ ] **Task 3** — access control rules, deny by default once one exists,

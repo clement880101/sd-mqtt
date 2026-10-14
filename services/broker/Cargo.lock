@@ -1566,6 +1566,8 @@ dependencies = [
 name = "sdmqtt-server"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
+ "base64",
  "broker-core",
  "bytes",
  "cluster",
