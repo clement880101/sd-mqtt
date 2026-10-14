@@ -194,6 +194,25 @@ pub struct ConnectionConfig {
     /// default. Two clients with the same identifier on two mountpoints
     /// are two sessions.
     pub mountpoint: Arc<str>,
+    /// The highest quality of service this listener serves. Section 5.4.
+    ///
+    /// Advertised in the acknowledgement when below two, and enforced on
+    /// every publish regardless, because advertising is advice and a
+    /// client may not take it. A subscription above it is granted at it,
+    /// which 3.8.4 permits and is not a refusal.
+    pub max_qos: QoS,
+    /// Whether this listener accepts retained messages. Section 5.4.
+    ///
+    /// Advertised as zero when false; a retained publish is then a
+    /// protocol error, and a retained will refuses the connect, because
+    /// accepting the connect and quietly dropping the flag would arm a
+    /// will the client believes is retained.
+    pub retain_available: bool,
+    /// Section 8.6's durability mode for publishes on this listener, or
+    /// `None` for the node's. A listener carrying commands can be
+    /// synchronous while one carrying telemetry is not; the timeout is
+    /// the node's in both cases.
+    pub durability: Option<cluster::Durability>,
 }
 
 impl Default for ConnectionConfig {
@@ -217,6 +236,9 @@ impl Default for ConnectionConfig {
             receive_maximum: 1024,
             topic_alias_maximum: 16,
             mountpoint: Arc::from(""),
+            max_qos: QoS::ExactlyOnce,
+            retain_available: true,
+            durability: None,
         }
     }
 }
@@ -479,6 +501,27 @@ where
     // holds — so there is no previous owner anywhere in the cluster,
     // and asking would be a register and a round trip per anonymous
     // connect.
+    // Section 5.4, 3.1.2.7: a retained will on a listener that does not
+    // accept retained messages refuses the connect, rather than taking
+    // the connect and dropping the flag the client asked for. Before
+    // the claim, so that nothing is registered or drained for a client
+    // that is about to be told no. Over 3.1.1 there is no code for it
+    // and the socket closes, which is section 13's answer.
+    if let Some(will) = &connect.will {
+        if will.retain && !config.retain_available {
+            if version == Version::V5 {
+                refuse(
+                    &mut write_half,
+                    version,
+                    ReasonCode::RetainNotSupported,
+                    &metrics,
+                )
+                .await?;
+            }
+            return Err(ConnectionError::Protocol(ReasonCode::RetainNotSupported));
+        }
+    }
+
     let claimed = if connect.client_id.is_empty() || shared.migrator().is_none() {
         None
     } else {
@@ -656,6 +699,9 @@ where
         version,
         maximum_packet_size,
         topic_alias_maximum: config.topic_alias_maximum,
+        max_qos: config.max_qos,
+        retain_available: config.retain_available,
+        durability: config.durability,
     };
 
     // A takeover addresses two connections by one handle, and the
@@ -797,6 +843,20 @@ fn acknowledgement(
             maximum_packet_size: Some(config.limits.max_packet_size),
             topic_alias_maximum: Some(config.topic_alias_maximum),
             server_keep_alive,
+            // Section 5.4's two listener policies, 3.2.2.3.4 and
+            // 3.2.2.3.5: omitted at their defaults, because absent means
+            // "two" and "yes" and a client that reads neither property
+            // assumes exactly that.
+            maximum_qos: match config.max_qos {
+                QoS::ExactlyOnce => None,
+                QoS::AtLeastOnce => Some(1),
+                QoS::AtMostOnce => Some(0),
+            },
+            retain_available: if config.retain_available {
+                None
+            } else {
+                Some(0)
+            },
             ..Properties::default()
         },
     }
@@ -952,6 +1012,12 @@ struct Attached {
     /// connection for the same reason: 3.3.2.3.4 ends a mapping with
     /// the network connection that made it.
     topic_alias_maximum: u16,
+    /// The listener's policy. See [`ConnectionConfig::max_qos`].
+    max_qos: QoS,
+    /// See [`ConnectionConfig::retain_available`].
+    retain_available: bool,
+    /// See [`ConnectionConfig::durability`].
+    durability: Option<cluster::Durability>,
 }
 
 impl Attached {
@@ -1057,6 +1123,17 @@ impl Attached {
                 self.close_with(reason);
                 return Err(ConnectionError::Protocol(reason));
             }
+            // Section 5.4's listener policy, before the broker sees the
+            // packet, for the reason the alias table is: the broker does
+            // not know listeners exist. A publish above the maximum or
+            // retained where retain is unavailable is a protocol error
+            // [MQTT-3.2.2-11], [MQTT-3.2.2-14], told by the same path a
+            // second connect is; a subscription above the maximum is
+            // granted at it, which is what 3.8.4 lets the SUBACK say.
+            if let Err(reason) = self.within_policy(&mut packet) {
+                self.close_with(reason);
+                return Err(ConnectionError::Protocol(reason));
+            }
             // Section 8.5, before the broker sees it, for the reason
             // the alias table above is before the broker: nothing
             // below this shell knows that a cluster exists, and
@@ -1085,7 +1162,8 @@ impl Attached {
             // decided from what came out beside them, under the same
             // lock. The wait is here, after the lock is gone and
             // before a single action is delivered.
-            let ((outcome, actions), committed) = self.shared.with_broker_committed(
+            let ((outcome, actions), committed) = self.shared.with_broker_committed_as(
+                self.durability,
                 |broker| {
                     let mut out = Vec::new();
                     let outcome = broker.handle(self.subscriber, &packet, &mut out);
@@ -1283,6 +1361,30 @@ impl Attached {
     fn close_with(&self, reason: ReasonCode) {
         self.shared
             .deliver(vec![(self.subscriber, Action::Close(reason))]);
+    }
+
+    /// Hold an inbound packet to this listener's policy. Section 5.4.
+    ///
+    /// A subscription is clamped rather than refused: the granted level
+    /// may be lower than requested, and the acknowledgement says so.
+    fn within_policy(&self, packet: &mut Packet) -> Result<(), ReasonCode> {
+        match packet {
+            Packet::Publish(publish) => {
+                if publish.qos > self.max_qos {
+                    return Err(ReasonCode::QosNotSupported);
+                }
+                if publish.retain && !self.retain_available {
+                    return Err(ReasonCode::RetainNotSupported);
+                }
+            }
+            Packet::Subscribe(request) => {
+                for filter in &mut request.filters {
+                    filter.qos = filter.qos.min(self.max_qos);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Tell the broker the connection is gone. The obligation.
@@ -4389,6 +4491,277 @@ mod tests {
     /// Connect, and say what came back.
     async fn connected(client: &mut tokio::io::DuplexStream, version: Version) -> ConnAck {
         connected_as(client, version, "sensor").await
+    }
+
+    // -----------------------------------------------------------
+    // Section 5.4: a listener's maximum QoS and retain availability.
+    // -----------------------------------------------------------
+
+    /// A publish packet for the policy tests.
+    fn publish_at(qos: QoS, retain: bool) -> Packet {
+        Packet::Publish(mqtt_codec::packet::Publish {
+            dup: false,
+            qos,
+            retain,
+            topic: "site/1/temp".into(),
+            packet_id: (qos != QoS::AtMostOnce).then_some(9),
+            payload: bytes::Bytes::from_static(b"21.5"),
+            properties: Properties::default(),
+        })
+    }
+
+    /// A will for the policy tests, retained.
+    fn retained_will() -> mqtt_codec::packet::Will {
+        mqtt_codec::packet::Will {
+            topic: "site/1/gone".into(),
+            payload: bytes::Bytes::from_static(b"bye"),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            properties: Properties::default(),
+        }
+    }
+
+    /// A listener capped at one advertises it, and the cap is enforced
+    /// on the packet as well, because a client may not look.
+    #[tokio::test]
+    async fn a_listener_capped_at_qos_one_says_so_and_disconnects_a_qos_two_publish() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let config = ConnectionConfig {
+            max_qos: QoS::AtLeastOnce,
+            ..ConnectionConfig::default()
+        };
+        let mut client = serve_one_with_config(Arc::clone(&shared), config);
+        let ack = connected(&mut client, Version::V5).await;
+        assert_eq!(ack.reason, ReasonCode::Success);
+        assert_eq!(
+            ack.properties.maximum_qos,
+            Some(1),
+            "3.2.2.3.4: a server that does not support QoS 2 says so"
+        );
+
+        write(
+            &mut client,
+            &publish_at(QoS::ExactlyOnce, false),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::Disconnect(gone) => assert_eq!(
+                gone.reason,
+                ReasonCode::QosNotSupported,
+                "[MQTT-3.2.2-11]: a publish above the maximum is a protocol error"
+            ),
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            client.read(&mut buf).await.expect("a read"),
+            0,
+            "and the socket closes"
+        );
+    }
+
+    /// The default advertises nothing and refuses nothing, which is what
+    /// every existing test and the conformance suite rely on.
+    #[tokio::test]
+    async fn the_default_listener_advertises_no_maximum_and_no_retain_limit() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut client = serve_one(Arc::clone(&shared));
+        let ack = connected(&mut client, Version::V5).await;
+        assert_eq!(ack.properties.maximum_qos, None);
+        assert_eq!(ack.properties.retain_available, None);
+        write(
+            &mut client,
+            &publish_at(QoS::ExactlyOnce, true),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::PubRec(rec) => assert!(
+                matches!(
+                    rec.reason,
+                    ReasonCode::Success | ReasonCode::NoMatchingSubscribers
+                ),
+                "taken, with nobody to deliver to: {:?}",
+                rec.reason
+            ),
+            other => panic!("a retained QoS 2 publish is ordinary by default, got {other:?}"),
+        }
+    }
+
+    /// A subscription above the cap is granted at the cap, not refused:
+    /// 3.8.4 says the granted level may be lower than requested.
+    #[tokio::test]
+    async fn a_subscription_above_the_cap_is_granted_at_the_cap() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let config = ConnectionConfig {
+            max_qos: QoS::AtMostOnce,
+            ..ConnectionConfig::default()
+        };
+        let mut client = serve_one_with_config(Arc::clone(&shared), config);
+        connected(&mut client, Version::V5).await;
+        write(
+            &mut client,
+            &Packet::Subscribe(mqtt_codec::packet::Subscribe {
+                packet_id: 1,
+                filters: vec![mqtt_codec::packet::SubscriptionOptions {
+                    filter: "site/+/temp".into(),
+                    qos: QoS::ExactlyOnce,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: mqtt_codec::packet::RetainHandling::DoNotSend,
+                }],
+                properties: Properties::default(),
+            }),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::SubAck(ack) => {
+                assert_eq!(ack.reasons, vec![ReasonCode::Success], "granted at zero")
+            }
+            other => panic!("expected a subscription acknowledgement, got {other:?}"),
+        }
+    }
+
+    /// Retain unavailable: advertised as zero, a retained publish is a
+    /// disconnect with 0x9A, and a retained will is refused at connect
+    /// rather than accepted with the flag quietly dropped.
+    #[tokio::test]
+    async fn a_listener_without_retain_refuses_a_retained_publish_and_a_retained_will() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let config = ConnectionConfig {
+            retain_available: false,
+            ..ConnectionConfig::default()
+        };
+        let mut client = serve_one_with_config(Arc::clone(&shared), config.clone());
+        let ack = connected(&mut client, Version::V5).await;
+        assert_eq!(ack.properties.retain_available, Some(0));
+        write(&mut client, &publish_at(QoS::AtMostOnce, true), Version::V5).await;
+        match read(&mut client, Version::V5).await {
+            Packet::Disconnect(gone) => {
+                assert_eq!(gone.reason, ReasonCode::RetainNotSupported);
+            }
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
+
+        let mut client = serve_one_with_config(Arc::clone(&shared), config);
+        let mut connect = connect("with-a-will", 0);
+        connect.will = Some(retained_will());
+        write(
+            &mut client,
+            &Packet::Connect(Box::new(connect)),
+            Version::V5,
+        )
+        .await;
+        match read(&mut client, Version::V5).await {
+            Packet::ConnAck(ack) => assert_eq!(
+                ack.reason,
+                ReasonCode::RetainNotSupported,
+                "3.1.2.7: a retained will on a server without retain is refused"
+            ),
+            other => panic!("expected a connack, got {other:?}"),
+        }
+        // The first client was disconnected for its retained publish and
+        // the second was never registered: nobody is connected.
+        assert_eq!(shared.with_broker(|broker| broker.connected_count()), 0);
+    }
+
+    /// Two listeners on one broker, one synchronous and one not, with
+    /// the node's mode `async`: the publisher on the synchronous one
+    /// waits for the follower, and the publisher on the other does not.
+    /// Section 8.6's per-listener override.
+    #[tokio::test]
+    async fn a_listener_s_own_durability_overrides_the_node_s() {
+        let (shared, copies) = replicating(cluster::Durability::Async, Duration::from_secs(30));
+        a_queued_session(&shared, "sensor", "site/+/temp").await;
+        let session = SessionKey::new("", "sensor");
+        copies.install_followers(|_| {
+            vec![cluster::Placed {
+                node: [0xaa; 16],
+                reachable: true,
+            }]
+        });
+        copies.marked(session.clone(), [0xaa; 16], 0);
+
+        // The node's listener: answered without the follower.
+        let mut relaxed = serve_one(Arc::clone(&shared));
+        connected_as(&mut relaxed, Version::V5, "relaxed").await;
+        let ack = tokio::time::timeout(
+            Duration::from_secs(2),
+            publish_once(&mut relaxed, "site/1/temp"),
+        )
+        .await
+        .expect("asynchronous mode does not wait for the follower");
+        assert_eq!(ack.reason, ReasonCode::Success);
+
+        // The synchronous listener: waits until the follower confirms.
+        let mut strict = serve_one_with_config(
+            Arc::clone(&shared),
+            ConnectionConfig {
+                durability: Some(cluster::Durability::Sync),
+                ..ConnectionConfig::default()
+            },
+        );
+        connected_as(&mut strict, Version::V5, "strict").await;
+        let releasing = Arc::clone(&copies);
+        let told = session.clone();
+        let confirmed_at = Arc::new(std::sync::Mutex::new(None));
+        let noted = Arc::clone(&confirmed_at);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            *noted.lock().expect("a lock") = Some(std::time::Instant::now());
+            releasing.marked(told, [0xaa; 16], u64::MAX);
+        });
+        let ack = publish_once(&mut strict, "site/1/temp").await;
+        let acknowledged_at = std::time::Instant::now();
+        assert_eq!(ack.reason, ReasonCode::Success);
+        let confirmed = confirmed_at.lock().expect("a lock").expect(
+            "the acknowledgement arrived before the follower confirmed, so it did not wait",
+        );
+        assert!(acknowledged_at >= confirmed);
+    }
+
+    /// Over 3.1.1 there is no code to send: the socket closes, for the
+    /// publish and for the will alike.
+    #[tokio::test]
+    async fn a_v311_publish_above_the_cap_closes_the_socket() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let config = ConnectionConfig {
+            max_qos: QoS::AtMostOnce,
+            retain_available: false,
+            ..ConnectionConfig::default()
+        };
+        let mut client = serve_one_with_config(Arc::clone(&shared), config.clone());
+        connected(&mut client, Version::V311).await;
+        write(
+            &mut client,
+            &publish_at(QoS::AtLeastOnce, false),
+            Version::V311,
+        )
+        .await;
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            client.read(&mut buf).await.expect("a read"),
+            0,
+            "the socket is closed without an acknowledgement"
+        );
+
+        let mut client = serve_one_with_config(Arc::clone(&shared), config);
+        let mut connect = connect("with-a-will", 0);
+        connect.version = Version::V311;
+        connect.will = Some(retained_will());
+        write(
+            &mut client,
+            &Packet::Connect(Box::new(connect)),
+            Version::V311,
+        )
+        .await;
+        assert_eq!(
+            client.read(&mut buf).await.expect("a read"),
+            0,
+            "no 3.1.1 connack can say 0x9A, so the socket closes"
+        );
     }
 
     /// The same, under an identifier of the caller's choosing.

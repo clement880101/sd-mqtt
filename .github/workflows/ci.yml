@@ -179,7 +179,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: conformance-output
-          path: services/broker/conformance/.work/*.out
+          path: |
+            services/broker/conformance/.work/*.out
+            services/broker/conformance/.work/via.log
           if-no-files-found: ignore
 
   # Section 15 says budgets are checked in CI and that exceeding one

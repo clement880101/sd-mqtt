@@ -389,6 +389,9 @@ pub struct Shared {
     /// the reading before anything is installed — a node still
     /// starting must not refuse.
     refuse_unconfirmed: AtomicBool,
+    /// Whether a listener has taken charge of the one-second tick. See
+    /// [`Shared::claim_ticker`].
+    ticker_claimed: AtomicBool,
 }
 
 impl Shared {
@@ -451,7 +454,20 @@ impl Shared {
             copies: OnceLock::new(),
             durability: OnceLock::new(),
             refuse_unconfirmed: AtomicBool::new(false),
+            ticker_claimed: AtomicBool::new(false),
         }
+    }
+
+    /// Take charge of the one-second tick, once.
+    ///
+    /// Several listeners share one broker, and the tick — expiries,
+    /// wills, keep-alives — is the broker's, not a listener's. The first
+    /// listener bound on this `Shared` gets `true` and spawns the ticker;
+    /// every later one gets `false` and spawns nothing, so a node with
+    /// three listeners does not sweep its sessions three times a second
+    /// and age a keep-alive three times as fast.
+    pub fn claim_ticker(&self) -> bool {
+        !self.ticker_claimed.swap(true, Ordering::Relaxed)
     }
 
     /// Claim sessions through `migrator`, section 8.4.
@@ -1059,13 +1075,26 @@ impl Shared {
         f: impl FnOnce(&mut Broker) -> T,
         promised: impl FnOnce(&T) -> bool,
     ) -> (T, Committed) {
+        self.with_broker_committed_as(None, f, promised)
+    }
+
+    /// [`Self::with_broker_committed`] under a listener's durability
+    /// mode, section 8.6's per-listener override. `None` is the node's.
+    /// What a connection calls, because a connection knows which
+    /// listener it came in on and nothing below it does.
+    pub fn with_broker_committed_as<T>(
+        &self,
+        mode: Option<Durability>,
+        f: impl FnOnce(&mut Broker) -> T,
+        promised: impl FnOnce(&T) -> bool,
+    ) -> (T, Committed) {
         let mut broker = self.broker.lock();
         let value = f(&mut broker);
         // Under the guard, which is still alive until this function
         // returns. Everything it calls returns without touching the
         // device: a send on an unbounded channel, and at most the
         // allocation of a `oneshot`.
-        let committed = self.hand_over(&mut broker, promised(&value));
+        let committed = self.hand_over_as(&mut broker, mode, promised(&value));
         (value, committed)
     }
 
@@ -1116,8 +1145,16 @@ impl Shared {
     /// discard are not producers a peer can drive in a loop, and putting
     /// the one task that drives every deadline in the process behind a
     /// disk would be the stall this is trying to avoid.
-    fn hand_over(&self, broker: &mut Broker, promised: bool) -> Committed {
-        self.hand_over_originating(broker, promised, true, Vec::new())
+    ///
+    /// `mode` is a listener's durability, section 8.6's per-listener
+    /// override; `None` is the node's.
+    fn hand_over_as(
+        &self,
+        broker: &mut Broker,
+        mode: Option<Durability>,
+        promised: bool,
+    ) -> Committed {
+        self.hand_over_originating(broker, mode, promised, true, Vec::new())
     }
 
     /// Apply what a peer replicated: the local effect and the registers
@@ -1144,7 +1181,7 @@ impl Shared {
     ) -> Committed {
         let mut broker = self.broker.lock();
         f(&mut broker);
-        self.hand_over_originating(&mut broker, false, false, registers)
+        self.hand_over_originating(&mut broker, None, false, false, registers)
     }
 
     /// The same, saying whether this node is the author of what it is
@@ -1161,6 +1198,7 @@ impl Shared {
     fn hand_over_originating(
         &self,
         broker: &mut Broker,
+        mode: Option<Durability>,
         promised: bool,
         originate: bool,
         extra: Vec<Record>,
@@ -1195,7 +1233,7 @@ impl Shared {
         // that arrived between the write and the registration would
         // find nobody waiting, and the publisher would then wait for a
         // position that had already gone past.
-        let confirming = self.confirming(promised, &streamed);
+        let confirming = self.confirming(mode, promised, &streamed);
 
         let Some(writer) = &self.writer else {
             // No store: nothing is written down and nothing can be
@@ -1316,14 +1354,19 @@ impl Shared {
     /// drains in the same order for the same reason.
     fn confirming(
         &self,
+        mode: Option<Durability>,
         promised: bool,
         streamed: &[Streamed],
     ) -> Option<(Vec<Confirming>, Duration)> {
         if !promised {
             return None;
         }
-        let (mode, patience) = self.durability.get().copied()?;
-        if !mode.waits() {
+        // The listener's mode when it has one, the node's otherwise;
+        // the patience is the node's in both cases, because a second
+        // timeout would be a second answer to "how long is too long"
+        // on one node.
+        let (installed, patience) = self.durability.get().copied()?;
+        if !mode.unwrap_or(installed).waits() {
             return None;
         }
         let copies = self.copies.get()?;

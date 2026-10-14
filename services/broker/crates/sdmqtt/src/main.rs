@@ -35,7 +35,7 @@ use sdmqtt_admin::{
     listener_list, AdminRunning, AdminServer, AdminStartError, AdminState, ClusterPeer,
     ListenerProtocol, ListenerView, Listeners, Readiness, Router,
 };
-use sdmqtt_server::listener::{Running, Server};
+use sdmqtt_server::listener::Server;
 use sdmqtt_server::shared::Shared;
 use storage::record::Record;
 use storage::{Storage, StorageError, Writer};
@@ -810,7 +810,7 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, Sta
 /// readiness reports is what *startup* did and startup is here.
 async fn start_admin(
     config: &Config,
-    running: &Running,
+    shared: &Arc<Shared>,
     readiness: Arc<Readiness>,
     listeners: Listeners,
     ingest: &Arc<Ingest>,
@@ -838,7 +838,7 @@ async fn start_admin(
         }
         return Ok(None);
     }
-    let mut state = AdminState::new(Arc::clone(running.shared()))
+    let mut state = AdminState::new(Arc::clone(shared))
         .with_readiness(readiness)
         .with_listeners(listeners)
         // Section 11.1 serves rules, and section 9.1 makes one
@@ -890,7 +890,7 @@ async fn start_admin(
              asked for; they are behind the admin listener's host check as well as their \
              own tokens"
         );
-        rules::http_in::routes::<AdminState>(Arc::clone(running.shared()), Arc::clone(ingest))
+        rules::http_in::routes::<AdminState>(Arc::clone(shared), Arc::clone(ingest))
     } else {
         Router::new()
     };
@@ -1015,13 +1015,32 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         tracing::info!(rules = connectors.len(), "rules are running");
     }
 
-    let running = Server::bind_shared(config.server(), shared).await?;
-    tracing::info!(
-        address = %running.address(),
-        mountpoint = %config.listener.mountpoint,
-        max_connections = config.listener.max_connections,
-        "sdmqtt is serving MQTT over TCP"
-    );
+    // Every listener, in configuration order, over the one broker. The
+    // first drives the node's clock (`Shared::claim_ticker`), which is
+    // why they are stopped together and in reverse at the end.
+    let mut servers = Vec::new();
+    for (name, server) in config.servers() {
+        let mountpoint = server.connection.mountpoint.clone();
+        let max_connections = server.max_connections;
+        let (protocol, over) = match &server.kind {
+            sdmqtt_server::listener::Kind::Tcp => (ListenerProtocol::Mqtt, "TCP"),
+            sdmqtt_server::listener::Kind::Tls(_) => (ListenerProtocol::MqttTls, "TLS"),
+            sdmqtt_server::listener::Kind::Ws => (ListenerProtocol::MqttWs, "WebSocket"),
+            sdmqtt_server::listener::Kind::Wss(_) => {
+                (ListenerProtocol::MqttWss, "WebSocket over TLS")
+            }
+        };
+        let running = Server::bind_shared(server, Arc::clone(&shared)).await?;
+        tracing::info!(
+            listener = %name,
+            address = %running.address(),
+            mountpoint = %mountpoint,
+            max_connections,
+            "sdmqtt is serving MQTT over {over}"
+        );
+        servers.push((name, protocol, running));
+    }
+    let running = &servers[0].2;
 
     // Section 8.1's mesh, after the store has been read and after the
     // listener clients use is up. Binding this one last means a cluster
@@ -1280,13 +1299,24 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     // the admin one once it knows its port and the ingest one
     // whenever it is bound — which is not only at startup; see
     // `ingest`.
-    let mut bound = vec![ListenerView {
-        name: "mqtt".to_owned(),
-        protocol: ListenerProtocol::Mqtt,
-        address: running.address(),
-        mountpoint: config.listener.mountpoint.clone(),
-        max_connections: Some(config.listener.max_connections),
-    }];
+    let mut bound: Vec<ListenerView> = config
+        .each_listener_config()
+        .zip(servers.iter())
+        .map(|(listener, (name, protocol, running))| ListenerView {
+            name: name.clone(),
+            protocol: *protocol,
+            address: running.address(),
+            mountpoint: listener.mountpoint.clone(),
+            max_connections: Some(listener.max_connections),
+            max_qos: Some(listener.max_qos),
+            retain_available: Some(listener.retain_available),
+            durability: Some(match listener.durability {
+                None => "node",
+                Some(cluster::Durability::Async) => "async",
+                Some(cluster::Durability::Sync) => "sync",
+            }),
+        })
+        .collect();
     if let (Some(mesh), Some(address)) = (&mesh, config.cluster.address) {
         bound.push(ListenerView {
             name: "cluster".to_owned(),
@@ -1300,6 +1330,9 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             // would be the one thing an operator cannot use.
             mountpoint: mesh.advertise().to_owned(),
             max_connections: None,
+            max_qos: None,
+            retain_available: None,
+            durability: None,
         });
     }
     let listeners = listener_list(bound);
@@ -1312,7 +1345,7 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     let ingest = start_ingest(&config, running.shared(), &connectors, &listeners).await?;
     let admin = start_admin(
         &config,
-        &running,
+        &shared,
         Arc::clone(&readiness),
         Arc::clone(&listeners),
         connectors.ingest(),
@@ -1376,7 +1409,11 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             tracing::info!("the ingest listener has stopped");
         }
     }
-    running.shutdown().await;
+    // In reverse, so the first listener — the one driving the clock —
+    // is the last to stop.
+    for (_, _, running) in servers.into_iter().rev() {
+        running.shutdown().await;
+    }
     // Section 8.2's tasks, after the listener and before the pumps: a
     // broadcast of something a client did is worth finishing, and an
     // exchange with a peer is not worth starting. Aborted rather than

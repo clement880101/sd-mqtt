@@ -581,6 +581,12 @@ async fn nodes(State(state): State<AdminState>, paging: Paging) -> Json<Page<Nod
 pub enum ListenerProtocol {
     /// MQTT over TCP.
     Mqtt,
+    /// MQTT over TLS. Section 12.1.
+    MqttTls,
+    /// MQTT over WebSocket.
+    MqttWs,
+    /// MQTT over WebSocket over TLS.
+    MqttWss,
     /// This API.
     Admin,
     /// Section 9.2's ingest endpoint, on a listener of its own.
@@ -619,6 +625,13 @@ pub struct ListenerView {
     /// How many connections it will serve at once, where it has a
     /// limit.
     pub max_connections: Option<usize>,
+    /// Section 5.4's cap, on an MQTT listener; `null` on every other row.
+    pub max_qos: Option<u8>,
+    /// Whether retained messages are accepted, on an MQTT listener.
+    pub retain_available: Option<bool>,
+    /// Section 8.6's mode for publishes on an MQTT listener: `async`,
+    /// `sync`, or `node` for the node's own. `null` on every other row.
+    pub durability: Option<&'static str>,
 }
 
 async fn listeners(State(state): State<AdminState>, paging: Paging) -> Json<Page<ListenerView>> {
@@ -1849,6 +1862,9 @@ mod tests {
             address: mqtt.address(),
             mountpoint: String::new(),
             max_connections: Some(1_024),
+            max_qos: Some(1),
+            retain_available: Some(false),
+            durability: Some("sync"),
         }];
         let admin = admin_over(Arc::clone(mqtt.shared()), described).await;
 
@@ -1866,6 +1882,15 @@ mod tests {
         );
         assert!(
             response.body.contains("\"max_connections\":1024"),
+            "{}",
+            response.body
+        );
+        // Section 5.4 and 8.6's policy, which is what an operator reads
+        // this row for once there is more than one listener.
+        assert!(
+            response.body.contains("\"max_qos\":1")
+                && response.body.contains("\"retain_available\":false")
+                && response.body.contains("\"durability\":\"sync\""),
             "{}",
             response.body
         );

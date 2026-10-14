@@ -37,3 +37,21 @@ v5:test_flow_control2        assumption The broker does send DISCONNECT 0x93 aft
 
 # --- the test races with itself ----------------------------------------
 v5:test_subscribe_options    flaky      Waits on aclient's subscribeds after bclient subscribes, so it can publish before bclient's SUBSCRIBE is processed; observed passing three runs in four, and a direct probe shows noLocal routing is correct.
+
+# --- the same suites through TLS and WebSocket ---------------------------
+# `via.py` carries the suite's plain client through each layer, so what
+# fails is what fails above, under the label of the layer. A line here
+# that the plain pass does not have would be a defect in the layer, and
+# is fixed there rather than classified.
+v5-tls:test_subscribe_failure    deferred   As v5.
+v311-tls:test_subscribe_failure  deferred   As v311.
+v5-ws:test_subscribe_failure     deferred   As v5.
+v311-ws:test_subscribe_failure   deferred   As v311.
+v5-tls:test_server_keep_alive    assumption As v5.
+v5-ws:test_server_keep_alive     assumption As v5.
+v5-tls:test_server_topic_alias   assumption As v5.
+v5-ws:test_server_topic_alias    assumption As v5.
+v5-tls:test_flow_control2        assumption As v5.
+v5-ws:test_flow_control2         assumption As v5.
+v5-tls:test_subscribe_options    flaky      As v5.
+v5-ws:test_subscribe_options     flaky      As v5.

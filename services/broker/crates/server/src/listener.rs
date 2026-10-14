@@ -24,6 +24,8 @@ use tokio::task::JoinHandle;
 use crate::connection::{serve, ConnectionConfig};
 use crate::shared::Shared;
 use crate::ticker::spawn_ticker;
+use crate::tls;
+use crate::websocket;
 
 /// The port MQTT over plain TCP is registered on.
 pub const DEFAULT_PORT: u16 = 1883;
@@ -46,11 +48,33 @@ const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 /// process still needs the file descriptors to go with it.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 100_000;
 
+/// What wraps an accepted socket before MQTT. Section 12.1.
+///
+/// Plain TCP is the only kind today; TLS and WebSocket are the next two
+/// tasks of the listeners plan and arrive as variants here, each a
+/// function from one `AsyncRead + AsyncWrite` to another in front of
+/// the same [`serve`].
+#[derive(Debug, Clone, Default)]
+pub enum Kind {
+    /// MQTT straight over the socket.
+    #[default]
+    Tcp,
+    /// A TLS handshake first, with the certificate these settings name
+    /// and re-read. Section 12.1.
+    Tls(tls::Settings),
+    /// An HTTP upgrade to WebSocket first, then MQTT in binary frames.
+    Ws,
+    /// Both: TLS, then the upgrade, then MQTT.
+    Wss(tls::Settings),
+}
+
 /// How a listener is configured.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Where to bind.
     pub address: SocketAddr,
+    /// What this listener speaks under MQTT.
+    pub kind: Kind,
     /// How the broker behind the socket is configured.
     pub broker: BrokerConfig,
     /// How each accepted connection is configured.
@@ -67,6 +91,7 @@ impl Default for ServerConfig {
             // container, where a broker on the loopback is a broker
             // nothing can reach.
             address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT),
+            kind: Kind::Tcp,
             broker: BrokerConfig::default(),
             connection: ConnectionConfig::default(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -117,6 +142,23 @@ impl Server {
     /// and the caller is expected to have built it from the same
     /// configuration. Everything else in `config` is used as usual.
     pub async fn bind_shared(config: ServerConfig, shared: Arc<Shared>) -> io::Result<Running> {
+        // The certificate before the socket: a pair that does not load
+        // is a listener that must not be reported as bound. The
+        // configuration already checked the files at startup; this is
+        // the read that keeps them.
+        let acceptor = match &config.kind {
+            Kind::Tcp | Kind::Ws => None,
+            Kind::Tls(settings) | Kind::Wss(settings) => Some(Arc::new(
+                tls::Acceptor::load(settings, shared.metrics().tls()).map_err(io::Error::other)?,
+            )),
+        };
+        let accepting = match (&config.kind, acceptor.clone()) {
+            (Kind::Tcp, _) => Accepting::Plain,
+            (Kind::Ws, _) => Accepting::Ws,
+            (Kind::Tls(_), Some(acceptor)) => Accepting::Tls(acceptor),
+            (Kind::Wss(_), Some(acceptor)) => Accepting::Wss(acceptor),
+            (Kind::Tls(_) | Kind::Wss(_), None) => unreachable!("loaded just above"),
+        };
         let listener = TcpListener::bind(config.address).await?;
         let address = listener.local_addr()?;
 
@@ -128,7 +170,13 @@ impl Server {
         shared.metrics().watch(&shared);
 
         let (shutdown, _) = broadcast::channel(1);
-        let ticker = spawn_ticker(Arc::clone(&shared), shutdown.subscribe());
+        // **One tick per node, not per listener.** The first listener
+        // bound on this broker drives the clock; see
+        // `Shared::claim_ticker`. Stopping that listener stops the
+        // clock, which is why a node stops its listeners together.
+        let ticker = shared
+            .claim_ticker()
+            .then(|| spawn_ticker(Arc::clone(&shared), shutdown.subscribe()));
         let permits = Arc::new(Semaphore::new(config.max_connections));
         // Subscribed here rather than inside the task, because a
         // broadcast receiver only hears what is sent after it exists. A
@@ -137,12 +185,20 @@ impl Server {
         let stop = shutdown.subscribe();
         let accept = tokio::spawn(accept_loop(
             listener,
+            accepting,
             Arc::clone(&shared),
             config.connection.clone(),
             permits,
             shutdown.clone(),
             stop,
         ));
+        // The reloader lives as long as the listener and no longer;
+        // aborted at shutdown rather than signalled, because there is
+        // nothing it is in the middle of that is worth finishing.
+        let reloader = acceptor.as_ref().map(|acceptor| {
+            let acceptor = Arc::clone(acceptor);
+            tokio::spawn(async move { acceptor.reloading().await })
+        });
 
         tracing::info!(%address, "listening");
         Ok(Running {
@@ -151,17 +207,25 @@ impl Server {
             shutdown,
             accept,
             ticker,
+            tls: acceptor,
+            reloader,
         })
     }
 }
 
-/// A bound listener, its accept loop and its ticker.
+/// A bound listener, its accept loop and, on the first listener bound
+/// over a broker, the broker's ticker.
 pub struct Running {
     address: SocketAddr,
     shared: Arc<Shared>,
     shutdown: broadcast::Sender<()>,
     accept: JoinHandle<()>,
-    ticker: JoinHandle<()>,
+    /// `Some` on the listener that drives the node's clock.
+    ticker: Option<JoinHandle<()>>,
+    /// The TLS acceptor, on a TLS listener.
+    tls: Option<Arc<tls::Acceptor>>,
+    /// Its certificate reloader.
+    reloader: Option<JoinHandle<()>>,
 }
 
 impl Running {
@@ -188,7 +252,25 @@ impl Running {
         // the state we are asking for.
         let _ = self.shutdown.send(());
         let _ = self.accept.await;
-        let _ = self.ticker.await;
+        if let Some(ticker) = self.ticker {
+            let _ = ticker.await;
+        }
+        if let Some(reloader) = self.reloader {
+            reloader.abort();
+        }
+    }
+
+    /// The TLS acceptor, on a TLS listener: for a test that wants to
+    /// know which certificate is being served.
+    pub fn tls(&self) -> Option<&Arc<tls::Acceptor>> {
+        self.tls.as_ref()
+    }
+
+    /// Whether this listener's shutdown stops the node's clock: true on
+    /// the first listener bound over a `Shared`, false on every later
+    /// one.
+    pub fn drives_the_clock(&self) -> bool {
+        self.ticker.is_some()
     }
 }
 
@@ -198,8 +280,18 @@ impl Running {
 /// not hand over is not a reason to stop serving every other client on
 /// the node. What it does change is how soon we try again, which
 /// [`affects_one_connection`] decides.
+/// What the accept loop does to a socket before serving it.
+#[derive(Clone)]
+enum Accepting {
+    Plain,
+    Tls(Arc<tls::Acceptor>),
+    Ws,
+    Wss(Arc<tls::Acceptor>),
+}
+
 async fn accept_loop(
     listener: TcpListener,
+    kind: Accepting,
     shared: Arc<Shared>,
     config: ConnectionConfig,
     permits: Arc<Semaphore>,
@@ -256,22 +348,127 @@ async fn accept_loop(
 
         let shared = Arc::clone(&shared);
         let config = config.clone();
-        let mut stop = shutdown.subscribe();
-        tokio::spawn(async move {
-            tokio::select! {
-                served = serve(socket, shared, config) => {
-                    if let Err(error) = served {
-                        tracing::debug!(%peer, %error, "a connection ended");
-                    }
-                }
-                // Dropping the `serve` future drops the value that owes
-                // the broker a disconnect, which is how the obligation
-                // is discharged on this path too.
-                _ = stop.recv() => tracing::debug!(%peer, "a connection was stopped by shutdown"),
+        let stop = shutdown.subscribe();
+        match &kind {
+            Accepting::Plain => {
+                tokio::spawn(serving(socket, peer, shared, config, stop, permit));
             }
-            drop(permit);
-        });
+            Accepting::Tls(acceptor) => {
+                let acceptor = Arc::clone(acceptor);
+                tokio::spawn(async move {
+                    match handshaken(&acceptor, socket, peer, &shared, &config).await {
+                        Some(stream) => serving(stream, peer, shared, config, stop, permit).await,
+                        None => drop(permit),
+                    }
+                });
+            }
+            Accepting::Ws => {
+                tokio::spawn(async move {
+                    match upgraded(socket, peer, &shared, &config).await {
+                        Some(stream) => serving(stream, peer, shared, config, stop, permit).await,
+                        None => drop(permit),
+                    }
+                });
+            }
+            Accepting::Wss(acceptor) => {
+                let acceptor = Arc::clone(acceptor);
+                tokio::spawn(async move {
+                    // One connect timeout covers both layers, not one
+                    // each: what is being bounded is how long a socket
+                    // may be open without MQTT on it.
+                    let started = tokio::time::Instant::now();
+                    let Some(stream) = handshaken(&acceptor, socket, peer, &shared, &config).await
+                    else {
+                        drop(permit);
+                        return;
+                    };
+                    let remaining = config.connect_timeout.saturating_sub(started.elapsed());
+                    let config = ConnectionConfig {
+                        connect_timeout: remaining,
+                        ..config
+                    };
+                    match upgraded(stream, peer, &shared, &config).await {
+                        Some(stream) => serving(stream, peer, shared, config, stop, permit).await,
+                        None => drop(permit),
+                    }
+                });
+            }
+        }
     }
+}
+
+/// The TLS handshake, bounded by the connect timeout and counted when
+/// it fails: a peer that opens a socket and never finishes a handshake
+/// is the peer that never sends CONNECT.
+async fn handshaken<S>(
+    acceptor: &tls::Acceptor,
+    socket: S,
+    peer: SocketAddr,
+    shared: &Shared,
+    config: &ConnectionConfig,
+) -> Option<tokio_rustls::server::TlsStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(config.connect_timeout, acceptor.accept(socket)).await {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(error)) => {
+            shared.metrics().tls().handshakes_failed.inc();
+            tracing::debug!(%peer, %error, "a TLS handshake failed");
+            None
+        }
+        Err(_) => {
+            shared.metrics().tls().handshakes_failed.inc();
+            tracing::debug!(%peer, "a TLS handshake did not finish within the connect timeout");
+            None
+        }
+    }
+}
+
+/// The WebSocket upgrade, bounded and counted the same way.
+async fn upgraded<S>(
+    socket: S,
+    peer: SocketAddr,
+    shared: &Shared,
+    config: &ConnectionConfig,
+) -> Option<websocket::Bytes<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match websocket::upgrade(socket, config.connect_timeout).await {
+        Ok(stream) => Some(stream),
+        Err(refused) => {
+            shared.metrics().websocket_refused(refused.label()).inc();
+            tracing::debug!(%peer, %refused, "a WebSocket upgrade was not served");
+            None
+        }
+    }
+}
+
+/// Serve one connection until it ends or the listener stops, then
+/// release its permit.
+async fn serving<S>(
+    socket: S,
+    peer: SocketAddr,
+    shared: Arc<Shared>,
+    config: ConnectionConfig,
+    mut stop: broadcast::Receiver<()>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    tokio::select! {
+        served = serve(socket, shared, config) => {
+            if let Err(error) = served {
+                tracing::debug!(%peer, %error, "a connection ended");
+            }
+        }
+        // Dropping the `serve` future drops the value that owes
+        // the broker a disconnect, which is how the obligation
+        // is discharged on this path too.
+        _ = stop.recv() => tracing::debug!(%peer, "a connection was stopped by shutdown"),
+    }
+    drop(permit);
 }
 
 /// Whether an accept error was about one connection or about the
@@ -405,5 +602,25 @@ mod tests {
             "the clock did not advance: {before} then {after}"
         );
         running.shutdown().await;
+    }
+
+    /// Two listeners on one broker drive one clock, not two.
+    ///
+    /// A node with three listeners that ticked three times a second
+    /// would expire sessions and age keep-alives three times as fast;
+    /// the first listener bound takes the tick and the rest do not.
+    #[tokio::test]
+    async fn the_first_listener_bound_drives_the_clock_and_the_second_does_not() {
+        let first = Server::bind(ServerConfig::ephemeral())
+            .await
+            .expect("binds");
+        let second = Server::bind_shared(ServerConfig::ephemeral(), Arc::clone(first.shared()))
+            .await
+            .expect("binds beside it");
+        assert!(first.drives_the_clock());
+        assert!(!second.drives_the_clock(), "one broker, one tick");
+        assert_ne!(first.address(), second.address());
+        second.shutdown().await;
+        first.shutdown().await;
     }
 }

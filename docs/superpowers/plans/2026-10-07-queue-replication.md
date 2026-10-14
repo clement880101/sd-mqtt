@@ -437,9 +437,8 @@ Section 8.6 read sentence by sentence against the code, at the close:
   saving is a per-follower dedup in `stream_to_followers`, and it is a
   cost, not a correctness matter.
 - **"Configurable globally and overridable per listener"**: the
-  override was never built. **Deferred to milestone 7**, where a
-  listener gains its other per-listener settings, and the spec now says
-  so rather than promising it.
+  override was never built here. Deferred to milestone 7 and **built
+  there** (`listener.durability`, the listeners plan's task 2).
 - **Both modes, the unconfirmed count, the strict flag, failover
   backing the drain, re-replication with grace and override, progress
   in the UI, the cost in the budgets**: as written, with the

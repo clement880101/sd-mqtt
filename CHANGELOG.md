@@ -7,6 +7,74 @@ milestones, which is what this project actually ships in.
 **The one thing to read before upgrading is "Before you upgrade" under
 the milestone you are moving to.** Everything else is description.
 
+## Unreleased — milestone 7: hardening
+
+### Added
+
+- **A listener's maximum QoS and retain availability**, section 5.4's
+  two deferred properties. `listener.max_qos` (0, 1 or 2) is advertised
+  to version 5 clients and enforced on every publish: above the cap is
+  a protocol error, 0x9B on version 5 and a closed socket on 3.1.1,
+  which has no code for it. A subscription above the cap is granted at
+  the cap, as 3.8.4 allows. `listener.retain_available = false` refuses
+  a retained publish with 0x9A and refuses the connect of a client whose
+  will is retained, rather than accepting it and dropping the flag the
+  client asked for. The defaults advertise nothing and refuse nothing,
+  so the conformance baseline is unchanged.
+
+- **A durability mode per listener**, section 8.6's override, deferred
+  from milestone 6. `listener.durability = "sync"` makes publishes on
+  that listener wait for a follower while the node's mode stays
+  `async`, or the reverse. The timeout is the node's in both cases: a
+  second timeout would be a second answer to "how long is too long" on
+  one node. Refused at startup on a node that does not cluster, as the
+  strict flag is, because it would wait for nobody on every publish.
+
+- **Several listeners on one broker.** `[listener]` stays the default
+  and is named `mqtt`; each `[[listeners]]` entry is one more, named,
+  with its own address, mountpoint and policy over the same sessions,
+  subscriptions and store. Two on one address are refused at startup
+  by name, rather than the second failing to bind after the first is
+  already serving. `GET /api/v1/listeners` lists each with its
+  `max_qos`, `retain_available` and `durability`. **One clock:** the
+  first listener bound drives the node's one-second tick and the rest
+  do not, so a node with three listeners does not age its keep-alives
+  three times as fast.
+
+- **TLS listeners, with a certificate that renews without a restart.**
+  `kind = "tls"` and a `tls` table naming the certificate and key. The
+  pair is read at startup — wrong files refuse to start, naming the
+  file — and re-read every `reload_ms`; a renewal is served by the next
+  handshake, and a renewal half-written keeps the previous pair and
+  logs once. The handshake is bounded by the connect timeout, failures
+  are counted, and the two TLS series exist only on a node with a TLS
+  listener. rustls with aws-lc-rs, which the rules crate's clients
+  already linked; `rustls`, `rustls-pki-types` and `tokio-rustls`
+  become direct dependencies of the server crate.
+
+- **MQTT over WebSocket**, `kind = "ws"`, and over TLS, `"wss"`. The
+  `mqtt` subprotocol is required and confirmed, every path upgrades,
+  MQTT travels in binary frames and a text frame is closed with 1003.
+  The connection shell never learns there was a frame: the adapter
+  reads binary frames as bytes and writes each burst as one frame,
+  flushing inside the write, because tungstenite queues a frame until
+  flushed and the shell flushes only at the end of a burst. Refused
+  upgrades are counted by reason, on a series that exists only on a
+  node with a WebSocket listener. `tokio-tungstenite` and
+  `futures-util` are new direct dependencies.
+
+- **The conformance suite runs over TLS and WebSocket as well**, which
+  is section 16's exit criterion for milestone 7's listeners. Paho's
+  suite speaks plain TCP and nothing else, so `conformance/via.py` — a
+  forwarder in the Python standard library, a TLS client on one side
+  and an RFC 6455 client on the other — carries it through each layer,
+  and the runner compares each pass against the baseline under its own
+  label. The failures under TLS and WebSocket are exactly the plain
+  pass's. Two defects in the forwarder itself were found by the suite
+  and fixed: an SSL socket read and written from two threads at once,
+  which hung most first connects, and a close that dropped the
+  DISCONNECT the broker had just sent.
+
 ## Unreleased — milestone 6: queue replication
 
 ### Before you upgrade: a store written before this milestone is refused

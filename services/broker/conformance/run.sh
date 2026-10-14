@@ -91,6 +91,57 @@ echo "conformance: broker $SDMQTT"
 
 interop="$suite/interoperability"
 
+# ---- TLS and WebSocket -----------------------------------------------------
+#
+# The suite speaks plain TCP and nothing else, so for the TLS and
+# WebSocket passes the broker listens on three ports — plain on
+# PORT+1 (unused by those passes), TLS on PORT+2, WebSocket on PORT+3 —
+# and `via.py` listens on PORT, carrying the suite's bytes through the
+# layer under test. Section 16: "the full conformance suite green
+# including TLS and WebSocket".
+#
+# A certificate is minted for the run with openssl when it is on the
+# path. Without it the TLS pass is skipped and the skip is printed,
+# never silent: a pass that quietly did not run is a pass that lies.
+tls_pass=1
+if command -v openssl >/dev/null; then
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -keyout "$work/key.pem" -out "$work/cert.pem" -subj /CN=localhost -days 2 \
+    -addext subjectAltName=DNS:localhost >/dev/null 2>&1 \
+    || fail "openssl could not mint a certificate for the run"
+else
+  echo "conformance: openssl is not on the path, so the TLS passes are SKIPPED"
+  tls_pass=0
+fi
+cat > "$work/listeners.toml" <<EOF
+[listener]
+address = "127.0.0.1:$((PORT + 1))"
+
+[[listeners]]
+name = "secure"
+kind = "tls"
+address = "127.0.0.1:$((PORT + 2))"
+
+[listeners.tls]
+certificate = "$work/cert.pem"
+key = "$work/key.pem"
+
+[[listeners]]
+name = "web"
+kind = "ws"
+address = "127.0.0.1:$((PORT + 3))"
+
+[admin]
+enabled = false
+
+[log]
+level = "warn"
+EOF
+if [ "$tls_pass" = 0 ]; then
+  # Without a certificate the file cannot name a TLS listener.
+  sed -i.bak '/^\[\[listeners\]\]$/,/^$/{/secure/,/^$/d;}' "$work/listeners.toml" 2>/dev/null || true
+fi
+
 # The tests each file defines, in the order unittest would run them.
 #
 # The digits matter: `test_flow_control1` and `test_flow_control2` both
@@ -106,18 +157,53 @@ failures="$work/failures.txt"
 passed=0
 failed=0
 
+# Wait until a loopback port answers, up to ten seconds.
+listening() {
+  local port="$1" tries=0
+  while [ "$tries" -lt 100 ]; do
+    if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.2); sys.exit(0 if s.connect_ex(('127.0.0.1', $port)) == 0 else 1)"; then
+      return 0
+    fi
+    tries=$((tries + 1))
+    sleep 0.1
+  done
+  return 1
+}
+
 run_one() {
-  local label="$1" script="$2" test="$3"
-  "$SDMQTT" serve --address "127.0.0.1:$PORT" --log-level warn \
-    > "$work/broker.log" 2>&1 &
-  local pid=$!
-  # Long enough for the listener to bind; `Server::bind` binds before it
-  # reports, so this is the process start, not a race with the socket.
-  sleep 1
+  local label="$1" script="$2" test="$3" mode="$4"
+  local via_pid=""
+  case "$mode" in
+    plain)
+      "$SDMQTT" serve --address "127.0.0.1:$PORT" --log-level warn \
+        > "$work/broker.log" 2>&1 &
+      local pid=$!
+      listening "$PORT" || fail "the broker did not listen on $PORT: $(cat "$work/broker.log")"
+      ;;
+    tls|ws)
+      # The three-listener file; `via.py` on PORT carries the suite's
+      # plain client through the layer under test.
+      "$SDMQTT" serve --config "$work/listeners.toml" > "$work/broker.log" 2>&1 &
+      local pid=$!
+      if [ "$mode" = tls ]; then
+        listening $((PORT + 2)) || fail "the TLS listener did not come up: $(cat "$work/broker.log")"
+        python3 "$here/via.py" tls "$PORT" "127.0.0.1:$((PORT + 2))" "$work/cert.pem" \
+          > "$work/via.log" 2>&1 &
+      else
+        listening $((PORT + 3)) || fail "the WebSocket listener did not come up: $(cat "$work/broker.log")"
+        python3 "$here/via.py" ws "$PORT" "127.0.0.1:$((PORT + 3))" \
+          > "$work/via.log" 2>&1 &
+      fi
+      via_pid=$!
+      listening "$PORT" || fail "via.py did not listen on $PORT: $(cat "$work/via.log")"
+      ;;
+  esac
   local out="$work/$label-$test.out"
   ( cd "$interop" && python3 "$script" "Test.$test" ) > "$out" 2>&1
+  [ -n "$via_pid" ] && kill "$via_pid" 2>/dev/null
   kill "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
+  [ -n "$via_pid" ] && wait "$via_pid" 2>/dev/null
   if grep -qE '^OK' "$out"; then
     passed=$((passed + 1))
     printf '  %-42s pass\n' "$label:$test"
@@ -128,15 +214,38 @@ run_one() {
   fi
 }
 
-for spec in "v5 client_test5.py" "v311 client_test.py"; do
+passes="v5 client_test5.py plain
+v311 client_test.py plain
+v5-ws client_test5.py ws
+v311-ws client_test.py ws"
+if [ "$tls_pass" = 1 ]; then
+  passes="$passes
+v5-tls client_test5.py tls
+v311-tls client_test.py tls"
+fi
+# `CONFORMANCE_MODES="tls ws"` runs a subset while working on one layer;
+# the baseline comparison then covers those labels alone. Not for CI,
+# which runs everything.
+if [ -n "${CONFORMANCE_MODES:-}" ]; then
+  kept=""
+  while read -r spec; do
+    set -- $spec
+    case " $CONFORMANCE_MODES " in *" $3 "*) kept="$kept$spec
+";; esac
+  done <<< "$passes"
+  passes="${kept%
+}"
+  echo "conformance: running only: $CONFORMANCE_MODES"
+fi
+while read -r spec; do
   set -- $spec
-  label="$1"; script="$2"
+  label="$1"; script="$2"; mode="$3"
   echo
-  echo "conformance: $label ($script)"
+  echo "conformance: $label ($script, $mode)"
   while read -r t; do
-    [ -n "$t" ] && run_one "$label" "$script" "$t"
+    [ -n "$t" ] && run_one "$label" "$script" "$t" "$mode"
   done < <(tests_in "$interop/$script")
-done
+done <<< "$passes"
 
 echo
 echo "conformance: $passed passed, $failed failed"
@@ -149,6 +258,19 @@ expected="$work/expected.txt"
 flaky="$work/flaky.txt"
 grep -vE '^\s*(#|$)' "$baseline" | awk '$2 == "flaky" {print $1}' | sort -u > "$flaky"
 grep -vE '^\s*(#|$)' "$baseline" | awk '$2 != "flaky" {print $1}' | sort -u > "$expected"
+if [ "$tls_pass" = 0 ]; then
+  # A skipped pass has no failures to compare; its baseline lines are
+  # not "now passing", they were never run.
+  grep -vE '^v(5|311)-tls:' "$expected" > "$expected.kept" && mv "$expected.kept" "$expected"
+fi
+if [ -n "${CONFORMANCE_MODES:-}" ]; then
+  ran=""
+  while read -r spec; do
+    set -- $spec
+    ran="$ran|$1"
+  done <<< "$passes"
+  grep -E "^(${ran#|}):" "$expected" > "$expected.kept" && mv "$expected.kept" "$expected" || : > "$expected"
+fi
 sort -u "$failures" -o "$failures"
 comm -23 "$failures" "$flaky" > "$failures.kept" && mv "$failures.kept" "$failures"
 if [ -s "$flaky" ]; then

@@ -68,6 +68,7 @@ use cluster::{
     ClusterSettings, Durability, Factor, Policy, Strict, DEFAULT_CLUSTER_NAME, DEFAULT_FACTOR,
 };
 use mqtt_codec::Limits;
+use mqtt_codec::QoS;
 use sdmqtt_admin::config::{AdminConfig, AdminStartError, Token};
 use sdmqtt_server::connection::{outbox_depth_for, ConnectionConfig};
 use sdmqtt_server::listener::{ServerConfig, DEFAULT_MAX_CONNECTIONS, DEFAULT_PORT};
@@ -255,10 +256,75 @@ impl std::str::FromStr for LogLevel {
     }
 }
 
-/// The listener section.
+/// What a listener speaks under MQTT. Section 12.1.
+///
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListenerKind {
+    /// MQTT straight over the socket. The default.
+    #[default]
+    Tcp,
+    /// A TLS handshake first; `tls` names the certificate and key.
+    Tls,
+    /// An HTTP upgrade to WebSocket first, then MQTT in binary frames.
+    Ws,
+    /// Both: TLS, then the upgrade. `tls` names the certificate and key.
+    Wss,
+}
+
+impl ListenerKind {
+    /// Whether this kind needs a certificate.
+    fn encrypted(self) -> bool {
+        matches!(self, Self::Tls | Self::Wss)
+    }
+}
+
+impl TlsSettings {
+    /// What the listener keeps.
+    fn settings(&self) -> sdmqtt_server::tls::Settings {
+        sdmqtt_server::tls::Settings {
+            certificate: self.certificate.clone(),
+            key: self.key.clone(),
+            reload: Duration::from_millis(self.reload_ms),
+        }
+    }
+}
+
+/// Section 12.1's certificate and key, for a listener that needs them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsSettings {
+    /// The certificate chain, PEM, leaf first.
+    pub certificate: PathBuf,
+    /// The private key, PEM, unencrypted.
+    pub key: PathBuf,
+    /// How often the two files are re-read so a renewal is picked up
+    /// without a restart. A minute by default.
+    #[serde(default = "default_reload_ms")]
+    pub reload_ms: u64,
+}
+
+fn default_reload_ms() -> u64 {
+    60_000
+}
+
+/// A listener: `[listener]` is the default one, named `mqtt`, and every
+/// `[[listeners]]` entry is one more, each with a name of its own.
+///
+/// One struct for both, because a second one would be a second set of
+/// defaults and a second answer to what a listener is. The default
+/// listener's `name` is fixed by [`Config::servers`]; the environment
+/// reaches only the default, and the README says so.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Listener {
+    /// What an operator calls this listener. Required on a
+    /// `[[listeners]]` entry; ignored on `[listener]`, which is `mqtt`.
+    pub name: String,
+    /// What it speaks under MQTT.
+    pub kind: ListenerKind,
+    /// The certificate and key, for a kind that needs them.
+    pub tls: Option<TlsSettings>,
     /// Where to bind.
     pub address: SocketAddr,
     /// How many connections to serve at once.
@@ -266,14 +332,55 @@ pub struct Listener {
     /// The namespace this listener's clients live in. Two clients with
     /// the same identifier on two mountpoints are two sessions.
     pub mountpoint: String,
+    /// The highest quality of service this listener serves: 0, 1 or 2.
+    /// Section 5.4. Advertised to version 5 clients and enforced on
+    /// every publish; a subscription above it is granted at it.
+    pub max_qos: u8,
+    /// Whether this listener accepts retained messages. Section 5.4.
+    /// A retained publish on a listener that does not is a protocol
+    /// error, and a retained will refuses the connect.
+    pub retain_available: bool,
+    /// Section 8.6's durability mode for publishes on this listener,
+    /// `"async"` or `"sync"`; absent takes `cluster.durability`. The
+    /// wait is bounded by `cluster.sync_timeout_ms` in both cases.
+    pub durability: Option<Durability>,
 }
 
 impl Default for Listener {
     fn default() -> Self {
         Self {
+            name: String::new(),
+            kind: ListenerKind::Tcp,
+            tls: None,
             address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             mountpoint: String::new(),
+            max_qos: 2,
+            retain_available: true,
+            durability: None,
+        }
+    }
+}
+
+/// The name of `[listener]`, and so a name a `[[listeners]]` entry may
+/// not take.
+pub const DEFAULT_LISTENER_NAME: &str = "mqtt";
+
+/// Names the admin API already uses for rows that are not MQTT
+/// listeners, which a `[[listeners]]` entry may not take either: an
+/// interface keys its rows on the name.
+const RESERVED_LISTENER_NAMES: [&str; 4] = [DEFAULT_LISTENER_NAME, "admin", "cluster", "ingest"];
+
+impl Listener {
+    /// The maximum as the connection reads it.
+    ///
+    /// `validate` refuses anything above two, so the catch-all is the
+    /// value an operator wrote when it is not zero or one.
+    fn max_qos(&self) -> QoS {
+        match self.max_qos {
+            0 => QoS::AtMostOnce,
+            1 => QoS::AtLeastOnce,
+            _ => QoS::ExactlyOnce,
         }
     }
 }
@@ -954,6 +1061,9 @@ pub struct Config {
     pub cluster: ClusterSection,
     /// The listener section.
     pub listener: Listener,
+    /// More listeners, each named. `[listener]` is the first and is
+    /// named `mqtt`; these follow it in the order written.
+    pub listeners: Vec<Listener>,
     /// The broker section.
     pub broker: BrokerSection,
     /// The storage section.
@@ -1086,6 +1196,7 @@ impl Config {
                       leave the key out to take the default",
             });
         }
+        self.validate_listeners()?;
         if self.broker.max_inflight == 0 {
             return Err(ConfigError::Unusable {
                 key: "broker.max_inflight",
@@ -1323,6 +1434,22 @@ impl Config {
                           would be refused. Set cluster.address, or leave the flag out",
                 });
             }
+            // The same shape for a listener that asks to wait: on a node
+            // with no follower it would count every publish unconfirmed
+            // and wait the timeout for each.
+            if let Some((prefix, _)) = self
+                .each_listener()
+                .find(|(_, listener)| listener.durability == Some(Durability::Sync))
+            {
+                return Err(ConfigError::Unusable {
+                    key: leak(format!("{prefix}.durability")),
+                    value: "sync".to_owned(),
+                    why: "this node does not cluster, because cluster.address is unset, so \
+                          it has no follower to confirm anything and every durable publish \
+                          on this listener would wait for nobody. Set cluster.address, or \
+                          leave the key out",
+                });
+            }
             if let Some(expected) = self.cluster.expected_size {
                 return Err(ConfigError::Unusable {
                     key: "cluster.expected_size",
@@ -1490,6 +1617,26 @@ impl Config {
         }
         if let Some(value) = lookup("SDMQTT_MOUNTPOINT") {
             self.listener.mountpoint = value;
+        }
+        if let Some(value) = lookup("SDMQTT_MAX_QOS") {
+            self.listener.max_qos = parse("SDMQTT_MAX_QOS", &value, "quality of service")?;
+        }
+        if let Some(value) = lookup("SDMQTT_RETAIN_AVAILABLE") {
+            self.listener.retain_available =
+                parse("SDMQTT_RETAIN_AVAILABLE", &value, "true or false")?;
+        }
+        if let Some(value) = lookup("SDMQTT_LISTENER_DURABILITY") {
+            self.listener.durability = Some(match value.as_str() {
+                "async" => Durability::Async,
+                "sync" => Durability::Sync,
+                _ => {
+                    return Err(ConfigError::Environment {
+                        variable: "SDMQTT_LISTENER_DURABILITY",
+                        value,
+                        expected: "async or sync",
+                    })
+                }
+            });
         }
         if let Some(value) = lookup("SDMQTT_STORAGE_DIRECTORY") {
             // An empty value turns the store off rather than naming a
@@ -1699,15 +1846,161 @@ impl Config {
         }
     }
 
-    /// What the listener should be started with.
+    /// Every listener's checks, for `[listener]` and each `[[listeners]]`
+    /// entry alike, then the two that are about the set: no two names
+    /// and no two addresses.
+    fn validate_listeners(&self) -> Result<(), ConfigError> {
+        for (prefix, listener) in self.each_listener() {
+            if listener.max_qos > 2 {
+                return Err(ConfigError::Unusable {
+                    key: leak(format!("{prefix}.max_qos")),
+                    value: listener.max_qos.to_string(),
+                    why: "a quality of service is 0, 1 or 2",
+                });
+            }
+            match (&listener.tls, listener.kind.encrypted()) {
+                (Some(_), false) => {
+                    return Err(ConfigError::Unusable {
+                        key: leak(format!("{prefix}.tls")),
+                        value: "set".to_owned(),
+                        why: "tls is set on a listener whose kind does not use it; a plain \
+                              listener with a certificate is a listener somebody believes \
+                              is encrypted. Change the kind, or remove the tls table",
+                    });
+                }
+                (None, true) => {
+                    return Err(ConfigError::Unusable {
+                        key: leak(format!("{prefix}.tls")),
+                        value: String::new(),
+                        why: "this kind of listener needs a certificate: add a tls table \
+                              with certificate and key",
+                    });
+                }
+                (Some(tls), true) => {
+                    if tls.reload_ms == 0 {
+                        return Err(ConfigError::Unusable {
+                            key: leak(format!("{prefix}.tls.reload_ms")),
+                            value: "0".to_owned(),
+                            why: "a reload every zero milliseconds is a loop that reads the \
+                                  files and nothing else; write how often a renewal should \
+                                  be noticed, or leave the key out for a minute",
+                        });
+                    }
+                    // Read now, so a listener whose files are wrong
+                    // refuses to start rather than failing every
+                    // handshake after the node has said it is serving.
+                    if let Err(why) = sdmqtt_server::tls::check(&tls.settings()) {
+                        return Err(ConfigError::Unusable {
+                            key: leak(format!("{prefix}.tls")),
+                            value: tls.certificate.display().to_string(),
+                            why: leak(why.to_string()),
+                        });
+                    }
+                }
+                (None, false) => {}
+            }
+        }
+        let mut names: Vec<&str> = Vec::new();
+        for (at, listener) in self.listeners.iter().enumerate() {
+            let prefix = format!("listeners[{at}]");
+            if listener.name.is_empty() {
+                return Err(ConfigError::Unusable {
+                    key: leak(format!("{prefix}.name")),
+                    value: String::new(),
+                    why: "every [[listeners]] entry needs a name an operator can tell it \
+                          by; the default [listener] is called mqtt",
+                });
+            }
+            if RESERVED_LISTENER_NAMES.contains(&listener.name.as_str())
+                || names.contains(&listener.name.as_str())
+            {
+                return Err(ConfigError::Unusable {
+                    key: leak(format!("{prefix}.name")),
+                    value: listener.name.clone(),
+                    why: "that name is taken: by another listener, or by one of mqtt, admin, \
+                          cluster and ingest, which the admin API uses for its own rows",
+                });
+            }
+            names.push(&listener.name);
+        }
+        let all: Vec<(String, &Listener)> = self.each_listener().collect();
+        for (at, (prefix, listener)) in all.iter().enumerate() {
+            if let Some((other, _)) = all[..at]
+                .iter()
+                .find(|(_, earlier)| earlier.address == listener.address)
+            {
+                return Err(ConfigError::Unusable {
+                    key: leak(format!("{prefix}.address")),
+                    value: listener.address.to_string(),
+                    why: leak(format!(
+                        "{other} binds the same address, and the second to bind would fail \
+                         after the first was already serving"
+                    )),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// `[listener]` under its key, then each `[[listeners]]` entry under
+    /// its index, for a refusal to name.
+    fn each_listener(&self) -> impl Iterator<Item = (String, &Listener)> {
+        std::iter::once(("listener".to_owned(), &self.listener)).chain(
+            self.listeners
+                .iter()
+                .enumerate()
+                .map(|(at, listener)| (format!("listeners[{at}]"), listener)),
+        )
+    }
+
+    /// Every listener's configuration, in the order [`Config::servers`]
+    /// starts them, for a caller that reports what it bound.
+    pub fn each_listener_config(&self) -> impl Iterator<Item = &Listener> {
+        std::iter::once(&self.listener).chain(self.listeners.iter())
+    }
+
+    /// Every listener to start, named, `[listener]` first as `mqtt`.
+    pub fn servers(&self) -> Vec<(String, ServerConfig)> {
+        std::iter::once((DEFAULT_LISTENER_NAME.to_owned(), self.server()))
+            .chain(
+                self.listeners
+                    .iter()
+                    .map(|listener| (listener.name.clone(), self.server_for(listener))),
+            )
+            .collect()
+    }
+
+    /// What the default listener should be started with.
     pub fn server(&self) -> ServerConfig {
+        self.server_for(&self.listener)
+    }
+
+    /// What `listener` should be started with. The broker's bounds are
+    /// the node's and the same for every listener; the connection's are
+    /// the listener's own.
+    fn server_for(&self, listener: &Listener) -> ServerConfig {
         let limits = Limits {
             max_packet_size: self.broker.max_packet_size,
             max_topic_depth: self.broker.max_topic_depth,
             max_client_id_len: self.broker.max_client_id_len,
         };
         ServerConfig {
-            address: self.listener.address,
+            address: listener.address,
+            kind: match (listener.kind, &listener.tls) {
+                (ListenerKind::Tls, Some(tls)) => {
+                    sdmqtt_server::listener::Kind::Tls(tls.settings())
+                }
+                (ListenerKind::Wss, Some(tls)) => {
+                    sdmqtt_server::listener::Kind::Wss(tls.settings())
+                }
+                (ListenerKind::Ws, _) => sdmqtt_server::listener::Kind::Ws,
+                // `validate` refuses an encrypted listener without a
+                // table, so the fallback is unreachable on anything
+                // `load` returns.
+                (ListenerKind::Tcp | ListenerKind::Tls | ListenerKind::Wss, _) => {
+                    sdmqtt_server::listener::Kind::Tcp
+                }
+            },
             broker: BrokerConfig {
                 limits,
                 trie_shards: self.broker.trie_shards,
@@ -1719,7 +2012,10 @@ impl Config {
             },
             connection: ConnectionConfig {
                 limits,
-                mountpoint: Arc::from(self.listener.mountpoint.as_str()),
+                mountpoint: Arc::from(listener.mountpoint.as_str()),
+                max_qos: listener.max_qos(),
+                retain_available: listener.retain_available,
+                durability: listener.durability,
                 // Derived from the bounds it drains rather than left a
                 // constant, so raising the queue raises the channel the
                 // queue empties into. `validate` refuses a configuration
@@ -1732,9 +2028,16 @@ impl Config {
                 .unwrap_or(usize::MAX),
                 ..ConnectionConfig::default()
             },
-            max_connections: self.listener.max_connections,
+            max_connections: listener.max_connections,
         }
     }
+}
+
+/// A key or reason built at runtime, for a [`ConfigError`] that carries
+/// `&'static str`. A refusal ends the process, so the handful of bytes
+/// leaked are leaked once.
+fn leak(text: String) -> &'static str {
+    Box::leak(text.into_boxed_str())
 }
 
 /// Read one environment value, naming it when it cannot be read.
@@ -2950,6 +3253,293 @@ mod tests {
         assert_eq!(server.broker.max_queue_messages, 5);
         assert_eq!(server.broker.max_queue_bytes, 8192);
         assert_eq!(server.connection.limits, server.broker.limits);
+    }
+
+    /// Section 5.4's two listener policies are read, mapped, and a
+    /// level that is not one is refused by name.
+    #[test]
+    fn a_listener_policy_is_read_and_a_bad_qos_is_refused() {
+        let config = Config::from_toml(
+            r#"
+            [listener]
+            max_qos = 1
+            retain_available = false
+        "#,
+        )
+        .expect("both keys are known");
+        assert_eq!(config.listener.max_qos, 1);
+        assert!(!config.listener.retain_available);
+        let server = config.server();
+        assert_eq!(server.connection.max_qos, QoS::AtLeastOnce);
+        assert!(!server.connection.retain_available);
+
+        let bad =
+            Config::from_toml("[listener]\nmax_qos = 3\n").expect("parses; validation refuses");
+        let why = bad
+            .validate()
+            .expect_err("three is not a quality of service");
+        assert!(why.to_string().contains("listener.max_qos"), "{why}");
+
+        let mut from_env = Config::default();
+        from_env
+            .apply_env(|name| match name {
+                "SDMQTT_MAX_QOS" => Some("0".to_owned()),
+                "SDMQTT_RETAIN_AVAILABLE" => Some("false".to_owned()),
+                _ => None,
+            })
+            .expect("both read");
+        assert_eq!(from_env.listener.max_qos, 0);
+        assert!(!from_env.listener.retain_available);
+    }
+
+    /// `[[listeners]]` entries follow `[listener]`, in order, each with
+    /// its own policy and the node's bounds.
+    #[test]
+    fn extra_listeners_are_read_in_order_after_the_default_one() {
+        let config = Config::from_toml(
+            r#"
+            [listener]
+            address = "127.0.0.1:1883"
+
+            [[listeners]]
+            name = "tenant-b"
+            address = "127.0.0.1:1884"
+            mountpoint = "tenant-b"
+            max_qos = 1
+        "#,
+        )
+        .expect("every key is known");
+        config.validate().expect("two listeners on two addresses");
+        let servers = config.servers();
+        let names: Vec<&str> = servers.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["mqtt", "tenant-b"]);
+        assert_eq!(servers[1].1.address.port(), 1884);
+        assert_eq!(&*servers[1].1.connection.mountpoint, "tenant-b");
+        assert_eq!(servers[1].1.connection.max_qos, QoS::AtLeastOnce);
+        assert_eq!(
+            servers[0].1.connection.max_qos,
+            QoS::ExactlyOnce,
+            "the default listener keeps its own policy"
+        );
+    }
+
+    /// Two listeners on one address are refused by name, at startup,
+    /// rather than the second failing to bind after the first is
+    /// already serving.
+    #[test]
+    fn two_listeners_on_one_address_are_refused_by_name() {
+        let config = Config::from_toml(
+            r#"
+            [listener]
+            address = "127.0.0.1:1883"
+
+            [[listeners]]
+            name = "again"
+            address = "127.0.0.1:1883"
+        "#,
+        )
+        .expect("parses");
+        let why = config
+            .validate()
+            .expect_err("one address, two listeners")
+            .to_string();
+        assert!(
+            why.contains("listener") && why.contains("listeners[0].address"),
+            "{why}"
+        );
+    }
+
+    /// A `[[listeners]]` entry needs a name, and not one that is taken.
+    #[test]
+    fn a_listener_without_a_name_or_with_a_taken_one_is_refused() {
+        let unnamed =
+            Config::from_toml("[[listeners]]\naddress = \"127.0.0.1:1884\"\n").expect("parses");
+        let why = unnamed.validate().expect_err("no name").to_string();
+        assert!(why.contains("listeners[0].name"), "{why}");
+
+        let taken =
+            Config::from_toml("[[listeners]]\nname = \"mqtt\"\naddress = \"127.0.0.1:1884\"\n")
+                .expect("parses");
+        let why = taken
+            .validate()
+            .expect_err("mqtt is the default listener's name")
+            .to_string();
+        assert!(why.contains("mqtt"), "{why}");
+
+        let twice = Config::from_toml(
+            "[[listeners]]\nname = \"x\"\naddress = \"127.0.0.1:1884\"\n\
+             [[listeners]]\nname = \"x\"\naddress = \"127.0.0.1:1885\"\n",
+        )
+        .expect("parses");
+        let why = twice.validate().expect_err("x twice").to_string();
+        assert!(why.contains("listeners[1].name"), "{why}");
+    }
+
+    /// A kind the configuration does not know is refused by the parser.
+    #[test]
+    fn an_unknown_listener_kind_is_refused() {
+        let why = Config::from_toml(
+            "[[listeners]]\nname = \"x\"\nkind = \"udp\"\naddress = \"127.0.0.1:1884\"\n",
+        )
+        .expect_err("udp is not a kind")
+        .to_string();
+        assert!(why.contains("udp") || why.contains("kind"), "{why}");
+    }
+
+    /// A TLS listener without a certificate, with a key that does not
+    /// match, or with files that are not there, is refused at startup
+    /// naming the listener and the file; a good pair is accepted and
+    /// reaches the server configuration.
+    #[test]
+    fn a_tls_listener_s_files_are_checked_at_startup() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let minted = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("rcgen mints a certificate");
+        let certificate = directory.path().join("cert.pem");
+        let key = directory.path().join("key.pem");
+        std::fs::write(&certificate, minted.cert.pem()).expect("written");
+        std::fs::write(&key, minted.signing_key.serialize_pem()).expect("written");
+
+        let bare = Config::from_toml(
+            "[[listeners]]\nname = \"secure\"\nkind = \"tls\"\naddress = \"127.0.0.1:8883\"\n",
+        )
+        .expect("parses");
+        let why = bare.validate().expect_err("no certificate").to_string();
+        assert!(why.contains("listeners[0].tls"), "{why}");
+
+        let good = Config::from_toml(&format!(
+            r#"
+            [[listeners]]
+            name = "secure"
+            kind = "tls"
+            address = "127.0.0.1:8883"
+
+            [listeners.tls]
+            certificate = "{}"
+            key = "{}"
+            reload_ms = 500
+        "#,
+            certificate.display(),
+            key.display()
+        ))
+        .expect("parses");
+        good.validate().expect("a good pair loads");
+        let servers = good.servers();
+        match &servers[1].1.kind {
+            sdmqtt_server::listener::Kind::Tls(settings) => {
+                assert_eq!(settings.certificate, certificate);
+                assert_eq!(settings.reload, Duration::from_millis(500));
+            }
+            other => panic!("a tls listener, got {other:?}"),
+        }
+
+        let other =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("a second key");
+        std::fs::write(&key, other.signing_key.serialize_pem()).expect("swapped");
+        let why = good
+            .validate()
+            .expect_err("the key no longer matches")
+            .to_string();
+        assert!(why.contains("does not match"), "{why}");
+
+        std::fs::remove_file(&certificate).expect("removed");
+        let why = good.validate().expect_err("no such file").to_string();
+        assert!(why.contains("could not be read"), "{why}");
+    }
+
+    /// `ws` needs no certificate and `wss` does; each maps to its kind.
+    #[test]
+    fn websocket_kinds_map_and_wss_needs_a_certificate() {
+        let plain = Config::from_toml(
+            "[[listeners]]\nname = \"web\"\nkind = \"ws\"\naddress = \"127.0.0.1:8080\"\n",
+        )
+        .expect("parses");
+        plain
+            .validate()
+            .expect("a plain WebSocket listener needs nothing more");
+        assert!(matches!(
+            plain.servers()[1].1.kind,
+            sdmqtt_server::listener::Kind::Ws
+        ));
+
+        let bare = Config::from_toml(
+            "[[listeners]]\nname = \"web\"\nkind = \"wss\"\naddress = \"127.0.0.1:8443\"\n",
+        )
+        .expect("parses");
+        let why = bare
+            .validate()
+            .expect_err("wss without a certificate")
+            .to_string();
+        assert!(why.contains("listeners[0].tls"), "{why}");
+    }
+
+    /// A certificate on a plain listener is a listener somebody believes
+    /// is encrypted, and is refused.
+    #[test]
+    fn tls_on_a_plain_listener_is_refused() {
+        let config = Config::from_toml(
+            r#"
+            [listener]
+            address = "127.0.0.1:1883"
+
+            [listener.tls]
+            certificate = "cert.pem"
+            key = "key.pem"
+        "#,
+        )
+        .expect("parses");
+        let why = config.validate().expect_err("tls on tcp").to_string();
+        assert!(why.contains("listener.tls"), "{why}");
+    }
+
+    /// Section 8.6's per-listener durability: read, passed through, and
+    /// refused where it could only ever wait for nobody.
+    #[test]
+    fn a_listener_durability_is_read_and_refused_on_a_node_that_does_not_cluster() {
+        let alone =
+            Config::from_toml("[listener]\ndurability = \"sync\"\n").expect("the key is known");
+        assert_eq!(alone.listener.durability, Some(Durability::Sync));
+        let why = alone
+            .validate()
+            .expect_err("a listener that waits for a follower on a node with none");
+        assert!(why.to_string().contains("listener.durability"), "{why}");
+
+        let clustered = Config::from_toml(
+            r#"
+            [listener]
+            durability = "sync"
+
+            [storage]
+            directory = "/tmp/a-store-for-the-test"
+
+            [cluster]
+            address = "127.0.0.1:7700"
+            secret = "a-secret"
+        "#,
+        )
+        .expect("every key is known");
+        clustered
+            .validate()
+            .expect("a clustering node may have a waiting listener");
+        assert_eq!(
+            clustered.server().connection.durability,
+            Some(Durability::Sync)
+        );
+
+        let mut from_env = Config::default();
+        from_env
+            .apply_env(|name| (name == "SDMQTT_LISTENER_DURABILITY").then(|| "async".to_owned()))
+            .expect("read");
+        assert_eq!(from_env.listener.durability, Some(Durability::Async));
+        let refused = Config::default()
+            .apply_env(|name| {
+                (name == "SDMQTT_LISTENER_DURABILITY").then(|| "eventually".to_owned())
+            })
+            .expect_err("not a mode");
+        assert!(
+            refused.to_string().contains("SDMQTT_LISTENER_DURABILITY"),
+            "{refused}"
+        );
     }
 
     #[test]
