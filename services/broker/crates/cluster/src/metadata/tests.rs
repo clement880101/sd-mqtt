@@ -118,6 +118,19 @@ fn every_kind(me: NodeId) -> Vec<(MetadataKey, MetadataValue)> {
             },
             MetadataValue::NodeGroup,
         ),
+        (
+            MetadataKey::User {
+                name: "alice".to_owned(),
+            },
+            MetadataValue::User(Box::new(storage::record::UserRecord {
+                name: "alice".to_owned(),
+                password: Some(storage::record::Secret::new(
+                    "$argon2id$v=19$m=19456,t=2,p=1$x$y",
+                )),
+                scram: None,
+                created_at: 1,
+            })),
+        ),
     ]
 }
 
@@ -229,6 +242,7 @@ fn every_kind_survives_a_restart() {
             MetadataValue::NodeGroup => before
                 .group_joined("workers", "jobs/+")
                 .expect("the first member writes a register"),
+            MetadataValue::User(held) => before.user(*held),
         });
     }
     // And a tombstone, which is the last unsubscribe: the register that

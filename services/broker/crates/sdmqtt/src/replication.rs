@@ -384,6 +384,7 @@ pub async fn applying(
     mut waiting: mpsc::UnboundedReceiver<Applying>,
     shared: Arc<Shared>,
     rules: Arc<Registry>,
+    directory: Arc<directory::Directory>,
 ) {
     // Read once rather than per write. A node with no store cannot
     // cluster and so reaches none of this, but the type does not say
@@ -402,9 +403,15 @@ pub async fn applying(
         // of which can happen under the broker's lock, so the registry
         // writes its own records — and the registers below are stored
         // first, so that what the registry writes is only its own copy.
-        let (for_rules, for_broker): (Vec<MetadataWrite>, Vec<MetadataWrite>) = writes
+        let (for_rules, rest): (Vec<MetadataWrite>, Vec<MetadataWrite>) = writes
             .into_iter()
             .partition(|write| matches!(write.key(), MetadataKey::Rule { .. }));
+        // Section 12.1's users go to the directory, which writes them
+        // the way the rule registry writes a rule: the register and the
+        // record in one batch, stamped by nobody here.
+        let (for_directory, for_broker): (Vec<MetadataWrite>, Vec<MetadataWrite>) = rest
+            .into_iter()
+            .partition(|write| matches!(write.key(), MetadataKey::User { .. }));
 
         // **The registers go to the store whatever they mean here**, and in
         // one batch with the local effect. A node holds every register,
@@ -486,6 +493,18 @@ pub async fn applying(
             }
         }
 
+        // The registers are already stored above, so the directory's
+        // batch carries this node's own copy of the user and nothing
+        // else, like the registry's below.
+        for write in &for_directory {
+            if let Err(why) = directory.apply_replicated(write).await {
+                tracing::error!(
+                    %why,
+                    "a user a peer replicated could not be written here; the cluster and \
+                     this node disagree about who may connect until it is fixed"
+                );
+            }
+        }
         for write in &for_rules {
             // The registers are already stored above, so the registry's
             // batch carries this node's own copy of the rule and nothing

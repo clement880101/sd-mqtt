@@ -42,6 +42,7 @@ pub mod host;
 pub mod resources;
 pub mod rules;
 pub mod taps;
+pub mod users;
 
 #[cfg(test)]
 mod testing;
@@ -322,6 +323,8 @@ pub struct AdminState {
     /// no rules and says so rather than answering with an empty
     /// collection. See [`rules`].
     pub rules: Option<Arc<::rules::live::Registry>>,
+    /// Section 12.1's directory, on a node with a store. See [`users`].
+    pub directory: Option<Arc<::directory::Directory>>,
     /// The live subscribers the interface reads.
     ///
     /// See [`taps`]: a tap is a real session inside the broker, so
@@ -354,6 +357,7 @@ impl AdminState {
             token: None,
             allowed_hosts: Arc::from(Vec::new()),
             rules: None,
+            directory: None,
             taps: Arc::new(Taps::new()),
         }
     }
@@ -431,6 +435,13 @@ impl AdminState {
     #[must_use]
     pub fn with_rules(mut self, registry: Option<Arc<::rules::live::Registry>>) -> Self {
         self.rules = registry;
+        self
+    }
+
+    /// Serve users from `directory`. Section 12.1.
+    #[must_use]
+    pub fn with_directory(mut self, directory: Option<Arc<::directory::Directory>>) -> Self {
+        self.directory = directory;
         self
     }
 }
@@ -705,6 +716,7 @@ fn router(state: AdminState, extra: Router<AdminState>) -> Router {
         .merge(health::routes())
         .merge(resources::routes())
         .merge(rules::routes())
+        .merge(users::routes())
         .merge(events::routes())
         .merge(taps::routes())
         // Whatever the caller asked to be served here as well, inside

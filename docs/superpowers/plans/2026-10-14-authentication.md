@@ -430,7 +430,7 @@ The rest of task 1 and the tasks after it are executed from the spec and
 the RFCs directly, each with its tests, its mutation proof and the full
 gate, and ticked here as it lands:
 
-- [ ] **Task 1** — the directory crate: users with argon2 passwords and
+- [x] **Task 1** — the directory crate: users with argon2 passwords and
   SCRAM verifiers, replicated as metadata, installed as the authenticate
   hook; `auth.anonymous`; `ClientInfo.username`; format version 11.
 - [ ] **Task 2** — SCRAM-SHA-256 over MQTT 5's AUTH exchange, including

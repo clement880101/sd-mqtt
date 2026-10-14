@@ -34,6 +34,7 @@ thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "signal"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+directory = { version = "0.1.0", path = "../directory" }
 
 [dev-dependencies]
 # For the store tests: a directory that is created, opened and thrown

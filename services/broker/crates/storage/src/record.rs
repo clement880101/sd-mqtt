@@ -150,7 +150,7 @@ use serde::{Deserialize, Serialize};
 /// operations as it had before the restart — a follower that quietly
 /// stops following, which is the failure replication exists to
 /// prevent.
-pub const FORMAT_VERSION: u16 = 10;
+pub const FORMAT_VERSION: u16 = 11;
 
 /// What every sd-mqtt store begins with, so a file that is not one is
 /// refused as such rather than as a corrupt store.
@@ -1027,6 +1027,11 @@ pub enum MetadataKeyRecord {
         /// because that is what a published topic is matched against.
         filter: String,
     },
+    /// A user, by name. Section 8.2 lists users among what replicates.
+    User {
+        /// The name.
+        name: String,
+    },
 }
 
 /// What a replicated register holds, section 8.2.
@@ -1076,6 +1081,8 @@ pub enum MetadataValueRecord {
     /// the part section 8.2 keeps on the node, as it does for a node
     /// subscription.
     NodeGroup,
+    /// A user, whole. Boxed for the reason a rule is.
+    User(Box<UserRecord>),
 }
 
 /// One replicated register, as a store holds it.
@@ -1519,6 +1526,51 @@ pub enum Record {
         /// The position of the last change sent.
         at: u64,
     },
+    /// A user exists, or its credentials changed. Section 12.1.
+    ///
+    /// Carries the argon2 string and the SCRAM verifier, never a
+    /// password: both are derived when the password is set, because a
+    /// verifier cannot be derived from an argon2 hash (section 12.2).
+    /// Boxed for the reason a rule is: the record is large and the
+    /// enum is sized by its largest variant.
+    UserPut(Box<UserRecord>),
+    /// A user is gone.
+    UserDeleted {
+        /// Its name.
+        name: String,
+    },
+}
+
+/// A user, as stored. Sections 12.1 and 12.2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserRecord {
+    /// The name a client presents. Compared exactly.
+    pub name: String,
+    /// The argon2id hash in PHC string form, when the user has a
+    /// password. `None` for a user enrolled in SCRAM alone.
+    pub password: Option<Secret>,
+    /// The SCRAM-SHA-256 verifier, when the user is enrolled.
+    pub scram: Option<ScramVerifierRecord>,
+    /// Seconds since the epoch, for the page.
+    pub created_at: u64,
+}
+
+/// What SCRAM-SHA-256 needs to verify a client without the password.
+///
+/// Section 12.2: "a weaker secret at rest than an argon2 hash, because
+/// possession of the stored key permits impersonating that client", so
+/// both keys are [`Secret`]s and the API never returns them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScramVerifierRecord {
+    /// Random, per user.
+    pub salt: Vec<u8>,
+    /// PBKDF2 rounds. Section 12.2: configurable, defaulting to a value
+    /// a constrained client can afford.
+    pub iterations: u32,
+    /// `H(ClientKey)`, base64.
+    pub stored_key: Secret,
+    /// `HMAC(SaltedPassword, "Server Key")`, base64.
+    pub server_key: Secret,
 }
 
 impl Record {
@@ -1644,6 +1696,8 @@ impl Record {
                     }
             }
             Self::RuleRemoved { id } => id.len(),
+            Self::UserPut(user) => weigh_user(user),
+            Self::UserDeleted { name } => name.len(),
             // The client identifier is a peer's, and the rule
             // identifier an operator's. The payload is not counted
             // because it is not here: the `BodyPut` beside this record
@@ -1700,6 +1754,7 @@ fn weigh_metadata(entry: &MetadataRecord) -> usize {
             .weight()
                 - std::mem::size_of::<Record>()
         }
+        Some(MetadataValueRecord::User(user)) => weigh_user(user),
     };
     weigh_metadata_key(&entry.key) + value
 }
@@ -1712,7 +1767,18 @@ fn weigh_metadata_key(key: &MetadataKeyRecord) -> usize {
         MetadataKeyRecord::Rule { id } => id.len(),
         MetadataKeyRecord::SessionOwner { session } => weigh_key(session),
         MetadataKeyRecord::NodeGroup { group, filter, .. } => group.len() + filter.len(),
+        MetadataKeyRecord::User { name } => name.len(),
     }
+}
+
+/// What a user's record holds beyond its own footprint: the name, the
+/// hash string and the verifier's three byte strings.
+fn weigh_user(user: &UserRecord) -> usize {
+    user.name.len()
+        + user.password.as_ref().map_or(0, |hash| hash.expose().len())
+        + user.scram.as_ref().map_or(0, |scram| {
+            scram.salt.len() + scram.stored_key.expose().len() + scram.server_key.expose().len()
+        })
 }
 
 /// What a session key's two strings hold.

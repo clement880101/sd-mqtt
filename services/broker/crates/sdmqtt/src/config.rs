@@ -726,6 +726,37 @@ impl Default for IngestConfig {
     }
 }
 
+/// The authentication section. Section 12.1.
+///
+/// Users themselves are not here: they are durable metadata, written
+/// through the API and replicated, and a file is the wrong place for a
+/// password. What is here is how the directory behaves.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AuthConfig {
+    /// Whether a client with no username is admitted. **A switch, not
+    /// an inference**: it does not flip itself when the first user is
+    /// created, because a setting that changes under an operator is
+    /// one they cannot reason about. On by default, which is what the
+    /// broker did through milestone 6.
+    pub anonymous: bool,
+    /// PBKDF2 rounds for a new SCRAM-SHA-256 verifier. Section 12.2:
+    /// a client performs the same derivation, so this trades the
+    /// server's resistance to an offline attack against a constrained
+    /// client's connect time. 4096 is RFC 7677's example and the
+    /// common floor.
+    pub scram_iterations: u32,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            anonymous: true,
+            scram_iterations: 4096,
+        }
+    }
+}
+
 /// The log section.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -1079,6 +1110,8 @@ pub struct Config {
     pub admin: AdminConfig,
     /// Where section 9.2's ingest endpoint is served.
     pub ingest: IngestConfig,
+    /// Section 12.1's switches.
+    pub auth: AuthConfig,
     /// The log section.
     pub log: Log,
     /// The rules this node holds, section 9.1.
@@ -1197,6 +1230,14 @@ impl Config {
             });
         }
         self.validate_listeners()?;
+        if self.auth.scram_iterations < 1000 {
+            return Err(ConfigError::Unusable {
+                key: "auth.scram_iterations",
+                value: self.auth.scram_iterations.to_string(),
+                why: "fewer than a thousand rounds makes a stored verifier cheap to attack \
+                      offline; RFC 7677 uses 4096, and leaving the key out takes that",
+            });
+        }
         if self.broker.max_inflight == 0 {
             return Err(ConfigError::Unusable {
                 key: "broker.max_inflight",
@@ -1624,6 +1665,12 @@ impl Config {
         if let Some(value) = lookup("SDMQTT_RETAIN_AVAILABLE") {
             self.listener.retain_available =
                 parse("SDMQTT_RETAIN_AVAILABLE", &value, "true or false")?;
+        }
+        if let Some(value) = lookup("SDMQTT_AUTH_ANONYMOUS") {
+            self.auth.anonymous = parse("SDMQTT_AUTH_ANONYMOUS", &value, "true or false")?;
+        }
+        if let Some(value) = lookup("SDMQTT_AUTH_SCRAM_ITERATIONS") {
+            self.auth.scram_iterations = parse("SDMQTT_AUTH_SCRAM_ITERATIONS", &value, "count")?;
         }
         if let Some(value) = lookup("SDMQTT_LISTENER_DURABILITY") {
             self.listener.durability = Some(match value.as_str() {
@@ -3290,6 +3337,31 @@ mod tests {
             .expect("both read");
         assert_eq!(from_env.listener.max_qos, 0);
         assert!(!from_env.listener.retain_available);
+    }
+
+    /// Section 12.1's switches are read, and a cheap verifier refused.
+    #[test]
+    fn the_auth_section_is_read_and_a_cheap_verifier_is_refused() {
+        let config = Config::from_toml("[auth]\nanonymous = false\nscram_iterations = 8192\n")
+            .expect("both keys are known");
+        assert!(!config.auth.anonymous);
+        assert_eq!(config.auth.scram_iterations, 8192);
+        config.validate().expect("eight thousand rounds is fine");
+
+        let cheap = Config::from_toml("[auth]\nscram_iterations = 100\n").expect("parses");
+        let why = cheap.validate().expect_err("a hundred rounds").to_string();
+        assert!(why.contains("auth.scram_iterations"), "{why}");
+
+        let mut from_env = Config::default();
+        from_env
+            .apply_env(|name| match name {
+                "SDMQTT_AUTH_ANONYMOUS" => Some("false".to_owned()),
+                "SDMQTT_AUTH_SCRAM_ITERATIONS" => Some("5000".to_owned()),
+                _ => None,
+            })
+            .expect("both read");
+        assert!(!from_env.auth.anonymous);
+        assert_eq!(from_env.auth.scram_iterations, 5000);
     }
 
     /// `[[listeners]]` entries follow `[listener]`, in order, each with

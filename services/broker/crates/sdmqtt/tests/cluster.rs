@@ -623,6 +623,40 @@ impl Client {
         Self::opened(address, client_id, true, 0).0
     }
 
+    /// CONNECT as `username` with `password`, and the acknowledgement's
+    /// reason: `None` when the broker closed without one.
+    fn connect_with(
+        address: SocketAddr,
+        client_id: &str,
+        username: &str,
+        password: &str,
+    ) -> Option<ReasonCode> {
+        let stream = TcpStream::connect_timeout(&address, REPLY).expect("the broker accepts");
+        stream
+            .set_read_timeout(Some(REPLY))
+            .expect("a read deadline");
+        let mut client = Self {
+            stream,
+            buf: BytesMut::new(),
+            packets: 0,
+            pending: Vec::new(),
+        };
+        client.send(&Packet::Connect(Box::new(Connect {
+            version: Version::V5,
+            client_id: client_id.to_owned(),
+            clean_start: true,
+            keep_alive: 0,
+            username: Some(username.to_owned()),
+            password: Some(Bytes::from(password.to_owned())),
+            will: None,
+            properties: Properties::default(),
+        })));
+        match client.next() {
+            Some(Packet::ConnAck(ack)) => Some(ack.reason),
+            _ => None,
+        }
+    }
+
     /// Connect asking to resume, with a session that survives the
     /// connection going away.
     ///
@@ -2752,4 +2786,57 @@ async fn asynchronous_loss_is_bounded_by_the_lag_metric() {
         !got.is_empty(),
         "the message copied before the stall has to be there, or nothing was replicated"
     );
+}
+
+// -------------------------------------------------------------------
+// Section 12.1: a user is replicated metadata.
+// -------------------------------------------------------------------
+
+/// A user created on one node connects on another, and a delete on one
+/// refuses on another. Section 8.2 lists users among what replicates;
+/// this is the sentence against three processes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_user_created_on_one_node_connects_on_another() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cluster = Cluster::start(directory.path()).await;
+    cluster.settle();
+
+    let answered =
+        cluster.nodes[0].post("/api/v1/users", r#"{"name":"alice","password":"hunter2"}"#);
+    assert!(answered.contains("\"name\":\"alice\""), "{answered}");
+    assert!(
+        !answered.contains("hunter2"),
+        "the answer carries no secret: {answered}"
+    );
+
+    // On the node it was made on, at once.
+    assert_eq!(
+        Client::connect_with(cluster.nodes[0].mqtt, "alice-at-alpha", "alice", "hunter2"),
+        Some(ReasonCode::Success)
+    );
+    assert_eq!(
+        Client::connect_with(cluster.nodes[0].mqtt, "alice-at-alpha", "alice", "wrong"),
+        Some(ReasonCode::NotAuthorized)
+    );
+    // On the others, once the register has arrived.
+    for at in 1..NODES {
+        until("the user has replicated", || {
+            Client::connect_with(
+                cluster.nodes[at].mqtt,
+                "alice-elsewhere",
+                "alice",
+                "hunter2",
+            ) == Some(ReasonCode::Success)
+        });
+        let listed = cluster.nodes[at].get("/api/v1/users");
+        assert!(listed.contains("\"name\":\"alice\""), "{listed}");
+    }
+
+    // A delete on gamma refuses on alpha, in time.
+    let (code, _) = cluster.nodes[2].delete("/api/v1/users/alice");
+    assert_eq!(code, 200);
+    until("the delete has replicated", || {
+        Client::connect_with(cluster.nodes[0].mqtt, "alice-at-alpha", "alice", "hunter2")
+            == Some(ReasonCode::NotAuthorized)
+    });
 }

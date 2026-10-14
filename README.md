@@ -381,6 +381,34 @@ broker told somebody it had accepted. Turning a connector off while an
 endpoint is down is `enabled = false`, or the disable button, which
 keeps the outbox.
 
+### Who may connect
+
+```toml
+[auth]
+anonymous = true                  # false refuses a client with no username
+scram_iterations = 4096           # PBKDF2 rounds for a new SCRAM-SHA-256 verifier
+```
+
+Users are not in the file. They are durable metadata, written through
+the API and replicated to every node like a rule:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"alice","password":"hunter2"}' http://127.0.0.1:1884/api/v1/users
+```
+
+The password is hashed with argon2id for a password login and derived
+into a SCRAM-SHA-256 verifier for the AUTH exchange, both at that
+moment, and neither is ever returned: `GET /api/v1/users` lists names
+and which credential forms exist. Posting the same name again changes
+the password. `DELETE /api/v1/users/{name}` removes the user, and the
+removal replicates as a tombstone. A client presenting a wrong password,
+or a name nobody has, is refused with 0x87; the two are one answer, so
+nobody can learn which names exist by trying. `anonymous` is a switch
+and nothing else: creating the first user does not flip it. A node with
+no store holds no users and admits by the default alone.
+`SDMQTT_AUTH_ANONYMOUS` and `SDMQTT_AUTH_SCRAM_ITERATIONS` set the two.
+
 ### What a listener accepts
 
 ```toml

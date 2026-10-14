@@ -9,7 +9,39 @@ the milestone you are moving to.** Everything else is description.
 
 ## Unreleased — milestone 7: hardening
 
+### Before you upgrade: a store written before this milestone is refused
+
+**A broker built from this milestone will not open a store written by
+milestone 6.** The format moved from 10 to 11 for the user records, and
+the refusal says so:
+
+```
+store format version 10 is not readable by this build, which reads version 11.
+```
+
+What to do is what every version move asks: stop the broker, move or
+delete the store directory, start the new build. What that throws away
+is the milestone 5 list plus, from milestone 6, the replica copies and
+stream positions. On a cluster, one store at a time, letting the node
+rejoin and be repaired before the next.
+
 ### Added
+
+- **A directory of users**, section 12.1, in a crate of its own. A user
+  is durable metadata like a rule: written through `POST /api/v1/users`
+  on any node, replicated as a register to every other, removed by a
+  tombstone. The password is hashed with argon2id (PHC string) and
+  derived into a SCRAM-SHA-256 verifier at the one moment the password
+  is in hand, because a verifier cannot be made from an argon2 hash;
+  neither is ever returned by the API, and the record's `Debug` says
+  `<redacted>`. The directory is a section 9.3 hook — `authenticate` —
+  and the broker's connect path does not know users exist. A wrong
+  password and an unknown name are one answer. `auth.anonymous` is an
+  explicit switch, on by default, that creating a user does not flip;
+  `auth.scram_iterations` sets the verifier's rounds and refuses fewer
+  than a thousand. `ClientInfo` carries the authenticated username, for
+  the access control rules that follow. `argon2` is the one new direct
+  dependency.
 
 - **A listener's maximum QoS and retain availability**, section 5.4's
   two deferred properties. `listener.max_qos` (0, 1 or 2) is advertised

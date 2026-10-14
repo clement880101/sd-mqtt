@@ -120,6 +120,9 @@ const RETAINED: TableDefinition<&str, &[u8]> = TableDefinition::new("retained");
 /// rule belongs to the node rather than to a session: there is no prefix
 /// to scope it under and nothing to escape.
 const RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("rules");
+/// User name, to [`UserRecord`]. Section 12.1. A user belongs to the
+/// node like a rule does, and is keyed the same way.
+const USERS: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
 /// Rule identifier and big-endian sequence, to [`OutboxRecord`].
 ///
 /// Keyed like a queue and for the same reasons. The identifier is
@@ -351,6 +354,13 @@ impl Storage for RedbStorage {
             .open_table(RETAINED)
             .map_err(StorageError::from)?;
         let rules = transaction.open_table(RULES).map_err(StorageError::from)?;
+        // Absent on a store written before users existed, which is a
+        // store with no users rather than a broken one.
+        let users = match transaction.open_table(USERS) {
+            Ok(table) => Some(table),
+            Err(::redb::TableError::TableDoesNotExist(_)) => None,
+            Err(error) => return Err(StorageError::from(error)),
+        };
         let metadata = open_read(&transaction, METADATA)?;
         let oplog = open_read(&transaction, OPLOG)?;
         let metadata_seen = open_read(&transaction, METADATA_SEEN)?;
@@ -436,6 +446,12 @@ impl Storage for RedbStorage {
         for entry in rules.iter().map_err(StorageError::from)? {
             let (_, value) = entry.map_err(StorageError::from)?;
             restored.rules.push(decode(value.value())?);
+        }
+        if let Some(users) = &users {
+            for entry in users.iter().map_err(StorageError::from)? {
+                let (_, value) = entry.map_err(StorageError::from)?;
+                restored.users.push(decode(value.value())?);
+            }
         }
         restored.node = match meta.get(NODE_KEY).map_err(StorageError::from)? {
             Some(held) => Some(decode::<NodeIdentityRecord>(held.value())?),
@@ -582,6 +598,7 @@ struct Tables<'txn> {
     body_references: ByteTable<'txn>,
     retained: Table<'txn, &'static str, &'static [u8]>,
     rules: Table<'txn, &'static str, &'static [u8]>,
+    users: Table<'txn, &'static str, &'static [u8]>,
     outboxes: ByteTable<'txn>,
     outbox_state: ByteTable<'txn>,
     metadata: ByteTable<'txn>,
@@ -620,6 +637,7 @@ impl<'txn> Tables<'txn> {
                 .open_table(RETAINED)
                 .map_err(StorageError::from)?,
             rules: transaction.open_table(RULES).map_err(StorageError::from)?,
+            users: transaction.open_table(USERS).map_err(StorageError::from)?,
             outboxes: transaction
                 .open_table(OUTBOXES)
                 .map_err(StorageError::from)?,
@@ -889,6 +907,16 @@ impl<'txn> Tables<'txn> {
             Record::RulePut { rule } => {
                 self.rules
                     .insert(rule.id.as_str(), encode(rule).as_slice())
+                    .map_err(StorageError::from)?;
+            }
+            Record::UserPut(user) => {
+                self.users
+                    .insert(user.name.as_str(), encode(user.as_ref()).as_slice())
+                    .map_err(StorageError::from)?;
+            }
+            Record::UserDeleted { name } => {
+                self.users
+                    .remove(name.as_str())
                     .map_err(StorageError::from)?;
             }
             Record::ReplicaFollows {
@@ -1365,6 +1393,10 @@ fn metadata_key(key: &MetadataKeyRecord) -> Vec<u8> {
             out.extend_from_slice(node);
             push_component(&mut out, group);
             push_component(&mut out, filter);
+        }
+        MetadataKeyRecord::User { name } => {
+            out.push(5);
+            push_component(&mut out, name);
         }
     }
     out

@@ -49,6 +49,10 @@ pub struct Session {
     version: Version,
     epoch: u64,
     connected: bool,
+    /// The name the current connection authenticated as. Per
+    /// connection, not stored: every connect authenticates afresh, so a
+    /// resumed session's name is whatever its new connection presented.
+    username: Option<String>,
     /// The outbound path, which outlives the connection.
     pub outbound: Outbound,
     /// The inbound path.
@@ -222,6 +226,7 @@ impl Session {
             version,
             epoch,
             connected: true,
+            username: None,
             outbound,
             inbound: Inbound::new(key, 0),
             subscriptions: Vec::new(),
@@ -516,6 +521,18 @@ impl Session {
     pub fn set_version(&mut self, version: Version) {
         self.version = version;
         self.journal_state();
+    }
+
+    /// The name this connection authenticated as, if any.
+    #[must_use]
+    pub fn username(&self) -> Option<&str> {
+        self.username.as_deref()
+    }
+
+    /// Remember what the connection authenticated as. Not journalled:
+    /// see the field.
+    pub fn set_username(&mut self, username: Option<String>) {
+        self.username = username;
     }
 
     /// The claim's generation.

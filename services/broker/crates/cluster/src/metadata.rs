@@ -97,7 +97,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use storage::{
     MetadataKeyRecord, MetadataRecord, MetadataValueRecord, Record, Restored, RetainedRecord,
-    RuleRecord, SeenRecord, SessionKey, StampRecord,
+    RuleRecord, SeenRecord, SessionKey, StampRecord, UserRecord,
 };
 
 use crate::clock::HybridClock;
@@ -167,6 +167,12 @@ pub enum MetadataKey {
         /// matched against.
         filter: String,
     },
+    /// A user, by name. Section 12.1; section 8.2 lists users among
+    /// what replicates.
+    User {
+        /// The name.
+        name: String,
+    },
 }
 
 impl MetadataKey {
@@ -194,6 +200,7 @@ impl MetadataKey {
                 group: group.clone(),
                 filter: filter.clone(),
             },
+            Self::User { name } => MetadataKeyRecord::User { name: name.clone() },
         }
     }
 
@@ -217,6 +224,7 @@ impl MetadataKey {
                 group,
                 filter,
             },
+            MetadataKeyRecord::User { name } => Self::User { name },
         }
     }
 
@@ -229,6 +237,7 @@ impl MetadataKey {
             Self::Rule { .. } => "a rule",
             Self::SessionOwner { .. } => "a session owner",
             Self::NodeGroup { .. } => "a shared group membership",
+            Self::User { .. } => "a user",
         }
     }
 }
@@ -273,6 +282,8 @@ pub enum MetadataValue {
     /// fact. How many of that node's clients are in the group is the
     /// part that stays on the node.
     NodeGroup,
+    /// A user, whole. Boxed for the reason a rule is.
+    User(Box<UserRecord>),
 }
 
 impl MetadataValue {
@@ -288,6 +299,7 @@ impl MetadataValue {
                 epoch: *epoch,
             },
             Self::NodeGroup => MetadataValueRecord::NodeGroup,
+            Self::User(user) => MetadataValueRecord::User(user.clone()),
         }
     }
 
@@ -303,6 +315,7 @@ impl MetadataValue {
                 epoch,
             },
             MetadataValueRecord::NodeGroup => Self::NodeGroup,
+            MetadataValueRecord::User(user) => Self::User(user),
         }
     }
 
@@ -315,6 +328,7 @@ impl MetadataValue {
             Self::Rule(_) => "a rule",
             Self::SessionOwner { .. } => "a session owner",
             Self::NodeGroup => "a shared group membership",
+            Self::User(_) => "a user",
         }
     }
 
@@ -327,6 +341,7 @@ impl MetadataValue {
                 | (MetadataKey::Rule { .. }, Self::Rule(_))
                 | (MetadataKey::SessionOwner { .. }, Self::SessionOwner { .. })
                 | (MetadataKey::NodeGroup { .. }, Self::NodeGroup)
+                | (MetadataKey::User { .. }, Self::User(_))
         )
     }
 }
@@ -623,7 +638,8 @@ fn index(
         // routing does not read.
         MetadataKey::Retained { .. }
         | MetadataKey::Rule { .. }
-        | MetadataKey::SessionOwner { .. } => {}
+        | MetadataKey::SessionOwner { .. }
+        | MetadataKey::User { .. } => {}
     }
 }
 
@@ -1264,6 +1280,27 @@ impl Replicated {
     pub fn rule_removed(&self, id: &str) -> MetadataWrite {
         let mut state = self.held();
         self.write(&mut state, MetadataKey::Rule { id: id.to_owned() }, None)
+    }
+
+    /// A user was written, whole. Section 12.1.
+    pub fn user(&self, user: UserRecord) -> MetadataWrite {
+        let mut state = self.held();
+        let key = MetadataKey::User {
+            name: user.name.clone(),
+        };
+        self.write(&mut state, key, Some(MetadataValue::User(Box::new(user))))
+    }
+
+    /// A user was removed.
+    pub fn user_removed(&self, name: &str) -> MetadataWrite {
+        let mut state = self.held();
+        self.write(
+            &mut state,
+            MetadataKey::User {
+                name: name.to_owned(),
+            },
+            None,
+        )
     }
 
     /// Who owns `session`, and at what epoch. Section 8.4.

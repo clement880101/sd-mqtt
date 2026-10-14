@@ -2341,6 +2341,68 @@ mod contract {
         assert_eq!(restore(&store).rules, vec![rule("b")]);
     }
 
+    /// A user is held, replaced whole and removed, like a rule, and
+    /// comes back in name order. Section 12.1.
+    pub fn users_are_held_replaced_and_removed<S: Storage>(new: impl Fn() -> S) {
+        fn user(name: &str, hash: &str) -> storage::record::UserRecord {
+            storage::record::UserRecord {
+                name: name.to_owned(),
+                password: Some(storage::record::Secret::new(hash)),
+                scram: Some(storage::record::ScramVerifierRecord {
+                    salt: vec![1, 2, 3],
+                    iterations: 4096,
+                    stored_key: storage::record::Secret::new("stored"),
+                    server_key: storage::record::Secret::new("server"),
+                }),
+                created_at: 9,
+            }
+        }
+        let store = new();
+        assert!(
+            restore(&store).users.is_empty(),
+            "an empty store holds no users"
+        );
+        apply(
+            &store,
+            &[
+                Record::UserPut(Box::new(user("bob", "$one"))),
+                Record::UserPut(Box::new(user("alice", "$two"))),
+            ],
+        );
+        assert_eq!(
+            restore(&store).users,
+            vec![user("alice", "$two"), user("bob", "$one")],
+            "both come back, in name order, verifier and all"
+        );
+        apply(
+            &store,
+            &[Record::UserPut(Box::new(user("alice", "$three")))],
+        );
+        assert_eq!(
+            restore(&store).users,
+            vec![user("alice", "$three"), user("bob", "$one")],
+            "a put over a held name replaces it whole"
+        );
+        apply(
+            &store,
+            &[Record::UserDeleted {
+                name: "alice".to_owned(),
+            }],
+        );
+        assert_eq!(restore(&store).users, vec![user("bob", "$one")]);
+        apply(
+            &store,
+            &[Record::UserDeleted {
+                name: "never".to_owned(),
+            }],
+        );
+        assert_eq!(
+            restore(&store).users,
+            vec![user("bob", "$one")],
+            "removing a name nobody has is a no-op, like every removal here"
+        );
+    }
+
     /// A rule belongs to the node, not to a session.
     ///
     /// The mistake this guards is filing rules under whatever structure
@@ -3100,6 +3162,7 @@ macro_rules! every_contract_test {
             releasing_a_body_that_is_not_held_is_refused,
             a_pop_does_not_release_the_body_it_named,
             rules_are_held_replaced_and_removed,
+            users_are_held_replaced_and_removed,
             a_rule_survives_the_session_that_was_there_when_it_was_made,
             an_outbox_holds_an_envelope_with_every_field_and_counts_it,
             an_attempt_moves_the_stored_count_and_the_next_time,

@@ -428,6 +428,8 @@ struct Node<'a> {
     /// Section 8.5's policy, on the same nodes as the mesh: the two
     /// are made together and neither is useful without the other.
     gate: Option<&'a Arc<Gate>>,
+    /// Section 12.1's directory, on a node with a store.
+    directory: Option<&'a Arc<directory::Directory>>,
 }
 
 /// Start section 8.1's mesh, when this node clusters.
@@ -598,6 +600,9 @@ struct Rebuilt {
     /// ones it held, and a second restore would be a second answer to
     /// both.
     replicated: Arc<Replicated>,
+    /// Section 12.1's users, as the store held them, for the directory
+    /// to start from.
+    users: Vec<storage::record::UserRecord>,
 }
 
 /// The same, against a store somebody else opened.
@@ -796,6 +801,7 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, Sta
         identity: reconciled.identity,
         copies,
         replicated,
+        users: restored.users.clone(),
     })
 }
 
@@ -844,7 +850,8 @@ async fn start_admin(
         // Section 11.1 serves rules, and section 9.1 makes one
         // durable metadata, so a node with no store has none to
         // serve. See `sdmqtt_admin::rules`.
-        .with_rules(registry.map(Arc::clone));
+        .with_rules(registry.map(Arc::clone))
+        .with_directory(node.directory.map(Arc::clone));
     // **Section 8.1's identity, not the word `local`.** A node with no
     // store has none — its identity is a thing that is written down —
     // so it keeps the old answer, which is honest: it is the only node
@@ -991,6 +998,32 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         Some(rebuilt) => Arc::clone(&rebuilt.shared),
         None => Arc::new(Shared::new(config.server().broker)),
     };
+
+    // Section 12.1's directory, **before anything binds**, for the
+    // reason the rules are: the first packet after a listener comes up
+    // is a CONNECT, and a connect that found no authenticator installed
+    // would be admitted by the default. A node with no store has no
+    // directory — a user is durable metadata — and admits by the
+    // default alone.
+    let directory = rebuilt.as_ref().map(|rebuilt| {
+        let directory = directory::Directory::new(
+            Arc::clone(&rebuilt.writer),
+            Arc::clone(&shared),
+            Arc::clone(&rebuilt.replicated),
+            directory::Settings {
+                anonymous: config.auth.anonymous,
+                scram_iterations: config.auth.scram_iterations,
+            },
+            rebuilt.users.clone(),
+        );
+        shared.with_broker(|broker| broker.hooks_mut().install(directory.hook()));
+        tracing::info!(
+            users = directory.users().len(),
+            anonymous = config.auth.anonymous,
+            "the directory is installed"
+        );
+        directory
+    });
 
     // **Before anything binds.** A rule half installed is a message
     // that fires nothing, and the first thing a client does after a
@@ -1239,6 +1272,11 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
                     applying,
                     Arc::clone(&rebuilt.shared),
                     Arc::clone(registry),
+                    Arc::clone(
+                        directory
+                            .as_ref()
+                            .expect("a node with a store has a directory"),
+                    ),
                 )));
             }
             replicating.push(tokio::spawn(replication::exchanging(
@@ -1356,6 +1394,7 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             migrations: &migrations,
             copies: copies.as_ref(),
             gate: gate.as_ref(),
+            directory: directory.as_ref(),
         },
     )
     .await?;
