@@ -82,6 +82,15 @@ rejoin and be repaired before the next.
   refusal; 0x87 on an acknowledged publish, dropped and counted
   otherwise. Only the first level is reserved.
 
+- **API keys**, section 11.1, with `read`, `write` and `admin` scopes.
+  `POST /api/v1/keys` mints one and shows it once; the broker stores a
+  SHA-256 digest; `DELETE /api/v1/keys/{id}` revokes, and keys and
+  revocations replicate as registers. Every mutating endpoint names the
+  scope it needs. The configured `admin.token` is now the bootstrap key
+  with `admin` scope. **A `write` key cannot manage users, access
+  control rules, keys or nodes**, and is answered with the new `forbidden`
+  error code and `403`.
+
 - **A listener's maximum QoS and retain availability**, section 5.4's
   two deferred properties. `listener.max_qos` (0, 1 or 2) is advertised
   to version 5 clients and enforced on every publish: above the cap is

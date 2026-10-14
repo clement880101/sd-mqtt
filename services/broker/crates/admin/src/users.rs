@@ -12,8 +12,8 @@
 //!
 //! # Guarded like every mutation
 //!
-//! Creating and deleting need the configured token today, and an
-//! `admin` key once API keys exist. [`Authorized`] is the guard.
+//! Creating and deleting need an `admin` key, which the configured
+//! token is. [`Authorized`] is the guard.
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -24,7 +24,7 @@ use serde::Deserialize;
 use storage::record::Secret;
 
 use crate::error::{ApiError, ErrorCode};
-use crate::resources::{page, select, Authorized, Page, Paging};
+use crate::resources::{page, select, Authorized, Page, Paging, ToAdminister};
 use crate::AdminState;
 
 /// A user as a caller writes one.
@@ -89,7 +89,7 @@ async fn read(
 
 async fn create(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToAdminister>,
     body: Result<Json<UserSpec>, JsonRejection>,
 ) -> Result<Json<UserView>, ApiError> {
     let Json(spec) = body.map_err(|rejection| {
@@ -107,7 +107,7 @@ async fn create(
 
 async fn delete(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToAdminister>,
     Path(name): Path<String>,
 ) -> Result<Json<Deleted>, ApiError> {
     directory(&state)?
@@ -172,6 +172,7 @@ mod tests {
             Arc::clone(&shared),
             replicated,
             directory::Settings::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         );

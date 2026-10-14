@@ -1103,6 +1103,23 @@ is refused wherever it is written — the file and `SDMQTT_ADMIN_TOKEN` read it
 the same way, because one value meaning two things in one program is how an
 operator comes to believe a listener is guarded when it is not.
 
+**Since milestone 7 there are API keys, and the token is the first of
+them.** A key has a name and one of three scopes, ordered: `read` opens
+taps, `write` also publishes and writes rules, `admin` also writes users,
+access control rules and keys, and forgets nodes. A key is
+`sdmqtt_<id>_<secret>` with thirty-two random bytes of secret; it is shown
+once, in the answer that minted it, and stored as a SHA-256 digest, which
+needs no salt or work factor because nothing about it is guessable. Keys
+are durable metadata and replicate as section 8.2 registers; a revocation
+is a tombstone. The configured token stays as a bootstrap key with
+`admin` scope, so a cluster can mint its first key, and the startup
+refusal is unchanged: a non-loopback listener still needs it. A request
+presenting a real key that is too narrow is answered `403 forbidden`,
+naming both scopes; anything else wrong is `401 unauthorized`, in one
+sentence whichever it was. The read resources stay unguarded. The UI
+session cookie is not built: the Settings page sends a key the operator
+pastes, held for the tab's life.
+
 **Where it listens is an answer to another host, not to a browser on this
 one.** An ordinary cross-origin request is already stopped: every mutating
 endpoint takes a JSON body, which forces a preflight, and nothing here

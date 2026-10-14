@@ -84,7 +84,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::error::{ApiError, ErrorCode};
-use crate::resources::{page, select, Authorized, Page, Paging};
+use crate::resources::{page, select, Authorized, Page, Paging, ToWrite};
 use serde::Serialize;
 
 use crate::AdminState;
@@ -290,7 +290,7 @@ async fn read(
 /// finds out. Changing one is [`update`].
 async fn create(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToWrite>,
     request: Result<Json<RuleSpec>, JsonRejection>,
 ) -> Result<Json<RuleView>, ApiError> {
     let registry = registry(&state)?;
@@ -321,7 +321,7 @@ async fn create(
 /// note.
 async fn update(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToWrite>,
     Path(id): Path<String>,
     request: Result<Json<RuleSpec>, JsonRejection>,
 ) -> Result<Json<RuleView>, ApiError> {
@@ -355,7 +355,7 @@ async fn update(
 /// Turn a rule on.
 async fn enable(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToWrite>,
     Path(id): Path<String>,
 ) -> Result<Json<RuleView>, ApiError> {
     switch(&state, &id, true).await
@@ -364,7 +364,7 @@ async fn enable(
 /// Turn a rule off, without deleting it.
 async fn disable(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToWrite>,
     Path(id): Path<String>,
 ) -> Result<Json<RuleView>, ApiError> {
     switch(&state, &id, false).await
@@ -387,7 +387,7 @@ async fn switch(state: &AdminState, id: &str, enabled: bool) -> Result<Json<Rule
 /// somebody it had accepted. See [`::rules::live`].
 async fn delete(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToWrite>,
     Path(id): Path<String>,
 ) -> Result<Json<Deleted>, ApiError> {
     let id = identifier(&id)?;

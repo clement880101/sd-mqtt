@@ -422,6 +422,27 @@ method. Passwords are taken as written: SASLprep is not applied, so a
 password that is plain ASCII behaves exactly as RFC 7677 describes and
 one that is not should be set through a client that normalises it.
 
+### Who may use the admin API
+
+Mutating requests to the admin listener need an **API key** with a scope
+that covers them: `read` opens taps, `write` also publishes and writes
+rules, `admin` also manages users, access control rules, keys and nodes.
+The configured `admin.token` is a key with `admin` scope, which is how
+the first key is minted:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"ci","scope":"write"}' http://127.0.0.1:1884/api/v1/keys
+```
+
+The answer carries the key, `sdmqtt_<id>_<secret>`, **once**: the broker
+keeps a digest of it and nothing that would give it back. `GET
+/api/v1/keys` lists identifiers, names and scopes; `DELETE
+/api/v1/keys/{id}` revokes, and the revocation replicates to every node
+like a user's removal. A real key that is too narrow is answered `403`
+with both scopes named; a wrong one is `401`. A node with no store
+holds no keys, and the token is then the only credential.
+
 ### Who may publish and subscribe where
 
 ```toml
@@ -842,7 +863,9 @@ allowed_hosts = ["broker.internal"]   # only if you reach it through a name
 
 The admin listener is bound to loopback by default, and binding it
 further with no `admin.token` set is refused at startup rather than
-warned about: the API publishes.
+warned about: the API publishes. On loopback with no token, a mutating
+request that presents nothing is still answered; one that presents a
+key is judged by it.
 
 It also checks the name a request was made under. An **address** is
 always answered — by a browser, a probe, a scraper, `curl` — and so is

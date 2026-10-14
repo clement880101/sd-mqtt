@@ -1037,6 +1037,11 @@ pub enum MetadataKeyRecord {
         /// The identifier.
         id: String,
     },
+    /// An API key, by identifier.
+    ApiKey {
+        /// The identifier.
+        id: String,
+    },
 }
 
 /// What a replicated register holds, section 8.2.
@@ -1090,6 +1095,8 @@ pub enum MetadataValueRecord {
     User(Box<UserRecord>),
     /// An access control rule, whole.
     Acl(Box<AclRecord>),
+    /// An API key, whole.
+    ApiKey(Box<ApiKeyRecord>),
 }
 
 /// One replicated register, as a store holds it.
@@ -1553,6 +1560,35 @@ pub enum Record {
         /// Its identifier.
         id: String,
     },
+    /// An API key exists. Section 11.1.
+    ApiKeyPut(Box<ApiKeyRecord>),
+    /// An API key is revoked.
+    ApiKeyDeleted {
+        /// Its identifier.
+        id: String,
+    },
+}
+
+/// An API key, as stored. Section 11.1.
+///
+/// The secret itself is shown once, at creation, and kept nowhere:
+/// what is stored is a digest of it. A key is thirty-two random bytes,
+/// so the digest need not be slow — there is nothing to guess — and a
+/// request can be checked in the time a hash takes rather than the
+/// time a password hash is made to take.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyRecord {
+    /// The identifier, which the presented key carries in clear so the
+    /// digest to compare against can be found without trying them all.
+    pub id: String,
+    /// What an operator calls it.
+    pub name: String,
+    /// `read`, `write` or `admin`.
+    pub scope: String,
+    /// Base64 of the SHA-256 of the secret.
+    pub digest: Secret,
+    /// Seconds since the epoch.
+    pub created_at: u64,
 }
 
 /// One access control rule, as stored. Section 12.1.
@@ -1739,6 +1775,8 @@ impl Record {
             Self::UserDeleted { name } => name.len(),
             Self::AclPut(rule) => weigh_acl(rule),
             Self::AclDeleted { id } => id.len(),
+            Self::ApiKeyPut(key) => weigh_api_key(key),
+            Self::ApiKeyDeleted { id } => id.len(),
             // The client identifier is a peer's, and the rule
             // identifier an operator's. The payload is not counted
             // because it is not here: the `BodyPut` beside this record
@@ -1797,6 +1835,7 @@ fn weigh_metadata(entry: &MetadataRecord) -> usize {
         }
         Some(MetadataValueRecord::User(user)) => weigh_user(user),
         Some(MetadataValueRecord::Acl(rule)) => weigh_acl(rule),
+        Some(MetadataValueRecord::ApiKey(key)) => weigh_api_key(key),
     };
     weigh_metadata_key(&entry.key) + value
 }
@@ -1811,7 +1850,13 @@ fn weigh_metadata_key(key: &MetadataKeyRecord) -> usize {
         MetadataKeyRecord::NodeGroup { group, filter, .. } => group.len() + filter.len(),
         MetadataKeyRecord::User { name } => name.len(),
         MetadataKeyRecord::Acl { id } => id.len(),
+        MetadataKeyRecord::ApiKey { id } => id.len(),
     }
+}
+
+/// What a key's record holds beyond its own footprint.
+fn weigh_api_key(key: &ApiKeyRecord) -> usize {
+    key.id.len() + key.name.len() + key.scope.len() + key.digest.expose().len()
 }
 
 /// What a rule's record holds beyond its own footprint.

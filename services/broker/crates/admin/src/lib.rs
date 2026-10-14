@@ -8,10 +8,11 @@
 //!
 //! # What protects it
 //!
-//! Where it listens. Section 11.1: until milestone 7 there are no API
-//! keys, so the listener binds loopback by default and a non-loopback
-//! address with no token is refused at startup. See
-//! [`AdminConfig::check`].
+//! Where it listens, and API keys. Section 11.1: the listener binds
+//! loopback by default and a non-loopback address with no token is
+//! refused at startup, see [`AdminConfig::check`]; a mutating request
+//! needs a key whose scope covers it, and the token is the bootstrap
+//! `admin` key, see [`resources::Authorized`].
 //!
 //! # HTTP/1.1 only, deliberately
 //!
@@ -40,6 +41,7 @@ pub mod error;
 pub mod events;
 pub mod health;
 pub mod host;
+pub mod keys;
 pub mod resources;
 pub mod rules;
 pub mod taps;
@@ -300,8 +302,8 @@ pub struct AdminState {
     pub shutdown: watch::Sender<bool>,
     /// How often the sampler reads the broker.
     pub events_interval: Duration,
-    /// The interim bearer token a mutating request must present,
-    /// when one is configured.
+    /// The bootstrap bearer token, an API key with `admin` scope, when
+    /// one is configured.
     ///
     /// Set by [`AdminServer::bind`] from the configuration it is
     /// given, so that the token the guard checks and the token the
@@ -719,6 +721,7 @@ fn router(state: AdminState, extra: Router<AdminState>) -> Router {
         .merge(rules::routes())
         .merge(users::routes())
         .merge(acl::routes())
+        .merge(keys::routes())
         .merge(events::routes())
         .merge(taps::routes())
         // Whatever the caller asked to be served here as well, inside

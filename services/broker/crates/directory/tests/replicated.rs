@@ -41,6 +41,7 @@ fn node() -> (Arc<Directory>, Arc<Replicated>, Arc<MemoryStorage>) {
         Settings::default(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
     );
     (directory, replicated, store)
 }

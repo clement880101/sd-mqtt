@@ -97,6 +97,15 @@ pub enum ErrorCode {
     /// rather than where it is first thrown, because the set is meant
     /// to be readable in one place.
     Unauthorized,
+    /// The request presented a key that is real, and the key may not
+    /// do this.
+    ///
+    /// Section 11.1: a mutating request needs a key with an
+    /// appropriate scope. Distinct from [`ErrorCode::Unauthorized`]
+    /// because the caller's next move is different — not a credential
+    /// to find but a wider one to ask for — and the message names the
+    /// scope the key has and the one the endpoint needs.
+    Forbidden,
     /// The request is well formed and disagrees with what is there.
     ///
     /// Creating a rule at an identifier something already holds, and
@@ -156,6 +165,7 @@ impl ErrorCode {
             ErrorCode::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             ErrorCode::NotAcceptable => StatusCode::NOT_ACCEPTABLE,
             ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
+            ErrorCode::Forbidden => StatusCode::FORBIDDEN,
             // 409, which is what "Conflict" is for.
             ErrorCode::Conflict => StatusCode::CONFLICT,
             // 429 rather than 503. The broker is healthy and every

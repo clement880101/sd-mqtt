@@ -406,14 +406,15 @@ pub async fn applying(
         let (for_rules, rest): (Vec<MetadataWrite>, Vec<MetadataWrite>) = writes
             .into_iter()
             .partition(|write| matches!(write.key(), MetadataKey::Rule { .. }));
-        // Section 12.1's users go to the directory, which writes them
-        // the way the rule registry writes a rule: the register and the
+        // Section 12.1's users, its access control rules and section
+        // 11.1's API keys go to the directory, which writes them the
+        // way the rule registry writes a rule: the register and the
         // record in one batch, stamped by nobody here.
         let (for_directory, for_broker): (Vec<MetadataWrite>, Vec<MetadataWrite>) =
             rest.into_iter().partition(|write| {
                 matches!(
                     write.key(),
-                    MetadataKey::User { .. } | MetadataKey::Acl { .. }
+                    MetadataKey::User { .. } | MetadataKey::Acl { .. } | MetadataKey::ApiKey { .. }
                 )
             });
 

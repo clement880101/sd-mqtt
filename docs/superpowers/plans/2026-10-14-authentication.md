@@ -442,7 +442,7 @@ gate, and ticked here as it lands:
   conformance baseline on 3.1.1 and stays on version 5 as an `assumption`
   (the suite asserts 0x80 where 3.9.3 lists 0x87); `test_dollar_topics`
   still passes, since it only asserts that nothing is delivered.
-- [ ] **Task 4** — API keys with `read`, `write` and `admin` scopes,
+- [x] **Task 4** — API keys with `read`, `write` and `admin` scopes,
   hashed at rest and shown once; the configured token stays as a bootstrap
   key with admin scope; revocation replicates as a tombstone.
 - [ ] **Task 5** — section 10.3's two limiters: the per-session publish

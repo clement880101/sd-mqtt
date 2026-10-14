@@ -605,6 +605,8 @@ struct Rebuilt {
     users: Vec<storage::record::UserRecord>,
     /// And its access control rules.
     acl: Vec<storage::record::AclRecord>,
+    /// And section 11.1's API keys, as digests.
+    api_keys: Vec<storage::record::ApiKeyRecord>,
 }
 
 /// The same, against a store somebody else opened.
@@ -805,6 +807,7 @@ fn restore_from(store: Arc<dyn Storage>, config: &Config) -> Result<Rebuilt, Sta
         replicated,
         users: restored.users.clone(),
         acl: restored.acl.clone(),
+        api_keys: restored.api_keys.clone(),
     })
 }
 
@@ -1019,6 +1022,7 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
             },
             rebuilt.users.clone(),
             rebuilt.acl.clone(),
+            rebuilt.api_keys.clone(),
         );
         shared.with_broker(|broker| broker.hooks_mut().install(directory.hook()));
         shared

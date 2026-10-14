@@ -198,7 +198,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::error::{ApiError, ErrorCode};
-use crate::resources::{Authorized, MAX_INLINE_PAYLOAD};
+use crate::resources::{Authorized, ToRead, MAX_INLINE_PAYLOAD};
 use crate::AdminState;
 
 /// How many taps may exist at once. See the module documentation.
@@ -1235,7 +1235,7 @@ struct ReadQuery {
 /// Open a tap.
 async fn create(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToRead>,
     body: Result<Json<TapRequest>, JsonRejection>,
 ) -> Result<Json<TapOpened>, ApiError> {
     let Json(request) = body.map_err(|rejection| {
@@ -1252,7 +1252,7 @@ async fn create(
 }
 
 /// List the taps.
-async fn list(State(state): State<AdminState>, _authorized: Authorized) -> Json<TapList> {
+async fn list(State(state): State<AdminState>, _authorized: Authorized<ToRead>) -> Json<TapList> {
     let items = state.taps.list();
     Json(TapList {
         live: state.taps.live(),
@@ -1264,7 +1264,7 @@ async fn list(State(state): State<AdminState>, _authorized: Authorized) -> Json<
 /// Read one, and renew its lease.
 async fn read(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToRead>,
     id: Result<Path<u64>, PathRejection>,
     query: Result<Query<ReadQuery>, QueryRejection>,
 ) -> Result<Json<TapRead>, ApiError> {
@@ -1281,7 +1281,7 @@ async fn read(
 /// Close one.
 async fn close(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToRead>,
     id: Result<Path<u64>, PathRejection>,
 ) -> Result<Json<TapView>, ApiError> {
     let Path(id) = id.map_err(path_not_a_tap)?;

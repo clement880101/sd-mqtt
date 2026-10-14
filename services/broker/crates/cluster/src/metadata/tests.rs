@@ -144,6 +144,18 @@ fn every_kind(me: NodeId) -> Vec<(MetadataKey, MetadataValue)> {
                 subscribe: Some(true),
             })),
         ),
+        (
+            MetadataKey::ApiKey {
+                id: "k1".to_owned(),
+            },
+            MetadataValue::ApiKey(Box::new(storage::record::ApiKeyRecord {
+                id: "k1".to_owned(),
+                name: "ci".to_owned(),
+                scope: "write".to_owned(),
+                digest: storage::record::Secret::new("digest"),
+                created_at: 2,
+            })),
+        ),
     ]
 }
 
@@ -257,6 +269,7 @@ fn every_kind_survives_a_restart() {
                 .expect("the first member writes a register"),
             MetadataValue::User(held) => before.user(*held),
             MetadataValue::Acl(held) => before.acl(*held),
+            MetadataValue::ApiKey(held) => before.api_key(*held),
         });
     }
     // And a tombstone, which is the last unsubscribe: the register that

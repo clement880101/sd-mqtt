@@ -96,8 +96,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use storage::{
-    AclRecord, MetadataKeyRecord, MetadataRecord, MetadataValueRecord, Record, Restored,
-    RetainedRecord, RuleRecord, SeenRecord, SessionKey, StampRecord, UserRecord,
+    AclRecord, ApiKeyRecord, MetadataKeyRecord, MetadataRecord, MetadataValueRecord, Record,
+    Restored, RetainedRecord, RuleRecord, SeenRecord, SessionKey, StampRecord, UserRecord,
 };
 
 use crate::clock::HybridClock;
@@ -178,6 +178,11 @@ pub enum MetadataKey {
         /// The identifier.
         id: String,
     },
+    /// An API key, by identifier. Section 11.1.
+    ApiKey {
+        /// The identifier.
+        id: String,
+    },
 }
 
 impl MetadataKey {
@@ -207,6 +212,7 @@ impl MetadataKey {
             },
             Self::User { name } => MetadataKeyRecord::User { name: name.clone() },
             Self::Acl { id } => MetadataKeyRecord::Acl { id: id.clone() },
+            Self::ApiKey { id } => MetadataKeyRecord::ApiKey { id: id.clone() },
         }
     }
 
@@ -232,6 +238,7 @@ impl MetadataKey {
             },
             MetadataKeyRecord::User { name } => Self::User { name },
             MetadataKeyRecord::Acl { id } => Self::Acl { id },
+            MetadataKeyRecord::ApiKey { id } => Self::ApiKey { id },
         }
     }
 
@@ -246,6 +253,7 @@ impl MetadataKey {
             Self::NodeGroup { .. } => "a shared group membership",
             Self::User { .. } => "a user",
             Self::Acl { .. } => "an access control rule",
+            Self::ApiKey { .. } => "an API key",
         }
     }
 }
@@ -294,6 +302,8 @@ pub enum MetadataValue {
     User(Box<UserRecord>),
     /// An access control rule, whole.
     Acl(Box<AclRecord>),
+    /// An API key, whole.
+    ApiKey(Box<ApiKeyRecord>),
 }
 
 impl MetadataValue {
@@ -311,6 +321,7 @@ impl MetadataValue {
             Self::NodeGroup => MetadataValueRecord::NodeGroup,
             Self::User(user) => MetadataValueRecord::User(user.clone()),
             Self::Acl(rule) => MetadataValueRecord::Acl(rule.clone()),
+            Self::ApiKey(key) => MetadataValueRecord::ApiKey(key.clone()),
         }
     }
 
@@ -328,6 +339,7 @@ impl MetadataValue {
             MetadataValueRecord::NodeGroup => Self::NodeGroup,
             MetadataValueRecord::User(user) => Self::User(user),
             MetadataValueRecord::Acl(rule) => Self::Acl(rule),
+            MetadataValueRecord::ApiKey(key) => Self::ApiKey(key),
         }
     }
 
@@ -342,6 +354,7 @@ impl MetadataValue {
             Self::NodeGroup => "a shared group membership",
             Self::User(_) => "a user",
             Self::Acl(_) => "an access control rule",
+            Self::ApiKey(_) => "an API key",
         }
     }
 
@@ -356,6 +369,7 @@ impl MetadataValue {
                 | (MetadataKey::NodeGroup { .. }, Self::NodeGroup)
                 | (MetadataKey::User { .. }, Self::User(_))
                 | (MetadataKey::Acl { .. }, Self::Acl(_))
+                | (MetadataKey::ApiKey { .. }, Self::ApiKey(_))
         )
     }
 }
@@ -654,7 +668,8 @@ fn index(
         | MetadataKey::Rule { .. }
         | MetadataKey::SessionOwner { .. }
         | MetadataKey::User { .. }
-        | MetadataKey::Acl { .. } => {}
+        | MetadataKey::Acl { .. }
+        | MetadataKey::ApiKey { .. } => {}
     }
 }
 
@@ -1331,6 +1346,23 @@ impl Replicated {
     pub fn acl_removed(&self, id: &str) -> MetadataWrite {
         let mut state = self.held();
         self.write(&mut state, MetadataKey::Acl { id: id.to_owned() }, None)
+    }
+
+    /// An API key was written, whole. Section 11.1.
+    pub fn api_key(&self, key: ApiKeyRecord) -> MetadataWrite {
+        let mut state = self.held();
+        let metadata_key = MetadataKey::ApiKey { id: key.id.clone() };
+        self.write(
+            &mut state,
+            metadata_key,
+            Some(MetadataValue::ApiKey(Box::new(key))),
+        )
+    }
+
+    /// An API key was revoked.
+    pub fn api_key_removed(&self, id: &str) -> MetadataWrite {
+        let mut state = self.held();
+        self.write(&mut state, MetadataKey::ApiKey { id: id.to_owned() }, None)
     }
 
     /// Who owns `session`, and at what epoch. Section 8.4.

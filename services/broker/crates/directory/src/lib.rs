@@ -32,9 +32,11 @@ use storage::record::{ScramVerifierRecord, Secret, UserRecord};
 use storage::{Record, Writer};
 
 pub mod acl;
+pub mod key;
 pub mod user;
 
-pub use storage::record::AclRecord;
+pub use key::{ApiKeyView, Minted, Scope};
+pub use storage::record::{AclRecord, ApiKeyRecord};
 pub use user::UserView;
 
 /// How the directory behaves beyond its tables.
@@ -85,6 +87,12 @@ pub enum DirectoryError {
         /// The identifier asked for.
         id: String,
     },
+    /// No such API key.
+    #[error("there is no API key with the identifier {id}")]
+    NoSuchKey {
+        /// The identifier asked for.
+        id: String,
+    },
     /// The store would not take it.
     #[error("the store refused the change: {why}")]
     Storage {
@@ -93,7 +101,7 @@ pub enum DirectoryError {
     },
 }
 
-/// The directory: users, with access control rules and API keys to come.
+/// The directory: users, access control rules and API keys.
 pub struct Directory {
     writer: Arc<Writer>,
     shared: Arc<Shared>,
@@ -103,6 +111,8 @@ pub struct Directory {
     /// Section 12.1's access control rules, by identifier; consulted in
     /// order through [`Directory::acl`].
     acl: RwLock<BTreeMap<String, AclRecord>>,
+    /// Section 11.1's API keys, by identifier, as digests.
+    api_keys: RwLock<BTreeMap<String, ApiKeyRecord>>,
     /// One change at a time, so two puts of one name cannot interleave
     /// their records and their registers.
     changing: tokio::sync::Mutex<()>,
@@ -127,6 +137,7 @@ impl Directory {
         settings: Settings,
         restored: Vec<UserRecord>,
         restored_acl: Vec<AclRecord>,
+        restored_keys: Vec<ApiKeyRecord>,
     ) -> Arc<Self> {
         Arc::new(Self {
             writer,
@@ -143,6 +154,12 @@ impl Directory {
                 restored_acl
                     .into_iter()
                     .map(|rule| (rule.id.clone(), rule))
+                    .collect(),
+            ),
+            api_keys: RwLock::new(
+                restored_keys
+                    .into_iter()
+                    .map(|key| (key.id.clone(), key))
                     .collect(),
             ),
             changing: tokio::sync::Mutex::new(()),
@@ -208,6 +225,89 @@ impl Directory {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(id);
         Ok(())
+    }
+
+    /// Mint an API key. Section 11.1. The text is in the answer and
+    /// nowhere else.
+    ///
+    /// # Errors
+    ///
+    /// An unusable name, or a store that refused.
+    pub async fn create_api_key(&self, name: &str, scope: Scope) -> Result<Minted, DirectoryError> {
+        if name.is_empty() || name.chars().any(char::is_control) {
+            return Err(DirectoryError::BadName);
+        }
+        let _changing = self.changing.lock().await;
+        let minted = key::mint(name, scope, now());
+        let write = self.replicated.api_key(minted.record.clone());
+        let mut records = vec![Record::ApiKeyPut(Box::new(minted.record.clone()))];
+        records.extend(self.replicated.records(&write));
+        self.durable(records, Some(write)).await?;
+        self.api_keys
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(minted.record.id.clone(), minted.record.clone());
+        Ok(minted)
+    }
+
+    /// Revoke an API key. A tombstone replicates the revocation.
+    ///
+    /// # Errors
+    ///
+    /// No such key, or a store that refused.
+    pub async fn revoke_api_key(&self, id: &str) -> Result<(), DirectoryError> {
+        let _changing = self.changing.lock().await;
+        if !self
+            .api_keys
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(id)
+        {
+            return Err(DirectoryError::NoSuchKey { id: id.to_owned() });
+        }
+        let write = self.replicated.api_key_removed(id);
+        let mut records = vec![Record::ApiKeyDeleted { id: id.to_owned() }];
+        records.extend(self.replicated.records(&write));
+        self.durable(records, Some(write)).await?;
+        self.api_keys
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+        Ok(())
+    }
+
+    /// Every API key, by identifier, without secrets.
+    #[must_use]
+    pub fn api_keys(&self) -> Vec<ApiKeyView> {
+        self.api_keys
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .map(ApiKeyView::from)
+            .collect()
+    }
+
+    /// One API key, by identifier, without its secret.
+    #[must_use]
+    pub fn api_key(&self, id: &str) -> Option<ApiKeyView> {
+        self.api_keys
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .map(ApiKeyView::from)
+    }
+
+    /// What a presented key may do, when it is one this directory
+    /// minted and has not revoked.
+    ///
+    /// `None` for text that is not a key, a key nobody holds, or one
+    /// whose stored scope this build cannot read.
+    #[must_use]
+    pub fn scope_of_key(&self, presented: &str) -> Option<Scope> {
+        let id = key::id_of(presented)?;
+        let held = self.api_keys.read().unwrap_or_else(PoisonError::into_inner);
+        let record = held.get(id)?;
+        key::matches(record, presented).then(|| Scope::parse(&record.scope))?
     }
 
     /// The settings this directory runs with.
@@ -336,11 +436,12 @@ impl Directory {
         let name = match write.key() {
             MetadataKey::User { name } => name,
             MetadataKey::Acl { id } => return self.apply_replicated_acl(id, write).await,
+            MetadataKey::ApiKey { id } => return self.apply_replicated_key(id, write).await,
             other => {
                 tracing::error!(
                     kind = other.kind(),
-                    "a register that is neither a user nor an access control rule reached \
-                     the directory"
+                    "a register that is not a user, an access control rule or an API key \
+                     reached the directory"
                 );
                 return Ok(());
             }
@@ -403,6 +504,40 @@ impl Directory {
                 self.durable(vec![Record::AclDeleted { id: id.to_owned() }], None)
                     .await?;
                 self.acl
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(id);
+            }
+        }
+        Ok(())
+    }
+
+    /// A peer's API key, applied the way a peer's rule is.
+    async fn apply_replicated_key(
+        &self,
+        id: &str,
+        write: &MetadataWrite,
+    ) -> Result<(), DirectoryError> {
+        let _changing = self.changing.lock().await;
+        match write.register().value() {
+            Some(MetadataValue::ApiKey(key)) => {
+                self.durable(vec![Record::ApiKeyPut(key.clone())], None)
+                    .await?;
+                self.api_keys
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(id.to_owned(), (**key).clone());
+            }
+            Some(other) => {
+                tracing::error!(
+                    kind = other.kind(),
+                    "an API key's register carried something that is not one"
+                );
+            }
+            None => {
+                self.durable(vec![Record::ApiKeyDeleted { id: id.to_owned() }], None)
+                    .await?;
+                self.api_keys
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(id);

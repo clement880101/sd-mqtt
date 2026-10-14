@@ -1,15 +1,12 @@
 //! What the admin listener is configured with, and what it refuses.
 //!
-//! # The listener is protected by where it listens
+//! # The listener is protected by where it listens, and by keys
 //!
-//! Section 11.1: until milestone 7 there are no API keys. What stands
-//! in for them is the address. The listener binds loopback by default,
-//! a static bearer token may be configured, and mutating requests need
-//! it when one is set.
-//!
-//! The token is an interim and the configuration says so. It is one
-//! secret with no scopes, no rotation and no per-user identity, which
-//! is precisely what milestone 7 replaces.
+//! Section 11.1. The listener binds loopback by default, a static
+//! bearer token may be configured, and binding further without one is
+//! refused. Since milestone 7 the token is the bootstrap API key, with
+//! `admin` scope: what mints the first of the directory's keys, which
+//! carry scopes and can be revoked. See [`crate::resources::Authorized`].
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
@@ -82,7 +79,8 @@ pub struct AdminConfig {
     pub enabled: bool,
     /// Where to bind.
     pub address: SocketAddr,
-    /// The interim bearer token, if one is configured.
+    /// The bootstrap bearer token, if one is configured: an API key
+    /// with `admin` scope that lives in the file rather than the store.
     ///
     /// **Temporary.** Milestone 7 replaces it with API keys that have
     /// scopes, rotation and an identity behind them. It exists so that

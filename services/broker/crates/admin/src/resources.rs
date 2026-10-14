@@ -514,7 +514,7 @@ struct Forgot {
 /// has nothing to forget and answers not found for any identifier.
 async fn forget_node(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToAdminister>,
     Path(id): Path<String>,
 ) -> Result<Json<Forgot>, ApiError> {
     let Some(cluster) = &state.cluster else {
@@ -1133,50 +1133,118 @@ async fn retained(State(state): State<AdminState>, paging: Paging) -> Json<Page<
 // Publishing
 // ---------------------------------------------------------------
 
-/// Whether a request carried the token, when one is configured.
+/// Whether a request may do what the handler does, and that it
+/// proved it.
 ///
 /// An extractor rather than a line at the top of the handler,
 /// because a second mutating endpoint added later gets the guard by
-/// naming it in its signature and cannot get it by forgetting to.
+/// naming it in its signature and cannot get it by forgetting to. The
+/// type parameter is the scope the handler needs — [`ToRead`],
+/// [`ToWrite`] or [`ToAdminister`] — so the signature says what the
+/// endpoint grants and the check cannot be looser than it reads.
 ///
-/// Section 11.1: only *mutating* requests need it. The read
-/// resources are not guarded, and the listener's real protection
-/// until milestone 7 is where it listens.
+/// Section 11.1: only *mutating* requests need it. The read resources
+/// are not guarded, and a listener with no token configured is a
+/// loopback listener, which the startup refusal guarantees; on one, a
+/// request that presents nothing is admitted as before. A request
+/// that presents something is always judged: the configured token is
+/// the bootstrap `admin` key, and anything else is looked up as an
+/// API key the directory minted, whose scope must cover the handler's.
+/// A key that is real but too narrow is `forbidden`, and names both
+/// scopes; one that is not real, or a token that is wrong, is
+/// `unauthorized`, in one sentence whichever it was.
 #[derive(Debug)]
-pub struct Authorized;
+pub struct Authorized<Needs = ToAdminister>(std::marker::PhantomData<Needs>);
 
-impl FromRequestParts<AdminState> for Authorized {
+/// A scope a handler can require. Sealed: the three below are all.
+pub trait Needs: Send + Sync + 'static {
+    /// The least scope that will do.
+    const SCOPE: directory::Scope;
+}
+
+/// Opening taps: reading, through an endpoint that happens to `POST`.
+#[derive(Debug)]
+pub struct ToRead;
+/// Publishing, writing rules, forgetting what is routine.
+#[derive(Debug)]
+pub struct ToWrite;
+/// Users, access control, keys, membership.
+#[derive(Debug)]
+pub struct ToAdminister;
+
+impl Needs for ToRead {
+    const SCOPE: directory::Scope = directory::Scope::Read;
+}
+impl Needs for ToWrite {
+    const SCOPE: directory::Scope = directory::Scope::Write;
+}
+impl Needs for ToAdminister {
+    const SCOPE: directory::Scope = directory::Scope::Admin;
+}
+
+impl<N: Needs> FromRequestParts<AdminState> for Authorized<N> {
     type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AdminState,
     ) -> Result<Self, Self::Rejection> {
-        let Some(configured) = state.token.as_deref() else {
-            // Nothing to present. Section 11.1: a listener with no
-            // token is a loopback listener, which the startup
-            // refusal guarantees.
-            return Ok(Self);
-        };
         let presented = parts
             .headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .unwrap_or("");
-        if secret_eq(presented, configured.expose()) {
-            Ok(Self)
-        } else {
+            .and_then(|value| value.strip_prefix("Bearer "));
+        match scope_of(state, presented) {
+            Presented::Nothing if state.token.is_none() => Ok(Self(std::marker::PhantomData)),
+            Presented::Scope(scope) if scope >= N::SCOPE => Ok(Self(std::marker::PhantomData)),
+            Presented::Scope(scope) => Err(ApiError::new(
+                ErrorCode::Forbidden,
+                format!(
+                    "this key's scope is {scope}, and this endpoint needs {}",
+                    N::SCOPE
+                ),
+            )),
             // The same sentence whether the header was missing, the
             // scheme was wrong or the secret was: which of the three
             // it was is a fact about our configuration, and the
             // caller has not earned it.
-            Err(ApiError::new(
+            Presented::Nothing | Presented::Wrong => Err(ApiError::new(
                 ErrorCode::Unauthorized,
-                "this endpoint needs the configured admin token, presented as \
-                 `Authorization: Bearer <token>`",
-            ))
+                "this endpoint needs an API key with the right scope, or the configured \
+                 admin token, presented as `Authorization: Bearer <key>`",
+            )),
         }
+    }
+}
+
+/// What a request's credential came to.
+enum Presented {
+    /// No bearer at all.
+    Nothing,
+    /// A bearer, and it is the token or a key: this is what it may do.
+    Scope(directory::Scope),
+    /// A bearer that is neither.
+    Wrong,
+}
+
+/// Judge a bearer: the configured token first, in constant time, then
+/// the directory's keys.
+fn scope_of(state: &AdminState, presented: Option<&str>) -> Presented {
+    let Some(presented) = presented else {
+        return Presented::Nothing;
+    };
+    if let Some(configured) = state.token.as_deref() {
+        if secret_eq(presented, configured.expose()) {
+            return Presented::Scope(directory::Scope::Admin);
+        }
+    }
+    match state
+        .directory
+        .as_ref()
+        .and_then(|directory| directory.scope_of_key(presented))
+    {
+        Some(scope) => Presented::Scope(scope),
+        None => Presented::Wrong,
     }
 }
 
@@ -1354,7 +1422,7 @@ pub(crate) fn publish_refusal(refused: &PublishRefused) -> ApiError {
 /// been made instead.
 async fn publish(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToWrite>,
     body: Result<Json<PublishRequest>, JsonRejection>,
 ) -> Result<Json<PublishAccepted>, ApiError> {
     let Json(request) = body.map_err(|rejection| {

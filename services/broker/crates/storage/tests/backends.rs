@@ -2439,6 +2439,39 @@ mod contract {
         assert_eq!(restore(&store).acl, vec![rule("b", 2)]);
     }
 
+    /// An API key is held, replaced and removed like a rule.
+    pub fn api_keys_are_held_replaced_and_removed<S: Storage>(new: impl Fn() -> S) {
+        fn key(id: &str, scope: &str) -> storage::record::ApiKeyRecord {
+            storage::record::ApiKeyRecord {
+                id: id.to_owned(),
+                name: "ci".to_owned(),
+                scope: scope.to_owned(),
+                digest: storage::record::Secret::new("digest"),
+                created_at: 4,
+            }
+        }
+        let store = new();
+        assert!(restore(&store).api_keys.is_empty());
+        apply(
+            &store,
+            &[
+                Record::ApiKeyPut(Box::new(key("b", "write"))),
+                Record::ApiKeyPut(Box::new(key("a", "read"))),
+            ],
+        );
+        assert_eq!(
+            restore(&store).api_keys,
+            vec![key("a", "read"), key("b", "write")]
+        );
+        apply(&store, &[Record::ApiKeyPut(Box::new(key("a", "admin")))]);
+        assert_eq!(
+            restore(&store).api_keys,
+            vec![key("a", "admin"), key("b", "write")]
+        );
+        apply(&store, &[Record::ApiKeyDeleted { id: "a".to_owned() }]);
+        assert_eq!(restore(&store).api_keys, vec![key("b", "write")]);
+    }
+
     /// A rule belongs to the node, not to a session.
     ///
     /// The mistake this guards is filing rules under whatever structure
@@ -3200,6 +3233,7 @@ macro_rules! every_contract_test {
             rules_are_held_replaced_and_removed,
             users_are_held_replaced_and_removed,
             acl_rules_are_held_replaced_and_removed,
+            api_keys_are_held_replaced_and_removed,
             a_rule_survives_the_session_that_was_there_when_it_was_made,
             an_outbox_holds_an_envelope_with_every_field_and_counts_it,
             an_attempt_moves_the_stored_count_and_the_next_time,

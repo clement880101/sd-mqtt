@@ -44,6 +44,7 @@ fn broker_with(settings: Settings) -> (Arc<Shared>, Arc<Directory>) {
         settings,
         Vec::new(),
         Vec::new(),
+        Vec::new(),
     );
     shared.with_broker(|broker| broker.hooks_mut().install(directory.hook()));
     (shared, directory)

@@ -14,7 +14,7 @@ use directory::{AclRecord, Directory, DirectoryError};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorCode};
-use crate::resources::{page, select, Authorized, Page, Paging};
+use crate::resources::{page, select, Authorized, Page, Paging, ToAdminister};
 use crate::AdminState;
 
 /// A rule as the API spells one, in and out.
@@ -122,7 +122,7 @@ async fn read(
 
 async fn create(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToAdminister>,
     body: Result<Json<AclSpec>, JsonRejection>,
 ) -> Result<Json<AclSpec>, ApiError> {
     let Json(spec) = body.map_err(|rejection| {
@@ -140,7 +140,7 @@ async fn create(
 
 async fn delete(
     State(state): State<AdminState>,
-    _authorized: Authorized,
+    _authorized: Authorized<ToAdminister>,
     Path(id): Path<String>,
 ) -> Result<Json<Deleted>, ApiError> {
     directory(&state)?.delete_acl(&id).await.map_err(refusal)?;
@@ -200,6 +200,7 @@ mod tests {
             Arc::clone(&shared),
             replicated,
             directory::Settings::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         );

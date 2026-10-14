@@ -1251,6 +1251,37 @@ mod golden {
     }
 
     #[test]
+    fn api_key_put() {
+        pins(
+            &Record::ApiKeyPut(Box::new(crate::record::ApiKeyRecord {
+                id: "k1".to_owned(),
+                name: "ci".to_owned(),
+                scope: "write".to_owned(),
+                digest: crate::record::Secret::new("d"),
+                created_at: 3,
+            })),
+            &[
+                0x21, // Record::ApiKeyPut is variant 33
+                0x02, b'k', b'1', // id
+                0x02, b'c', b'i', // name
+                0x05, b'w', b'r', b'i', b't', b'e', // scope
+                0x01, b'd', // digest
+                0x03, // created_at
+            ],
+        );
+    }
+
+    #[test]
+    fn api_key_deleted() {
+        pins(
+            &Record::ApiKeyDeleted {
+                id: "k1".to_owned(),
+            },
+            &[0x22, 0x02, b'k', b'1'], // variant 34, then the identifier
+        );
+    }
+
+    #[test]
     fn replica_dropped() {
         pins(
             &Record::ReplicaDropped { session: key() },

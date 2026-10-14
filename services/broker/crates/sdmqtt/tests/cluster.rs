@@ -379,13 +379,18 @@ impl Node {
 
     /// The body of a `POST` of JSON, without its head.
     fn post(&self, path: &str, body: &str) -> String {
+        self.post_as(path, body, TOKEN).1
+    }
+
+    /// A `POST` of JSON presenting `bearer`: the status code and the body.
+    fn post_as(&self, path: &str, body: &str, bearer: &str) -> (u16, String) {
         let mut socket =
             TcpStream::connect_timeout(&self.admin, REPLY).expect("the listener accepts");
         socket
             .set_read_timeout(Some(REPLY))
             .expect("a read deadline");
         let head = format!(
-            "POST {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {TOKEN}\r\n\
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {bearer}\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\n\
              Connection: close\r\n\r\n",
             self.admin,
@@ -399,8 +404,13 @@ impl Node {
         let mut raw = Vec::new();
         socket.read_to_end(&mut raw).expect("the response ends");
         let text = String::from_utf8_lossy(&raw).into_owned();
+        let code = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status in {text:?}"));
         match text.split_once("\r\n\r\n") {
-            Some((_head, body)) => body.to_owned(),
+            Some((_head, body)) => (code, body.to_owned()),
             None => panic!("no body in {text:?}"),
         }
     }
@@ -2960,5 +2970,33 @@ async fn a_user_created_on_one_node_connects_on_another() {
     until("the delete has replicated", || {
         Client::connect_with(cluster.nodes[0].mqtt, "alice-at-alpha", "alice", "hunter2")
             == Some(ReasonCode::NotAuthorized)
+    });
+
+    // Section 11.1: an API key minted on alpha is a key on beta, with
+    // its scope and no more; revoked on gamma, it is nothing on beta.
+    let minted = cluster.nodes[0].post("/api/v1/keys", r#"{"name":"ci","scope":"write"}"#);
+    let minted: serde_json::Value = serde_json::from_str(&minted).expect("JSON");
+    let key = minted["key"].as_str().expect("the key, once").to_owned();
+    let id = minted["id"].as_str().expect("its identifier").to_owned();
+    let publication = r#"{"topic":"fleet/ci/build","payload":"ok","qos":1}"#;
+    until("the key has replicated to beta", || {
+        cluster.nodes[1]
+            .post_as("/api/v1/publish", publication, &key)
+            .0
+            == 200
+    });
+    let (code, body) = cluster.nodes[1].post_as(
+        "/api/v1/users",
+        r#"{"name":"carol","password":"hunter2"}"#,
+        &key,
+    );
+    assert_eq!(code, 403, "{body}");
+    let (code, _) = cluster.nodes[2].delete(&format!("/api/v1/keys/{id}"));
+    assert_eq!(code, 200);
+    until("the revocation has replicated to beta", || {
+        cluster.nodes[1]
+            .post_as("/api/v1/publish", publication, &key)
+            .0
+            == 401
     });
 }

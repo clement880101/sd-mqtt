@@ -62,6 +62,7 @@ fn broker_with(configured: Vec<AclRecord>) -> (Arc<Shared>, Arc<Directory>) {
         Settings::default(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
     );
     let in_force = RulesInForce::new(configured, Some(Arc::clone(&directory)));
     shared.with_broker(|broker| {

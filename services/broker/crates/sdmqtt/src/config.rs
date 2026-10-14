@@ -23,9 +23,9 @@
 //! it in a wrapper that refuses to print; see
 //! [`sdmqtt_admin::Token`].
 //!
-//! The token is an interim that milestone 7 replaces with API keys.
-//! Until then the admin listener is protected by where it listens, and
-//! [`Config::validate`] refuses a configuration that binds it further
+//! Since milestone 7 the token is the bootstrap API key, with `admin`
+//! scope; the keys it mints are the directory's. [`Config::validate`]
+//! still refuses a configuration that binds the admin listener further
 //! than loopback with no token set.
 //!
 //! # No store directory means no store
