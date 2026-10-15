@@ -632,6 +632,15 @@ burst is never less than one second's worth.
 `SDMQTT_MAX_PUBLISH_RATE` and `SDMQTT_PUBLISH_BURST` set the two on
 `[listener]`.
 
+**When the process runs out of file descriptors**, a listener pauses
+accepting for a moment and tries again, rather than spinning, and counts
+each pause on `sdmqtt_accept_pauses_total`. No connection is refused: it
+waits in the kernel's backlog until the pause ends. A counter that keeps
+moving means the descriptor limit is below what the node is asked to
+hold; raise it (`ulimit -n`, or `LimitNOFILE=` under systemd), since each
+connection is one descriptor. `sdmqtt_build_info{version, allocator}`
+names the build a node runs.
+
 `[listener]` is the default listener and is named `mqtt`. More
 listeners share the same broker — the same sessions, subscriptions,
 retained messages and store — and each carries its own policy:

@@ -12,6 +12,8 @@ by what it does, not by what its Dockerfile says:
 - an MQTT client connects;
 - it has no shell, carries `LICENSE` and both notices files, and is
   under 25 MB;
+- its binary says the workspace's version, so the image a release pushes
+  cannot carry another build's binary;
 - without `SDMQTT_ADMIN_TOKEN` it refuses to start, because its admin
   listener binds every interface;
 - **a durable session survives `docker stop` and `docker start`**: the
@@ -140,12 +142,23 @@ def main() -> int:
     shell = docker("run", "--rm", "--entrypoint", "/bin/sh", IMAGE, "-c", "true", check_status=False)
     check("the image has no shell", shell.returncode != 0)
 
-    refused = docker("run", "--rm", IMAGE, check_status=False)
-    check(
-        "without an admin token it refuses to start",
-        refused.returncode != 0 and "token" in (refused.stderr + refused.stdout).lower(),
-        (refused.stderr + refused.stdout)[-300:],
-    )
+    # Bounded, because the failure this guards against is a broker that
+    # starts: without a timeout that would hang the job, not fail it.
+    unguarded = "sdmqtt-image-test-" + uuid.uuid4().hex[:8]
+    try:
+        refused = subprocess.run(
+            ["docker", "run", "--rm", "--name", unguarded, IMAGE],
+            capture_output=True, text=True, timeout=60,
+        )
+        said = refused.stderr + refused.stdout
+        check(
+            "without an admin token it refuses to start",
+            refused.returncode != 0 and "token" in said.lower(),
+            said[-300:],
+        )
+    except subprocess.TimeoutExpired:
+        check("without an admin token it refuses to start", False, "it was still running after 60 s")
+        docker("rm", "-f", unguarded, check_status=False)
 
     volume = "sdmqtt-image-test-" + uuid.uuid4().hex[:8]
     name = "sdmqtt-image-test-" + uuid.uuid4().hex[:8]
@@ -165,10 +178,13 @@ def main() -> int:
         if not up:
             return 1
         top = docker("top", name, "-eo", "pid,uid,comm").stdout
-        check("the process is uid 65532", "65532" in top, top)
+        uids = {line.split()[1] for line in top.splitlines()[1:] if line.split()[-1:] == ["sdmqtt"]}
+        check("the process is uid 65532", uids == {"65532"}, top)
 
-        notices = docker("run", "--rm", "--entrypoint", "/sdmqtt", "-v", f"{volume}:/probe", IMAGE, "--version", check_status=False)
-        check("the binary answers --version", notices.returncode == 0, notices.stderr)
+        cargo = (ROOT / "services/broker/Cargo.toml").read_text()
+        version = cargo.split("[workspace.package]", 1)[1].split('version = "', 1)[1].split('"', 1)[0]
+        said = docker("run", "--rm", "--entrypoint", "/sdmqtt", IMAGE, "--version", check_status=False)
+        check(f"the binary says {version}", said.stdout.strip() == f"sdmqtt {version}", said.stdout + said.stderr)
         copied = subprocess.run(["docker", "cp", f"{name}:/usr/share/doc/sdmqtt/", "-"], capture_output=True)
         listing = copied.stdout
         for wanted in (b"LICENSE", b"THIRD-PARTY-NOTICES.txt", b"web-THIRD-PARTY-NOTICES.txt"):

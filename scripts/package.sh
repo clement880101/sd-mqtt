@@ -75,12 +75,23 @@ case "$target" in
 esac
 
 chmod 0755 "$stage/$name/sdmqtt"
-# Reproducible enough to compare: fixed order, no owner names. And no
-# AppleDouble `._` files: macOS's tar writes one per file that carries
-# extended attributes, which scripts/test_package.py found in the first
-# archive this wrote.
-export COPYFILE_DISABLE=1
-tar -C "$stage" --uid 0 --gid 0 --uname root --gname root -czf "$out/$name.tar.gz" "$name" 2>/dev/null \
-    || tar -C "$stage" -czf "$out/$name.tar.gz" "$name"
+# Written by Python's tarfile rather than whichever tar the host has: in
+# a fixed order, owned by root, and carrying nothing of the machine it
+# was built on. GNU tar on a CI runner wrote the runner's uid into every
+# entry, and macOS's tar wrote AppleDouble files and its own extended
+# attributes; scripts/test_package.py checks for all three.
+python3 - "$stage" "$name" "$out/$name.tar.gz" <<'PACK'
+import os, sys, tarfile
+stage, name, destination = sys.argv[1:]
+def owned(info):
+    info.uid = info.gid = 0
+    info.uname = info.gname = "root"
+    info.pax_headers = {}
+    return info
+with tarfile.open(destination, "w:gz", format=tarfile.USTAR_FORMAT) as tar:
+    tar.add(os.path.join(stage, name), arcname=name, recursive=False, filter=owned)
+    for entry in sorted(os.listdir(os.path.join(stage, name))):
+        tar.add(os.path.join(stage, name, entry), arcname=f"{name}/{entry}", filter=owned)
+PACK
 (cd "$out" && { command -v sha256sum >/dev/null && sha256sum "$name.tar.gz" || shasum -a 256 "$name.tar.gz"; } > "$name.tar.gz.sha256")
 echo "wrote dist/$name.tar.gz"

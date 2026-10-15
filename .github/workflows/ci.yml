@@ -251,6 +251,15 @@ jobs:
       # because a release changes the sources it quotes.
       - name: The landing page agrees with what it quotes
         run: python3 scripts/test_site.py
+      # The release workflow's shape (nothing published before every
+      # artifact has run; no retired runner) and the archive test's
+      # commands on every host: both found by review, both run once per
+      # release otherwise.
+      - name: The release workflow and the archive test's commands
+        run: |
+          python3 -m pip install --quiet pyyaml==6.0.2
+          python3 scripts/test_release_workflow.py
+          python3 scripts/test_test_package.py
 
   # Section 15's fourth budget, idle resident memory under 30 MB. A
   # process has to start and settle, so it runs on the schedule rather

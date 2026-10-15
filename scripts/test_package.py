@@ -53,27 +53,33 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
-def launcher(target: str, unpacked: Path) -> tuple[list[str], str]:
-    """How to run the binary here, and the host the admin port is reached on."""
-    machine = platform.machine().lower()
+def commands(target: str, unpacked: Path, admin: int, mqtt: int, system: str, machine: str) -> tuple[list[str], list[str]]:
+    """How to ask the binary its version, and how to serve with it, on this host.
+
+    The admin listener ends up on `127.0.0.1:<admin>` of the host either
+    way. In a container that is a published port with bridge networking,
+    on every host: host networking would discard the publication, which
+    is the bug `scripts/test_test_package.py` exists to keep out.
+    """
+    machine = machine.lower()
+    binary = str(unpacked / "sdmqtt")
+    native_serve = ["serve", "--address", f"127.0.0.1:{mqtt}", "--admin-address", f"127.0.0.1:{admin}"]
     if target.endswith("apple-darwin"):
-        if sys.platform != "darwin":
+        if system != "darwin":
             raise SystemExit(f"{target} can only be run on macOS")
-        if target.startswith("x86_64") and machine in ("arm64", "aarch64"):
-            return ["arch", "-x86_64", str(unpacked / "sdmqtt")], "127.0.0.1"
-        return [str(unpacked / "sdmqtt")], "127.0.0.1"
+        prefix = ["arch", "-x86_64"] if target.startswith("x86_64") and machine in ("arm64", "aarch64") else []
+        return [*prefix, binary, "--version"], [*prefix, binary, *native_serve]
     arch = "amd64" if target.startswith("x86_64") else "arm64"
-    native = sys.platform.startswith("linux") and (
-        (arch == "amd64" and machine in ("x86_64", "amd64"))
-        or (arch == "arm64" and machine in ("aarch64", "arm64"))
+    native = system == "linux" and (
+        (arch == "amd64" and machine in ("x86_64", "amd64")) or (arch == "arm64" and machine in ("aarch64", "arm64"))
     )
     if native:
-        return [str(unpacked / "sdmqtt")], "127.0.0.1"
+        return [binary, "--version"], [binary, *native_serve]
+    container = ["docker", "run", "--rm", "--platform", f"linux/{arch}", "-v", f"{unpacked}:/pkg:ro"]
     return (
-        ["docker", "run", "--rm", "-i", "--platform", f"linux/{arch}",
-         "-v", f"{unpacked}:/pkg:ro", "--network", "host" if sys.platform.startswith("linux") else "bridge",
-         "alpine:3.20", "/pkg/sdmqtt"],
-        "127.0.0.1",
+        [*container, "alpine:3.20", "/pkg/sdmqtt", "--version"],
+        [*container, "-i", "-p", f"127.0.0.1:{admin}:1884", "-e", "SDMQTT_ADMIN_TOKEN=package-test",
+         "alpine:3.20", "/pkg/sdmqtt", "serve", "--admin-address", "0.0.0.0:1884"],
     )
 
 
@@ -96,7 +102,13 @@ def main() -> int:
     try:
         with tarfile.open(archive) as tar:
             names = tar.getnames()
+            owners = {(member.uid, member.gid, member.uname, member.gname) for member in tar.getmembers()}
+            foreign = sorted({key for member in tar.getmembers() for key in member.pax_headers})
             tar.extractall(work, filter="data")
+        # Whoever extracts with sudo gets these owners, so they are root
+        # and not the build runner's user.
+        check("every entry is owned by root", owners == {(0, 0, "root", "root")}, str(owners))
+        check("no entry carries the build machine's extended attributes", not foreign, str(foreign))
         top = f"sdmqtt-{version}-{target}"
         inside = {Path(name).name for name in names if name != top}
         check("one directory named for the archive", all(n == top or n.startswith(top + "/") for n in names), str(names))
@@ -106,19 +118,12 @@ def main() -> int:
         size = binary.stat().st_size if binary.is_file() else BUDGET_BYTES
         check("the binary is under 15 MB", size < BUDGET_BYTES, f"{size / 1e6:.2f} MB")
 
-        command, host = launcher(target, unpacked)
-        said = subprocess.run([*command, "--version"], capture_output=True, text=True, timeout=120)
+        admin = free_port()
+        version_command, serve = commands(target, unpacked, admin, free_port(), sys.platform, platform.machine())
+        host = "127.0.0.1"
+        said = subprocess.run(version_command, capture_output=True, text=True, timeout=120)
         check(f"--version says {version}", said.stdout.strip() == f"sdmqtt {version}", said.stdout + said.stderr)
 
-        admin = free_port()
-        serve = [*command, "serve", "--address", f"0.0.0.0:{free_port()}",
-                 "--admin-address", f"127.0.0.1:{admin}"]
-        if command[0] == "docker":
-            # In a container the admin port is published, so it binds
-            # every interface there, and then a token is required.
-            serve = command[:-1]
-            serve[serve.index("--rm") + 1:serve.index("--rm") + 1] = ["-p", f"127.0.0.1:{admin}:1884", "-e", "SDMQTT_ADMIN_TOKEN=package-test"]
-            serve += ["/pkg/sdmqtt", "serve", "--admin-address", "0.0.0.0:1884"]
         broker = subprocess.Popen(
             serve, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             env={**os.environ, "SDMQTT_CONFIG": "", "SDMQTT_STORAGE_DIRECTORY": ""},

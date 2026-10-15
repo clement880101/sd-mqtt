@@ -10,9 +10,15 @@ named. With `--notes`, the CHANGELOG's section for that version — from
 its heading to the next `## ` — is written to FILE as the release's
 body.
 
-The release workflow runs this first, so a tag the build disagrees with
-fails before anything is built or published. `scripts/test_check_version.py`
-breaks each source in turn.
+The release workflow runs this first, so a tag the sources disagree with
+fails before anything is built. **The built binaries are compared
+later, where they exist**: each archive's by `scripts/test_package.py`,
+which requires `--version` to say the version the archive is named for,
+and the image's by `scripts/test_image.py`, which requires the
+workspace's. Since this check ties the workspace's version to the tag,
+the chain from tag to every shipped binary is closed. `--binary` is for
+checking one by hand. `scripts/test_check_version.py` breaks each source
+in turn.
 """
 import argparse
 import json

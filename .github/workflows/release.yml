@@ -76,8 +76,10 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             runner: macos-14
+          # Intel macOS: GitHub retired macos-13 on 4 December 2025, and
+          # macos-15-intel is the label it names in its place.
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
@@ -102,9 +104,11 @@ jobs:
           path: dist/*
 
   # Two platforms, one build per platform, from the same Dockerfile the
-  # archives were cut from. Tested before it is pushed.
+  # archives were cut from. Tested before it is pushed, and pushed only
+  # after every archive has been unpacked and run, so a failing archive
+  # leaves no image in the registry and no release half made.
   image:
-    needs: [version, gates]
+    needs: [version, gates, linux, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: read
