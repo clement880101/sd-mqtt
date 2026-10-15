@@ -775,7 +775,13 @@ static HANDED_OUT: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 fn reserved_port() -> (TcpListener, u16) {
     // Started somewhere different in each process so that two runs in
     // quick succession do not queue up on the same first candidate.
-    let offset = usize::from(std::process::id() as u16) % PORTS.len();
+    // Hashed rather than the id itself: under nextest each test is a
+    // process, and consecutive ids one port apart collided in CI. See
+    // `first_candidate` in tests/cluster.rs.
+    let offset = usize::try_from(
+        u64::from(std::process::id()).wrapping_mul(2_654_435_761) % PORTS.len() as u64,
+    )
+    .unwrap_or(0);
     for step in 0..PORTS.len() {
         let port = PORTS.start + u16::try_from((offset + step) % PORTS.len()).unwrap_or(0);
         if !first_time(port) {

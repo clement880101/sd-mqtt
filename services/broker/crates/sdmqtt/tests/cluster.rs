@@ -536,14 +536,53 @@ fn raw_get(address: SocketAddr, path: &str) -> String {
 ///
 /// **Below every platform's ephemeral range, deliberately.** Linux draws
 /// automatic ports from 32768 upwards, macOS and Windows from 49152, so
-/// nothing in this window is ever assigned by the kernel: not a bind of
+/// nothing in this window is ever assigned by the kernel — which the
+/// first version of this said of 30,000 to 40,000, a quarter of which is
+/// Linux's, and GitHub's runners found it: not a bind of
 /// port zero and not the source port of an outbound connection. A port
 /// read from a bind of port zero is a hint and not a reservation — it is
 /// free again before the caller has it — and this test hands nine of them
 /// to three child processes that bind them milliseconds later. The same
 /// defect was measured in `tests/rules.rs` at one failure in six under
 /// load; this is the same fix.
-const PORTS: std::ops::Range<u16> = 30_000..40_000;
+const PORTS: std::ops::Range<u16> = 10_000..20_000;
+
+/// Under nextest every test is its own process, so [`HANDED_OUT`] is not
+/// shared between them and the only thing keeping two tests apart is
+/// where each starts. Consecutive tests have consecutive process ids, and
+/// starting at the id itself put them one port apart: the second took the
+/// first's admin port in the first CI run this project had. Hashed, near
+/// ids start far apart.
+fn first_candidate(pid: u32, len: usize) -> usize {
+    usize::try_from(u64::from(pid).wrapping_mul(2_654_435_761) % len as u64).unwrap_or(0)
+}
+
+// Linux hands out automatic ports from 32768, and the gates in front of
+// each node bind port zero: a test port in that range can be given to a
+// gate in another test between the check and the bind. Checked when this
+// compiles, so a range that reaches it does not build.
+const _: () = assert!(PORTS.end <= 32_768, "PORTS reaches Linux's ephemeral range");
+// tests/rules.rs draws from 20,000 to 30,000 in a process of its own.
+const _: () = assert!(
+    PORTS.end <= 20_000 || PORTS.start >= 30_000,
+    "PORTS overlaps tests/rules.rs"
+);
+
+#[test]
+fn near_process_ids_start_far_apart() {
+    for pid in 1_000..1_200_u32 {
+        for gap in 1..8 {
+            let a = first_candidate(pid, PORTS.len());
+            let b = first_candidate(pid + gap, PORTS.len());
+            let apart = a.abs_diff(b).min(PORTS.len() - a.abs_diff(b));
+            assert!(
+                apart >= 64,
+                "pids {pid} and {} start {apart} ports apart",
+                pid + gap
+            );
+        }
+    }
+}
 
 /// Every port this test binary has taken.
 static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
@@ -558,7 +597,7 @@ static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new()
 fn free_port() -> u16 {
     // Started somewhere different in each process so that two runs in
     // quick succession do not queue up on the same first candidate.
-    let offset = usize::from(std::process::id() as u16) % PORTS.len();
+    let offset = first_candidate(std::process::id(), PORTS.len());
     for step in 0..PORTS.len() {
         let port = PORTS.start + u16::try_from((offset + step) % PORTS.len()).unwrap_or(0);
         let mut handed = HANDED_OUT.lock().expect("not poisoned");
@@ -1139,36 +1178,50 @@ impl Cluster {
             let label = labels[at];
             let config = directory.join(format!("{label}.toml"));
             let store = directory.join(format!("{label}-store"));
-            let admin = loopback(free_port());
-            let mqtt = loopback(free_port());
             let seeds: Vec<SocketAddr> = (0..NODES)
                 .filter(|to| *to != at)
                 .map(|to| gates[&(at, to)].address())
                 .collect();
-            write_config(
-                &config,
-                &store,
-                label,
-                mqtt,
-                admin,
-                ports[at],
-                advertised[at],
-                &seeds,
-            );
-            let log = directory.join(format!("{label}.log"));
-            let mut node = Node {
-                child: spawn(&config, &store, &log, knobs),
-                admin,
-                mqtt,
-                log,
-                label,
-                config,
-                store,
-                knobs,
+            // A port this binary handed out can still be taken by another
+            // process on the machine between the check and the child's
+            // bind; that is a fact about the machine, not the broker, so
+            // the node is started again on fresh ports rather than the
+            // test failed. Anything else the node says is a failure.
+            let mut attempt = 0;
+            let node = loop {
+                attempt += 1;
+                let admin = loopback(free_port());
+                let mqtt = loopback(free_port());
+                write_config(
+                    &config,
+                    &store,
+                    label,
+                    mqtt,
+                    admin,
+                    ports[at],
+                    advertised[at],
+                    &seeds,
+                );
+                let log = directory.join(format!("{label}.log"));
+                let mut node = Node {
+                    child: spawn(&config, &store, &log, knobs),
+                    admin,
+                    mqtt,
+                    log,
+                    label,
+                    config: config.clone(),
+                    store: store.clone(),
+                    knobs,
+                };
+                match node.wait_until_listening() {
+                    Ok(()) => break node,
+                    Err(why) if attempt < 3 && why.contains("Address already in use") => {
+                        drop(node);
+                        let _ = std::fs::remove_dir_all(&store);
+                    }
+                    Err(why) => panic!("{why}"),
+                }
             };
-            if let Err(why) = node.wait_until_listening() {
-                panic!("{why}");
-            }
             nodes.push(node);
         }
         Self {
