@@ -7,6 +7,8 @@ on:
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
+  # The release workflow runs every gate here before it builds anything.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -239,6 +241,11 @@ jobs:
       # measurement of the real broker is the scheduled job below.
       - name: The idle memory check fails when it cannot measure
         run: python3 scripts/test_idle_memory.py
+      # The release workflow's first gate: a tag that disagrees with any
+      # source of the version is refused. Tested here so it is known to
+      # refuse before the day it is needed.
+      - name: The release version check refuses every disagreement
+        run: python3 scripts/test_check_version.py
 
   # Section 15's fourth budget, idle resident memory under 30 MB. A
   # process has to start and settle, so it runs on the schedule rather

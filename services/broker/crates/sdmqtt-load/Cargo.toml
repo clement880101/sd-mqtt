@@ -19,7 +19,7 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "derive", "error-context"] }
 
 [dev-dependencies]
-sdmqtt-server = { path = "../server", version = "0.1.0" }
+sdmqtt-server = { path = "../server", version = "0.7.0" }
 
 [lints]
 workspace = true

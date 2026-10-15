@@ -1,13 +1,14 @@
 # Changelog
 
-What changes between builds, and what an upgrade costs. Nothing is
-released yet, so there are no version numbers here; the headings are
-milestones, which is what this project actually ships in.
+What changes between builds, and what an upgrade costs. The first
+release is 0.7.0, numbered for the milestone it completes; the headings
+below it are milestones, which is what this project shipped in before
+it had releases.
 
 **The one thing to read before upgrading is "Before you upgrade" under
 the milestone you are moving to.** Everything else is description.
 
-## Unreleased — milestone 7: hardening
+## 0.7.0 — 2026-10-15 — milestone 7: hardening
 
 ### Before you upgrade: a store written before this milestone is refused
 

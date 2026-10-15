@@ -11,7 +11,7 @@ description = "Node identity, the authenticated link and the membership view for
 # The record vocabulary and nothing that touches a disk, for the reason
 # `broker-core` takes it that way: which engine a node's identity is
 # written to is the binary's choice and nothing this crate can see.
-storage = { path = "../storage", version = "0.1.0", default-features = false }
+storage = { path = "../storage", version = "0.7.0", default-features = false }
 # Section 8.3's routing map asks the same question the subscription trie
 # answers — which filters does this topic match — about other nodes'
 # filters rather than this node's sessions. So it is the same trie, in a
@@ -39,7 +39,7 @@ storage = { path = "../storage", version = "0.1.0", default-features = false }
 # `broker-core` gains no dependency, the `cargo tree -p broker-core -e
 # normal` check its own manifest documents is untouched, and there is no
 # cycle to make.
-broker-core = { path = "../broker-core", version = "0.1.0" }
+broker-core = { path = "../broker-core", version = "0.7.0" }
 # Section 8.1's identity is a UUID v7. The same features `broker-core`
 # names, and the same crate: a second version 7 generator in one binary
 # would be two answers to what a fresh identifier looks like.
@@ -86,7 +86,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # back unchanged across a restart" is a claim about a file, and the
 # in-memory backend answers it with a store that cannot be reopened.
 # Dev only: nothing this crate ships gains redb.
-storage = { path = "../storage", version = "0.1.0", features = ["redb"] }
+storage = { path = "../storage", version = "0.7.0", features = ["redb"] }
 # The directory those stores live in, thrown away with them.
 tempfile.workspace = true
 # Section 8.2's two properties are properties: a clock that resumes from
@@ -107,7 +107,7 @@ proptest.workspace = true
 # is the subscription trie in a second instance — so it is not repeated
 # here. The reasoning that used to live in this paragraph, and what of
 # it still holds, is above it.
-mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
+mqtt-codec = { path = "../mqtt-codec", version = "0.7.0" }
 # `rt` and `macros` for `#[tokio::test]`; `io-util` for `duplex`, which
 # is the pair of ends every handshake test runs over; `time` for the
 # bounds that make a stalled handshake fail rather than hang.

@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Subscription matching and retained message storage for sd-mqtt"
 
 [dependencies]
-mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
+mqtt-codec = { path = "../mqtt-codec", version = "0.7.0" }
 # The `Record` vocabulary, and nothing that touches a disk. Section 7.3
 # makes this crate pure: it says what happened and the shell writes it.
 #
@@ -23,7 +23,7 @@ mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
 # is about the dependency graph, which nothing inside the crate can see:
 # a `#[cfg]` cannot ask whether another package's feature is off, and by
 # the time this crate compiles the answer has already been decided.
-storage = { path = "../storage", version = "0.1.0", default-features = false }
+storage = { path = "../storage", version = "0.7.0", default-features = false }
 bytes.workspace = true
 thiserror.workspace = true
 foldhash = "0.2"

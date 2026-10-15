@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "broker-core"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -404,7 +404,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "cluster"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "aws-lc-rs",
  "broker-core",
@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "directory"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "argon2",
  "aws-lc-rs",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-codec"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "proptest",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "rules"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "base64",
@@ -1532,7 +1532,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sdmqtt"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "broker-core",
  "brotli",
@@ -1559,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "sdmqtt-admin"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "broker-core",
@@ -1583,7 +1583,7 @@ dependencies = [
 
 [[package]]
 name = "sdmqtt-load"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "clap",
  "sdmqtt-server",
@@ -1592,7 +1592,7 @@ dependencies = [
 
 [[package]]
 name = "sdmqtt-server"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "aws-lc-rs",
  "base64",
@@ -1757,7 +1757,7 @@ dependencies = [
 
 [[package]]
 name = "storage"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "postcard",
