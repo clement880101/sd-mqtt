@@ -30,6 +30,8 @@ RUN npm run build
 # --- the broker, cross-compiled ------------------------------------------
 FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-slim-bookworm AS builder
 ARG TARGETARCH
+# Extra cargo flags, for a measurement build only; see scripts/package.sh.
+ARG CARGO_FLAGS=""
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-pip ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
@@ -52,7 +54,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/services/broker/target \
     target="$(cat /target)" \
     && cd services/broker \
-    && cargo zigbuild --release --locked -p sdmqtt --target "$target" \
+    && cargo zigbuild --release --locked -p sdmqtt --target "$target" $CARGO_FLAGS \
     && mkdir -p /out/doc /out/data \
     && cp "target/$target/release/sdmqtt" /out/sdmqtt \
     && cd /src \

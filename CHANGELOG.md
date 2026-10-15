@@ -85,6 +85,15 @@ rejoin and be repaired before the next.
   refusal; 0x87 on an acknowledged publish, dropped and counted
   otherwise. Only the first level is reserved.
 
+- **Release archives** for `x86_64` and `aarch64` Linux (static musl,
+  cut from the image's own builder) and Intel and Apple silicon macOS:
+  `scripts/package.sh <target>` writes `dist/sdmqtt-<version>-<target>.tar.gz`
+  with the binary, LICENSE, README and both notices, and its `.sha256`.
+  `scripts/test_package.py` unpacks one and runs it — natively, under
+  Rosetta, or in a container of its architecture — and requires the
+  version, a ready broker and the embedded interface. It caught macOS
+  `tar` shipping AppleDouble `._` files in the first archive.
+
 - **A container image.** `services/broker/Dockerfile` cross-compiles the
   broker as a static musl binary with cargo-zigbuild and ships it on
   `scratch` with its licence and notices: about 10 MB, uid 65532, store

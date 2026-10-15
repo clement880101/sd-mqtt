@@ -1081,6 +1081,16 @@ enable its local dynamic TLS mode. The reason is that musl's allocator
 serializes on a single global lock and loses by a factor of seven on six
 cores and far more on larger machines.
 
+**As built in milestone 7**, and what was measured. The release's Linux
+binaries are static musl with mimalloc; `tests/allocator.rs` proves the
+allocator is in use, and the same check holds for the musl build. Against
+the same musl build on musl's own allocator, 50,000 connects took a median
+of 16,000 a second with mimalloc and 9,200 without, over three runs each
+whose ranges overlapped. The connect path is bound by the kernel more than
+by allocation, so that figure neither reproduces the factor of seven nor
+contradicts it; it is the literature's claim, about allocation-heavy
+multi-threaded work, and this project has not measured such a workload.
+
 ## 11. HTTP API, UI and observability
 
 ### 11.1 API
