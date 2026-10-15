@@ -6,6 +6,7 @@ on:
   pull_request:
   schedule:
     - cron: "0 3 * * *"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -219,6 +220,32 @@ jobs:
         run: scripts/test_budgets.sh
       - name: Budgets
         run: scripts/budgets.sh
+      # The idle memory check's own failure paths, against a fake broker
+      # that holds a known amount: seconds, so on every push. The
+      # measurement of the real broker is the scheduled job below.
+      - name: The idle memory check fails when it cannot measure
+        run: python3 scripts/test_idle_memory.py
+
+  # Section 15's fourth budget, idle resident memory under 30 MB. A
+  # process has to start and settle, so it runs on the schedule rather
+  # than on every push, as the section says.
+  memory:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/broker
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the binary that ships
+        working-directory: services/broker
+        run: cargo build --release -p sdmqtt
+      - name: Idle resident memory
+        run: python3 scripts/idle-memory.py services/broker/target/release/sdmqtt
 
   fuzz:
     runs-on: ubuntu-latest

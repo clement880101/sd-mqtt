@@ -1593,14 +1593,21 @@ in CI, not when the code is written.
 
 | Metric | Target | Today | Checked |
 |---|---|---|---|
-| Release binary, all features, stripped, link-time optimized | under 15 MB | 3.76 MB | every push |
-| Idle resident memory, single node, no clients | under 30 MB | not yet measured | scheduled |
-| UI bundle, gzipped | under 150 KB | 52.2 KB | every push |
-| Direct dependencies across broker crates | under 35 | 16 | every push |
+| Release binary, all features, stripped, link-time optimized | under 15 MB | 9.88 MB | every push |
+| Idle resident memory, single node, no clients | under 30 MB | 8.39 MB | scheduled |
+| UI bundle, gzipped | under 150 KB | 67.4 KB | every push |
+| Direct dependencies across broker crates | under 35 | 31 | every push |
 | Concurrent connections per node, target hardware | 100,000 | not yet measured | milestone 7 |
 
 The "today" column is the trend, not the limit, and is what tells a
-reader whether a budget is at 94% or at 4%. Recorded at the close of
+reader whether a budget is at 94% or at 4%. **Refreshed in milestone 7**,
+on macOS arm64 with `scripts/budgets.sh` and `scripts/idle-memory.py`: the
+binary at 9.88 MB with mimalloc in it, the idle broker at 8.39 MB resident
+with a store and no clients, the bundle at 67.4 KB with the Settings page,
+and thirty-one direct dependencies. The column had gone stale a second
+time, reading milestone 3's figures against a binary two and a half times
+that size; the paragraphs below are kept as the record of the first
+time. Recorded at the close of
 milestone 3 with `scripts/budgets.sh`: the binary was 3,764,176 bytes
 on macOS arm64, the bundle 52.2 KB across three documents, and the
 sixteen distinct direct dependencies were `axum`, `bytes`, `clap`,
