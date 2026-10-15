@@ -246,6 +246,11 @@ jobs:
       # refuse before the day it is needed.
       - name: The release version check refuses every disagreement
         run: python3 scripts/test_check_version.py
+      # The landing page may not quote a version or a figure its sources
+      # do not; checked on every push, not only when it is deployed,
+      # because a release changes the sources it quotes.
+      - name: The landing page agrees with what it quotes
+        run: python3 scripts/test_site.py
 
   # Section 15's fourth budget, idle resident memory under 30 MB. A
   # process has to start and settle, so it runs on the schedule rather

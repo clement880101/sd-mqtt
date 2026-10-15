@@ -86,6 +86,12 @@ rejoin and be repaired before the next.
   refusal; 0x87 on an acknowledged publish, dropped and counted
   otherwise. Only the first level is reserved.
 
+- **A landing page**, `site/index.html`, published with GitHub Pages by
+  `.github/workflows/pages.yml`. `scripts/test_site.py`, in CI and before
+  every deployment, holds it to its sources: every version it names is
+  the workspace's, every figure it quotes is one the spec, a decision or
+  the README records, and every link names this repository.
+
 - **Install documentation, checked.** The README opens with installing
   from a release archive, the image, and Compose, and carries a table of
   every configuration section and every `SDMQTT_*` variable;
