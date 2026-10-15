@@ -85,6 +85,13 @@ rejoin and be repaired before the next.
   refusal; 0x87 on an acknowledged publish, dropped and counted
   otherwise. Only the first level is reserved.
 
+- **The connection target is met.** 100,000 MQTT connections opened in
+  2.5 seconds and held for a minute on one node, at about 32 KB each;
+  `scripts/connection-target.sh` measures it in the development image
+  with `sdmqtt-load`, a generator that is a workspace member and never
+  ships. See `docs/decisions/0001-connection-target.md`. Running out of
+  file descriptors is now counted: `sdmqtt_accept_pauses_total`.
+
 - **mimalloc is the global allocator**, section 10.4, on every target
   but Windows, on by default and removable with
   `--no-default-features`; static musl builds use its local dynamic TLS

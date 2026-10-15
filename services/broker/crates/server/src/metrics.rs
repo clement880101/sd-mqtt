@@ -797,6 +797,9 @@ pub struct Metrics {
     /// fallen behind loses events, and none of them may disappear
     /// uncounted. See [`Metrics::admin_events_dropped`].
     admin_events_dropped: Counter,
+    /// Times a listener stopped accepting for a moment because accepting
+    /// failed for the whole process — descriptor exhaustion, in practice.
+    accept_pauses: Counter,
     /// Section 9's connectors, by why a publication one of them made
     /// went nowhere. One family rather than a counter per refusal,
     /// because an operator wants one number for "a connector lost a
@@ -1066,6 +1069,16 @@ impl Metrics {
             "Client sockets closed without being served, at the connection limit",
             sockets_refused.clone(),
         );
+        let accept_pauses = Counter::default();
+        registry.register(
+            "accept_pauses",
+            // No socket is refused when this moves: the connection
+            // waits in the kernel's backlog until the pause ends. What
+            // happened is that the process could not take it, which an
+            // operator fixes by raising the descriptor limit.
+            "Times accepting paused because the process could not take a connection, usually out of file descriptors",
+            accept_pauses.clone(),
+        );
         let admin_events_dropped = Counter::default();
         registry.register(
             "admin_events_dropped",
@@ -1203,6 +1216,7 @@ impl Metrics {
             rate_limited,
             auth_failure_addresses,
             admin_events_dropped,
+            accept_pauses,
             publications_refused,
             dropped_by_queue,
             dropped_by_shell,
@@ -1382,6 +1396,12 @@ impl Metrics {
     /// how an operator sees that a browser is falling behind.
     pub fn admin_events_dropped(&self) -> &Counter {
         &self.admin_events_dropped
+    }
+
+    /// A listener paused accepting because accepting failed for the
+    /// whole process. See `listener::affects_one_connection`.
+    pub fn accept_paused(&self) -> &Counter {
+        &self.accept_pauses
     }
 
     /// A publication a connector made that went nowhere, by why.

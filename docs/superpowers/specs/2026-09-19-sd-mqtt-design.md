@@ -1597,14 +1597,17 @@ in CI, not when the code is written.
 | Idle resident memory, single node, no clients | under 30 MB | 8.39 MB | scheduled |
 | UI bundle, gzipped | under 150 KB | 67.4 KB | every push |
 | Direct dependencies across broker crates | under 35 | 31 | every push |
-| Concurrent connections per node, target hardware | 100,000 | not yet measured | milestone 7 |
+| Concurrent connections per node, target hardware | 100,000 | 100,000 held, 32 KB each | before a release |
 
 The "today" column is the trend, not the limit, and is what tells a
 reader whether a budget is at 94% or at 4%. **Refreshed in milestone 7**,
 on macOS arm64 with `scripts/budgets.sh` and `scripts/idle-memory.py`: the
 binary at 9.88 MB with mimalloc in it, the idle broker at 8.39 MB resident
 with a store and no clients, the bundle at 67.4 KB with the Settings page,
-and thirty-one direct dependencies. The column had gone stale a second
+and thirty-one direct dependencies. The connection target is met: 100,000
+held for a minute on one node, measured by `scripts/connection-target.sh` on
+the machine [decision 0001](../../decisions/0001-connection-target.md)
+names, at about 32 KB of broker memory each. The column had gone stale a second
 time, reading milestone 3's figures against a binary two and a half times
 that size; the paragraphs below are kept as the record of the first
 time. Recorded at the close of

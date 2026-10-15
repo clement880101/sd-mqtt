@@ -1582,6 +1582,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdmqtt-load"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "sdmqtt-server",
+ "tokio",
+]
+
+[[package]]
 name = "sdmqtt-server"
 version = "0.1.0"
 dependencies = [
