@@ -86,6 +86,15 @@ rejoin and be repaired before the next.
   refusal; 0x87 on an acknowledged publish, dropped and counted
   otherwise. Only the first level is reserved.
 
+- **Install documentation, checked.** The README opens with installing
+  from a release archive, the image, and Compose, and carries a table of
+  every configuration section and every `SDMQTT_*` variable;
+  `tests/documented.rs` fails naming any variable the configuration reads
+  or any section it accepts that the README does not mention, which found
+  ten variables and two sections missing. The store-format refusal no
+  longer says nothing is released: it says releases before 1.0 do not
+  migrate a store.
+
 - **Release archives** for `x86_64` and `aarch64` Linux (static musl,
   cut from the image's own builder) and Intel and Apple silicon macOS:
   `scripts/package.sh <target>` writes `dist/sdmqtt-<version>-<target>.tar.gz`

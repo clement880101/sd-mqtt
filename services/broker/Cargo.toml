@@ -7,7 +7,7 @@ version = "0.7.0"
 edition = "2021"
 rust-version = "1.90"
 license = "MIT"
-repository = "https://github.com/clementchang/sd-mqtt"
+repository = "https://github.com/clement880101/sd-mqtt"
 
 [workspace.dependencies]
 bytes = "1"

@@ -1607,7 +1607,7 @@ in CI, not when the code is written.
 | Metric | Target | Today | Checked |
 |---|---|---|---|
 | Release binary, all features, stripped, link-time optimized | under 15 MB | 9.88 MB | every push |
-| Idle resident memory, single node, no clients | under 30 MB | 8.39 MB | scheduled |
+| Idle resident memory, single node, no clients | under 30 MB | 19.4 MB (Linux, musl) | scheduled |
 | UI bundle, gzipped | under 150 KB | 67.4 KB | every push |
 | Direct dependencies across broker crates | under 35 | 31 | every push |
 | Concurrent connections per node, target hardware | 100,000 | 100,000 held, 32 KB each | before a release |
@@ -1616,7 +1616,8 @@ The "today" column is the trend, not the limit, and is what tells a
 reader whether a budget is at 94% or at 4%. **Refreshed in milestone 7**,
 on macOS arm64 with `scripts/budgets.sh` and `scripts/idle-memory.py`: the
 binary at 9.88 MB with mimalloc in it, the idle broker at 8.39 MB resident
-with a store and no clients, the bundle at 67.4 KB with the Settings page,
+with a store and no clients — and 19.4 MB for the static musl build that
+ships, idle on Linux, which is the figure the table carries, the bundle at 67.4 KB with the Settings page,
 and thirty-one direct dependencies. The connection target is met: 100,000
 held for a minute on one node, measured by `scripts/connection-target.sh` on
 the machine [decision 0001](../../decisions/0001-connection-target.md)
