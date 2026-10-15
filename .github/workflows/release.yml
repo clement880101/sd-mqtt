@@ -1,0 +1,167 @@
+name: Release
+
+# A release is a `v<major>.<minor>.<patch>` tag. Nothing is published
+# unless every CI gate passes, the tag agrees with every source of the
+# version, and every artifact has been unpacked and run.
+#
+# Run by hand (workflow_dispatch) it is a dry run: everything is built
+# and tested, nothing is pushed and no release is made.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to dry-run, e.g. v0.7.0"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+
+jobs:
+  # Before anything is built: the tag, both manifests and the CHANGELOG
+  # must say one version (scripts/check_version.py). The CHANGELOG's
+  # section for it becomes the release's body.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - id: version
+        run: |
+          python3 scripts/check_version.py "$TAG" --notes notes.md
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notes
+          path: notes.md
+
+  gates:
+    uses: ./.github/workflows/ci.yml
+
+  linux:
+    needs: [version, gates]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Package
+        run: scripts/package.sh ${{ matrix.target }}
+      - name: Unpack it and run it
+        run: python3 scripts/test_package.py dist/sdmqtt-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/*
+
+  macos:
+    needs: [version, gates]
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          # Intel macOS: GitHub retired macos-13 on 4 December 2025, and
+          # macos-15-intel is the label it names in its place.
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: services/web/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Package
+        run: scripts/package.sh ${{ matrix.target }}
+      - name: Unpack it and run it
+        run: python3 scripts/test_package.py dist/sdmqtt-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/*
+
+  # Two platforms, one build per platform, from the same Dockerfile the
+  # archives were cut from. Tested before it is pushed, and pushed only
+  # after every archive has been unpacked and run, so a failing archive
+  # leaves no image in the registry and no release half made.
+  image:
+    needs: [version, gates, linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test the image for this runner's platform
+        run: python3 scripts/test_image.py
+      - name: The image's name
+        id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/sd-mqtt" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/broker/Dockerfile
+          target: image
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ steps.name.outputs.image }}:${{ needs.version.outputs.version }}
+            ${{ steps.name.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+
+  release:
+    needs: [version, linux, macos, image]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "sd-mqtt ${{ needs.version.outputs.version }}" \
+            --notes-file artifacts/notes/notes.md \
+            artifacts/archive-*/*

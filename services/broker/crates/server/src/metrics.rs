@@ -797,6 +797,9 @@ pub struct Metrics {
     /// fallen behind loses events, and none of them may disappear
     /// uncounted. See [`Metrics::admin_events_dropped`].
     admin_events_dropped: Counter,
+    /// Times a listener stopped accepting for a moment because accepting
+    /// failed for the whole process — descriptor exhaustion, in practice.
+    accept_pauses: Counter,
     /// Section 9's connectors, by why a publication one of them made
     /// went nowhere. One family rather than a counter per refusal,
     /// because an operator wants one number for "a connector lost a
@@ -838,6 +841,8 @@ pub struct Metrics {
     tls: OnceLock<Arc<TlsCounters>>,
     /// Refused WebSocket upgrades, by reason; the same rule.
     websocket_refused: OnceLock<Family<[(&'static str, &'static str); 1], Counter>>,
+    /// Whether [`Metrics::record_build`] has run.
+    build_recorded: OnceLock<()>,
 }
 
 /// What a running cluster can be asked for, once there is one.
@@ -1064,6 +1069,16 @@ impl Metrics {
             "Client sockets closed without being served, at the connection limit",
             sockets_refused.clone(),
         );
+        let accept_pauses = Counter::default();
+        registry.register(
+            "accept_pauses",
+            // No socket is refused when this moves: the connection
+            // waits in the kernel's backlog until the pause ends. What
+            // happened is that the process could not take it, which an
+            // operator fixes by raising the descriptor limit.
+            "Times accepting paused because the process could not take a connection, usually out of file descriptors",
+            accept_pauses.clone(),
+        );
         let admin_events_dropped = Counter::default();
         registry.register(
             "admin_events_dropped",
@@ -1201,6 +1216,7 @@ impl Metrics {
             rate_limited,
             auth_failure_addresses,
             admin_events_dropped,
+            accept_pauses,
             publications_refused,
             dropped_by_queue,
             dropped_by_shell,
@@ -1211,6 +1227,7 @@ impl Metrics {
             watching_cluster: AtomicBool::new(false),
             tls: OnceLock::new(),
             websocket_refused: OnceLock::new(),
+            build_recorded: OnceLock::new(),
         }
     }
 
@@ -1256,6 +1273,25 @@ impl Metrics {
             );
             counters
         }))
+    }
+
+    /// Name the build: `sdmqtt_build_info{version, allocator} 1`.
+    ///
+    /// The binary knows both and this crate knows neither, so the binary
+    /// says, once, at startup. A second call is ignored rather than
+    /// adding a second row: a node runs one build.
+    pub fn record_build(&self, version: &str, allocator: &str) {
+        self.build_recorded.get_or_init(|| {
+            let info = Family::<[(&'static str, String); 2], Gauge>::default();
+            info.get_or_create(&[
+                ("version", version.to_owned()),
+                ("allocator", allocator.to_owned()),
+            ])
+            .set(1);
+            self.registry
+                .lock()
+                .register("build_info", "Which build this node runs", info);
+        });
     }
 
     /// A WebSocket upgrade refused for `reason`, registered on first
@@ -1360,6 +1396,12 @@ impl Metrics {
     /// how an operator sees that a browser is falling behind.
     pub fn admin_events_dropped(&self) -> &Counter {
         &self.admin_events_dropped
+    }
+
+    /// A listener paused accepting because accepting failed for the
+    /// whole process. See `listener::affects_one_connection`.
+    pub fn accept_paused(&self) -> &Counter {
+        &self.accept_pauses
     }
 
     /// A publication a connector made that went nowhere, by why.
@@ -1678,6 +1720,22 @@ impl Collector for ClusterLive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Section 11.3's build series: one constant row naming the version
+    /// and the allocator, registered once, so a dashboard can tell which
+    /// build a node runs and a second call cannot add a second row.
+    #[test]
+    fn the_build_is_one_constant_row() {
+        let metrics = Metrics::new();
+        metrics.record_build("0.7.0", "mimalloc");
+        metrics.record_build("9.9.9", "system");
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("sdmqtt_build_info{version=\"0.7.0\",allocator=\"mimalloc\"} 1"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("9.9.9"), "{rendered}");
+    }
 
     /// One metric family's whole exposition block, with its samples in
     /// a stable order.

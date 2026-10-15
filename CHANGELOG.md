@@ -1,13 +1,14 @@
 # Changelog
 
-What changes between builds, and what an upgrade costs. Nothing is
-released yet, so there are no version numbers here; the headings are
-milestones, which is what this project actually ships in.
+What changes between builds, and what an upgrade costs. The first
+release is 0.7.0, numbered for the milestone it completes; the headings
+below it are milestones, which is what this project shipped in before
+it had releases.
 
 **The one thing to read before upgrading is "Before you upgrade" under
 the milestone you are moving to.** Everything else is description.
 
-## Unreleased — milestone 7: hardening
+## 0.7.0 — 2026-10-15 — milestone 7: hardening
 
 ### Before you upgrade: a store written before this milestone is refused
 
@@ -84,6 +85,59 @@ rejoin and be repaired before the next.
   before the authorizing chain and told to the hooks as a `reserved`
   refusal; 0x87 on an acknowledged publish, dropped and counted
   otherwise. Only the first level is reserved.
+
+- **A landing page**, `site/index.html`, published with GitHub Pages by
+  `.github/workflows/pages.yml`. `scripts/test_site.py`, in CI and before
+  every deployment, holds it to its sources: every version it names is
+  the workspace's, every figure it quotes is one the spec, a decision or
+  the README records, and every link names this repository.
+
+- **Install documentation, checked.** The README opens with installing
+  from a release archive, the image, and Compose, and carries a table of
+  every configuration section and every `SDMQTT_*` variable;
+  `tests/documented.rs` fails naming any variable the configuration reads
+  or any section it accepts that the README does not mention, which found
+  ten variables and two sections missing. The store-format refusal no
+  longer says nothing is released: it says releases before 1.0 do not
+  migrate a store.
+
+- **Release archives** for `x86_64` and `aarch64` Linux (static musl,
+  cut from the image's own builder) and Intel and Apple silicon macOS:
+  `scripts/package.sh <target>` writes `dist/sdmqtt-<version>-<target>.tar.gz`
+  with the binary, LICENSE, README and both notices, and its `.sha256`.
+  `scripts/test_package.py` unpacks one and runs it — natively, under
+  Rosetta, or in a container of its architecture — and requires the
+  version, a ready broker and the embedded interface. It caught macOS
+  `tar` shipping AppleDouble `._` files in the first archive.
+
+- **A container image.** `services/broker/Dockerfile` cross-compiles the
+  broker as a static musl binary with cargo-zigbuild and ships it on
+  `scratch` with its licence and notices: about 10 MB, uid 65532, store
+  in `/data`, read-only root works. The admin listener binds every
+  interface in the image, so it refuses to start without
+  `SDMQTT_ADMIN_TOKEN`. `scripts/test_image.py`, in CI, checks a running
+  container, including that a durable session and a message queued for
+  it survive `docker stop` and `docker start`. The notices generator now
+  covers every release target and audits a given `--binary`.
+
+- **Four decisions recorded** in `docs/decisions/`, which section 17
+  always said they would be: the SCRAM iteration count stays 4,096 by
+  measurement (0002); `SCRAM-SHA-256-PLUS` is not offered (0003); the
+  admin listener stays HTTP/1.1 (0004); release artifacts are Linux musl
+  and macOS, not Windows (0005).
+
+- **The connection target is met.** 100,000 MQTT connections opened in
+  2.5 seconds and held for a minute on one node, at about 32 KB each;
+  `scripts/connection-target.sh` measures it in the development image
+  with `sdmqtt-load`, a generator that is a workspace member and never
+  ships. See `docs/decisions/0001-connection-target.md`. Running out of
+  file descriptors is now counted: `sdmqtt_accept_pauses_total`.
+
+- **mimalloc is the global allocator**, section 10.4, on every target
+  but Windows, on by default and removable with
+  `--no-default-features`; static musl builds use its local dynamic TLS
+  mode. `sdmqtt_build_info{version, allocator}` names the build a node
+  runs.
 
 - **Two rate limiters**, section 10.3, both the generic cell rate
   algorithm on the broker's coarse clock. **Repeated authentication

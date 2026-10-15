@@ -1,0 +1,25 @@
+[package]
+name = "sdmqtt-load"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Opens and holds many MQTT connections, for section 15's connection target. Never shipped."
+# A measuring tool. It is a workspace member so it builds with the
+# broker's toolchain and lints, and it is never packaged: the release
+# scripts build `-p sdmqtt` alone, so nothing of it reaches the binary
+# the notices are audited against.
+publish = false
+
+[dependencies]
+# Both already direct dependencies of the broker, so the budget's count
+# of distinct crates does not move.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+clap = { version = "4", default-features = false, features = ["std", "help", "usage", "derive", "error-context"] }
+
+[dev-dependencies]
+sdmqtt-server = { path = "../server", version = "0.7.0" }
+
+[lints]
+workspace = true

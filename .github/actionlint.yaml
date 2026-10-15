@@ -1,0 +1,7 @@
+# actionlint 1.7.7's list of hosted runner labels predates
+# `macos-15-intel`, which GitHub named on 19 September 2025 as the Intel
+# macOS label in place of the retired `macos-13`:
+# https://github.blog/changelog/2025-09-19-github-actions-macos-13-runner-image-is-closing-down/
+self-hosted-runner:
+  labels:
+    - macos-15-intel

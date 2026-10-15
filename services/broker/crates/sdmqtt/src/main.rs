@@ -6,6 +6,19 @@
 //! entirely by its defaults, so the only thing a command line has to do
 //! is not get in the way.
 
+/// Section 10.4's allocator. See `tests/allocator.rs` for how it is
+/// proven to be the one in use rather than merely linked.
+#[cfg(all(feature = "mimalloc", not(windows)))]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// The allocator this build installed, as `sdmqtt_build_info` names it.
+const ALLOCATOR_NAME: &str = if cfg!(all(feature = "mimalloc", not(windows))) {
+    "mimalloc"
+} else {
+    "system"
+};
+
 mod config;
 mod connectors;
 mod ingest;
@@ -1009,6 +1022,9 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
     // binds, on every node: a node with no store authenticates through
     // its hooks and is guessed at just the same.
     shared.limit_authentication_failures(config.auth.max_failures_per_minute);
+    shared
+        .metrics()
+        .record_build(env!("CARGO_PKG_VERSION"), ALLOCATOR_NAME);
 
     // Section 12.1's directory, **before anything binds**, for the
     // reason the rules are: the first packet after a listener comes up

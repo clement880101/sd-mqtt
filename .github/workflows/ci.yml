@@ -6,6 +6,9 @@ on:
   pull_request:
   schedule:
     - cron: "0 3 * * *"
+  workflow_dispatch:
+  # The release workflow runs every gate here before it builds anything.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -150,6 +153,20 @@ jobs:
               cargo deny --manifest-path Cargo.toml --config ../../deny.toml check
             '
 
+  # The container image, built and then judged by what a running
+  # container does: read-only and unprivileged, ready, reachable over
+  # MQTT, refusing to start without a token, and a durable session that
+  # survives `docker stop` and `docker start`. See scripts/test_image.py.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and test the image
+        run: python3 scripts/test_image.py
+
   conformance:
     runs-on: ubuntu-latest
     steps:
@@ -219,6 +236,51 @@ jobs:
         run: scripts/test_budgets.sh
       - name: Budgets
         run: scripts/budgets.sh
+      # The idle memory check's own failure paths, against a fake broker
+      # that holds a known amount: seconds, so on every push. The
+      # measurement of the real broker is the scheduled job below.
+      - name: The idle memory check fails when it cannot measure
+        run: python3 scripts/test_idle_memory.py
+      # The release workflow's first gate: a tag that disagrees with any
+      # source of the version is refused. Tested here so it is known to
+      # refuse before the day it is needed.
+      - name: The release version check refuses every disagreement
+        run: python3 scripts/test_check_version.py
+      # The landing page may not quote a version or a figure its sources
+      # do not; checked on every push, not only when it is deployed,
+      # because a release changes the sources it quotes.
+      - name: The landing page agrees with what it quotes
+        run: python3 scripts/test_site.py
+      # The release workflow's shape (nothing published before every
+      # artifact has run; no retired runner) and the archive test's
+      # commands on every host: both found by review, both run once per
+      # release otherwise.
+      - name: The release workflow and the archive test's commands
+        run: |
+          python3 -m pip install --quiet pyyaml==6.0.2
+          python3 scripts/test_release_workflow.py
+          python3 scripts/test_test_package.py
+
+  # Section 15's fourth budget, idle resident memory under 30 MB. A
+  # process has to start and settle, so it runs on the schedule rather
+  # than on every push, as the section says.
+  memory:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/broker
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the binary that ships
+        working-directory: services/broker
+        run: cargo build --release -p sdmqtt
+      - name: Idle resident memory
+        run: python3 scripts/idle-memory.py services/broker/target/release/sdmqtt
 
   fuzz:
     runs-on: ubuntu-latest

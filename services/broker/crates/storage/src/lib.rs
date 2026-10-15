@@ -118,8 +118,8 @@ pub enum StorageError {
     #[error(
         "store format version {found} is not readable by this build, which reads version \
          {expected}. The store is not damaged; it was written by a different build. \
-         Nothing is released yet, so there is no migration: see CHANGELOG.md for what \
-         moved and what starting with a fresh store directory throws away."
+         Releases before 1.0 do not migrate a store between formats: see CHANGELOG.md \
+         for what moved and what starting with a fresh store directory throws away."
     )]
     UnsupportedVersion {
         /// The version the store carries.
@@ -488,6 +488,12 @@ mod tests {
         .to_string();
         assert!(
             message.contains(&later.to_string()) && message.contains(&FORMAT_VERSION.to_string()),
+            "said: {message}"
+        );
+        // Since 0.7.0 there are releases, so the refusal may not say there
+        // are none; what it says is the policy, and where to read the cost.
+        assert!(
+            !message.contains("Nothing is released") && message.contains("before 1.0"),
             "said: {message}"
         );
     }

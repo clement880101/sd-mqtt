@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>sd-mqtt — a distributed MQTT broker in one binary</title>
+<meta name="description" content="sd-mqtt is a distributed MQTT broker: MQTT 3.1.1 and 5, durable sessions, clustering with replicated queues, rules and connectors, and an admin interface, in one static binary.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600;700&display=swap">
+<style>
+  :root {
+    --paper: #f3f5f7;
+    --raised: #ffffff;
+    --ink: #13233a;
+    --steel: #5b6b7c;
+    --rule: #d5dce3;
+    --signal: #c27712;
+    --signal-glow: #e0962f;
+    --signal-wash: #fbefdc;
+    --sans: "Instrument Sans", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+    --measure: 68ch;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0f1a28;
+      --raised: #152335;
+      --ink: #e6ecf2;
+      --steel: #93a3b5;
+      --rule: #243649;
+      --signal: #e9a649;
+      --signal-glow: #f2b860;
+      --signal-wash: #2a2416;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 400 1.0625rem/1.6 var(--sans);
+  }
+  a { color: inherit; text-underline-offset: 0.2em; text-decoration-thickness: 1px; }
+  a:hover { color: var(--signal); }
+  :focus-visible { outline: 2px solid var(--signal-glow); outline-offset: 3px; border-radius: 2px; }
+  code, pre, .topic { font-family: var(--mono); }
+
+  .wrap { width: min(100% - 2rem, 72rem); margin-inline: auto; }
+
+  header.top {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 1rem;
+    padding-block: 1.25rem; flex-wrap: wrap;
+  }
+  .brand { font: 600 1.125rem var(--mono); text-decoration: none; }
+  nav ul { display: flex; gap: 1.5rem; list-style: none; margin: 0; padding: 0; flex-wrap: wrap; }
+  nav a { text-decoration: none; color: var(--steel); }
+  nav a:hover { color: var(--ink); }
+
+  /* The hero: a topic filter, and the topics it does and does not match. */
+  .hero { padding-block: clamp(2.5rem, 8vw, 6rem) clamp(2.5rem, 6vw, 4.5rem); }
+  .filter {
+    font: 500 clamp(2rem, 7.4vw, 5.25rem)/1.05 var(--mono);
+    letter-spacing: -0.03em;
+    margin: 0;
+  }
+  .filter .level { color: var(--ink); }
+  .filter .sep { color: var(--rule); }
+  .filter .wild { color: var(--signal); }
+  .topics {
+    list-style: none; margin: 1.5rem 0 0; padding: 0;
+    font: 400 clamp(0.95rem, 2.2vw, 1.15rem)/1.9 var(--mono);
+    color: var(--steel);
+  }
+  .topics li { display: flex; column-gap: 1rem; row-gap: 0; align-items: baseline; flex-wrap: wrap; transition: color 300ms ease, opacity 300ms ease; }
+  @media (max-width: 40rem) {
+    .topics { line-height: 1.45; }
+    .topics li { margin-bottom: 0.55rem; }
+  }
+  .topics .verdict { font-family: var(--sans); font-size: 0.85em; }
+  .topics li.match .verdict { color: var(--signal); }
+  .topics.running li { opacity: 0.62; }
+  .topics.running li.lit { opacity: 1; color: var(--ink); }
+
+  .lede { max-width: var(--measure); margin-top: clamp(2rem, 5vw, 3.5rem); }
+  h1 { font: 600 clamp(1.6rem, 3.4vw, 2.4rem)/1.2 var(--sans); letter-spacing: -0.015em; margin: 0 0 0.75rem; max-width: 30ch; text-wrap: balance; }
+  .lede p { margin: 0; color: var(--steel); font-size: 1.1875rem; }
+  .actions { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 1.75rem; }
+  .button {
+    display: inline-block; padding: 0.7rem 1.15rem; border-radius: 6px;
+    font-weight: 600; text-decoration: none; border: 1px solid var(--rule);
+  }
+  .button.primary { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+  .button.primary:hover { background: var(--signal); border-color: var(--signal); color: #13233a; }
+  .button:not(.primary):hover { border-color: var(--ink); color: var(--ink); }
+
+  section.part { padding-block: clamp(2.5rem, 6vw, 4.5rem); border-top: 1px solid var(--rule); }
+  h2 { font: 600 1.5rem/1.25 var(--sans); margin: 0 0 1.25rem; letter-spacing: -0.01em; }
+  .part > .wrap > p { max-width: var(--measure); color: var(--steel); margin: 0 0 1.5rem; }
+
+  /* Running it: two commands, each copyable. */
+  .runs { display: grid; gap: 1.25rem; grid-template-columns: repeat(auto-fit, minmax(min(100%, 30rem), 1fr)); }
+  .run h3 { font: 600 1.0625rem var(--sans); margin: 0 0 0.5rem; }
+  .run p { margin: 0 0 0.75rem; color: var(--steel); font-size: 0.975rem; max-width: 60ch; }
+  .code { position: relative; }
+  pre {
+    margin: 0; padding: 1rem 1.1rem; padding-right: 5.5rem;
+    background: var(--raised); border: 1px solid var(--rule); border-radius: 8px;
+    font-size: 0.875rem; line-height: 1.6; overflow-x: auto;
+  }
+  .copy {
+    position: absolute; top: 0.6rem; right: 0.6rem;
+    font: 500 0.8125rem var(--sans); color: var(--steel);
+    background: var(--paper); border: 1px solid var(--rule); border-radius: 5px;
+    padding: 0.3rem 0.6rem; cursor: pointer;
+  }
+  .copy:hover { color: var(--ink); border-color: var(--steel); }
+  .copy[data-done] { color: var(--signal); border-color: var(--signal); }
+
+  /* What it does: terms and what they mean, two columns where there is room. */
+  dl.does { margin: 0; display: grid; grid-template-columns: minmax(10rem, 15rem) minmax(0, 1fr); column-gap: 2.5rem; max-width: 62rem; }
+  dl.does dt { font-weight: 600; padding-block: 1rem; border-top: 1px solid var(--rule); }
+  dl.does dd { margin: 0; padding-block: 1rem; border-top: 1px solid var(--rule); color: var(--steel); max-width: var(--measure); }
+  dl.does dt:first-of-type, dl.does dt:first-of-type + dd { border-top: 0; }
+  @media (max-width: 40rem) {
+    dl.does { grid-template-columns: 1fr; }
+    dl.does dd { border-top: 0; padding-top: 0; }
+  }
+
+  /* Measured: each figure with where it came from. */
+  table { border-collapse: collapse; width: 100%; max-width: 62rem; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 0.8rem 1rem 0.8rem 0; border-bottom: 1px solid var(--rule); vertical-align: baseline; }
+  th { font-weight: 500; color: var(--steel); font-size: 0.9rem; }
+  td.figure { font: 500 1.0625rem var(--mono); white-space: nowrap; }
+  td.source { font-size: 0.95rem; }
+  .table { overflow-x: auto; }
+
+  footer { border-top: 1px solid var(--rule); padding-block: 2rem 3rem; color: var(--steel); font-size: 0.95rem; }
+  footer .wrap { display: flex; gap: 1rem 2rem; flex-wrap: wrap; justify-content: space-between; }
+  footer ul { list-style: none; display: flex; gap: 1.5rem; margin: 0; padding: 0; flex-wrap: wrap; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .topics li { transition: none; }
+  }
+</style>
+</head>
+<body>
+<header class="top wrap">
+  <a class="brand" href="#">sd-mqtt</a>
+  <nav aria-label="Sections">
+    <ul>
+      <li><a href="#run">Run it</a></li>
+      <li><a href="#does">What it does</a></li>
+      <li><a href="#measured">Measured</a></li>
+      <li><a href="https://github.com/clement880101/sd-mqtt">GitHub</a></li>
+    </ul>
+  </nav>
+</header>
+
+<main>
+  <section class="hero wrap" aria-labelledby="title">
+    <p class="filter" aria-label="The topic filter sensors/+/temperature">
+      <span class="level">sensors</span><span class="sep">/</span><wbr><span class="wild">+</span><span class="sep">/</span><wbr><span class="level">temperature</span>
+    </p>
+    <ul class="topics" id="topics" aria-label="Topics, and whether that filter matches them">
+      <li class="match"><span class="topic">sensors/kitchen/temperature</span><span class="verdict">matches</span></li>
+      <li><span class="topic">sensors/kitchen/humidity</span><span class="verdict">does not match</span></li>
+      <li class="match"><span class="topic">sensors/greenhouse-2/temperature</span><span class="verdict">matches</span></li>
+      <li><span class="topic">sensors/roof/wind/temperature</span><span class="verdict">does not match: two levels where + takes one</span></li>
+    </ul>
+
+    <div class="lede">
+      <h1 id="title">A distributed MQTT broker in one binary</h1>
+      <p>MQTT 3.1.1 and 5, sessions that survive a restart, clustering that keeps a client's queue when its node dies, rules that carry messages to and from HTTP, and an admin interface built in. Version 0.7.0, MIT licensed.</p>
+      <div class="actions">
+        <a class="button primary" href="https://github.com/clement880101/sd-mqtt/releases/tag/v0.7.0">Download 0.7.0</a>
+        <a class="button" href="https://github.com/clement880101/sd-mqtt/blob/main/README.md">Read the documentation</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="part" id="run" aria-labelledby="run-title">
+    <div class="wrap">
+      <h2 id="run-title">Run it</h2>
+      <p>Either way you get a broker on port 1883 and its admin interface on port 1884.</p>
+      <div class="runs">
+        <div class="run">
+          <h3>In a container</h3>
+          <p>The image is the static broker and nothing else. It refuses to start without an admin token, because inside a container the admin port is reachable from outside.</p>
+          <div class="code">
+<pre><code>docker run -d -p 1883:1883 -p 1884:1884 \
+  -v sdmqtt-data:/data \
+  -e SDMQTT_ADMIN_TOKEN="$(openssl rand -hex 24)" \
+  ghcr.io/clement880101/sd-mqtt:0.7.0</code></pre>
+            <button class="copy" type="button">Copy</button>
+          </div>
+        </div>
+        <div class="run">
+          <h3>As a binary</h3>
+          <p>Static builds for Linux on x86-64 and ARM, and builds for macOS. Each archive carries its checksum, the licence, and the notices for everything compiled in.</p>
+          <div class="code">
+<pre><code>tar -xzf sdmqtt-0.7.0-x86_64-unknown-linux-musl.tar.gz
+cd sdmqtt-0.7.0-x86_64-unknown-linux-musl
+./sdmqtt serve --store-directory ./data</code></pre>
+            <button class="copy" type="button">Copy</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="part" id="does" aria-labelledby="does-title">
+    <div class="wrap">
+      <h2 id="does-title">What it does</h2>
+      <dl class="does">
+        <dt>MQTT 3.1.1 and 5</dt>
+        <dd>Shared subscriptions, retained messages, wills, topic aliases and enhanced authentication, checked against Eclipse Paho's interoperability suite over TCP, TLS and WebSocket.</dd>
+        <dt>Durable when you give it a directory</dt>
+        <dd>Sessions, their subscriptions and their queued messages survive a restart, and no publisher is acknowledged before its message is on the disk.</dd>
+        <dt>Clustering</dt>
+        <dd>Nodes route to each other's subscribers, move a session to wherever its client reconnects, and keep each queue on more than one node. In synchronous mode, losing the node that owns a queue loses none of it.</dd>
+        <dt>Rules and connectors</dt>
+        <dd>Send matching messages to HTTP endpoints, accept HTTP posts as publications, poll an API, or bridge to another broker, with a durable outbox and dead letters for what could not be delivered.</dd>
+        <dt>Who may do what</dt>
+        <dd>Users with argon2 passwords or SCRAM-SHA-256, access control rules by user or client, API keys with read, write and admin scopes, and limits on publish rate and failed logins.</dd>
+        <dt>An interface in the broker</dt>
+        <dd>Live rates, connected clients, a topic browser that watches messages as they arrive, rule statistics, cluster health, and settings, served by the broker itself.</dd>
+      </dl>
+    </div>
+  </section>
+
+  <section class="part" id="measured" aria-labelledby="measured-title">
+    <div class="wrap">
+      <h2 id="measured-title">Measured</h2>
+      <p>Each figure links to how it was measured, on what machine, and what it does not cover.</p>
+      <div class="table">
+        <table>
+          <thead><tr><th scope="col">What</th><th scope="col">Figure</th><th scope="col">Where it comes from</th></tr></thead>
+          <tbody>
+            <tr><td>Concurrent connections held on one node</td><td class="figure" data-figure="100,000">100,000</td><td class="source"><a href="https://github.com/clement880101/sd-mqtt/blob/main/docs/decisions/0001-connection-target.md">Decision 0001</a></td></tr>
+            <tr><td>Time to open them</td><td class="figure" data-figure="2.5 s">2.5 s</td><td class="source"><a href="https://github.com/clement880101/sd-mqtt/blob/main/docs/decisions/0001-connection-target.md">Decision 0001</a></td></tr>
+            <tr><td>Broker memory per connection</td><td class="figure" data-figure="32 KB">32 KB</td><td class="source"><a href="https://github.com/clement880101/sd-mqtt/blob/main/docs/decisions/0001-connection-target.md">Decision 0001</a></td></tr>
+            <tr><td>Idle memory, Linux, with a store</td><td class="figure" data-figure="19.4 MB">19.4 MB</td><td class="source"><a href="https://github.com/clement880101/sd-mqtt/blob/main/docs/superpowers/specs/2026-09-19-sd-mqtt-design.md">The design's budgets</a></td></tr>
+            <tr><td>Release binary</td><td class="figure" data-figure="9.88 MB">9.88 MB</td><td class="source"><a href="https://github.com/clement880101/sd-mqtt/blob/main/docs/superpowers/specs/2026-09-19-sd-mqtt-design.md">The design's budgets</a></td></tr>
+            <tr><td>Container image</td><td class="figure" data-figure="10 MB">10 MB</td><td class="source"><a href="https://github.com/clement880101/sd-mqtt/blob/main/README.md">The README</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>sd-mqtt is MIT licensed.</span>
+    <ul>
+      <li><a href="https://github.com/clement880101/sd-mqtt">Source</a></li>
+      <li><a href="https://github.com/clement880101/sd-mqtt/releases">Releases</a></li>
+      <li><a href="https://github.com/clement880101/sd-mqtt/blob/main/CHANGELOG.md">Changelog</a></li>
+      <li><a href="https://github.com/clement880101/sd-mqtt/tree/main/docs/decisions">Decisions</a></li>
+      <li><a href="https://github.com/clement880101/sd-mqtt/blob/main/LICENSE">Licence</a></li>
+    </ul>
+  </div>
+</footer>
+
+<script>
+  // The hero's one motion: step through the topics, lighting each in
+  // turn so the filter is read against them. Without it, or with
+  // reduced motion preferred, every topic and its verdict stay visible.
+  (function () {
+    var list = document.getElementById("topics");
+    var still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!list || still) return;
+    var items = list.querySelectorAll("li");
+    var at = 0;
+    list.classList.add("running");
+    function step() {
+      items.forEach(function (item, index) { item.classList.toggle("lit", index === at); });
+      at = (at + 1) % items.length;
+    }
+    step();
+    setInterval(step, 1800);
+  })();
+
+  // Copy buttons: say what happened, then go back.
+  document.querySelectorAll(".copy").forEach(function (button) {
+    button.addEventListener("click", function () {
+      var text = button.parentElement.querySelector("code").textContent;
+      var done = function () {
+        button.textContent = "Copied";
+        button.setAttribute("data-done", "");
+        setTimeout(function () { button.textContent = "Copy"; button.removeAttribute("data-done"); }, 1600);
+      };
+      if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, function () {});
+    });
+  });
+</script>
+</body>
+</html>

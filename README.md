@@ -3,11 +3,50 @@
 A distributed MQTT broker with a built-in admin UI and UI-configurable
 integrations. One binary, no external dependencies.
 
-Status: in development. See `docs/superpowers/specs/` for the design and
-`docs/superpowers/plans/` for the implementation plans.
-`CHANGELOG.md` is what to read before upgrading: while nothing is
-released the stored format is allowed to move, and a store written by an
-earlier build is refused rather than migrated.
+Status: **0.7.0**, the first release. See `docs/superpowers/specs/` for
+the design, `docs/superpowers/plans/` for how it was built and
+`docs/decisions/` for the questions that were settled by measurement.
+`CHANGELOG.md` is what to read before upgrading: before 1.0 the stored
+format may move, and a store written by an earlier build is refused
+rather than migrated.
+
+## Install
+
+**A binary.** Each release has a static Linux build for `x86_64` and
+`aarch64`, and macOS builds for Intel and Apple silicon, each with its
+checksum:
+
+```bash
+curl -LO https://github.com/clement880101/sd-mqtt/releases/download/v0.7.0/sdmqtt-0.7.0-x86_64-unknown-linux-musl.tar.gz
+curl -LO https://github.com/clement880101/sd-mqtt/releases/download/v0.7.0/sdmqtt-0.7.0-x86_64-unknown-linux-musl.tar.gz.sha256
+sha256sum -c sdmqtt-0.7.0-x86_64-unknown-linux-musl.tar.gz.sha256
+tar -xzf sdmqtt-0.7.0-x86_64-unknown-linux-musl.tar.gz
+./sdmqtt-0.7.0-x86_64-unknown-linux-musl/sdmqtt serve --store-directory ./data
+```
+
+That is a broker on port 1883 with its admin interface on
+<http://127.0.0.1:1884>, keeping its sessions in `./data`. The archive
+carries the licence and the notices for everything compiled in.
+
+**A container**, `ghcr.io/clement880101/sd-mqtt`, for `linux/amd64` and
+`linux/arm64`; see [Running it in a container](#running-it-in-a-container).
+With Compose:
+
+```yaml
+services:
+  sdmqtt:
+    image: ghcr.io/clement880101/sd-mqtt:0.7.0
+    ports: ["1883:1883", "1884:1884"]
+    volumes: ["sdmqtt-data:/data"]
+    environment:
+      SDMQTT_ADMIN_TOKEN: ${SDMQTT_ADMIN_TOKEN:?set a token for the admin API}
+    read_only: true
+    restart: unless-stopped
+volumes:
+  sdmqtt-data:
+```
+
+**From source**, below.
 
 ## Build
 
@@ -24,6 +63,54 @@ optional, and the keys are documented in full in
 `services/broker/crates/sdmqtt/src/config.rs`. Three sources are layered
 in this order: `sdmqtt.toml`, then `SDMQTT_*` in the environment, then a
 flag.
+
+### Every setting at a glance
+
+The file's sections, each explained further down:
+
+| Section | What it holds |
+|---|---|
+| `[node]` | this node's name |
+| `[listener]`, `[[listeners]]` | the MQTT listeners: address, kind, TLS, mountpoint, maximum QoS, retain, durability, publish cap |
+| `[broker]` | protocol limits: `max_packet_size`, `max_topic_depth`, `max_client_id_len`, `max_keep_alive`, `max_inflight`, `max_queue_messages`, `max_queue_bytes`, `max_hops`, `trie_shards` |
+| `[storage]` | where and how durably the store is kept |
+| `[admin]` | the admin listener: address, token, allowed hosts |
+| `[ingest]` | the HTTP ingest listener for `http_in` rules |
+| `[auth]` | anonymous access, SCRAM iterations, the failure limiter |
+| `[[acl]]` | access control rules |
+| `[[rules]]` | rules and their connectors |
+| `[cluster]` | membership, replication and durability across nodes |
+| `[log]` | `level`: `error`, `warn`, `info` (the default), `debug` or `trace` |
+
+Every variable, which overrides the file and is overridden by a flag:
+
+| Variable | Sets |
+|---|---|
+| `SDMQTT_CONFIG` | the configuration file to read |
+| `SDMQTT_ADDRESS` | `listener.address`, the default MQTT listener |
+| `SDMQTT_MAX_CONNECTIONS` | `listener.max_connections` |
+| `SDMQTT_MOUNTPOINT` | `listener.mountpoint` |
+| `SDMQTT_MAX_QOS` | `listener.max_qos` |
+| `SDMQTT_RETAIN_AVAILABLE` | `listener.retain_available` |
+| `SDMQTT_LISTENER_DURABILITY` | `listener.durability` |
+| `SDMQTT_MAX_PUBLISH_RATE` | `listener.max_publish_rate` |
+| `SDMQTT_PUBLISH_BURST` | `listener.publish_burst` |
+| `SDMQTT_STORAGE_DIRECTORY` | `storage.directory`; empty is no store |
+| `SDMQTT_STORAGE_SYNC` | `storage.sync`: `immediate` or `relaxed` |
+| `SDMQTT_STORAGE_FLUSH_INTERVAL_MS` | `storage.flush_interval_ms` |
+| `SDMQTT_STORAGE_FLUSH_RECORDS` | `storage.flush_records` |
+| `SDMQTT_ADMIN_ADDRESS` | `admin.address` |
+| `SDMQTT_ADMIN_ENABLED` | `admin.enabled`; `false` runs no admin listener |
+| `SDMQTT_ADMIN_TOKEN` | `admin.token` |
+| `SDMQTT_ADMIN_ALLOWED_HOSTS` | `admin.allowed_hosts`, comma separated |
+| `SDMQTT_AUTH_ANONYMOUS` | `auth.anonymous` |
+| `SDMQTT_AUTH_SCRAM_ITERATIONS` | `auth.scram_iterations` |
+| `SDMQTT_AUTH_MAX_FAILURES_PER_MINUTE` | `auth.max_failures_per_minute` |
+| `SDMQTT_LOG` | `log.level` |
+| `SDMQTT_NODE_NAME` | `node.name` |
+| `SDMQTT_CLUSTER_*` | the `[cluster]` keys of the same names, under [Joining a cluster](#joining-a-cluster) |
+
+The `[[listeners]]`, `[[acl]]` and `[[rules]]` tables are file-only.
 
 ### Persistence is off unless you ask for it
 
@@ -57,16 +144,16 @@ broker that meets a store it does not know refuses to start and names
 both versions:
 
 ```
-store format version 3 is not readable by this build, which reads version 4.
-The store is not damaged; it was written by a different build. Nothing is
-released yet, so there is no migration: see CHANGELOG.md for what moved and
+store format version 10 is not readable by this build, which reads version 11.
+The store is not damaged; it was written by a different build. Releases before
+1.0 do not migrate a store between formats: see CHANGELOG.md for what moved and
 what starting with a fresh store directory throws away.
 ```
 
 The file is not damaged; it is being read by the wrong build, and
 guessing at an unknown layout would restore nonsense from healthy bytes.
-Nothing is released yet, so there is no migration: move or delete the
-store directory and start again. `CHANGELOG.md` says, per milestone,
+Releases before 1.0 do not migrate a store: move or delete the store
+directory and start again. `CHANGELOG.md` says, per milestone,
 whether the version moved and what starting again throws away.
 
 ### Rules, and the four things one can do
@@ -413,6 +500,11 @@ nobody can learn which names exist by trying. `anonymous` is a switch
 and nothing else: creating the first user does not flip it. A node with
 no store holds no users and admits by the default alone.
 `SDMQTT_AUTH_ANONYMOUS` and `SDMQTT_AUTH_SCRAM_ITERATIONS` set the two.
+The iteration count is what a SCRAM client pays on every connect and what
+an attacker with a stolen verifier pays per guess; the broker pays it only
+when a password is set. 4,096 costs a laptop 0.3 ms, so a fleet of capable
+clients loses nothing by raising it, and a microcontroller may need it
+where it is (`docs/decisions/0002-scram-iterations.md`).
 
 **Repeated failures from one address are slowed.** After
 `max_failures_per_minute` failed logins — a wrong password, an unknown
@@ -539,6 +631,15 @@ rate is measured on the broker's one-second clock, which is why the
 burst is never less than one second's worth.
 `SDMQTT_MAX_PUBLISH_RATE` and `SDMQTT_PUBLISH_BURST` set the two on
 `[listener]`.
+
+**When the process runs out of file descriptors**, a listener pauses
+accepting for a moment and tries again, rather than spinning, and counts
+each pause on `sdmqtt_accept_pauses_total`. No connection is refused: it
+waits in the kernel's backlog until the pause ends. A counter that keeps
+moving means the descriptor limit is below what the node is asked to
+hold; raise it (`ulimit -n`, or `LimitNOFILE=` under systemd), since each
+connection is one descriptor. `sdmqtt_build_info{version, allocator}`
+names the build a node runs.
 
 `[listener]` is the default listener and is named `mqtt`. More
 listeners share the same broker — the same sessions, subscriptions,
@@ -918,6 +1019,32 @@ rebinding gets around that by making the page's request same-origin.
 The name is the one thing the attack cannot forge. If you reach the
 listener through a name of your own, put it in the list; the refusal
 says so.
+
+## Running it in a container
+
+```bash
+docker run -d --name sdmqtt \
+  -p 1883:1883 -p 1884:1884 \
+  -v sdmqtt-data:/data \
+  -e SDMQTT_ADMIN_TOKEN="$(openssl rand -hex 24)" \
+  ghcr.io/clement880101/sd-mqtt:latest
+```
+
+The image is the static broker on `scratch`: no shell, nothing else to
+patch, about 10 MB. It runs as uid 65532 and writes only to `/data`, so it
+runs with `--read-only` too. Its admin listener binds every interface,
+because inside a container that is the only way to reach it, and so **it
+refuses to start without `SDMQTT_ADMIN_TOKEN`**. `docker stop` is a clean
+shutdown: the broker flushes its store on SIGTERM and exits inside Docker's
+grace. Every setting is an `SDMQTT_*` variable, listed under
+[Configuration](#configuration). Kubernetes or Compose health checks should
+ask `GET /health/ready` on port 1884; the image has no client to run a
+`HEALTHCHECK` of its own. `LICENSE` and both notices files are in
+`/usr/share/doc/sdmqtt/`.
+
+Build it from the repository root with
+`docker build -f services/broker/Dockerfile -t sdmqtt .`, and test a build
+with `python3 scripts/test_image.py`.
 
 ## Conformance
 

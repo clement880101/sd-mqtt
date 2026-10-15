@@ -313,6 +313,7 @@ async fn accept_loop(
                 continue;
             }
             Err(error) => {
+                shared.metrics().accept_paused().inc();
                 // Warn rather than debug: descriptor exhaustion is a
                 // configuration problem an operator can fix, and one
                 // they will never learn about from a line they do not
