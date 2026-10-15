@@ -413,6 +413,11 @@ nobody can learn which names exist by trying. `anonymous` is a switch
 and nothing else: creating the first user does not flip it. A node with
 no store holds no users and admits by the default alone.
 `SDMQTT_AUTH_ANONYMOUS` and `SDMQTT_AUTH_SCRAM_ITERATIONS` set the two.
+The iteration count is what a SCRAM client pays on every connect and what
+an attacker with a stolen verifier pays per guess; the broker pays it only
+when a password is set. 4,096 costs a laptop 0.3 ms, so a fleet of capable
+clients loses nothing by raising it, and a microcontroller may need it
+where it is (`docs/decisions/0002-scram-iterations.md`).
 
 **Repeated failures from one address are slowed.** After
 `max_failures_per_minute` failed logins — a wrong password, an unknown

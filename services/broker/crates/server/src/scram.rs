@@ -423,6 +423,30 @@ impl Client {
 mod tests {
     use super::*;
 
+    /// Section 17's measurement, by hand: how long the derivation a
+    /// client must run takes at three iteration counts. Ignored, because
+    /// it is a timing and not a check; `docs/decisions/0002` records
+    /// what it printed and where.
+    ///
+    ///     cargo test -p sdmqtt-server --release --lib scram_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn scram_cost() {
+        for iterations in [4_096_u32, 10_000, 50_000] {
+            let rounds = 20;
+            let started = std::time::Instant::now();
+            for round in 0..rounds {
+                std::hint::black_box(salted_password(
+                    b"a password of ordinary length",
+                    &[round; 16],
+                    iterations,
+                ));
+            }
+            let each = started.elapsed() / u32::from(rounds);
+            println!("scram_cost iterations={iterations} each={each:?}");
+        }
+    }
+
     /// RFC 7677 §3's exchange, byte for byte: the one published vector.
     const CLIENT_NONCE: &str = "rOprNGfwEbeRWgbNEkqO";
     const SERVER_NONCE: &str = "%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
@@ -495,6 +519,16 @@ mod tests {
         let (_, server_final) = server.finish(&client_final).expect("verifies");
         assert!(client.verify(&server_final));
         assert!(!client.verify(b"v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    }
+
+    /// RFC 5802 §6: `y` is a client that supports channel binding and
+    /// believes this server does not. A server that offers no `-PLUS`
+    /// must serve it; refusing would lock out every client that asks
+    /// politely. Decision 0003 rests on this.
+    #[test]
+    fn a_client_that_could_bind_but_does_not_is_served() {
+        let started = Server::start(b"y,,n=user,r=abc", &rfc_user(), None);
+        assert!(started.is_ok(), "{:?}", started.err());
     }
 
     #[test]

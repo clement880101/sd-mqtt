@@ -1176,6 +1176,9 @@ it and is deliberately not enabled: browsers negotiate it only over TLS, TLS
 is milestone 7, and ten crates bought now would buy nothing until then. The
 interface therefore opens exactly one stream for the whole application
 rather than one per page, and the limit is revisited when TLS lands.
+**Revisited in milestone 7 and kept:** TLS landed on the MQTT listeners,
+not the admin listener, so there is still nothing for a browser to
+negotiate HTTP/2 over. See [decision 0004](../../decisions/0004-admin-http2.md).
 
 ### 11.2 UI
 
@@ -1704,7 +1707,8 @@ shippable.
 7. **Hardening.** TLS with certificate hot reload, WebSocket, SCRAM-SHA-256,
    the authentication and access control UI, rate limits, a configurable
    maximum quality of service and retain availability, the container image,
-   cross-compiled release artifacts and documentation. Carries section 12.3's
+   cross-compiled release artifacts and documentation (the platforms are
+   [decision 0005](../../decisions/0005-platforms.md)). Carries section 12.3's
    refusal of a client publishing to a dollar-prefixed topic, deferred from
    milestone 3: it needs a reason code per protocol version and it adds a
    classified line to the conformance baseline, both of which belong with the
@@ -1823,13 +1827,13 @@ needs it, and the resolution is recorded as an architecture decision record.
   per-listener override. Whether it should also be settable per session, via
   the authenticate hook, is a milestone 6 question. It is cheap to add and
   should only be added if a real deployment wants it.
-- **SCRAM iteration count default.** The trade-off is between resistance to
-  offline attack and the work a constrained client must perform, since the
-  client runs the same derivation. Milestone 7 should pick a number against
-  measurements on representative hardware rather than guessing now.
-- **Channel binding.** SCRAM-SHA-256-PLUS defends against an attacker who
-  terminates TLS in the middle. Whether that threat model applies depends on
-  whether deployments terminate TLS at a proxy. Milestone 7 decides.
+- **SCRAM iteration count default — settled.** 4,096, measured and kept:
+  the server never pays it at connect, a laptop pays 0.3 ms, and a verifier
+  exists only for users explicitly enrolled. See
+  [decision 0002](../../decisions/0002-scram-iterations.md).
+- **Channel binding — settled.** Not offered in this release: where TLS ends
+  at a proxy the broker cannot bind to the client's channel at all. See
+  [decision 0003](../../decisions/0003-channel-binding.md).
 - **Conformance suite choice — settled.** Eclipse Paho's interoperability
   tests, `eclipse-paho/paho.mqtt.testing`, pinned at commit
   `9d7bb80bb8b9d9cfc0b52f8cb4c1916401281103`. It is maintained by the Paho

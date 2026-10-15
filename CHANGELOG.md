@@ -85,6 +85,12 @@ rejoin and be repaired before the next.
   refusal; 0x87 on an acknowledged publish, dropped and counted
   otherwise. Only the first level is reserved.
 
+- **Four decisions recorded** in `docs/decisions/`, which section 17
+  always said they would be: the SCRAM iteration count stays 4,096 by
+  measurement (0002); `SCRAM-SHA-256-PLUS` is not offered (0003); the
+  admin listener stays HTTP/1.1 (0004); release artifacts are Linux musl
+  and macOS, not Windows (0005).
+
 - **The connection target is met.** 100,000 MQTT connections opened in
   2.5 seconds and held for a minute on one node, at about 32 KB each;
   `scripts/connection-target.sh` measures it in the development image
