@@ -582,7 +582,10 @@ subscribe = true
 With no rule at all, every publish and subscribe is allowed, as it was
 through milestone 6. **The first rule flips the default to deny**: from
 then on an operation is allowed only by a rule that says so, which is
-why the second rule above exists. Rules are consulted in `order`, then
+why the second rule above exists. **Through the API, write the broad
+allow first**: each rule is its own write and replicates on its own, so
+a narrow deny written alone denies everything else, on every node,
+until the allow arrives. Rules are consulted in `order`, then
 by identifier, and the first whose subject and filter match and that
 has an opinion on the operation decides; a rule with no opinion is
 skipped. A subject's name may end in `*` to mean every name with that

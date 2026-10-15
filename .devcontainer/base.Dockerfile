@@ -2,6 +2,7 @@ FROM rust:1.98.1-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl jq ripgrep fd-find ca-certificates \
+    procps \
     build-essential pkg-config clang \
     && rm -rf /var/lib/apt/lists/*
 

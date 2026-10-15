@@ -2539,15 +2539,27 @@ async fn a_node_gone_past_the_grace_is_repaired_away_from() {
     let before = cluster.nodes[survivor]
         .counter("sdmqtt_replica_sessions")
         .unwrap_or(0);
+    // The repairs this kill causes, not every repair since the cluster
+    // started: with a two-second grace, a node starved of CPU on a
+    // loaded runner can miss heartbeats long enough to be judged gone
+    // before the kill, and the sessions it held are then rightly
+    // repaired too. The figure before is in the message, so a failure
+    // says whether that happened or a session was repaired twice.
+    let repaired_before = cluster.nodes[0]
+        .counter("sdmqtt_replica_repairs_done_total")
+        .unwrap_or(0);
     cluster.nodes[victim].kill();
 
     until("the survivor holds every copy the victim held", || {
         cluster.nodes[survivor].counter("sdmqtt_replica_sessions") == Some(before + lost)
     });
     assert_eq!(
-        cluster.nodes[0].counter("sdmqtt_replica_repairs_done_total"),
+        cluster.nodes[0]
+            .counter("sdmqtt_replica_repairs_done_total")
+            .map(|done| done - repaired_before),
         Some(lost),
-        "exactly the sessions the victim held were repaired, and no others"
+        "exactly the sessions the victim held were repaired after it went, and no others \
+         ({repaired_before} repaired before the kill)"
     );
     until("and nothing is pending any more", || {
         cluster.nodes[0].counter("sdmqtt_replica_repairs_pending") == Some(0)
@@ -2945,26 +2957,29 @@ async fn a_user_created_on_one_node_connects_on_another() {
         Some(ReasonCode::NotAuthorized)
     );
 
-    // An access control rule written on alpha refuses on beta, in
-    // time: the first rule flips the default, so the second allows
-    // everything else.
-    cluster.nodes[0].post(
-        "/api/v1/acl",
-        r#"{"id":"no-secret","order":10,"subject":"anyone","filter":"secret/#","subscribe":false}"#,
-    );
+    // Access control rules written on alpha take effect on beta, in
+    // time. The broad allow is written first, as the README advises:
+    // the first rule flips the default to deny, and the two replicate
+    // as two registers, so written the other way round every node
+    // denies everything until the second arrives.
+    //
+    // **Both are waited for.** Waiting only for `secret/plans` to be
+    // refused was satisfied by either rule alone — one rule denies
+    // whatever it does not allow — and on a loaded runner the allow
+    // had not arrived when the next line looked.
     cluster.nodes[0].post(
         "/api/v1/acl",
         r##"{"id":"all","subject":"anyone","filter":"#","publish":true,"subscribe":true}"##,
     );
-    until("the rules have replicated to beta", || {
+    cluster.nodes[0].post(
+        "/api/v1/acl",
+        r#"{"id":"no-secret","order":10,"subject":"anyone","filter":"secret/#","subscribe":false}"#,
+    );
+    until("both rules have replicated to beta", || {
         let (mut probe, _) = Client::resuming(cluster.nodes[1].mqtt, "acl-probe");
         probe.subscribe_reasons("secret/plans") == vec![ReasonCode::NotAuthorized]
+            && probe.subscribe_reasons("fleet/+/telemetry") == vec![ReasonCode::GrantedQos1]
     });
-    let (mut probe, _) = Client::resuming(cluster.nodes[1].mqtt, "acl-probe");
-    assert_eq!(
-        probe.subscribe_reasons("fleet/+/telemetry"),
-        vec![ReasonCode::GrantedQos1]
-    );
 
     // A delete on gamma refuses on alpha, in time.
     let (code, _) = cluster.nodes[2].delete("/api/v1/users/alice");
