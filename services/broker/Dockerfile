@@ -50,8 +50,15 @@ COPY --from=web /src/services/web/dist services/web/dist
 # after a source change recompiles what changed rather than everything;
 # the binary is copied out in the same step because a cache mount is
 # gone when it ends.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/services/broker/target \
+#
+# **One per platform, and locked.** Both platforms' builders run on the
+# build machine at once, and a mount they shared was written by two
+# cargos together: the first release failed unpacking a crate the other
+# build was unpacking ("File exists"). Separate ids keep the two builds
+# apart, and `sharing=locked` keeps a second build of the same platform
+# from racing the first.
+RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=broker-target-${TARGETARCH},sharing=locked,target=/src/services/broker/target \
     target="$(cat /target)" \
     && cd services/broker \
     && cargo zigbuild --release --locked -p sdmqtt --target "$target" $CARGO_FLAGS \
