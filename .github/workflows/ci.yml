@@ -151,6 +151,20 @@ jobs:
               cargo deny --manifest-path Cargo.toml --config ../../deny.toml check
             '
 
+  # The container image, built and then judged by what a running
+  # container does: read-only and unprivileged, ready, reachable over
+  # MQTT, refusing to start without a token, and a durable session that
+  # survives `docker stop` and `docker start`. See scripts/test_image.py.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and test the image
+        run: python3 scripts/test_image.py
+
   conformance:
     runs-on: ubuntu-latest
     steps:

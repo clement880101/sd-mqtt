@@ -1,0 +1,13 @@
+# The image is built from the repository root, and everything below is
+# either rebuilt inside it or has nothing to do with it. The target
+# directories alone are gigabytes; sending them as build context is
+# minutes of nothing.
+.git
+.superpowers
+**/target
+**/node_modules
+services/web/dist
+services/broker/conformance/.work
+dist
+data
+**/__pycache__

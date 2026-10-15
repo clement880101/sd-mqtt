@@ -85,6 +85,16 @@ rejoin and be repaired before the next.
   refusal; 0x87 on an acknowledged publish, dropped and counted
   otherwise. Only the first level is reserved.
 
+- **A container image.** `services/broker/Dockerfile` cross-compiles the
+  broker as a static musl binary with cargo-zigbuild and ships it on
+  `scratch` with its licence and notices: about 10 MB, uid 65532, store
+  in `/data`, read-only root works. The admin listener binds every
+  interface in the image, so it refuses to start without
+  `SDMQTT_ADMIN_TOKEN`. `scripts/test_image.py`, in CI, checks a running
+  container, including that a durable session and a message queued for
+  it survive `docker stop` and `docker start`. The notices generator now
+  covers every release target and audits a given `--binary`.
+
 - **Four decisions recorded** in `docs/decisions/`, which section 17
   always said they would be: the SCRAM iteration count stays 4,096 by
   measurement (0002); `SCRAM-SHA-256-PLUS` is not offered (0003); the

@@ -111,9 +111,17 @@ ROOT_PACKAGE = "sdmqtt"
 # host would differ between them and the drift check would fail on
 # whichever machine did not write it. The two resolve identically
 # today; the union is what keeps that from being luck.
+#
+# **And every target a release ships**, since milestone 7: the archives
+# and the image are built for these, and a crate one of them links and
+# the others do not must still be attributed in the one file they all
+# carry.
 TARGETS = (
     "x86_64-unknown-linux-gnu",
     "aarch64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
 )
 
 # Which branch of a disjunction we take, in order of preference.
@@ -902,7 +910,15 @@ def main() -> int:
         action="store_true",
         help="fail if the file is stale or the binary names a crate it omits",
     )
+    parser.add_argument(
+        "--binary",
+        type=Path,
+        help="audit this binary rather than the host's release build: an archive's or the image's",
+    )
     arguments = parser.parse_args()
+    if arguments.binary is not None:
+        global BINARY
+        BINARY = arguments.binary.resolve()
 
     vendored, version = sysroot_crates()
     generated = render(shipped(allowed_licences()), vendored, version)
