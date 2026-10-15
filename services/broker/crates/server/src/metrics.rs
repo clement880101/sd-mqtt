@@ -838,6 +838,8 @@ pub struct Metrics {
     tls: OnceLock<Arc<TlsCounters>>,
     /// Refused WebSocket upgrades, by reason; the same rule.
     websocket_refused: OnceLock<Family<[(&'static str, &'static str); 1], Counter>>,
+    /// Whether [`Metrics::record_build`] has run.
+    build_recorded: OnceLock<()>,
 }
 
 /// What a running cluster can be asked for, once there is one.
@@ -1211,6 +1213,7 @@ impl Metrics {
             watching_cluster: AtomicBool::new(false),
             tls: OnceLock::new(),
             websocket_refused: OnceLock::new(),
+            build_recorded: OnceLock::new(),
         }
     }
 
@@ -1256,6 +1259,25 @@ impl Metrics {
             );
             counters
         }))
+    }
+
+    /// Name the build: `sdmqtt_build_info{version, allocator} 1`.
+    ///
+    /// The binary knows both and this crate knows neither, so the binary
+    /// says, once, at startup. A second call is ignored rather than
+    /// adding a second row: a node runs one build.
+    pub fn record_build(&self, version: &str, allocator: &str) {
+        self.build_recorded.get_or_init(|| {
+            let info = Family::<[(&'static str, String); 2], Gauge>::default();
+            info.get_or_create(&[
+                ("version", version.to_owned()),
+                ("allocator", allocator.to_owned()),
+            ])
+            .set(1);
+            self.registry
+                .lock()
+                .register("build_info", "Which build this node runs", info);
+        });
     }
 
     /// A WebSocket upgrade refused for `reason`, registered on first
@@ -1678,6 +1700,22 @@ impl Collector for ClusterLive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Section 11.3's build series: one constant row naming the version
+    /// and the allocator, registered once, so a dashboard can tell which
+    /// build a node runs and a second call cannot add a second row.
+    #[test]
+    fn the_build_is_one_constant_row() {
+        let metrics = Metrics::new();
+        metrics.record_build("0.7.0", "mimalloc");
+        metrics.record_build("9.9.9", "system");
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("sdmqtt_build_info{version=\"0.7.0\",allocator=\"mimalloc\"} 1"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("9.9.9"), "{rendered}");
+    }
 
     /// One metric family's whole exposition block, with its samples in
     /// a stable order.

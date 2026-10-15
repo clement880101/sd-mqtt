@@ -85,6 +85,12 @@ rejoin and be repaired before the next.
   refusal; 0x87 on an acknowledged publish, dropped and counted
   otherwise. Only the first level is reserved.
 
+- **mimalloc is the global allocator**, section 10.4, on every target
+  but Windows, on by default and removable with
+  `--no-default-features`; static musl builds use its local dynamic TLS
+  mode. `sdmqtt_build_info{version, allocator}` names the build a node
+  runs.
+
 - **Two rate limiters**, section 10.3, both the generic cell rate
   algorithm on the broker's coarse clock. **Repeated authentication
   failures from one address are slowed**: after
