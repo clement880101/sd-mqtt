@@ -2635,6 +2635,12 @@ async fn within_the_grace_nothing_is_copied() {
     let before = cluster.nodes[survivor]
         .counter("sdmqtt_replica_sessions")
         .unwrap_or(0);
+    // Measured from the kill rather than from zero, for the reason the
+    // forget test gives: a slow first mark can have cost one repair
+    // already.
+    let repaired_before = cluster.nodes[0]
+        .counter("sdmqtt_replica_repairs_done_total")
+        .unwrap_or(0);
     let gone = cluster.nodes[victim].kill();
     until("alpha declares the victim dead", || {
         cluster.nodes[0].how(&gone).as_deref() == Some("down")
@@ -2646,7 +2652,8 @@ async fn within_the_grace_nothing_is_copied() {
         Duration::from_secs(5),
         || {
             cluster.nodes[survivor].counter("sdmqtt_replica_sessions") == Some(before)
-                && cluster.nodes[0].counter("sdmqtt_replica_repairs_done_total") == Some(0)
+                && cluster.nodes[0].counter("sdmqtt_replica_repairs_done_total")
+                    == Some(repaired_before)
         },
     );
     assert_eq!(
@@ -2671,6 +2678,16 @@ async fn forgetting_a_node_starts_the_repair_at_once() {
     };
     let before = cluster.nodes[survivor]
         .counter("sdmqtt_replica_sessions")
+        .unwrap_or(0);
+    // Repairs this forget causes, not every repair since the start. The
+    // sweep runs every second and repairs any session whose named
+    // follower has not yet reported a mark, and on a loaded runner the
+    // first stream's mark can be slower than the sweep: that session is
+    // sent a second copy, and counted, before anything is killed. Seen
+    // in CI as four repairs for three lost sessions; not reproduced in
+    // eight runs on a two-core container here.
+    let repaired_before = cluster.nodes[0]
+        .counter("sdmqtt_replica_repairs_done_total")
         .unwrap_or(0);
     let gone = cluster.nodes[victim].kill();
     until("alpha declares the victim dead", || {
@@ -2702,8 +2719,11 @@ async fn forgetting_a_node_starts_the_repair_at_once() {
         cluster.nodes[survivor].counter("sdmqtt_replica_sessions") == Some(before + lost)
     });
     assert_eq!(
-        cluster.nodes[0].counter("sdmqtt_replica_repairs_done_total"),
-        Some(lost)
+        cluster.nodes[0]
+            .counter("sdmqtt_replica_repairs_done_total")
+            .map(|done| done - repaired_before),
+        Some(lost),
+        "the forget repaired exactly the victim's sessions ({repaired_before} repaired before it)"
     );
     let (code, _) = cluster.nodes[0].delete(&format!("/api/v1/nodes/{gone}"));
     assert_eq!(code, 404, "forgetting twice finds nothing the second time");
@@ -2744,6 +2764,9 @@ async fn repair_sends_no_more_sessions_a_second_than_it_is_allowed() {
         lost >= 3,
         "the hash gave the victim {lost}; six sessions should split 3+"
     );
+    let repaired_before = cluster.nodes[0]
+        .counter("sdmqtt_replica_repairs_done_total")
+        .unwrap_or(0);
     cluster.nodes[victim].kill();
 
     // The first repair marks the grace having run out. From there, at
@@ -2751,14 +2774,18 @@ async fn repair_sends_no_more_sessions_a_second_than_it_is_allowed() {
     // At least one, not exactly one: a build with no limit sends every
     // session in one sweep and would never show a count of one, and
     // the timing below is what this test is about, not the count.
-    until("the first session is repaired", || {
+    // Counted from the kill, like the other repair tests.
+    let repaired = || {
         cluster.nodes[0]
             .counter("sdmqtt_replica_repairs_done_total")
-            .is_some_and(|done| done >= 1)
+            .map(|done| done - repaired_before)
+    };
+    until("the first session is repaired", || {
+        repaired().is_some_and(|done| done >= 1)
     });
     let started = Instant::now();
     until("every session is repaired", || {
-        cluster.nodes[0].counter("sdmqtt_replica_repairs_done_total") == Some(lost)
+        repaired().is_some_and(|done| done >= lost)
     });
     let took = started.elapsed();
     assert!(
