@@ -284,14 +284,24 @@ jobs:
 
   fuzz:
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
+    # Nightly, and on demand, so a change to this job can be run rather
+    # than waited a night for.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@cargo-fuzz
+      # install-action has no cargo-fuzz manifest: `@cargo-fuzz` resolved
+      # to "no tool specified" and installed nothing, and the first
+      # nightly run failed with "no such command: fuzz". Built from
+      # source instead; it is a nightly job and can afford the minute.
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+      # `+nightly`, because services/broker/rust-toolchain.toml pins the
+      # stable toolchain for everything under it, the fuzz crate
+      # included, and the sanitizer cargo-fuzz builds with is nightly's.
       - name: Fuzz the decoder
         working-directory: services/broker/crates/mqtt-codec/fuzz
-        run: cargo fuzz run decode -- -max_total_time=600
+        run: cargo +nightly fuzz run decode -- -max_total_time=600
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
