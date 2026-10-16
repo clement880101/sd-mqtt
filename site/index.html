@@ -174,9 +174,9 @@
 
     <div class="lede">
       <h1 id="title">A distributed MQTT broker in one binary</h1>
-      <p>MQTT 3.1.1 and 5, sessions that survive a restart, clustering that keeps a client's queue when its node dies, rules that carry messages to and from HTTP, and an admin interface built in. Version 0.7.0, MIT licensed.</p>
+      <p>MQTT 3.1.1 and 5, sessions that survive a restart, clustering that keeps a client's queue when its node dies, rules that carry messages to and from HTTP, and an admin interface built in. Version 0.7.1, MIT licensed.</p>
       <div class="actions">
-        <a class="button primary" href="https://github.com/clement880101/sd-mqtt/releases/tag/v0.7.0">Download 0.7.0</a>
+        <a class="button primary" href="https://github.com/clement880101/sd-mqtt/releases/tag/v0.7.1">Download 0.7.1</a>
         <a class="button" href="https://github.com/clement880101/sd-mqtt/blob/main/README.md">Read the documentation</a>
       </div>
     </div>
@@ -194,7 +194,7 @@
 <pre><code>docker run -d -p 1883:1883 -p 1884:1884 \
   -v sdmqtt-data:/data \
   -e SDMQTT_ADMIN_TOKEN="$(openssl rand -hex 24)" \
-  ghcr.io/clement880101/sd-mqtt:0.7.0</code></pre>
+  ghcr.io/clement880101/sd-mqtt:0.7.1</code></pre>
             <button class="copy" type="button">Copy</button>
           </div>
         </div>
@@ -202,8 +202,8 @@
           <h3>As a binary</h3>
           <p>Static builds for Linux on x86-64 and ARM, and builds for macOS. Each archive carries its checksum, the licence, and the notices for everything compiled in.</p>
           <div class="code">
-<pre><code>tar -xzf sdmqtt-0.7.0-x86_64-unknown-linux-musl.tar.gz
-cd sdmqtt-0.7.0-x86_64-unknown-linux-musl
+<pre><code>tar -xzf sdmqtt-0.7.1-x86_64-unknown-linux-musl.tar.gz
+cd sdmqtt-0.7.1-x86_64-unknown-linux-musl
 ./sdmqtt serve --store-directory ./data</code></pre>
             <button class="copy" type="button">Copy</button>
           </div>

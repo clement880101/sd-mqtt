@@ -3,7 +3,7 @@
 A distributed MQTT broker with a built-in admin UI and UI-configurable
 integrations. One binary, no external dependencies.
 
-Status: **0.7.0**, the first release. See `docs/superpowers/specs/` for
+Status: **0.7.1**. See `docs/superpowers/specs/` for
 the design, `docs/superpowers/plans/` for how it was built and
 `docs/decisions/` for the questions that were settled by measurement.
 `CHANGELOG.md` is what to read before upgrading: before 1.0 the stored
@@ -17,11 +17,11 @@ rather than migrated.
 checksum:
 
 ```bash
-curl -LO https://github.com/clement880101/sd-mqtt/releases/download/v0.7.0/sdmqtt-0.7.0-x86_64-unknown-linux-musl.tar.gz
-curl -LO https://github.com/clement880101/sd-mqtt/releases/download/v0.7.0/sdmqtt-0.7.0-x86_64-unknown-linux-musl.tar.gz.sha256
-sha256sum -c sdmqtt-0.7.0-x86_64-unknown-linux-musl.tar.gz.sha256
-tar -xzf sdmqtt-0.7.0-x86_64-unknown-linux-musl.tar.gz
-./sdmqtt-0.7.0-x86_64-unknown-linux-musl/sdmqtt serve --store-directory ./data
+curl -LO https://github.com/clement880101/sd-mqtt/releases/download/v0.7.1/sdmqtt-0.7.1-x86_64-unknown-linux-musl.tar.gz
+curl -LO https://github.com/clement880101/sd-mqtt/releases/download/v0.7.1/sdmqtt-0.7.1-x86_64-unknown-linux-musl.tar.gz.sha256
+sha256sum -c sdmqtt-0.7.1-x86_64-unknown-linux-musl.tar.gz.sha256
+tar -xzf sdmqtt-0.7.1-x86_64-unknown-linux-musl.tar.gz
+./sdmqtt-0.7.1-x86_64-unknown-linux-musl/sdmqtt serve --store-directory ./data
 ```
 
 That is a broker on port 1883 with its admin interface on
@@ -35,7 +35,7 @@ With Compose:
 ```yaml
 services:
   sdmqtt:
-    image: ghcr.io/clement880101/sd-mqtt:0.7.0
+    image: ghcr.io/clement880101/sd-mqtt:0.7.1
     ports: ["1883:1883", "1884:1884"]
     volumes: ["sdmqtt-data:/data"]
     environment:

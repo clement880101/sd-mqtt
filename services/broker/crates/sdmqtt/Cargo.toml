@@ -8,22 +8,22 @@ repository.workspace = true
 description = "A distributed MQTT broker"
 
 [dependencies]
-sdmqtt-server = { path = "../server", version = "0.7.0" }
+sdmqtt-server = { path = "../server", version = "0.7.1" }
 # Section 8.1's node identity, minted or read back at startup. Already
 # in the binary through `rules`, which orders singleton ownership by
 # it; named here because this crate is the one that decides when it is
 # minted and writes it down.
-cluster = { path = "../cluster", version = "0.7.0" }
-sdmqtt-admin = { path = "../admin", version = "0.7.0" }
-broker-core = { path = "../broker-core", version = "0.7.0" }
+cluster = { path = "../cluster", version = "0.7.1" }
+sdmqtt-admin = { path = "../admin", version = "0.7.1" }
+broker-core = { path = "../broker-core", version = "0.7.1" }
 # The rules and the outbound connector. This is where the HTTP client
 # and the TLS under it enter the binary.
-rules = { path = "../rules", version = "0.7.0" }
-mqtt-codec = { path = "../mqtt-codec", version = "0.7.0" }
+rules = { path = "../rules", version = "0.7.1" }
+mqtt-codec = { path = "../mqtt-codec", version = "0.7.1" }
 # With its default features, which is the redb backend: this is the
 # crate that actually opens a file. `broker-core` and `sdmqtt-server`
 # turn them off, and the binary is where the choice of engine is made.
-storage = { path = "../storage", version = "0.7.0" }
+storage = { path = "../storage", version = "0.7.1" }
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "derive", "error-context"] }
 serde = { version = "1", features = ["derive"] }
 # A dead letter's payload, which the broker takes as `Bytes` and never
@@ -34,7 +34,7 @@ thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "signal"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
-directory = { version = "0.7.0", path = "../directory" }
+directory = { version = "0.7.1", path = "../directory" }
 
 # Section 10.4: the global allocator on every non-Windows target, on by
 # default and removable with the feature. musl's allocator serialises on

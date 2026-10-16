@@ -1,14 +1,14 @@
 # Changelog
 
 What changes between builds, and what an upgrade costs. The first
-release is 0.7.0, numbered for the milestone it completes; the headings
+release was 0.7.0, numbered for the milestone it completed; the headings
 below it are milestones, which is what this project shipped in before
 it had releases.
 
 **The one thing to read before upgrading is "Before you upgrade" under
 the milestone you are moving to.** Everything else is description.
 
-## Unreleased
+## 0.7.1 — 2026-10-16
 
 ### Fixed
 
