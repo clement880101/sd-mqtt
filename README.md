@@ -990,6 +990,16 @@ A copy holds the queue and only the queue. The client's subscriptions
 are not in it, so a client that has failed over re-subscribes — as it
 would after any session loss — and then receives what was queued.
 
+A client whose node is alive can also reconnect elsewhere, and the
+session moves with it: the new node claims it, the old one closes the
+old connection and hands over the queue, and the subscriptions follow.
+A publication forwarded to the old node while that was happening finds
+the session gone and is sent on to the node that took it, counted on
+`sdmqtt_forwards_redirected_total`. A forwarded publication nothing on a
+node wants and nothing can be done with is counted on
+`sdmqtt_forwards_unroutable_total`; a steady stream of those means a
+node's view of who subscribes where has stopped converging.
+
 Messages published on either side of a partition are not exchanged
 afterwards, whatever the flags say, and a node that acknowledged a
 message it never managed to replicate loses it when it rejoins.

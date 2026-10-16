@@ -651,6 +651,19 @@ hundred incomplete drains is an outage or a quiet afternoon depending on how
 many there were altogether. Like the other cluster series they are absent
 rather than zero on a node that does not cluster.
 
+**A forward in flight during a move, found after 0.7.0.** Section 8.3's
+forward and this section's claim arrive over different links, so a forward
+to the previous owner can land after the hand-over, when that node no longer
+holds the subscription; it found nobody and was dropped at debug level,
+which section 11.3 forbids. Since then the previous owner remembers, for
+thirty seconds, the filters of each session it handed over and the node that
+claimed it, and sends such a forward on to that node as it arrived;
+`sdmqtt_forwards_redirected_total` counts them, and a forward nothing here
+wanted and nothing could be done with is `sdmqtt_forwards_unroutable_total`
+rather than a log line. The window was found by the migration test failing
+once under load on GitHub's runners, and is now made to happen on purpose by
+a test that stalls the link.
+
 ### 8.5 Partitions
 
 The default policy is availability: a partitioned node keeps serving its

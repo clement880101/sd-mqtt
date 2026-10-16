@@ -2535,6 +2535,78 @@ async fn the_copy_furthest_ahead_is_the_one_pulled() {
     );
 }
 
+/// A publication in flight to the old owner while the session moves is
+/// delivered where the session went.
+///
+/// Section 8.3 forwards a publication to the node whose register says
+/// it holds the subscriber, and section 8.4 moves the session when its
+/// client reconnects elsewhere. The two are not ordered: beta's forward
+/// to alpha and gamma's claim of alpha arrive over different links, and
+/// a forward that lands after the hand-over finds no subscriber on
+/// alpha. The migration test above met this once on a loaded runner —
+/// the queued message never arrived — and could not make it happen on
+/// purpose. This one can: the link beta dials alpha over is stalled, so
+/// the forward sits in beta's socket buffer while the client moves, and
+/// is released after. Without a redirect the message is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_in_flight_during_a_move_follows_the_session() {
+    const FILTER: &str = "fleet/+/telemetry";
+    const TOPIC: &str = "fleet/0042/telemetry";
+    const IN_FLIGHT: &str = "in-flight-while-moving";
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cluster = Cluster::start(directory.path()).await;
+    cluster.settle();
+    let nodes = &cluster.nodes;
+
+    let (mut rover, _) = Client::resuming(nodes[0].mqtt, "rover");
+    rover.subscribe(FILTER);
+    drop(rover);
+    // Beta must already know alpha wants the filter, or the publish
+    // below is forwarded nowhere; this one is delivered and read, so the
+    // one that matters is the only one in flight.
+    until("beta learns that alpha wants the filter", || {
+        nodes[1].publish_reaching(TOPIC, "settling") > 0
+    });
+    let (mut rover, present) = Client::resuming(nodes[0].mqtt, "rover");
+    assert!(present);
+    assert_eq!(
+        rover.delivered_within(PATIENCE).map(|(_, payload)| payload),
+        Some("settling".to_owned())
+    );
+    drop(rover);
+
+    // Hold what beta sends alpha, whichever of the two dialled the other:
+    // forwards on the link beta dialled, backwards on the one alpha did.
+    // Queued on the link, so beta counts it as reaching a node; the bytes
+    // wait in the socket.
+    cluster.gates[&(1, 0)].stall(Direction::Forward);
+    cluster.gates[&(0, 1)].stall(Direction::Backward);
+    assert_eq!(nodes[1].publish_reaching(TOPIC, IN_FLIGHT), 1);
+
+    // The client comes back to gamma while the forward is in flight:
+    // gamma claims the session and drains alpha, which holds nothing yet.
+    let (mut rover, present) = Client::resuming(nodes[2].mqtt, "rover");
+    assert!(present, "the session moved to gamma");
+    until("alpha has let the session go", || {
+        !nodes[0].sessions().contains("rover")
+    });
+
+    // Now the forward lands on alpha, after the hand-over.
+    cluster.gates[&(1, 0)].heal(Direction::Forward);
+    cluster.gates[&(0, 1)].heal(Direction::Backward);
+    assert_eq!(
+        rover.delivered_within(PATIENCE),
+        Some((TOPIC.to_owned(), IN_FLIGHT.to_owned())),
+        "the publication that reached alpha after the move was sent on to gamma"
+    );
+    assert_eq!(
+        nodes[0].counter("sdmqtt_forwards_redirected_total"),
+        Some(1),
+        "and alpha counted the redirect"
+    );
+}
+
 /// Queue `count` sessions on alpha, each with one message, and wait for
 /// every one to have a copy on another node. Returns how many copies
 /// each of beta and gamma holds, in that order.

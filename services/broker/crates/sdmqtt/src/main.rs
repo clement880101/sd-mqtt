@@ -1159,6 +1159,12 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         .map(|(_, handler, _)| Arc::clone(handler) as Arc<dyn cluster::mesh::Deliver>);
 
     let mesh = start_cluster(&config, rebuilt.as_ref(), deliveries).await?;
+    // The handler sends one thing of its own: a forwarded publication
+    // that landed after its session moved, on to the node that took it.
+    // It needs the mesh for that, and the mesh needed the handler first.
+    if let (Some(mesh), Some((_, handler, _))) = (&mesh, replication.as_ref()) {
+        handler.install_mesh(Arc::clone(mesh));
+    }
     // Section 8.5's policy, made once and read in three places: the
     // connect path, the publish and subscribe paths, and the health
     // endpoint's expected count. One of them, so that a probe cannot

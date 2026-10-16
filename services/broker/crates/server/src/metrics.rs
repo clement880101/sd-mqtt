@@ -800,6 +800,12 @@ pub struct Metrics {
     /// Times a listener stopped accepting for a moment because accepting
     /// failed for the whole process — descriptor exhaustion, in practice.
     accept_pauses: Counter,
+    /// Section 8.3 forwards that found no subscriber here because the
+    /// session had just moved, and were sent on to where it went.
+    forwards_redirected: Counter,
+    /// Section 8.3 forwards that found no subscriber here and nowhere
+    /// to send them on: dropped, and counted rather than only logged.
+    forwards_unroutable: Counter,
     /// Section 9's connectors, by why a publication one of them made
     /// went nowhere. One family rather than a counter per refusal,
     /// because an operator wants one number for "a connector lost a
@@ -1069,6 +1075,18 @@ impl Metrics {
             "Client sockets closed without being served, at the connection limit",
             sockets_refused.clone(),
         );
+        let forwards_redirected = Counter::default();
+        registry.register(
+            "forwards_redirected",
+            "Forwarded publications that arrived after their session had moved and were sent on to its new node",
+            forwards_redirected.clone(),
+        );
+        let forwards_unroutable = Counter::default();
+        registry.register(
+            "forwards_unroutable",
+            "Forwarded publications that found no subscriber here and no node to send them on to",
+            forwards_unroutable.clone(),
+        );
         let accept_pauses = Counter::default();
         registry.register(
             "accept_pauses",
@@ -1217,6 +1235,8 @@ impl Metrics {
             auth_failure_addresses,
             admin_events_dropped,
             accept_pauses,
+            forwards_redirected,
+            forwards_unroutable,
             publications_refused,
             dropped_by_queue,
             dropped_by_shell,
@@ -1402,6 +1422,19 @@ impl Metrics {
     /// whole process. See `listener::affects_one_connection`.
     pub fn accept_paused(&self) -> &Counter {
         &self.accept_pauses
+    }
+
+    /// A forwarded publication that found its session gone and was sent
+    /// on to the node that took it. Section 8.4's move, met by 8.3's
+    /// forward in flight.
+    pub fn forward_redirected(&self) -> &Counter {
+        &self.forwards_redirected
+    }
+
+    /// A forwarded publication nothing here wanted and nowhere was known
+    /// to send on. Section 11.3: counted, where before it was a debug line.
+    pub fn forward_unroutable(&self) -> &Counter {
+        &self.forwards_unroutable
     }
 
     /// A publication a connector made that went nowhere, by why.

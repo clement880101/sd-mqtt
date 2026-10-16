@@ -62,7 +62,7 @@
 //! what makes both of those true.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use cluster::mesh::{Deliver, Mesh, Message};
@@ -118,7 +118,33 @@ pub struct Replication {
     /// session this node serves and is not in the broker at all. See
     /// `Shared::apply_aside`, which is how it got there.
     store: Arc<dyn storage::Storage>,
+    /// The mesh, for the one thing this handler sends on its own
+    /// account: see [`Replication::forwarded`]. Installed after the
+    /// mesh exists, which is after this handler does.
+    mesh: OnceLock<Arc<Mesh>>,
+    /// Sessions this node handed over lately, and where to. Section
+    /// 8.3's forward and section 8.4's claim arrive over different
+    /// links, so a forward can land after the session it was for has
+    /// gone; this is what says where to send it on.
+    departed: Mutex<Vec<Departed>>,
 }
+
+/// A session this node gave up, as a forward arriving late needs it.
+#[derive(Debug)]
+struct Departed {
+    /// The filters the session held, which a late forward's topic is
+    /// matched against.
+    filters: Vec<String>,
+    /// The node that claimed it.
+    to: NodeId,
+    /// When this is forgotten. A forward is in flight for milliseconds;
+    /// a stalled link holds one for as long as the link is stalled, and
+    /// section 8.1 gives a link ten seconds before it is dead.
+    until: Instant,
+}
+
+/// How long a hand-over is remembered for late forwards.
+const DEPARTED_HOLDS_FOR: Duration = Duration::from_secs(30);
 
 /// Writes a peer sent that won, and the records that go with them.
 #[derive(Debug)]
@@ -147,9 +173,51 @@ impl Replication {
                 shared,
                 migrations,
                 store,
+                mesh: OnceLock::new(),
+                departed: Mutex::new(Vec::new()),
             }),
             waiting,
         )
+    }
+
+    /// Give this handler the mesh, once, so a late forward can be sent
+    /// on. Without it a late forward is counted and dropped.
+    pub fn install_mesh(&self, mesh: Arc<Mesh>) {
+        let _ = self.mesh.set(mesh);
+    }
+
+    /// Remember where `session` went, for forwards that land late.
+    fn departed(&self, filters: Vec<String>, to: NodeId) {
+        if filters.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut departed = self.departed.lock().unwrap_or_else(PoisonError::into_inner);
+        departed.retain(|entry| entry.until > now);
+        departed.push(Departed {
+            filters,
+            to,
+            until: now + DEPARTED_HOLDS_FOR,
+        });
+    }
+
+    /// The node a late forward for `topic` should go to, if a session
+    /// that wanted it left here lately. The most recent hand-over wins,
+    /// because a session that moved twice is where it moved last.
+    fn gone_to(&self, topic: &str) -> Option<NodeId> {
+        let now = Instant::now();
+        let departed = self.departed.lock().unwrap_or_else(PoisonError::into_inner);
+        departed
+            .iter()
+            .rev()
+            .filter(|entry| entry.until > now)
+            .find(|entry| {
+                entry
+                    .filters
+                    .iter()
+                    .any(|filter| broker_core::topic::reference::matches(filter, topic))
+            })
+            .map(|entry| entry.to)
     }
 }
 
@@ -218,6 +286,16 @@ impl Deliver for Replication {
                     .shared
                     .hand_over_session(&claiming.session, claiming.clean)
                     .unwrap_or_default();
+                // Where the session went, for a forward still on its way
+                // here; see `forwarded`.
+                self.departed(
+                    handover
+                        .subscriptions
+                        .iter()
+                        .map(|subscription| subscription.filter.clone())
+                        .collect(),
+                    from,
+                );
                 return Drained::chunks(&claiming.session, claiming.epoch, handover)
                     .into_iter()
                     .map(Message::Drained)
@@ -356,24 +434,57 @@ impl Replication {
         // node has a member of and was not named for was served
         // elsewhere.
         let groups = forwarded.groups.clone();
-        let actions = self.shared.with_broker(|broker| {
+        // Kept whole until it is known to have reached somebody, so it
+        // can be sent on as it arrived; a frame is small and this is
+        // the cold path.
+        let frame = forwarded.clone();
+        let (reached, actions) = self.shared.with_broker(|broker| {
             let now = broker.clock().now();
             let mut out = Vec::new();
             let reached = broker.accept_forwarded(forwarded.into_message(), &groups, now, &mut out);
-            if reached == 0 {
-                // Not an error and not a defect: the routing map a peer
-                // forwarded by is its copy of this node's registers, and
-                // a subscriber that left a moment ago is a copy in
-                // flight. Said at debug because a *standing* stream of
-                // these is a map that has stopped converging.
-                tracing::debug!(
-                    topic,
-                    "a peer forwarded a publication this node has no subscriber for"
-                );
-            }
-            out
+            (reached, out)
         });
         self.shared.deliver(actions);
+        if reached > 0 {
+            return;
+        }
+        // Nobody here wanted it. Two reasons, told apart by what this
+        // node remembers. **The session moved**: it was handed over to a
+        // node that claimed it while this forward was on the link, which
+        // the two links' independence allows at any load and a stalled
+        // link makes certain. Then the forward goes on to where the
+        // session went, as it arrived, and is counted. **Or the map is
+        // behind**: the peer forwarded by its copy of this node's
+        // registers, and a subscriber that left a moment ago is a copy
+        // in flight. Counted too, where before it was a debug line: a
+        // standing stream of these is a map that has stopped converging,
+        // and section 11.3 says nothing disappears uncounted.
+        let metrics = self.shared.metrics();
+        if let (Some(to), Some(mesh)) = (self.gone_to(&topic), self.mesh.get()) {
+            match mesh.send(to, &Message::Forward(frame)) {
+                Some(Ok(cluster::link::Sent::Queued)) => {
+                    metrics.forward_redirected().inc();
+                    tracing::info!(
+                        topic,
+                        %to,
+                        "a forwarded publication arrived after its session moved and was sent on"
+                    );
+                    return;
+                }
+                other => tracing::warn!(
+                    topic,
+                    %to,
+                    ?other,
+                    "a forwarded publication arrived after its session moved and could not \
+                     be sent on"
+                ),
+            }
+        }
+        metrics.forward_unroutable().inc();
+        tracing::debug!(
+            topic,
+            "a peer forwarded a publication this node has no subscriber for"
+        );
     }
 }
 

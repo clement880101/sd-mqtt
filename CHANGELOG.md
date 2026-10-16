@@ -8,6 +8,28 @@ it had releases.
 **The one thing to read before upgrading is "Before you upgrade" under
 the milestone you are moving to.** Everything else is description.
 
+## Unreleased
+
+### Fixed
+
+- **A publication forwarded to a session's node while the session was
+  moving could be lost.** Section 8.3 forwards a publication to the node
+  whose register holds the subscriber; section 8.4 moves the session when
+  its client reconnects elsewhere; the two arrive over different links.
+  A forward that landed after the hand-over found no subscriber and was
+  dropped with a debug line. The node now remembers, for thirty seconds,
+  which filters each session it gave up held and where it went, and sends
+  such a forward on to that node. `sdmqtt_forwards_redirected_total`
+  counts those; `sdmqtt_forwards_unroutable_total` counts a forward
+  nothing wanted and nothing could be done with, which was uncounted
+  before. Found by a cluster test failing once on GitHub's runners; a new
+  test makes the race happen on purpose by stalling the link.
+
+- CI: the nightly fuzz job installed no fuzzer and used the wrong
+  toolchain; the cluster tests' repair counts are measured from the kill;
+  the cluster tests' ports are below Linux's ephemeral range and start
+  apart under nextest; the development image has `procps`.
+
 ## 0.7.0 — 2026-10-15 — milestone 7: hardening
 
 ### Before you upgrade: a store written before this milestone is refused
