@@ -153,9 +153,17 @@ jobs:
     permissions:
       contents: write
     steps:
+      # By name, never everything: the image action uploads a build
+      # record of its own that cannot be extracted, and downloading every
+      # artifact failed the first release after the image was pushed.
       - uses: actions/download-artifact@v4
         with:
+          pattern: archive-*
           path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: notes
+          path: artifacts/notes
       - name: Publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -54,6 +54,15 @@ for job in ("linux", "macos"):
     expect(f"the {job} job runs what it packaged", "package.sh" in runs(job) and "test_package.py" in runs(job), runs(job))
 expect("the image is tested before it is pushed", "test_image.py" in runs("image"), runs("image"))
 
+# The release job must download what it publishes and nothing else: the
+# image action uploads a build record of its own, which cannot be
+# extracted, and downloading every artifact failed the first release
+# after the image had already been pushed.
+downloads = [s for s in jobs["release"]["steps"] if "download-artifact" in s.get("uses", "")]
+expect("the release job downloads artifacts", bool(downloads))
+unnamed = [s for s in downloads if not ({"name", "pattern"} & set(s.get("with", {})))]
+expect("every download names what it takes", not unnamed, unnamed)
+
 # The image is built for two platforms at once from one Dockerfile, and
 # both builders run on the build machine: a cache mount they share is
 # written by two cargos at once. The first real release failed on
