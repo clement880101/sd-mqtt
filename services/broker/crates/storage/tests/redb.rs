@@ -185,6 +185,53 @@ fn a_later_format_is_refused_rather_than_read() {
     );
 }
 
+/// And it refuses by version even when a table's shape has changed too.
+///
+/// A later build that changed a table's type as well as the version is
+/// the ordinary case, not the odd one: the version is bumped *because*
+/// the layout moved. If the store opened every table before it read the
+/// marker, redb's type mismatch would be the error the operator saw, an
+/// engine failure with no hint that the file is simply newer than the
+/// build. The marker is read first, alone, so the one failure that has
+/// an obvious fix is the one reported.
+#[test]
+fn a_later_format_is_refused_before_any_other_table_is_opened() {
+    let workspace = workspace();
+    let path = store_path(&workspace);
+    drop(open(&path));
+    {
+        // The sessions table as this build knows it, and as a later one
+        // might: the same name, a value type this build cannot open.
+        const SESSIONS_NOW: redb::TableDefinition<&[u8], &[u8]> =
+            redb::TableDefinition::new("sessions");
+        const SESSIONS_LATER: redb::TableDefinition<&[u8], u64> =
+            redb::TableDefinition::new("sessions");
+        let database = redb::Database::create(&path).expect("the store must open as a database");
+        let transaction = database.begin_write().expect("a write must begin");
+        assert!(
+            transaction
+                .delete_table(SESSIONS_NOW)
+                .expect("the table must be deletable"),
+            "no sessions table was there to replace: the store does not keep one under \
+             that name any more, so this test is tampering with nothing"
+        );
+        transaction
+            .open_table(SESSIONS_LATER)
+            .expect("the later shape must be creatable");
+        transaction.commit().expect("the tampering must commit");
+    }
+    write_a_later_format_marker(&path);
+
+    match RedbStorage::open(&path) {
+        Err(StorageError::UnsupportedVersion { found, expected }) => {
+            assert_eq!(found, FORMAT_VERSION + 1);
+            assert_eq!(expected, FORMAT_VERSION);
+        }
+        Err(other) => panic!("a later format was reported as {other:?}"),
+        Ok(_) => panic!("a store with a later format and a foreign table opened"),
+    }
+}
+
 /// A store this build wrote opens again, which is what makes the refusal
 /// above mean something.
 #[test]

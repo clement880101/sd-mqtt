@@ -243,17 +243,17 @@ impl RedbStorage {
         // was found.
         let transaction = database.begin_write().map_err(StorageError::from)?;
         {
-            // Every table is created here rather than on first use, so
-            // that a read transaction never meets a table that does not
-            // exist and no read path has to pretend a missing table is an
-            // empty one. `meta` comes through the same struct rather than
-            // being opened beside it: redb refuses a second handle on a
-            // table already open in the transaction, so two ways of
-            // reaching one table is a runtime failure waiting for the
-            // first record that uses both.
-            let mut tables = Tables::open(&transaction)?;
-            let held = tables
-                .meta
+            // The marker first, and alone. A later build bumps the
+            // version *because* a table's shape moved, so opening every
+            // table before reading the marker would meet redb's type
+            // mismatch first and report an engine failure where the
+            // one error with an obvious fix, `UnsupportedVersion`, was
+            // the truth. The handle is dropped before the rest are
+            // opened: redb refuses a second handle on a table already
+            // open in the transaction, and `Tables::open` takes `meta`
+            // through the same struct as everything else.
+            let mut meta = transaction.open_table(META).map_err(StorageError::from)?;
+            let held = meta
                 .get(FORMAT_KEY)
                 .map_err(StorageError::from)?
                 .map(|marker| marker.value().to_vec());
@@ -262,12 +262,17 @@ impl RedbStorage {
                     FormatMarker::read(&marker)?;
                 }
                 None => {
-                    tables
-                        .meta
-                        .insert(FORMAT_KEY, FormatMarker::current().encode().as_slice())
+                    meta.insert(FORMAT_KEY, FormatMarker::current().encode().as_slice())
                         .map_err(StorageError::from)?;
                 }
             }
+        }
+        {
+            // Every table is created here rather than on first use, so
+            // that a read transaction never meets a table that does not
+            // exist and no read path has to pretend a missing table is an
+            // empty one.
+            Tables::open(&transaction)?;
         }
         // Immediate: a store whose marker was not written is a store the
         // next open cannot tell from a foreign file.
