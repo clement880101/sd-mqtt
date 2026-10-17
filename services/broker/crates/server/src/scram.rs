@@ -154,15 +154,20 @@ fn escape_name(name: &str) -> String {
 
 /// The attributes of one SCRAM message, `k=v` separated by commas, in
 /// order. A key appears once.
+///
+/// RFC 5802 §7 spells an attribute as one ASCII letter, `=`, then the
+/// value; anything else, including a key that is one character but
+/// several bytes, is not a SCRAM message and is `None` rather than a
+/// slice at a byte offset inside a character.
 fn attributes(message: &str) -> Option<Vec<(char, &str)>> {
     let mut out = Vec::new();
     for part in message.split(',') {
-        let mut chars = part.chars();
-        let key = chars.next()?;
-        if chars.next()? != '=' {
+        let (key, value) = part.split_at_checked(1)?;
+        let key = key.chars().next()?;
+        if !key.is_ascii_alphabetic() {
             return None;
         }
-        out.push((key, &part[2..]));
+        out.push((key, value.strip_prefix('=')?));
     }
     Some(out)
 }
@@ -554,6 +559,16 @@ mod tests {
         assert_eq!(
             Server::start(&[0xff, 0xfe], &rfc_user(), None).err(),
             Some(Refusal::Malformed)
+        );
+        assert_eq!(
+            Server::start("n,,あ=user,r=abc".as_bytes(), &rfc_user(), None).err(),
+            Some(Refusal::Malformed),
+            "an attribute key wider than one byte is malformed, not a panic"
+        );
+        assert_eq!(
+            Server::start("n,,n=user,r=abc,é".as_bytes(), &rfc_user(), None).err(),
+            Some(Refusal::Malformed),
+            "a trailing attribute of one multi-byte character and no equals sign"
         );
         let (server, _) = Server::start(b"n,,n=user,r=abc", &rfc_user(), None).expect("starts");
         assert_eq!(
