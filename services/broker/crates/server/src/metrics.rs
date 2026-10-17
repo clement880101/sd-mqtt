@@ -800,6 +800,10 @@ pub struct Metrics {
     publishes_unconfirmed: Counter,
     sockets_opened: Counter,
     sockets_refused: Counter,
+    /// Writes that made no progress within the connection's bound,
+    /// each of which ended its connection. See
+    /// [`crate::connection::ConnectionConfig::write_timeout`].
+    writes_stalled: Counter,
     /// Section 11.3, for the admin events stream: a reader that has
     /// fallen behind loses events, and none of them may disappear
     /// uncounted. See [`Metrics::admin_events_dropped`].
@@ -1080,6 +1084,12 @@ impl Metrics {
             "Client sockets this broker began serving",
             sockets_opened.clone(),
         );
+        let writes_stalled = Counter::default();
+        registry.register(
+            "writes_stalled",
+            "Connections ended because a write to the client made no progress within the bound",
+            writes_stalled.clone(),
+        );
         let sockets_refused = Counter::default();
         registry.register(
             "sockets_refused",
@@ -1245,6 +1255,7 @@ impl Metrics {
             publishes_unconfirmed,
             sockets_opened,
             sockets_refused,
+            writes_stalled,
             sockets_closed,
             reasons_sent,
             authentications,
@@ -1417,6 +1428,12 @@ impl Metrics {
     /// A socket this broker has begun serving.
     pub fn socket_opened(&self) -> &Counter {
         &self.sockets_opened
+    }
+
+    /// A write that made no progress within the bound, ending its
+    /// connection.
+    pub fn write_stalled(&self) -> &Counter {
+        &self.writes_stalled
     }
 
     /// A socket closed unserved, because the node is at its

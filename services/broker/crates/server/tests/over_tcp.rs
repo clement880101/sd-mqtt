@@ -335,6 +335,100 @@ async fn a_connection_past_the_limit_is_closed_rather_than_queued() {
     running.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_peer_that_stops_reading_is_cut_and_its_permit_and_outbox_released() {
+    // Keep-alive watches what a client sends, and a client that keeps
+    // sending while never reading passes it; the close that would end
+    // it then sits behind a write the kernel cannot complete. Without a
+    // bound on that write the task, its permit and its outbox entry
+    // outlive the session the broker has already released. Two permits
+    // here: the stalled subscriber's and the publisher's, so that a
+    // third connection is refused until the stalled one is cut.
+    let config = ServerConfig {
+        max_connections: 2,
+        connection: sdmqtt_server::connection::ConnectionConfig {
+            write_timeout: Duration::from_millis(500),
+            ..Default::default()
+        },
+        ..ServerConfig::ephemeral()
+    };
+    let running = Server::bind(config).await.expect("the server binds");
+
+    let (mut stalled, mut stalled_buf) = handshake(&running, "stalled", 0).await;
+    send(
+        &mut stalled,
+        &Packet::Subscribe(Subscribe {
+            packet_id: 1,
+            filters: vec![SubscriptionOptions {
+                filter: "flood".into(),
+                qos: QoS::AtMostOnce,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: mqtt_codec::packet::RetainHandling::SendAlways,
+            }],
+            properties: Properties::default(),
+        }),
+    )
+    .await;
+    assert!(matches!(
+        next(&mut stalled, &mut stalled_buf).await,
+        Some(Packet::SubAck(_))
+    ));
+
+    // From here the subscriber reads nothing. The kernel's loopback
+    // buffers are a few megabytes at most, and this is far more.
+    let (mut publisher, _) = handshake(&running, "publisher", 0).await;
+    let payload = bytes::Bytes::from(vec![0_u8; 512 * 1024]);
+    for _ in 0..48 {
+        send(
+            &mut publisher,
+            &Packet::Publish(Publish {
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: false,
+                topic: "flood".into(),
+                packet_id: None,
+                payload: payload.clone(),
+                properties: Properties::default(),
+            }),
+        )
+        .await;
+    }
+    assert_eq!(running.shared().outbox_count(), 2);
+
+    let mut refused = TcpStream::connect(running.address())
+        .await
+        .expect("the kernel completes the handshake from its backlog");
+    let mut chunk = [0u8; 16];
+    let read = tokio::time::timeout(REPLY, refused.read(&mut chunk))
+        .await
+        .expect("the refusal is prompt")
+        .expect("the socket is readable");
+    assert_eq!(read, 0, "both permits are held while the writer is stalled");
+
+    // The stalled connection's task ends, and with it its outbox entry.
+    let mut released = false;
+    for _ in 0..200 {
+        if running.shared().outbox_count() == 1 {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        released,
+        "the connection whose peer stopped reading was never cut"
+    );
+
+    // And its permit: the task that held it has returned, so a new
+    // connection is served rather than refused.
+    let (_third, _) = handshake(&running, "third", 0).await;
+
+    drop(stalled);
+    running.shutdown().await;
+}
+
+/// Connect without a clean start, and hand back what the broker said.
 /// Connect without a clean start, and hand back what the broker said.
 ///
 /// The resumption half of the handshake above, which always starts

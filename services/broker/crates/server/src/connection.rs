@@ -227,6 +227,15 @@ pub struct ConnectionConfig {
     /// address. `None` for a connection served without one, which no
     /// limiter counts.
     pub peer: Option<std::net::IpAddr>,
+    /// How long a write may make no progress before the connection
+    /// ends. The ceiling: a client that negotiated a keep-alive is
+    /// held to one and a half times that instead when it is shorter,
+    /// which is the figure section 3.1.2.10 already holds its sending
+    /// to. A peer that stops reading passes keep-alive as long as it
+    /// keeps sending, and the close that would end it then sits
+    /// behind a write the kernel cannot complete; this is what ends
+    /// it. Thirty seconds is a default and not a discovery.
+    pub write_timeout: Duration,
 }
 
 impl Default for ConnectionConfig {
@@ -256,6 +265,7 @@ impl Default for ConnectionConfig {
             max_publish_rate: 0,
             publish_burst: 0,
             peer: None,
+            write_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -782,6 +792,8 @@ where
         durability: config.durability,
         publish_limit: PublishLimit::new(config.max_publish_rate, config.publish_burst),
         peer: config.peer,
+        keep_alive: connect.keep_alive,
+        write_timeout: config.write_timeout,
     };
 
     // A takeover addresses two connections by one handle, and the
@@ -1270,9 +1282,32 @@ struct Attached {
     /// Who connected, for the authentication failure limiter when a
     /// re-authentication fails.
     peer: Option<std::net::IpAddr>,
+    /// The keep-alive this client is held to, after the clamp; zero
+    /// for none. See [`Attached::write_stall`].
+    keep_alive: u16,
+    /// See [`ConnectionConfig::write_timeout`].
+    write_timeout: Duration,
 }
 
 impl Attached {
+    /// How long the writer waits on a write that makes no progress.
+    ///
+    /// The configured bound, or one and a half times the negotiated
+    /// keep-alive when that is shorter: a client that promised to
+    /// speak every `keep_alive` seconds and is held to that by the
+    /// ring is held to the same figure for taking what it is sent. A
+    /// client with no keep-alive asked for no liveness check on its
+    /// sending, which says nothing about the broker's buffers, so the
+    /// configured bound stands alone.
+    fn write_stall(&self) -> Duration {
+        match self.keep_alive {
+            0 => self.write_timeout,
+            seconds => self
+                .write_timeout
+                .min(Duration::from_millis(u64::from(seconds) * 1500)),
+        }
+    }
+
     /// Acknowledge, start writing, and read until the connection ends.
     async fn run<R, W>(
         &self,
@@ -1312,8 +1347,9 @@ impl Attached {
             epoch: self.epoch,
         };
         let metrics = Arc::clone(&self.metrics);
+        let stall = self.write_stall();
         tokio::spawn(async move {
-            write_loop(write_half, outbox, version, limit, metrics).await;
+            write_loop(write_half, outbox, version, limit, metrics, stall).await;
             drop(gone);
         });
 
@@ -1822,12 +1858,20 @@ impl Drop for Attached {
 /// write half is shut down either way, so a client that has been
 /// displaced or timed out learns it from the stream rather than only
 /// from a packet it might never read.
+///
+/// `stall` bounds a write that makes no progress; see
+/// [`ConnectionConfig::write_timeout`]. A peer that has stopped
+/// reading leaves the kernel's buffers full and `write_all` pending
+/// for ever, with the close that would end the connection queued
+/// behind it, so the writer ends on its own and the read loop follows
+/// it out.
 async fn write_loop<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut outbox: mpsc::Receiver<Action>,
     version: Version,
     limit: SizeLimit,
     metrics: Arc<Metrics>,
+    stall: Duration,
 ) {
     let mut buf = BytesMut::new();
     while let Some(action) = outbox.recv().await {
@@ -1842,7 +1886,15 @@ async fn write_loop<W: AsyncWrite + Unpin>(
             limit.discard(&action);
         }
         if !buf.is_empty() {
-            if writer.write_all(&buf).await.is_err() {
+            if let Err(error) = write_within(&mut writer, &buf, stall).await {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    metrics.write_stalled().inc();
+                    tracing::debug!(
+                        subscriber = limit.subscriber.0,
+                        ?stall,
+                        "a write made no progress within the bound; the peer has stopped reading"
+                    );
+                }
                 break;
             }
             // After the write, not before it: what is counted as sent
@@ -1862,8 +1914,44 @@ async fn write_loop<W: AsyncWrite + Unpin>(
             break;
         }
     }
-    let _ = writer.flush().await;
-    let _ = writer.shutdown().await;
+    // Bounded for the same reason the writes are: a TLS close_notify
+    // or a WebSocket close frame is a write too, and a peer that will
+    // not take one would hold this task as surely as a publish did.
+    let _ = tokio::time::timeout(stall, async {
+        let _ = writer.flush().await;
+        let _ = writer.shutdown().await;
+    })
+    .await;
+}
+
+/// Write all of `buf`, failing with `TimedOut` when no byte of it is
+/// taken for `stall`.
+///
+/// Progress rather than total time: a large packet over a slow but
+/// live link takes as long as it takes, and each byte the socket
+/// accepts starts the clock again. `write` on a socket half, a TLS
+/// stream and the WebSocket adapter alike takes nothing when it is
+/// interrupted pending, so a timed-out write has not sent part of a
+/// packet.
+async fn write_within<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    mut buf: &[u8],
+    stall: Duration,
+) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match tokio::time::timeout(stall, writer.write(buf)).await {
+            Ok(Ok(0)) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(Ok(taken)) => buf = &buf[taken..],
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the peer took nothing within the write bound",
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The client's Maximum Packet Size, and the way back into the broker
