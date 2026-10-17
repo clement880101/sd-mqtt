@@ -206,14 +206,32 @@ mod tests {
     }
 
     /// The record keeps a digest, not the text, and a near miss fails.
+    ///
+    /// The secret is everything after the first separator, as `id_of`
+    /// reads it, and not after the last: URL-safe base64 may hold `_`,
+    /// and a test that cut there compared the digest against a tail of
+    /// one or two characters, which a forty-four character digest held
+    /// about one key in a hundred. Many keys, so the check is of the
+    /// shape and not of one draw.
     #[test]
     fn the_record_holds_no_secret_and_a_near_miss_does_not_match() {
-        let minted = mint("ci", Scope::Read, 1);
-        let text = minted.text.expose();
-        let secret = text.rsplit_once('_').map(|(_, s)| s).unwrap_or_default();
-        assert!(!minted.record.digest.expose().contains(secret));
-        assert!(!matches(&minted.record, &text[..text.len() - 1]));
-        assert!(!matches(&minted.record, &format!("{text}x")));
+        for _ in 0..256 {
+            let minted = mint("ci", Scope::Read, 1);
+            let text = minted.text.expose();
+            let secret = text
+                .strip_prefix(PREFIX)
+                .and_then(|rest| rest.split_once('_'))
+                .map(|(_, secret)| secret)
+                .expect("a minted key has the shape of one");
+            assert_eq!(
+                secret.len(),
+                43,
+                "thirty-two bytes, URL-safe, unpadded: {text}"
+            );
+            assert!(!minted.record.digest.expose().contains(secret));
+            assert!(!matches(&minted.record, &text[..text.len() - 1]));
+            assert!(!matches(&minted.record, &format!("{text}x")));
+        }
         assert_eq!(id_of("sdmqtt_"), None);
         assert_eq!(id_of("sdmqtt_abc_"), None);
         assert_eq!(id_of("bearer_abc_def"), None);
