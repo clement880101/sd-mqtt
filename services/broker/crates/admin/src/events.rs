@@ -27,6 +27,18 @@
 //! wanted it is told to refetch. The broadcast dropping an event for
 //! a slow reader is the one that would otherwise be silent.
 //!
+//! # The identifier carries the run
+//!
+//! Identifiers count from one in each process, so a browser that
+//! watched the broker before a restart reconnects with a number the
+//! new process may since have passed, and a ring that answered the
+//! number alone would replay this run's events as the previous run's
+//! gap. The `id:` on the wire is therefore `<epoch>-<id>`, where the
+//! epoch names the run, and [`Events::resume`] resynchronises any
+//! identifier from another epoch whatever its number. A bare number
+//! is still read as this run's, so an interface that kept one keeps
+//! working.
+//!
 //! # Why the subscribe and the backlog happen under one lock
 //!
 //! The race this exists to not have: read the ring, then subscribe,
@@ -292,7 +304,9 @@ impl Ring {
         // An identifier this process has never issued. Identifiers
         // start again at one on a restart, so this is a browser that
         // was watching the broker before it restarted: everything it
-        // believes is from another run.
+        // believes is from another run. [`Events::resume`] catches a
+        // tagged identifier from another run before it gets here,
+        // whatever its number; this is the net under a bare number.
         if after >= self.next {
             return (Vec::new(), true);
         }
@@ -316,6 +330,31 @@ impl Ring {
     }
 }
 
+/// What a `Last-Event-ID` said, read against this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resume {
+    /// No usable identifier: the live feed from now on.
+    Fresh,
+    /// An identifier this run issued, or a bare number read as one.
+    After(EventId),
+    /// An identifier another run issued.
+    AnotherRun,
+}
+
+/// The run this process is: the clock, in milliseconds.
+///
+/// Two runs of one process cannot share a millisecond, and nothing
+/// compares two epochs except for equality, so the clock is enough
+/// and costs no dependency. A clock before 1970 is run zero, which is
+/// still a run.
+fn epoch_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 /// What a new subscriber is handed.
 #[derive(Debug)]
 pub struct Subscription {
@@ -324,6 +363,9 @@ pub struct Subscription {
     pub backlog: Vec<Stored>,
     /// Whether it must refetch instead of trusting the backlog.
     pub resynchronise: bool,
+    /// Why, when it must. For a person reading a console; never
+    /// matched on.
+    pub why: &'static str,
     /// Everything published after this subscription was taken.
     pub live: broadcast::Receiver<Stored>,
 }
@@ -336,11 +378,30 @@ pub struct Events {
     dropped: AtomicU64,
     /// Where a drop is counted for a scraper as well as for a test.
     metrics: Arc<Metrics>,
+    /// Which run of the process these identifiers belong to.
+    ///
+    /// Identifiers start again at [`FIRST`] on a restart, and a
+    /// browser that was watching the old process reconnects with the
+    /// last one it saw. Once the new process has issued more events
+    /// than that number, the ring would hold a "gap" between the two
+    /// that was in fact another run's history and replay it as though
+    /// it followed. So the identifier on the wire is `<epoch>-<id>`,
+    /// and a `Last-Event-ID` from another epoch is told to
+    /// resynchronise whatever its number; see [`Events::resume`].
+    epoch: u64,
 }
 
 impl Events {
-    /// An empty ring over `metrics`.
+    /// An empty ring over `metrics`, for this run of the process.
     pub fn new(metrics: Arc<Metrics>) -> Self {
+        Self::with_epoch(metrics, epoch_now())
+    }
+
+    /// An empty ring whose identifiers belong to run `epoch`.
+    ///
+    /// What [`Events::new`] calls with the clock, and what a test
+    /// calls with two different numbers to stand for two runs.
+    pub fn with_epoch(metrics: Arc<Metrics>, epoch: u64) -> Self {
         let (live, _) = broadcast::channel(LIVE_CAPACITY);
         Self {
             ring: Mutex::new(Ring {
@@ -350,6 +411,65 @@ impl Events {
             live,
             dropped: AtomicU64::new(0),
             metrics,
+            epoch,
+        }
+    }
+
+    /// The run these identifiers belong to.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// What the stream writes in `id:` for event `id`: the run, a
+    /// dash, the number.
+    pub fn tagged(&self, id: EventId) -> String {
+        format!("{}-{id}", self.epoch)
+    }
+
+    /// Subscribe, resuming from whatever `Last-Event-ID` said.
+    ///
+    /// `None` is a browser with no header, which is up to date by
+    /// definition. A tagged identifier from this run resumes after
+    /// it, exactly as [`Events::subscribe`] does. One from **another
+    /// run** is told to resynchronise whatever its number: the
+    /// browser's whole picture is of a process that no longer exists,
+    /// and nothing in this ring is what it missed.
+    ///
+    /// A bare number is read as this run's, which is what every
+    /// identifier was before the run was part of it, so an interface
+    /// that kept one keeps working. Unreadable is read as absent
+    /// rather than refused, for the reason [`last_event_id`] gives.
+    pub fn resume(&self, last_event_id: Option<&str>) -> Subscription {
+        match self.resume_of(last_event_id) {
+            Resume::Fresh => self.subscribe(None),
+            Resume::After(after) => self.subscribe(Some(after)),
+            Resume::AnotherRun => {
+                // Under the ring's lock like every other subscribe, so
+                // that the receiver and the ring agree about where
+                // "live" starts.
+                let _ring = self.ring.lock();
+                Subscription {
+                    backlog: Vec::new(),
+                    resynchronise: true,
+                    why: "the events you missed are from before this broker restarted",
+                    live: self.live.subscribe(),
+                }
+            }
+        }
+    }
+
+    /// Read a `Last-Event-ID` against this run.
+    fn resume_of(&self, last_event_id: Option<&str>) -> Resume {
+        let Some(value) = last_event_id.map(str::trim) else {
+            return Resume::Fresh;
+        };
+        match value.split_once('-') {
+            Some((run, id)) => match (run.parse::<u64>(), id.parse::<EventId>()) {
+                (Ok(run), Ok(id)) if run == self.epoch => Resume::After(id),
+                (Ok(_), Ok(_)) => Resume::AnotherRun,
+                _ => Resume::Fresh,
+            },
+            None => value.parse().map_or(Resume::Fresh, Resume::After),
         }
     }
 
@@ -392,6 +512,7 @@ impl Events {
         Subscription {
             backlog,
             resynchronise,
+            why: "the events you missed are no longer held",
             live,
         }
     }
@@ -468,9 +589,14 @@ impl Stream for Frames {
 }
 
 /// The frame carrying one stored event.
-fn frame(stored: &Stored) -> SseEvent {
+///
+/// The identifier on the wire is `<epoch>-<id>`, so that a browser
+/// resuming after a restart can be told its identifier is from another
+/// run; see [`Events::resume`]. The browser never reads it, only
+/// echoes it.
+fn frame(epoch: u64, stored: &Stored) -> SseEvent {
     SseEvent::default()
-        .id(stored.id.to_string())
+        .id(format!("{epoch}-{}", stored.id))
         .event(stored.body.name())
         .json_data(&*stored.body)
         .expect("an event this crate defined serialises")
@@ -520,24 +646,19 @@ async fn pump(state: AdminState, subscription: Subscription, frames: mpsc::Sende
     let Subscription {
         backlog,
         resynchronise: stale,
+        why,
         mut live,
     } = subscription;
+    let epoch = state.events.epoch();
 
     if !hand_over(&frames, opening(), &mut shutdown).await {
         return;
     }
-    if stale
-        && !hand_over(
-            &frames,
-            resynchronise("the events you missed are no longer held"),
-            &mut shutdown,
-        )
-        .await
-    {
+    if stale && !hand_over(&frames, resynchronise(why), &mut shutdown).await {
         return;
     }
     for stored in backlog {
-        if !hand_over(&frames, frame(&stored), &mut shutdown).await {
+        if !hand_over(&frames, frame(epoch, &stored), &mut shutdown).await {
             return;
         }
     }
@@ -553,7 +674,7 @@ async fn pump(state: AdminState, subscription: Subscription, frames: mpsc::Sende
         };
         match received {
             Ok(stored) => {
-                if !hand_over(&frames, frame(&stored), &mut shutdown).await {
+                if !hand_over(&frames, frame(epoch, &stored), &mut shutdown).await {
                     return;
                 }
             }
@@ -591,16 +712,19 @@ async fn pump(state: AdminState, subscription: Subscription, frames: mpsc::Sende
 /// worst it costs is a browser that sees the live feed from now on,
 /// and refusing the request would leave an interface with no stream
 /// at all over a header it did not write by hand.
-fn last_event_id(headers: &HeaderMap) -> Option<EventId> {
+///
+/// Returned as text rather than parsed here, because what it means
+/// depends on which run issued it and [`Events::resume`] is what knows.
+fn last_event_id(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse().ok())
+        .map(str::trim)
 }
 
 /// The events stream.
 async fn events(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    let subscription = state.events.subscribe(last_event_id(&headers));
+    let subscription = state.events.resume(last_event_id(&headers));
     let (sender, frames) = mpsc::channel(PENDING_FRAMES);
     // One task per open stream. It ends when the client goes, when
     // the broadcast sender goes, or when the listener stops, and
@@ -1043,6 +1167,60 @@ mod tests {
         );
     }
 
+    /// An identifier from another run of this process is told to
+    /// resynchronise, never replayed.
+    ///
+    /// Identifiers start again at [`FIRST`] on a restart. A browser
+    /// that was watching the old process reconnects with its last
+    /// identifier, and once the new process has issued more events
+    /// than that number the ring held a "gap" that was in fact another
+    /// run's history, and replayed it as though it followed. So the
+    /// identifier on the wire carries the run as well as the number,
+    /// and a number from another run is resynchronised whatever it is.
+    /// A bare number is read as this run's, which is what every
+    /// identifier was before the run was part of it.
+    #[test]
+    fn an_identifier_from_another_run_is_told_to_resynchronise() {
+        let before = Arc::new(Events::with_epoch(Arc::new(Metrics::new()), 1));
+        let after = Arc::new(Events::with_epoch(Arc::new(Metrics::new()), 2));
+        for index in 0..5 {
+            before.publish(connected(&format!("old-{index}")));
+        }
+        for index in 0..10 {
+            after.publish(connected(&format!("new-{index}")));
+        }
+
+        // The id the old run put on its third event, handed to the new
+        // run, which has passed that number.
+        let stale = after.resume(Some(&before.tagged(3)));
+        assert!(stale.resynchronise, "another run's identifier is stale");
+        assert!(
+            stale.backlog.is_empty(),
+            "and nothing of this run is dressed up as what it missed: {:?}",
+            stale.backlog
+        );
+
+        // This run's own identifier resumes exactly as before.
+        let resumed = after.resume(Some(&after.tagged(3)));
+        assert!(!resumed.resynchronise);
+        assert_eq!(resumed.backlog.len(), 7, "{:?}", resumed.backlog);
+        assert_eq!(resumed.backlog[0].id, 4);
+
+        // A bare number is this run's: the identifiers the interface
+        // sent before the run was part of them.
+        let plain = after.resume(Some("3"));
+        assert!(!plain.resynchronise);
+        assert_eq!(plain.backlog.len(), 7);
+
+        // Unreadable is absent, as it always was.
+        let fresh = after.resume(Some("not-an-id"));
+        assert!(!fresh.resynchronise);
+        assert!(fresh.backlog.is_empty());
+        let fresh = after.resume(None);
+        assert!(!fresh.resynchronise);
+        assert!(fresh.backlog.is_empty());
+    }
+
     #[test]
     fn identifiers_are_monotonic_across_a_reconnect() {
         let events = ring();
@@ -1149,7 +1327,9 @@ mod tests {
             TestStream::open(admin.address(), "/api/v1/events", Some(&first.to_string())).await;
         stream.head().await;
         let seen = stream
-            .until(PATIENCE, |seen| seen.contains(&format!("id: {second}")))
+            .until(PATIENCE, |seen| {
+                seen.contains(&format!("id: {}", events.tagged(second)))
+            })
             .await;
         assert!(
             !seen.contains("event: resynchronise"),
@@ -1160,7 +1340,9 @@ mod tests {
         // And the live feed continues from there.
         let third = events.publish(connected("c"));
         let seen = stream
-            .until(PATIENCE, |seen| seen.contains(&format!("id: {third}")))
+            .until(PATIENCE, |seen| {
+                seen.contains(&format!("id: {}", events.tagged(third)))
+            })
             .await;
         assert!(seen.contains("\"client_id\":\"c\""), "{seen}");
 
@@ -1187,6 +1369,53 @@ mod tests {
             "no gap dressed up as a history: {seen}"
         );
 
+        stream.close().await;
+        admin.shutdown().await;
+    }
+
+    /// Over a socket: every `id:` carries the run, this run's resumes,
+    /// and a previous run's is resynchronised even though this run has
+    /// passed its number.
+    #[tokio::test]
+    async fn an_identifier_from_before_a_restart_is_resynchronised_over_a_socket() {
+        let admin = serve(Duration::from_secs(3_600)).await;
+        let events = Arc::clone(admin.events());
+        for index in 0..3 {
+            events.publish(connected(&format!("client-{index}")));
+        }
+
+        let mut stream = TestStream::open(
+            admin.address(),
+            "/api/v1/events",
+            Some(&events.tagged(FIRST)),
+        )
+        .await;
+        stream.head().await;
+        let seen = stream
+            .until(PATIENCE, |seen| seen.contains("client-2"))
+            .await;
+        assert!(
+            seen.contains(&format!("id: {}", events.tagged(FIRST + 1))),
+            "the identifier on the wire carries the run: {seen}"
+        );
+        assert!(
+            !seen.contains("client-0"),
+            "resumed after the first: {seen}"
+        );
+        stream.close().await;
+
+        // What a browser that watched the previous process sends: the
+        // first identifier, tagged with a run this is not.
+        let previous = format!("{}-{FIRST}", events.epoch().wrapping_add(1));
+        let mut stream = TestStream::open(admin.address(), "/api/v1/events", Some(&previous)).await;
+        stream.head().await;
+        let seen = stream
+            .until(PATIENCE, |seen| seen.contains("event: resynchronise"))
+            .await;
+        assert!(
+            !seen.contains("event: connected"),
+            "another run's history was replayed as this run's: {seen}"
+        );
         stream.close().await;
         admin.shutdown().await;
     }
