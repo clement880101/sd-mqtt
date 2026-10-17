@@ -17,14 +17,26 @@ fn read(relative: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
 }
 
-/// Every `lookup("SDMQTT_…")` in the configuration's source.
+/// Every `"SDMQTT_…"` literal in the configuration's source, outside
+/// its tests.
+///
+/// Every literal and not only the argument of `lookup("…")`: the
+/// strict flags are read from a table of names that is handed to
+/// `lookup` one entry at a time, and a scan that keyed on the call
+/// walked straight past them. The tests are left out because they
+/// name variables that do not exist, on purpose, to check they are
+/// refused.
 fn variables(source: &str) -> Vec<String> {
-    let mut found: Vec<String> = source
-        .split("lookup(\"")
+    let outside_tests = source.split("#[cfg(test)]").next().unwrap_or(source);
+    let mut found: Vec<String> = outside_tests
+        .split("\"SDMQTT_")
         .skip(1)
         .filter_map(|rest| rest.split('"').next())
-        .filter(|name| name.starts_with("SDMQTT_"))
-        .map(str::to_owned)
+        .filter(|name| {
+            name.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        })
+        .map(|name| format!("SDMQTT_{name}"))
         .collect();
     found.sort();
     found.dedup();

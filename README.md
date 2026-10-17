@@ -109,6 +109,9 @@ Every variable, which overrides the file and is overridden by a flag:
 | `SDMQTT_CLUSTER_DURABILITY` | `cluster.durability`: `async` or `sync` |
 | `SDMQTT_CLUSTER_SYNC_TIMEOUT_MS` | `cluster.sync_timeout_ms` |
 | `SDMQTT_CLUSTER_STRICT_UNCONFIRMED` | `cluster.strict.unconfirmed` |
+| `SDMQTT_CLUSTER_STRICT_CONNECTS` | `cluster.strict.connects`, `true` or `false` and nothing else |
+| `SDMQTT_CLUSTER_STRICT_PUBLISHES` | `cluster.strict.publishes`, likewise |
+| `SDMQTT_CLUSTER_STRICT_SUBSCRIBES` | `cluster.strict.subscribes`, likewise |
 | `SDMQTT_CLUSTER_GONE_AFTER_MS` | `cluster.gone_after_ms`, the grace before a dead node is repaired away from |
 | `SDMQTT_CLUSTER_REPAIR_SESSIONS_PER_SECOND` | `cluster.repair_sessions_per_second` |
 
