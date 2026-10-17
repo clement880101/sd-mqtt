@@ -251,6 +251,8 @@ jobs:
       # because a release changes the sources it quotes.
       - name: The landing page agrees with what it quotes
         run: python3 scripts/test_site.py
+      - name: Every relative link in the docs resolves
+        run: python3 scripts/test_docs_links.py
       # The release workflow's shape (nothing published before every
       # artifact has run; no retired runner) and the archive test's
       # commands on every host: both found by review, both run once per

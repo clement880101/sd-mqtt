@@ -90,6 +90,7 @@ def main() -> int:
     evidence = (ROOT / "docs/superpowers/specs/2026-09-19-sd-mqtt-design.md").read_text()
     evidence += "".join(p.read_text() for p in (ROOT / "docs/decisions").glob("*.md"))
     evidence += (ROOT / "README.md").read_text()
+    evidence += "".join(p.read_text() for p in (ROOT / "docs").glob("**/*.md"))
     quoted = re.findall(r'data-figure="([^"]+)"', text)
     check("the page quotes measured figures", len(quoted) >= 4, str(quoted))
     unsourced = [figure for figure in quoted if figure not in evidence]

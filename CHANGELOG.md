@@ -8,6 +8,18 @@ it had releases.
 **The one thing to read before upgrading is "Before you upgrade" under
 the milestone you are moving to.** Everything else is description.
 
+## Unreleased
+
+### Changed
+
+- **The documentation is split into features and a setup guide.** The
+  README is the licence, a table of features, a quick start and the
+  configuration reference. Each feature has a page under
+  `docs/features/` saying what it does, how to configure it and what it
+  reports; `docs/setup.md` goes from nothing to a three-node cluster;
+  `docs/README.md` indexes it all. `scripts/test_docs_links.py` follows
+  every relative link.
+
 ## 0.7.1 — 2026-10-16
 
 ### Fixed
