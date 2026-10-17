@@ -304,10 +304,22 @@ impl Deliver for Replication {
             // which is what stops one session having two live
             // connections.
             Message::Claim(claiming) => {
-                let handover = self
+                let Some(handover) = self
                     .shared
                     .hand_over_session(&claiming.session, claiming.clean)
-                    .unwrap_or_default();
+                else {
+                    // **Not held here, and said so.** The register that
+                    // named this node is older than a restart, or the
+                    // session expired here. An empty complete drain was
+                    // the answer before, and the claimer took it at its
+                    // word: it never pulled, and the node holding the
+                    // queue as a copy was torn down when the register
+                    // arrived. See `Drained::not_held`.
+                    return vec![Message::Drained(Drained::not_held(
+                        &claiming.session,
+                        claiming.epoch,
+                    ))];
+                };
                 // Where the session went, for a forward still on its way
                 // here; see `forwarded`.
                 self.departed(
@@ -1287,6 +1299,39 @@ mod tests {
             tokio::time::sleep(HELD_RETRY).await;
         }
         counter()
+    }
+
+    /// A claim for a session this node does not hold is answered with
+    /// "not held", never with an empty complete drain.
+    ///
+    /// The register naming this node as owner can be older than a
+    /// restart, or the session expired here. A complete drain told the
+    /// claimer it had everything, so it never pulled from a copy, and
+    /// the node holding the real queue as a copy was torn down when the
+    /// register arrived.
+    #[tokio::test]
+    async fn a_claim_for_a_session_not_held_here_is_not_answered_complete() {
+        let (handler, _shared) = handler();
+        let session = storage::SessionKey::new("", "rover");
+        let answer = handler.delivered(
+            NodeId::mint(),
+            Message::Claim(cluster::Claiming {
+                session: session.clone(),
+                epoch: 3,
+                clean: false,
+            }),
+        );
+        match answer.as_slice() {
+            [Message::Drained(chunk)] => {
+                assert!(!chunk.last, "a drain of nothing was declared complete");
+                assert!(
+                    chunk.is_not_held(),
+                    "the answer says the session is not here"
+                );
+                assert_eq!((chunk.session.clone(), chunk.epoch), (session, 3));
+            }
+            other => panic!("a claim is answered with one chunk, not {other:?}"),
+        }
     }
 
     /// A forward that lands behind a drain, before the session the

@@ -187,6 +187,47 @@ impl Drained {
         first.inbound = inbound;
         chunks
     }
+
+    /// The answer of a previous owner that no longer holds the session.
+    ///
+    /// A register naming a node as owner can be older than that node's
+    /// restart, or the session can have expired there, so a claim can
+    /// reach a node with nothing to drain. Answering with an empty
+    /// *complete* drain was the defect: the claimer saw `complete`,
+    /// never pulled, and the node holding the real queue as a copy was
+    /// torn down when the register arrived. This is an empty chunk that
+    /// is **not** the last, which is a shape [`Self::chunks`] never
+    /// produces — a chunk is filled before another is cut, so the only
+    /// empty chunk is the last one of an empty session — and so it is
+    /// free to mean "I do not hold this"; the claimer stops waiting at
+    /// once and pulls from a copy. A claimer from before this reads it
+    /// as a drain that stopped, waits out its patience, and pulls just
+    /// the same.
+    #[must_use]
+    pub fn not_held(session: &SessionKey, epoch: u64) -> Self {
+        Self {
+            session: session.clone(),
+            epoch,
+            announced: 0,
+            subscriptions: Vec::new(),
+            inflight: Vec::new(),
+            queued: Vec::new(),
+            inbound: Vec::new(),
+            highest_sequence: 0,
+            last: false,
+        }
+    }
+
+    /// Whether this is [`Self::not_held`]'s answer.
+    #[must_use]
+    pub fn is_not_held(&self) -> bool {
+        !self.last
+            && self.announced == 0
+            && self.subscriptions.is_empty()
+            && self.inflight.is_empty()
+            && self.queued.is_empty()
+            && self.inbound.is_empty()
+    }
 }
 
 /// What a bounded wait came back with.
@@ -554,6 +595,12 @@ impl Awaiting {
                 // asserted away.
                 Ok(None) | Err(_) => break,
             };
+            if chunk.is_not_held() {
+                // The previous owner does not hold the session. Nothing
+                // more is coming, and waiting for it would only delay
+                // the pull; see `Drained::not_held`.
+                break;
+            }
             announced = announced.max(chunk.announced);
             handover.subscriptions.extend(chunk.subscriptions);
             handover.inbound.extend(chunk.inbound);

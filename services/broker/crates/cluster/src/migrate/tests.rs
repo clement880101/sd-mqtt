@@ -275,6 +275,44 @@ async fn a_drain_whose_first_chunk_was_lost_is_short_by_what_it_carried() {
     assert_eq!(migrations.stats().drained(), 0);
 }
 
+/// A previous owner that no longer holds the session says so, and the
+/// claimer stops waiting at once and pulls from a copy.
+///
+/// Before this the previous owner answered a claim for a session it did
+/// not hold with an empty, complete drain: the claimer saw `complete`,
+/// never pulled, and the node holding the real queue as a copy was torn
+/// down by the register arriving. An empty chunk that is not the last
+/// is a shape an ordinary drain never produces, which is what makes it
+/// free to carry this.
+#[tokio::test]
+async fn a_previous_owner_that_holds_nothing_ends_the_wait_without_completing_it() {
+    let migrations = Arc::new(Migrations::default());
+    let awaiting = migrations.begin(&key(), 4);
+    let answer = Drained::not_held(&key(), 4);
+    assert!(answer.is_not_held());
+    assert!(
+        !Drained::chunks(&key(), 4, Handover::default())[0].is_not_held(),
+        "an empty session's one chunk is a complete drain, not this"
+    );
+    migrations.arrived(answer);
+    let started = std::time::Instant::now();
+    let drain = bounded(awaiting.collect(Duration::from_secs(5))).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the claimer waited {:?} for an owner that had already said no",
+        started.elapsed()
+    );
+    assert!(
+        !drain.complete,
+        "nothing was drained, so nothing is complete"
+    );
+    assert_eq!(
+        drain.missing, 0,
+        "and nothing was announced, so nothing is missing"
+    );
+    assert_eq!(migrations.stats().incomplete(), 1);
+}
+
 #[tokio::test]
 async fn the_wait_is_bounded_over_the_whole_drain_and_not_over_each_chunk() {
     // **The mutation this exists for is "the drain unbounded", and it
