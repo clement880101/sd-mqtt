@@ -144,22 +144,33 @@ fn a_topic_deeper_than_the_limit_is_rejected() {
 ///
 /// 0x90, topic name invalid, is absent from MQTT-v5.0 Table 3-8, so the
 /// old mapping turned a configuration limit into an off-spec SUBACK.
+///
+/// Asked of the validator rather than of `decode`, because a SUBSCRIBE
+/// decodes whatever filters it carries: [MQTT-3.8.4-5] answers per
+/// filter, so the broker is what refuses one, with this code.
 #[test]
 fn a_filter_deeper_than_the_limit_reports_the_filter_error() {
     let limits = Limits {
         max_topic_depth: 2,
         ..Limits::default()
     };
-    // SUBSCRIBE, identifier 1, empty property block, filter "a/b/c",
-    // options 0.
+    let err = mqtt_codec::topic::validate_subscription("a/b/c", &limits).unwrap_err();
+    assert_eq!(err, CodecError::TopicFilterTooDeep);
+    assert_eq!(ReasonCode::from(err), ReasonCode::TopicFilterInvalid);
+
+    // And the SUBSCRIBE carrying that filter — identifier 1, empty
+    // property block, "a/b/c", options 0 — reaches the broker whole.
     let mut buf = BytesMut::from(
         &[
             0x82u8, 0x0B, 0x00, 0x01, 0x00, 0x00, 0x05, b'a', b'/', b'b', b'/', b'c', 0x00,
         ][..],
     );
-    let err = decode(&mut buf, Version::V5, &limits).unwrap_err();
-    assert_eq!(err, CodecError::TopicFilterTooDeep);
-    assert_eq!(ReasonCode::from(err), ReasonCode::TopicFilterInvalid);
+    match decode(&mut buf, Version::V5, &limits) {
+        Ok(Some(Packet::Subscribe(subscribe))) => {
+            assert_eq!(subscribe.filters[0].filter, "a/b/c");
+        }
+        other => panic!("a subscribe with a filter past the limit decodes, got {other:?}"),
+    }
 }
 
 /// The motivating example, checked from both ends.

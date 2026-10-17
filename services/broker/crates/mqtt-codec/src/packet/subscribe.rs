@@ -81,9 +81,10 @@ pub struct Subscribe {
 /// not covered by the note on [`Subscribe::encode_body`] that filter validity
 /// belongs to the caller. Both sides call this so they cannot drift.
 ///
-/// A filter carrying the share prefix but no well-formed group is rejected
-/// earlier on decode by [`crate::topic::validate_subscription`], so testing
-/// the prefix here agrees with that path while needing no [`Limits`].
+/// Testing the prefix alone needs no [`Limits`] and agrees with
+/// [`crate::topic::validate_subscription`], which the broker asks of each
+/// filter: a filter carrying the prefix but no well-formed group is
+/// refused there with 0x8F, and here only when it also sets no-local.
 fn check_no_local(filter: &str, no_local: bool) -> Result<(), CodecError> {
     if no_local && filter.starts_with(crate::topic::SHARE_PREFIX) {
         return Err(CodecError::ProtocolError(
@@ -105,10 +106,24 @@ fn read_packet_id(reader: &mut Reader<'_>) -> Result<u16, CodecError> {
 
 impl Subscribe {
     /// Decode the body that follows the fixed header.
+    ///
+    /// Filters are carried as written, not judged. [MQTT-3.8.4-5] has a
+    /// subscribe of several filters handled as a sequence of
+    /// single-filter subscribes with their answers combined, so an
+    /// invalid filter earns 0x8F in its slot of the SUBACK and the
+    /// filters beside it are granted; the broker asks
+    /// [`crate::topic::validate_subscription`] of each. Refusing the
+    /// packet here would close the connection over one filter, which
+    /// 4.13 permits but which punishes the ones that were fine. The
+    /// no-local rule stays, because it ties two fields together rather
+    /// than judging a filter and has no per-filter answer. `Limits`
+    /// is taken so the signature matches the other bodies the frame
+    /// decoder dispatches to; the depth limit is the broker's to apply
+    /// with the same value.
     pub fn decode_body(
         reader: &mut Reader<'_>,
         version: Version,
-        limits: &Limits,
+        _limits: &Limits,
     ) -> Result<Self, CodecError> {
         let packet_id = read_packet_id(reader)?;
         let properties = if version == Version::V5 {
@@ -137,7 +152,6 @@ impl Subscribe {
             let retain_as_published = options & 0x08 != 0;
             let retain_handling = RetainHandling::from_u8((options & 0x30) >> 4)?;
 
-            crate::topic::validate_subscription(&filter, limits)?;
             check_no_local(&filter, no_local)?;
 
             filters.push(SubscriptionOptions {
@@ -596,17 +610,30 @@ mod tests {
         allowed.encode_body(Version::V5, &mut out).expect("encodes");
     }
 
+    /// An invalid filter is carried to the broker as written, because
+    /// [MQTT-3.8.4-5] answers a subscribe per filter and the broker
+    /// refuses the bad one with 0x8F in its SUBACK. Refusing the packet
+    /// here would close the connection over one filter and punish the
+    /// ones beside it that were fine.
     #[test]
-    fn rejects_an_invalid_filter() {
+    fn decodes_an_invalid_filter_for_the_broker_to_refuse() {
         let mut out = Vec::new();
         crate::writer::put_u16(&mut out, 1);
         out.push(0x00); // empty property block
         crate::writer::put_string(&mut out, "a/#/b").unwrap();
         out.push(0x00);
+        crate::writer::put_string(&mut out, "ok/+").unwrap();
+        out.push(0x00);
         let mut reader = Reader::new(&out);
+        let decoded =
+            Subscribe::decode_body(&mut reader, Version::V5, &Limits::default()).expect("decodes");
         assert_eq!(
-            Subscribe::decode_body(&mut reader, Version::V5, &Limits::default()).unwrap_err(),
-            CodecError::InvalidTopicFilter
+            decoded
+                .filters
+                .iter()
+                .map(|options| options.filter.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a/#/b", "ok/+"]
         );
     }
 
