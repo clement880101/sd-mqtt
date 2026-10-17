@@ -543,7 +543,7 @@ impl Awaiting {
         let deadline = tokio::time::Instant::now() + patience;
         let mut handover = Handover::default();
         let mut announced = 0u64;
-        let mut complete = false;
+        let mut last = false;
         loop {
             let chunk = match tokio::time::timeout_at(deadline, self.chunks.recv()).await {
                 Ok(Some(chunk)) => chunk,
@@ -561,11 +561,20 @@ impl Awaiting {
             handover.inflight.extend(chunk.inflight);
             handover.queued.extend(chunk.queued);
             if chunk.last {
-                complete = true;
+                last = true;
                 break;
             }
         }
         let received = handover.messages() as u64;
+        // **Complete is counted, not declared.** `last` says the far
+        // node sent its final chunk; it does not say the earlier ones
+        // arrived, and the link drops rather than blocks. A drain whose
+        // first chunk was lost used to be reported complete with nothing
+        // missing — sixty-four messages and every filter gone with that
+        // chunk — and no pull was made because nothing looked short. So
+        // a drain is complete only when what arrived is what the far
+        // node announced it held.
+        let complete = last && received >= announced;
         let missing = announced.saturating_sub(received);
         let drain = Drain {
             handover,

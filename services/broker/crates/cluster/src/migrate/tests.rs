@@ -240,6 +240,41 @@ async fn a_drain_that_stops_partway_keeps_what_arrived_and_counts_the_rest() {
     assert_eq!(migrations.stats().messages(), CHUNK as u64);
 }
 
+/// A drain whose first chunk was lost is not complete, whatever the
+/// last chunk says.
+///
+/// `last` is a fact about the chunk and not about the drain: the link
+/// drops rather than blocks, so the first chunk can go missing and the
+/// last still arrive. Before this the drain was reported complete with
+/// nothing missing, sixty-four messages and every filter gone with the
+/// first chunk, and no pull was made because nothing looked short. A
+/// drain is complete only when what arrived is what was announced.
+#[tokio::test]
+async fn a_drain_whose_first_chunk_was_lost_is_short_by_what_it_carried() {
+    let migrations = Arc::new(Migrations::default());
+    let awaiting = migrations.begin(&key(), 4);
+    let messages = u8::try_from(CHUNK + 5).expect("the chunk is small enough to count in a byte");
+    let chunks = Drained::chunks(&key(), 4, handover(messages));
+    assert_eq!(chunks.len(), 2);
+    for chunk in chunks.into_iter().skip(1) {
+        migrations.arrived(chunk);
+    }
+    let drain = bounded(awaiting.collect(Duration::from_millis(150))).await;
+
+    assert!(
+        !drain.complete,
+        "the last chunk arrived, but the drain is not whole"
+    );
+    assert_eq!(drain.handover.queued.len(), 5, "what did arrive");
+    assert_eq!(
+        drain.missing, CHUNK as u64,
+        "and the first chunk's worth is missing"
+    );
+    assert_eq!(migrations.stats().missing(), CHUNK as u64);
+    assert_eq!(migrations.stats().incomplete(), 1);
+    assert_eq!(migrations.stats().drained(), 0);
+}
+
 #[tokio::test]
 async fn the_wait_is_bounded_over_the_whole_drain_and_not_over_each_chunk() {
     // **The mutation this exists for is "the drain unbounded", and it
