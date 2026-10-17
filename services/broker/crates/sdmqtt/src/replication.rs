@@ -933,6 +933,12 @@ fn records_for_change(
 /// out; this task only ever acts on what placement says is short, so a
 /// node that is merely restarting never becomes a repair.
 ///
+/// **And any follower stalled behind the owner's position.** A
+/// follower that missed one change reports a mark below the hole for
+/// ever, and before this it had a mark and so was never repaired; see
+/// `cluster::Copies::stalled`. It is sent the same snapshot, which
+/// replaces its copy and lands its mark on the owner's position.
+///
 /// A snapshot that was sent but not yet answered must not be sent
 /// again next second, or a slow follower would be sent its queue once
 /// a second for as long as it took to apply the first one. So each
@@ -947,6 +953,12 @@ pub async fn repairing(
 ) {
     /// How long a sent snapshot is given before it may be sent again.
     const SENT_HOLDS_FOR: Duration = Duration::from_secs(30);
+    /// How long a follower may sit behind at one mark before it is
+    /// treated as having missed something. Two sweeps: a follower that
+    /// is applying moves its mark within a round trip, and one that has
+    /// not moved in two seconds is waiting for a change that is not
+    /// coming.
+    const STALLED_FOR: Duration = Duration::from_secs(2);
 
     let mut sent: HashMap<(storage::SessionKey, [u8; 16]), Instant> = HashMap::new();
     loop {
@@ -964,7 +976,10 @@ pub async fn repairing(
                 .into_iter()
                 .filter(|node| *node != me)
                 .take(placement.factor().copies().saturating_sub(1))
-                .filter(|node| !copies.has_mark(&session, node.to_bytes()))
+                .filter(|node| {
+                    !copies.has_mark(&session, node.to_bytes())
+                        || copies.stalled(&session, node.to_bytes(), now, STALLED_FOR)
+                })
                 .collect();
             if followers.is_empty() {
                 continue;

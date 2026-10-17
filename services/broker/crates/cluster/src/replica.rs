@@ -46,7 +46,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
@@ -455,6 +455,9 @@ struct Tables {
     /// is caught up and whose furthest is a thousand behind is not
     /// described by either number alone.
     marks: HashMap<(SessionKey, [u8; 16]), u64>,
+    /// Followers seen behind this node's position, with the mark they
+    /// were at and when that was first seen. See [`Copies::stalled`].
+    behind: HashMap<(SessionKey, [u8; 16]), (u64, Instant)>,
 }
 
 impl Copies {
@@ -640,10 +643,18 @@ impl Copies {
     }
 
     /// Stop streaming `session`, because it has gone or moved.
+    ///
+    /// **Its waiters go too, and are told no.** A synchronous publish
+    /// waiting on a session this node no longer streams is waiting for
+    /// a mark nobody will send; left in the table it waited out its
+    /// patience and stayed there after. Dropping its sender is the no:
+    /// see [`Confirming::within`].
     pub fn stop(&self, session: &SessionKey) {
         let mut tables = locked(&self.inner);
         tables.owned.remove(session);
         tables.marks.retain(|(held, _), _| held != session);
+        tables.behind.retain(|(held, _), _| held != session);
+        tables.waiting.remove(session);
     }
 
     /// Record what a follower said about a session this node owns.
@@ -658,13 +669,73 @@ impl Copies {
         let Some(waiting) = tables.waiting.get_mut(&session) else {
             return;
         };
-        // What the retain removes are the senders whose position this
-        // mark has reached, and dropping a sender is how its waiter
-        // learns.
-        waiting.retain(|(at, _)| *at > through);
+        // **Told yes by a send, not by a drop.** A drop is how a waiter
+        // learns the session stopped being streamed, which is a no; see
+        // `Copies::stop`. A waiter that has already given up has closed
+        // its end, and the send to it is lost harmlessly.
+        let (reached, still): (Vec<_>, Vec<_>) = std::mem::take(waiting)
+            .into_iter()
+            .partition(|(at, _)| *at <= through);
+        *waiting = still;
+        for (_, tell) in reached {
+            let _ = tell.send(());
+        }
         if waiting.is_empty() {
             tables.waiting.remove(&session);
         }
+    }
+
+    /// Whether `follower` has sat behind this node's position for
+    /// `session` for the whole of `grace` without its mark moving.
+    ///
+    /// **Section 8.6's other repair.** A follower that missed one change
+    /// reports a mark below the hole for ever: the link is ordered, the
+    /// owner never re-sends, and [`Follower::HELD_MAX`] bounds what it
+    /// can bridge. It has a mark, so the repair that looks for a
+    /// follower with none passed it over, its copy stayed short, and a
+    /// synchronous publish waiting on it waited out its patience every
+    /// time. A stalled follower is sent the snapshot a new one is.
+    ///
+    /// Measured from when it was **first seen behind at that mark**,
+    /// not from when it last moved: a session idle for an hour whose
+    /// next append has not been answered yet is behind by one and
+    /// moving, not an hour stalled. Caught up, or moved, clears it. A
+    /// follower with no mark is never stalled; it is the other repair.
+    ///
+    /// `now` is injected, the way the clocks in this crate are, so that
+    /// a grace is an argument rather than a wait.
+    pub fn stalled(
+        &self,
+        session: &SessionKey,
+        follower: [u8; 16],
+        now: Instant,
+        grace: Duration,
+    ) -> bool {
+        let mut tables = locked(&self.inner);
+        let key = (session.clone(), follower);
+        let Some(&mark) = tables.marks.get(&key) else {
+            tables.behind.remove(&key);
+            return false;
+        };
+        let position = tables.owned.get(session).map_or(0, Owner::at);
+        if mark >= position {
+            tables.behind.remove(&key);
+            return false;
+        }
+        match tables.behind.get(&key) {
+            Some(&(seen, since)) if seen == mark => now.saturating_duration_since(since) >= grace,
+            _ => {
+                tables.behind.insert(key, (mark, now));
+                false
+            }
+        }
+    }
+
+    /// How many synchronous publishes are waiting on a follower, across
+    /// every session.
+    #[must_use]
+    pub fn waiters(&self) -> usize {
+        locked(&self.inner).waiting.values().map(Vec::len).sum()
     }
 
     /// Tell this table who a session it owns is streamed to.
@@ -740,6 +811,7 @@ impl Copies {
     pub fn forgot(&self, follower: [u8; 16]) {
         let mut tables = locked(&self.inner);
         tables.marks.retain(|(_, who), _| *who != follower);
+        tables.behind.retain(|(_, who), _| *who != follower);
     }
 
     /// Wait for some follower of `session` to have applied through
@@ -779,11 +851,12 @@ impl Copies {
             return Confirming::Already;
         }
         let (tell, told) = oneshot::channel();
-        tables
-            .waiting
-            .entry(session.clone())
-            .or_default()
-            .push((at, tell));
+        let waiting = tables.waiting.entry(session.clone()).or_default();
+        // A waiter that timed out has closed its end and is waiting for
+        // nothing; kept, the table grew by one for every publish that
+        // ever gave up on a follower that did not answer.
+        waiting.retain(|(_, tell)| !tell.is_closed());
+        waiting.push((at, tell));
         Confirming::Waiting(told)
     }
 
@@ -1071,10 +1144,13 @@ impl Confirming {
             Self::Nobody => Confirmed::No,
             Self::Waiting(told) => {
                 match tokio::time::timeout(patience, told).await {
-                    // The sender was dropped by `marked`, which is how
-                    // it says the position was reached.
-                    Ok(_) => Confirmed::Yes,
-                    Err(_) => Confirmed::No,
+                    // Sent by `marked`, which is how it says the
+                    // position was reached.
+                    Ok(Ok(())) => Confirmed::Yes,
+                    // Dropped by `Copies::stop`: the session is no
+                    // longer streamed from here, and nothing will ever
+                    // confirm it.
+                    Ok(Err(_)) | Err(_) => Confirmed::No,
                 }
             }
         }

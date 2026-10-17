@@ -768,3 +768,109 @@ fn a_follower_no_longer_placed_leaves_the_lag() {
     assert!(!copies.has_mark(&session, [0xbb; 16]));
     assert!(copies.has_mark(&session, [0xaa; 16]));
 }
+
+/// A follower stuck behind a hole is one the owner sends a snapshot.
+///
+/// Section 8.6's repair looked only for a follower with no mark, so a
+/// follower that missed one frame and reported a mark below it, for
+/// ever, was never repaired: its copy stayed short and a synchronous
+/// publish waiting on it waited out its patience every time. Behind
+/// the owner's position and not moving for the grace is stalled; a
+/// mark that moves, or that catches up, is not.
+#[test]
+fn a_follower_behind_and_not_moving_is_stalled_and_one_catching_up_is_not() {
+    let copies = Copies::new();
+    let session = key("rover");
+    for at in 1..=5 {
+        copies.send(&session, appended(at));
+    }
+    copies.marked(session.clone(), BETA, 3);
+    let start = std::time::Instant::now();
+    let grace = Duration::from_secs(2);
+
+    assert!(
+        !copies.stalled(&session, BETA, start, grace),
+        "behind, but only just seen behind"
+    );
+    assert!(!copies.stalled(&session, BETA, start + Duration::from_secs(1), grace));
+    assert!(
+        copies.stalled(&session, BETA, start + Duration::from_secs(2), grace),
+        "behind for the whole grace without moving is stalled"
+    );
+
+    // A mark that moves starts the clock again.
+    copies.marked(session.clone(), BETA, 4);
+    assert!(!copies.stalled(&session, BETA, start + Duration::from_secs(3), grace));
+    assert!(!copies.stalled(&session, BETA, start + Duration::from_secs(4), grace));
+    assert!(copies.stalled(&session, BETA, start + Duration::from_secs(5), grace));
+
+    // Caught up is never stalled, however long it sits there.
+    copies.marked(session.clone(), BETA, 5);
+    assert!(!copies.stalled(&session, BETA, start + Duration::from_secs(60), grace));
+
+    // And a follower with no mark is the other repair, not this one.
+    assert!(!copies.stalled(&session, ALPHA, start + Duration::from_secs(60), grace));
+}
+
+/// A session that stops being streamed answers its waiters no, and
+/// does not leave them behind.
+///
+/// `stop` cleared the marks and not the waiters, so a synchronous
+/// publish to a session that moved or ended waited out its patience,
+/// and its entry stayed in the table. And the waiters cannot simply be
+/// dropped, because a dropped sender was how `marked` said yes: the
+/// confirmation is a send now, and a drop is a no.
+#[tokio::test]
+async fn a_session_that_stops_answers_its_waiters_no() {
+    let copies = Copies::new();
+    copies.install_followers(|_| {
+        vec![Placed {
+            node: BETA,
+            reachable: true,
+        }]
+    });
+    let session = key("moving");
+    copies.send(&session, appended(1));
+    let confirming = copies.confirming(&session, 1);
+    assert!(matches!(confirming, Confirming::Waiting(_)));
+
+    copies.stop(&session);
+    let started = std::time::Instant::now();
+    assert_eq!(
+        confirming.within(Duration::from_secs(5)).await,
+        Confirmed::No,
+        "a session nobody is streaming any more confirmed nothing"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the waiter was left to time out rather than told"
+    );
+    assert_eq!(copies.waiters(), 0, "and it is not left in the table");
+}
+
+/// A waiter that gave up is not kept in the table for ever.
+#[tokio::test]
+async fn a_waiter_that_timed_out_leaves_the_table() {
+    let copies = Copies::new();
+    copies.install_followers(|_| {
+        vec![Placed {
+            node: BETA,
+            reachable: true,
+        }]
+    });
+    let session = key("quiet");
+    copies.send(&session, appended(1));
+    for _ in 0..10 {
+        let confirming = copies.confirming(&session, 1);
+        assert_eq!(
+            confirming.within(Duration::from_millis(1)).await,
+            Confirmed::No
+        );
+    }
+    let _still = copies.confirming(&session, 1);
+    assert_eq!(
+        copies.waiters(),
+        1,
+        "only the waiter still waiting is held, not the ten that gave up"
+    );
+}

@@ -2535,6 +2535,63 @@ async fn a_session_that_moved_is_copied_under_its_new_owner() {
     );
 }
 
+/// A follower that missed a change is repaired, section 8.6.
+///
+/// The link drops rather than blocks, so a follower can miss one change
+/// and hold everything after it behind the hole, reporting a mark below
+/// it for ever. Repair looked only for a follower with no mark, so this
+/// one was never sent anything again: the lag stayed up, the copy stayed
+/// short, and under synchronous durability every publish to the session
+/// waited out its patience. The change is lost by cutting the link from
+/// the owner to the follower while it is sent; the lag has to come back
+/// to zero, by a repair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_that_missed_a_change_is_repaired() {
+    const FILTER: &str = "fleet/+/telemetry";
+    const TOPIC: &str = "fleet/0042/telemetry";
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cluster = Cluster::start(directory.path()).await;
+    cluster.settle();
+
+    let (mut rover, _) = Client::resuming(cluster.nodes[0].mqtt, "rover");
+    rover.subscribe(FILTER);
+    drop(rover);
+    assert_eq!(cluster.nodes[0].publish_reaching(TOPIC, "message-0"), 1);
+    until("the first message has a copy somewhere", || {
+        (1..NODES)
+            .any(|at| cluster.nodes[at].counter("sdmqtt_replica_changes_applied_total") == Some(1))
+    });
+    let holder = (1..NODES)
+        .find(|at| cluster.nodes[*at].counter("sdmqtt_replica_changes_applied_total") == Some(1))
+        .expect("the wait above found one");
+    until("the copy is current", || {
+        cluster.nodes[0].counter("sdmqtt_replication_lag") == Some(0)
+    });
+    let repaired_before = cluster.nodes[0]
+        .counter("sdmqtt_replica_repairs_done_total")
+        .unwrap_or(0);
+
+    // ---- one change is lost on the way ----
+    cluster.gates[&(0, holder)].cut(Direction::Forward);
+    assert_eq!(cluster.nodes[0].publish_reaching(TOPIC, "message-1"), 1);
+    std::thread::sleep(Duration::from_millis(500));
+    cluster.gates[&(0, holder)].heal(Direction::Forward);
+    // And one after it, which the follower holds behind the hole.
+    assert_eq!(cluster.nodes[0].publish_reaching(TOPIC, "message-2"), 1);
+
+    until(
+        "the follower is repaired and the copy is current again",
+        || {
+            cluster.nodes[0].counter("sdmqtt_replication_lag") == Some(0)
+                && cluster.nodes[0]
+                    .counter("sdmqtt_replica_repairs_done_total")
+                    .unwrap_or(0)
+                    > repaired_before
+        },
+    );
+}
+
 /// Of two copies, the one furthest ahead is the one taken.
 ///
 /// **This is the test the chooser exists for.** With a factor of three
