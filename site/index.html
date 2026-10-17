@@ -139,9 +139,7 @@
   .stat b { display: block; font: 500 clamp(1.75rem, 3.2vw, 2.375rem) / 1.1 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
   .stat span { display: block; margin-top: 0.4rem; color: var(--steel); font-size: 0.95rem; max-width: 18rem; }
   .measured-note { max-width: var(--measure); color: var(--steel); font-size: 0.95rem; margin: 2.5rem 0 0; }
-  .compare { margin-top: 3rem; }
-  .compare h3 { font-size: 1.25rem; font-weight: 600; margin: 0 0 0.5rem; }
-  .compare > p { max-width: var(--measure); color: var(--steel); margin: 0 0 1.25rem; }
+  #compared .table + p { margin-top: 1.25rem; }
   .table { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; max-width: 62rem; font-variant-numeric: tabular-nums; font-size: 0.95rem; }
   th, td { text-align: left; padding: 0.7rem 1rem 0.7rem 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
@@ -165,6 +163,7 @@
   <nav aria-label="Sections">
     <ul>
       <li><a href="#measured">Measured</a></li>
+      <li><a href="#compared">Beside the others</a></li>
       <li><a href="#run">Run it</a></li>
       <li><a href="#does">What it does</a></li>
       <li><a href="https://github.com/clement880101/sd-mqtt">GitHub</a></li>
@@ -207,26 +206,29 @@
       </ul>
       <p class="measured-note">Measured on one node in the development image on an Apple M2 Pro. How, and what the figures do not cover, is in <a href="https://github.com/clement880101/sd-mqtt/blob/main/docs/design.md#15-budgets">section 15 of the design</a>.</p>
 
-      <div class="compare">
-        <h3 id="compared">Beside the other brokers</h3>
-        <p>What each project says about its own licence and what it ships for free, and the size of its container image. Nothing here is a speed comparison: no two published benchmarks ran on the same machine, so none is quoted.</p>
-        <div class="table">
-          <table>
-            <thead>
-              <tr><th scope="col">Broker</th><th scope="col">Licence</th><th scope="col">Clustering without a commercial licence</th><th scope="col">Admin interface included</th><th scope="col">Image, compressed</th><th scope="col">Source</th></tr>
-            </thead>
-            <tbody>
-              <tr class="ours"><td>sd-mqtt</td><td>MIT</td><td>Yes, with replicated queues</td><td>Yes</td><td class="num">5.5 MB</td><td class="cite"><a href="https://github.com/clement880101/sd-mqtt/blob/main/LICENSE">licence</a></td></tr>
-              <tr><td>Mosquitto 2</td><td>EPL-2.0 or EDL-1.0</td><td>No, bridging between brokers</td><td>No</td><td class="num">13.0 MB</td><td class="cite"><a href="https://mosquitto.org/">mosquitto.org</a></td></tr>
-              <tr><td>NanoMQ</td><td>MIT</td><td>No, bridging between brokers</td><td>No</td><td class="num">4.8 MB</td><td class="cite"><a href="https://nanomq.io/">nanomq.io</a></td></tr>
-              <tr><td>EMQX 5.9 and later</td><td>BSL 1.1, free in production for one node</td><td>No, a commercial licence</td><td>Yes</td><td class="num">150.2 MB</td><td class="cite"><a href="https://www.emqx.com/en/content/license-faq">licence FAQ</a></td></tr>
-              <tr><td>VerneMQ</td><td>Apache-2.0 source; the official packages and images need a paid subscription in production</td><td>Yes, if you build it yourself</td><td>No</td><td class="num">102.9 MB</td><td class="cite"><a href="https://vernemq.com/vernemq-licenses.html">licences</a></td></tr>
-              <tr><td>HiveMQ Community Edition</td><td>Apache-2.0</td><td>No, the commercial editions</td><td>No</td><td class="num">199.7 MB</td><td class="cite"><a href="https://community.hivemq.com/t/cluster-support-in-community-edition-ce/737">HiveMQ forum</a></td></tr>
-            </tbody>
-          </table>
-        </div>
-        <p>Image sizes are the compressed amd64 layers of each project's current tag on Docker Hub, and of ours on GitHub's registry, read on 17 October 2026. Licence terms are as each project states them on the page linked; read that page before relying on this table.</p>
+    </div>
+  </section>
+
+  <section class="part" id="compared" aria-labelledby="compared-title">
+    <div class="wrap">
+      <h2 id="compared-title">Beside the other brokers</h2>
+      <p>What each project says about its own licence and what it ships for free, and the size of its container image. Nothing here is a speed comparison: no two published benchmarks ran on the same machine, so none is quoted.</p>
+      <div class="table">
+        <table>
+          <thead>
+            <tr><th scope="col">Broker</th><th scope="col">Licence</th><th scope="col">Clustering without a commercial licence</th><th scope="col">Admin interface included</th><th scope="col">Image, compressed</th><th scope="col">Source</th></tr>
+          </thead>
+          <tbody>
+            <tr class="ours"><td>sd-mqtt</td><td>MIT</td><td>Yes, with replicated queues</td><td>Yes</td><td class="num">5.5 MB</td><td class="cite"><a href="https://github.com/clement880101/sd-mqtt/blob/main/LICENSE">licence</a></td></tr>
+            <tr><td>Mosquitto 2</td><td>EPL-2.0 or EDL-1.0</td><td>No, bridging between brokers</td><td>No</td><td class="num">13.0 MB</td><td class="cite"><a href="https://mosquitto.org/">mosquitto.org</a></td></tr>
+            <tr><td>NanoMQ</td><td>MIT</td><td>No, bridging between brokers</td><td>No</td><td class="num">4.8 MB</td><td class="cite"><a href="https://nanomq.io/">nanomq.io</a></td></tr>
+            <tr><td>EMQX 5.9 and later</td><td>BSL 1.1, free in production for one node</td><td>No, a commercial licence</td><td>Yes</td><td class="num">150.2 MB</td><td class="cite"><a href="https://www.emqx.com/en/content/license-faq">licence FAQ</a></td></tr>
+            <tr><td>VerneMQ</td><td>Apache-2.0 source; the official packages and images need a paid subscription in production</td><td>Yes, if you build it yourself</td><td>No</td><td class="num">102.9 MB</td><td class="cite"><a href="https://vernemq.com/vernemq-licenses.html">licences</a></td></tr>
+            <tr><td>HiveMQ Community Edition</td><td>Apache-2.0</td><td>No, the commercial editions</td><td>No</td><td class="num">199.7 MB</td><td class="cite"><a href="https://community.hivemq.com/t/cluster-support-in-community-edition-ce/737">HiveMQ forum</a></td></tr>
+          </tbody>
+        </table>
       </div>
+      <p>Image sizes are the compressed amd64 layers of each project's current tag on Docker Hub, and of ours on GitHub's registry, read on 17 October 2026. Licence terms are as each project states them on the page linked; read that page before relying on this table.</p>
     </div>
   </section>
 
