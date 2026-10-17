@@ -95,6 +95,16 @@ def main() -> int:
     unsourced = [figure for figure in quoted if figure not in evidence]
     check("every figure quoted is one the spec, a decision or the README records", not unsourced, str(unsourced))
 
+    # The comparison with other brokers: every row cites a page, and
+    # the sizes carry the day they were read, because both go stale.
+    rows = re.findall(r"<tr(?: class=\"ours\")?><td>(.*?)</td>.*?</tr>", text, re.S)
+    compared = [row for row in rows if row and not row.startswith("<")]
+    check("the comparison names several brokers", len(compared) >= 4, str(compared))
+    body = text[text.index("<tbody>"):text.index("</tbody>")] if "<tbody>" in text else ""
+    uncited = [r for r in body.split("</tr>") if "<td" in r and "<a href=\"http" not in r]
+    check("every compared broker cites a source", not uncited, str(uncited)[:200])
+    check("the comparison says when it was read", bool(re.search(r"read on \d{1,2} \w+ 20\d\d", text)))
+
     foreign = [s for s in parser.sources if s.startswith("http") and not s.startswith(("https://fonts.googleapis.com", "https://fonts.gstatic.com"))]
     check("it loads nothing but Google Fonts from elsewhere", not foreign, str(foreign))
     check("it styles both colour schemes", "prefers-color-scheme: dark" in text)
