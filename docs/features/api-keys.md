@@ -2,11 +2,16 @@
 
 Keys with read, write and admin scopes for the admin API, shown once and stored as digests.
 
-Mutating requests to the admin listener need an **API key** with a scope
-that covers them: `read` opens taps, `write` also publishes and writes
-rules, `admin` also manages users, access control rules, keys and nodes.
-The configured `admin.token` is a key with `admin` scope, which is how
-the first key is minted:
+Mutating requests to a guarded admin listener need an **API key** with a
+scope that covers them: `read` opens taps, `write` also publishes and
+writes rules, `admin` also manages users, access control rules, keys and
+nodes. A listener is guarded when `admin.token` is set, which binding it
+anywhere but loopback requires. On loopback with no token, a mutating
+request that presents nothing is still answered — the listener is
+reachable only from the machine itself — and one that presents a key is
+judged by it, so a wrong or too-narrow key is refused there too. The
+configured `admin.token` is a key with `admin` scope, which is how the
+first key is minted:
 
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
