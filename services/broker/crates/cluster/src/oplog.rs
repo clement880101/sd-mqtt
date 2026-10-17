@@ -290,6 +290,18 @@ impl OpLog {
         self.highest
     }
 
+    /// The last sequence collection removed.
+    ///
+    /// **Everything at or below this is gone**, and a peer that asks for
+    /// it cannot be answered from the log. Section 8.2's exchange reads
+    /// this to tell such a peer apart from one that is merely behind:
+    /// the first is sent the registers themselves, the second the next
+    /// batch of entries.
+    #[must_use]
+    pub const fn collected_through(&self) -> u64 {
+        self.collected_through
+    }
+
     /// How many published entries are held.
     #[must_use]
     pub fn len(&self) -> usize {

@@ -950,6 +950,111 @@ impl Replicated {
         vec![Record::OpLogTruncated { through: sequence }]
     }
 
+    /// The last sequence of this node's own log that collection removed.
+    ///
+    /// A peer whose watermark is below this cannot be served from the
+    /// log; see [`OpLog::collected_through`].
+    #[must_use]
+    pub fn log_collected_through(&self) -> u64 {
+        self.held().oplog.collected_through()
+    }
+
+    /// Up to `limit` registers in key order, after `after`.
+    ///
+    /// **Section 8.2's join snapshot.** A peer that asks for a stretch
+    /// of this node's log that collection has removed is sent the
+    /// registers instead — every register this node holds, whoever
+    /// wrote it, tombstones included — a page at a time in the order
+    /// the keys sort, so that the peer can say where to continue from
+    /// without either side keeping a cursor. One register more than
+    /// `limit` tells the caller whether there is another page.
+    ///
+    /// Every register and not only this node's own, because the peer is
+    /// behind on everybody's and the one register table is the only
+    /// thing that holds what the truncated entries said. A register
+    /// another node wrote is as good from here as from its writer: the
+    /// merge is by stamp, and the stamp travels with it.
+    #[must_use]
+    pub fn registers_after(&self, after: Option<&MetadataKey>, limit: usize) -> Vec<MetadataWrite> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let state = self.held();
+        let from: std::ops::Bound<&MetadataKey> = match after {
+            Some(after) => Excluded(after),
+            None => Unbounded,
+        };
+        state
+            .registers
+            .range((from, Unbounded))
+            .take(limit)
+            .map(|(key, register)| MetadataWrite::new(key.clone(), register.clone()))
+            .collect()
+    }
+
+    /// Take a page of `origin`'s registers, sent because this node's
+    /// watermark is behind what `origin` has truncated.
+    ///
+    /// Each register is merged as a broadcast's would be, and
+    /// [`index`] is told about the ones that won. `through` is the last
+    /// sequence `origin` truncated, given on the last page only: once
+    /// every register has arrived, this node holds everything those
+    /// entries said, so its watermark may move there and the exchange
+    /// can go on from the log above it. **Not before the last page**,
+    /// because a watermark is a claim to hold what is below it, and a
+    /// page lost on the way would otherwise be a claim to hold registers
+    /// this node was never sent.
+    ///
+    /// The watermark never moves backwards: a page from a peer whose
+    /// truncation point is behind what this node has already read says
+    /// nothing new about the log.
+    pub fn observed_snapshot(
+        &self,
+        origin: NodeId,
+        registers: Vec<MetadataWrite>,
+        through: Option<u64>,
+    ) -> Taken {
+        let mut state = self.held();
+        let mut taken = Taken::default();
+        let wall = crate::clock::wall_millis();
+        let mut refused = false;
+        for write in registers {
+            // Section 8.2's clock, as in `observed_from`; a reading past
+            // the bound is refused by `Replicator` before it gets here.
+            if self.clock.observe(wall, write.stamp().reading()).is_err() {
+                refused = true;
+                continue;
+            }
+            if merge(&mut state, &write) {
+                index(
+                    &self.routes,
+                    &self.groups,
+                    write.key(),
+                    Some(write.register()),
+                );
+                taken.records.push(Record::MetadataPut {
+                    entry: write.to_record(),
+                });
+                taken.applied.push(write);
+            }
+        }
+        let before = state.seen.get(&origin).copied().unwrap_or(0);
+        taken.through = before;
+        if let Some(through) = through {
+            // A register left out is a register this node does not hold,
+            // so the claim the watermark makes would be false.
+            if !refused && through > before {
+                state.seen.insert(origin, through);
+                taken.records.push(Record::MetadataSeenPut {
+                    seen: SeenRecord {
+                        node: origin.to_bytes(),
+                        through,
+                    },
+                });
+                taken.through = through;
+            }
+        }
+        taken
+    }
+
     /// How far this node has read `origin`'s log.
     ///
     /// Zero for a node nothing has been read from, which is why a log

@@ -99,7 +99,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use storage::{ClockRecord, LoggedRecord, Record};
+use storage::{ClockRecord, LoggedRecord, MetadataKeyRecord, MetadataRecord, Record};
 
 use crate::clock::Reading;
 use crate::identity::NodeId;
@@ -263,6 +263,51 @@ pub enum Replication {
         entries: Vec<LoggedRecord>,
         /// Whether the sender has more past the last of these.
         more: bool,
+    },
+    /// One page of the sender's registers, for an asker behind the
+    /// sender's log truncation. **Section 8.2's join snapshot.**
+    ///
+    /// A log every known node has read is truncated, so a node that was
+    /// not known when that happened — one joining the cluster, or one an
+    /// operator removed and brought back — asks for entries that no
+    /// longer exist. The answer to such a digest is the registers
+    /// themselves rather than the log: every register the sender holds,
+    /// whoever wrote it, tombstones included, in key order, a page at a
+    /// time. The receiver merges them exactly as it merges a broadcast,
+    /// and once the last page has arrived it moves its watermark to
+    /// [`Self::Snapshot::through`] and reads the log above that like
+    /// any other peer.
+    ///
+    /// A page rather than the lot, for [`Self::Batch`]'s reason: a
+    /// retained message can be a quarter of a megabyte and the frame
+    /// has a bound.
+    ///
+    /// **Added after 0.7.0.** A node from before it will not decode
+    /// this frame and closes the link with a reason; it is only ever
+    /// sent to a node whose watermark is behind a truncation, which an
+    /// older node reaches only by joining an upgraded cluster fresh.
+    Snapshot {
+        /// The registers on this page, in key order.
+        registers: Vec<MetadataRecord>,
+        /// The last sequence of the sender's log that collection
+        /// removed, which is where the receiver's watermark may move to
+        /// once the last page has arrived.
+        through: u64,
+        /// Whether this is the last page.
+        last: bool,
+    },
+    /// "Send me the registers after this key": the next page of a
+    /// [`Self::Snapshot`].
+    ///
+    /// Sent by the receiver of a page that was not the last, naming the
+    /// last key it was sent. The sender keeps no cursor and the receiver
+    /// keeps none either: a page lost on the way ends the round, and the
+    /// next scheduled exchange starts the snapshot again from the
+    /// digest, which is what a repair that happens once per node per
+    /// truncation can afford.
+    SnapshotFrom {
+        /// The last key already received.
+        after: MetadataKeyRecord,
     },
 }
 
@@ -485,16 +530,95 @@ impl Replicator {
                 Reading::new(collected.millis, collected.counter),
             )),
             Replication::Batch { entries, more } => {
+                let before = self.replicated.seen_through(from);
                 let mut handled = self.take(from, entries)?;
                 // Asked again only where the peer said there is more, so a
                 // round against a peer that is up to date is one frame and
-                // the answer to it, and never a third.
-                if more {
+                // the answer to it, and never a third. **And only where
+                // the watermark moved.** A batch that begins above what
+                // this node has read is kept for what it holds but moves
+                // nothing, and a digest sent now would say the same thing
+                // and bring the same batch back, at link speed, for as
+                // long as that was true. The round ends instead and the
+                // next scheduled exchange asks again.
+                if more && self.replicated.seen_through(from) > before {
                     handled.reply = Some(self.digest_for(from));
                 }
                 Ok(handled)
             }
+            Replication::Snapshot {
+                registers,
+                through,
+                last,
+            } => self.take_snapshot(from, registers, through, last),
+            Replication::SnapshotFrom { after } => {
+                Ok(self.snapshot_page(Some(&MetadataKey::from_record(after))))
+            }
         }
+    }
+
+    /// One page of this node's registers, after `after`, for a peer
+    /// behind this node's log truncation. See [`Replication::Snapshot`].
+    fn snapshot_page(&self, after: Option<&MetadataKey>) -> Handled {
+        let batch = self.settings.batch.max(1);
+        // One more than the page, which is how the last page knows it is.
+        let mut registers = self.replicated.registers_after(after, batch + 1);
+        let last = registers.len() <= batch;
+        registers.truncate(batch);
+        Handled {
+            reply: Some(Replication::Snapshot {
+                registers: registers.iter().map(MetadataWrite::to_record).collect(),
+                through: self.replicated.log_collected_through(),
+                last,
+            }),
+            ..Handled::default()
+        }
+    }
+
+    /// Take a page of `from`'s registers, and ask for the next or carry
+    /// on with the log.
+    ///
+    /// Decoded and refused before anything is merged, as [`Self::take`]
+    /// does for a batch and for the same reason.
+    fn take_snapshot(
+        &self,
+        from: NodeId,
+        registers: Vec<MetadataRecord>,
+        through: u64,
+        last: bool,
+    ) -> Result<Handled, ReplicationError> {
+        let wall = crate::clock::wall_millis();
+        let clock = self.replicated.clock();
+        let mut writes = Vec::with_capacity(registers.len());
+        for record in registers {
+            let write = MetadataWrite::from_record(record)?;
+            clock.check(wall, write.stamp().reading())?;
+            writes.push(write);
+        }
+        let continue_from = (!last)
+            .then(|| writes.last().map(|write| write.key().to_record()))
+            .flatten();
+        let before = self.replicated.seen_through(from);
+        let Taken {
+            applied, records, ..
+        } = self
+            .replicated
+            .observed_snapshot(from, writes, last.then_some(through));
+        // The next page, or — once the last has landed and the watermark
+        // has moved — the log above the truncation, asked for the
+        // ordinary way. A last page that moved nothing ends the round,
+        // for the reason a batch that moved nothing does: the same
+        // digest would bring the same page back.
+        let reply = match continue_from {
+            Some(after) => Some(Replication::SnapshotFrom { after }),
+            None if self.replicated.seen_through(from) > before => Some(self.digest_for(from)),
+            None => None,
+        };
+        Ok(Handled {
+            records,
+            applied,
+            reply,
+        })
     }
 
     /// Answer `from`'s digest with the next batch of this node's log.
@@ -534,6 +658,17 @@ impl Replicator {
                 .or_insert(collected);
         }
 
+        // Section 8.2's join snapshot: a peer asking for a stretch of the
+        // log that collection has removed cannot be answered from the
+        // log. It is a node that was not known when the truncation
+        // happened — joining, or removed and brought back — and before
+        // this it was sent the entries above the truncation, which it
+        // could not count past, or nothing at all; either way it never
+        // held what the truncated entries said. See
+        // [`Replication::Snapshot`].
+        if have < self.replicated.log_collected_through() {
+            return self.snapshot_page(None);
+        }
         let entries = self.replicated.log_after(have, self.settings.batch);
         if entries.is_empty() {
             return Handled::default();

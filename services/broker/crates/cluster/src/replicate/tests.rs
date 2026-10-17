@@ -225,6 +225,19 @@ impl Cluster {
         }
     }
 
+    /// A node that joins after the others have been running: it has
+    /// heard nothing and holds nothing.
+    ///
+    /// Returns its index. What section 8.2's join snapshot exists for.
+    fn join(&mut self) -> usize {
+        let index = self.nodes.len();
+        self.nodes.push(Node::new(
+            u8::try_from(index + 1).expect("a small index"),
+            "delta",
+        ));
+        index
+    }
+
     /// Sever what `from` says to `to`, and nothing else.
     fn cut(&mut self, from: usize, to: usize) {
         self.down.insert((from, to));
@@ -1456,4 +1469,173 @@ fn a_batch_with_one_entry_beyond_the_bound_is_refused_whole() {
         .expect_err("one entry beyond the bound refuses the batch");
     assert_eq!(cluster.nodes[1].text("a"), None, "half the batch was taken");
     assert_eq!(cluster.nodes[1].text("b"), None);
+}
+
+// ---- joining after a truncation, section 8.2 -----------------------------
+
+/// Write `count` retained messages from node `from` and deliver them to
+/// everybody, as `t/0` to `t/count-1` after `offset`.
+fn write_many(cluster: &mut Cluster, from: usize, offset: usize, count: usize) {
+    for index in offset..offset + count {
+        let frame = cluster.nodes[from].retain(&format!("t/{index}"), "v");
+        cluster.broadcast(from, &frame);
+        cluster.settle();
+    }
+}
+
+/// A node that joins after the writer's log has been truncated is sent
+/// the registers it missed, tombstones included, and then reads the log
+/// from the truncation point like anybody else.
+///
+/// Section 8.2's digest is a claim about a log, and a log every known
+/// node has read is truncated. A node that was not known when that
+/// happened asks for everything after zero, and before this the answer
+/// was the entries above the truncation — or nothing — so a fourth node
+/// added to a cluster that had swept once held none of the earlier
+/// subscriptions, retained messages, rules, users or keys, for ever.
+#[test]
+fn a_node_joining_after_a_truncation_is_sent_the_registers_it_missed() {
+    let mut cluster = Cluster::of(2);
+    // More than one page of registers, and one of them a tombstone.
+    write_many(&mut cluster, 0, 0, DEFAULT_BATCH + 6);
+    let frame = cluster.nodes[0].clear("t/0");
+    cluster.broadcast(0, &frame);
+    cluster.settle();
+    let written = u64::try_from(DEFAULT_BATCH + 7).expect("small");
+
+    // Node one says how far it has read, and node zero truncates its
+    // whole log behind that.
+    cluster.exchange(1, 0);
+    let swept = cluster.sweep(0, 0);
+    assert_eq!(
+        swept.log_through, written,
+        "the whole log was read by everybody"
+    );
+    assert_eq!(cluster.nodes[0].replicated().log_len(), 0);
+
+    let newcomer = cluster.join();
+    let writer = cluster.nodes[0].id();
+    assert_eq!(
+        cluster.nodes[newcomer].text("t/1"),
+        None,
+        "it holds nothing yet"
+    );
+    cluster.exchange(newcomer, 0);
+
+    for index in 1..DEFAULT_BATCH + 6 {
+        assert_eq!(
+            cluster.nodes[newcomer]
+                .text(&format!("t/{index}"))
+                .as_deref(),
+            Some("v"),
+            "t/{index} did not reach the node that joined after the truncation"
+        );
+    }
+    assert_eq!(cluster.nodes[newcomer].text("t/0"), None, "t/0 was cleared");
+    assert!(
+        cluster.nodes[newcomer].holds_anything("t/0"),
+        "the tombstone travelled too, so the newcomer will not resurrect t/0"
+    );
+    assert_eq!(
+        cluster.nodes[newcomer].replicated().seen_through(writer),
+        written,
+        "the newcomer's watermark did not move to the truncation point"
+    );
+
+    // And from here on it is an ordinary peer: the next write reaches
+    // it by the ordinary path, and it pulls nothing it already has.
+    let frame = cluster.nodes[0].retain("t/after", "later");
+    cluster.broadcast(0, &frame);
+    cluster.settle();
+    assert_eq!(
+        cluster.nodes[newcomer].text("t/after").as_deref(),
+        Some("later")
+    );
+    cluster.exchange(newcomer, 0);
+    assert!(
+        cluster.answers().iter().all(Option::is_none),
+        "a caught-up newcomer was answered with something: {:?}",
+        cluster.answers()
+    );
+}
+
+/// With more than one batch of log above the truncation, the exchange
+/// used to run at link speed for ever: the batch began above what the
+/// asker had, the asker's watermark could not move over the gap, and the
+/// asker asked for the same thing again because the batch said there was
+/// more. The harness panics on a round that never ends, which is how
+/// this failed before the fix.
+#[test]
+fn a_newcomer_behind_a_truncation_with_batches_above_it_catches_up_whole() {
+    let mut cluster = Cluster::of(2);
+    write_many(&mut cluster, 0, 0, 10);
+    cluster.exchange(1, 0);
+    let swept = cluster.sweep(0, 0);
+    assert_eq!(swept.log_through, 10);
+    // Two batches and a bit more, above the truncation.
+    write_many(&mut cluster, 0, 10, 2 * DEFAULT_BATCH + 3);
+    let total = 10 + 2 * DEFAULT_BATCH + 3;
+
+    let newcomer = cluster.join();
+    cluster.exchange(newcomer, 0);
+    for index in 0..total {
+        assert_eq!(
+            cluster.nodes[newcomer]
+                .text(&format!("t/{index}"))
+                .as_deref(),
+            Some("v"),
+            "t/{index} is missing on the newcomer"
+        );
+    }
+    assert_eq!(
+        cluster.nodes[newcomer]
+            .replicated()
+            .seen_through(cluster.nodes[0].id()),
+        u64::try_from(total).expect("small"),
+    );
+}
+
+/// A batch the asker cannot count past is taken for what it holds and
+/// not asked for again in the same round.
+///
+/// The watermark moves only over a contiguous run, so a batch that
+/// begins above it leaves it where it was; a reply with the same digest
+/// would bring the same batch back, at link speed, until something else
+/// changed. The round ends instead, and the next scheduled exchange asks
+/// again.
+#[test]
+fn a_batch_that_does_not_move_the_watermark_is_not_asked_for_again() {
+    let cluster = Cluster::of(2);
+    let wall = crate::clock::wall_millis();
+    let entry = |topic: &str, sequence| match stamped_at(topic, wall, sequence) {
+        Replication::Broadcast { entry } => entry,
+        _ => unreachable!(),
+    };
+    let handled = cluster.nodes[1]
+        .replicator
+        .received(
+            cluster.nodes[0].id(),
+            Replication::Batch {
+                entries: vec![entry("a", 5), entry("b", 6)],
+                more: true,
+            },
+        )
+        .expect("it reads");
+    assert_eq!(
+        cluster.nodes[1].text("a").as_deref(),
+        Some("ahead"),
+        "the registers are kept"
+    );
+    assert_eq!(
+        cluster.nodes[1]
+            .replicated()
+            .seen_through(cluster.nodes[0].id()),
+        0,
+        "the watermark cannot move over a gap"
+    );
+    assert!(
+        handled.reply.is_none(),
+        "asked again for a batch that cannot be counted: {:?}",
+        handled.reply
+    );
 }
