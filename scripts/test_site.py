@@ -20,6 +20,7 @@ release's number. So it is held to the sources it quotes:
 Exits non-zero naming each check that failed.
 """
 import html.parser
+import json
 import re
 import sys
 from pathlib import Path
@@ -42,6 +43,8 @@ class Links(html.parser.HTMLParser):
         self.hrefs: list[str] = []
         self.sources: list[str] = []
         self.ids: set[str] = set()
+        self.canonical: str | None = None
+        self.meta: dict[str, str] = {}
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -51,8 +54,15 @@ class Links(html.parser.HTMLParser):
             self.hrefs.append(attrs["href"])
         if tag in ("script", "img", "iframe") and "src" in attrs:
             self.sources.append(attrs["src"])
-        if tag == "link" and "href" in attrs:
+        # A canonical link names this page; it loads nothing.
+        if tag == "link" and "href" in attrs and attrs.get("rel") != "canonical":
             self.sources.append(attrs["href"])
+        if tag == "link" and attrs.get("rel") == "canonical":
+            self.canonical = attrs.get("href")
+        if tag == "meta" and "property" in attrs:
+            self.meta[attrs["property"]] = attrs.get("content", "")
+        if tag == "meta" and "name" in attrs:
+            self.meta[attrs["name"]] = attrs.get("content", "")
 
 
 def main() -> int:
@@ -104,6 +114,42 @@ def main() -> int:
     uncited = [r for r in body.split("</tr>") if "<td" in r and "<a href=\"http" not in r]
     check("every compared broker cites a source", not uncited, str(uncited)[:200])
     check("the comparison says when it was read", bool(re.search(r"read on \d{1,2} \w+ 20\d\d", text)))
+
+    # What search engines and assistants read: the page names its own
+    # address, a card to show when it is shared, structured data that
+    # agrees with what the page says, and a sitemap and llms.txt beside it.
+    site = "https://clement880101.github.io/sd-mqtt/"
+    check("the page names its canonical address", parser.canonical == site, str(parser.canonical))
+    title = re.search(r"<title>(.*?)</title>", text, re.S)[1]
+    check("the title fits a search result", len(title) <= 60, f"{len(title)}: {title}")
+    description = parser.meta.get("description", "")
+    check("the description fits a search result", 50 <= len(description) <= 160, str(len(description)))
+    card = parser.meta.get("og:image", "")
+    check("the share card is this site's and exists",
+          card.startswith(site) and (ROOT / "site" / card[len(site):]).is_file(), card)
+    check("the share card is set for every reader",
+          all(parser.meta.get(k) for k in ("og:title", "og:description", "og:url", "twitter:card", "twitter:image")))
+    blocks = re.findall(r'<script type="application/ld\+json">(.*?)</script>', text, re.S)
+    check("there is one block of structured data", len(blocks) == 1, str(len(blocks)))
+    graph = {node["@type"]: node for node in json.loads(blocks[0])["@graph"]} if blocks else {}
+    check(f"the structured data names version {version}",
+          graph.get("SoftwareApplication", {}).get("softwareVersion") == version)
+    entities = graph.get("FAQPage", {}).get("mainEntity", [])
+    faq = re.search(r'<section class="part" id="faq".*?</section>', text, re.S)
+    shown_q = [html.unescape(q) for q in re.findall(r"<dt>(.*?)</dt>", faq[0])] if faq else []
+    shown_a = [html.unescape(a) for a in re.findall(r"<dd>(.*?)</dd>", faq[0])] if faq else []
+    check("the questions in the structured data are the ones on the page",
+          bool(entities) and [e["name"] for e in entities] == shown_q)
+    check("and so are the answers", [e["acceptedAnswer"]["text"] for e in entities] == shown_a)
+    sitemap = (ROOT / "site/sitemap.xml").read_text() if (ROOT / "site/sitemap.xml").is_file() else ""
+    check("the sitemap lists the page", f"<loc>{site}</loc>" in sitemap)
+    llms = (ROOT / "site/llms.txt").read_text() if (ROOT / "site/llms.txt").is_file() else ""
+    check("llms.txt says what it is", llms.startswith("# sd-mqtt\n") and "MIT" in llms)
+    named = re.findall(rf"https://github.com/{REPO}/blob/main/([^)#\s]+)", llms)
+    check("every repository path llms.txt names exists",
+          bool(named) and all((ROOT / n).exists() for n in named), str([n for n in named if not (ROOT / n).exists()]))
+    missing_figures = [f for f in re.findall(r'data-figure="([^"]+)"', text) if f not in llms]
+    check("llms.txt quotes the page's figures", not missing_figures, str(missing_figures))
 
     foreign = [s for s in parser.sources if s.startswith("http") and not s.startswith(("https://fonts.googleapis.com", "https://fonts.gstatic.com"))]
     check("it loads nothing but Google Fonts from elsewhere", not foreign, str(foreign))

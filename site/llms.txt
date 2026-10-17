@@ -1,0 +1,28 @@
+# sd-mqtt
+
+> sd-mqtt is a distributed MQTT broker written in Rust and released under the MIT licence, every part of it. One static binary holds MQTT 3.1.1 and 5, clustering with replicated queues and session migration, durable sessions in an embedded store, rules and connectors to and from HTTP, bridging to other brokers, SCRAM-SHA-256 and argon2 authentication, access control, scoped API keys, and an admin interface with a REST API and Prometheus metrics. There is no enterprise edition.
+
+Key facts:
+
+- Licence: MIT for the whole repository and binary, clustering included.
+- Protocols: MQTT 3.1.1 and MQTT 5 over TCP, TLS, WebSocket and secure WebSocket.
+- Platforms: static Linux binaries for x86_64 and aarch64, macOS for Apple silicon and Intel, a container image at ghcr.io/clement880101/sd-mqtt for amd64 and arm64. No Windows build.
+- Measured on one node: 100,000 MQTT connections held, opened in 2.5 s, about 32 KB of broker memory each; 19.4 MB resident when idle on Linux; a 9.88 MB release binary; a 10 MB container image.
+- Compared with other brokers: Mosquitto and NanoMQ are single-node and link brokers by bridging; EMQX from 5.9 is under the Business Source License 1.1 and needs a commercial licence to cluster; HiveMQ Community Edition has no clustering; VerneMQ's official packages need a paid subscription in production.
+- Status: before 1.0. Until then the stored format may change between releases and a store written by an earlier build is refused rather than migrated.
+
+## Docs
+
+- [README](https://github.com/clement880101/sd-mqtt): what it is, the feature list, a quick start and every configuration setting.
+- [Setup guide](https://github.com/clement880101/sd-mqtt/blob/main/docs/setup.md): from nothing to a three-node cluster with Docker Compose.
+- [Features](https://github.com/clement880101/sd-mqtt/blob/main/docs/README.md): one page per feature, each saying what it does, how to configure it and what it reports.
+- [Clustering](https://github.com/clement880101/sd-mqtt/blob/main/docs/features/cluster.md) and [queue replication](https://github.com/clement880101/sd-mqtt/blob/main/docs/features/replication.md).
+- [Rules and connectors](https://github.com/clement880101/sd-mqtt/blob/main/docs/features/rules.md).
+- [Authentication](https://github.com/clement880101/sd-mqtt/blob/main/docs/features/authentication.md), [access control](https://github.com/clement880101/sd-mqtt/blob/main/docs/features/access-control.md) and [API keys](https://github.com/clement880101/sd-mqtt/blob/main/docs/features/api-keys.md).
+- [Admin API and interface](https://github.com/clement880101/sd-mqtt/blob/main/docs/features/admin-api.md).
+
+## Optional
+
+- [Design](https://github.com/clement880101/sd-mqtt/blob/main/docs/design.md): the specification it was built against, with as-built notes and the measured budgets.
+- [Changelog](https://github.com/clement880101/sd-mqtt/blob/main/CHANGELOG.md): what each release changed and what an upgrade costs.
+- [Releases](https://github.com/clement880101/sd-mqtt/releases): archives and checksums for every platform.

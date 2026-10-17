@@ -4,8 +4,146 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>sd-mqtt — an MIT-licensed distributed MQTT broker</title>
-<meta name="description" content="sd-mqtt is a distributed MQTT broker under the MIT licence, all of it: MQTT 3.1.1 and 5, durable sessions, clustering with replicated queues, rules and connectors, and an admin interface, in one static binary. No enterprise edition.">
+<title>sd-mqtt — an MIT-licensed distributed MQTT broker in Rust</title>
+<meta name="description" content="sd-mqtt is an MIT-licensed distributed MQTT broker in Rust: MQTT 3.1.1 and 5, clustering with replicated queues, rules and an admin UI in one static binary.">
+<link rel="canonical" href="https://clement880101.github.io/sd-mqtt/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="sd-mqtt">
+<meta property="og:title" content="sd-mqtt — an MIT-licensed distributed MQTT broker in Rust">
+<meta property="og:description" content="sd-mqtt is an MIT-licensed distributed MQTT broker in Rust: MQTT 3.1.1 and 5, clustering with replicated queues, rules and an admin UI in one static binary.">
+<meta property="og:url" content="https://clement880101.github.io/sd-mqtt/">
+<meta property="og:image" content="https://clement880101.github.io/sd-mqtt/social.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="sd-mqtt: a distributed MQTT broker, MIT licensed, all of it">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="sd-mqtt — an MIT-licensed distributed MQTT broker in Rust">
+<meta name="twitter:description" content="sd-mqtt is an MIT-licensed distributed MQTT broker in Rust: MQTT 3.1.1 and 5, clustering with replicated queues, rules and an admin UI in one static binary.">
+<meta name="twitter:image" content="https://clement880101.github.io/sd-mqtt/social.png">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@graph": [
+  {
+   "@type": "SoftwareApplication",
+   "@id": "https://clement880101.github.io/sd-mqtt/#software",
+   "name": "sd-mqtt",
+   "description": "sd-mqtt is an MIT-licensed distributed MQTT broker in Rust: MQTT 3.1.1 and 5, clustering with replicated queues, rules and an admin UI in one static binary.",
+   "url": "https://clement880101.github.io/sd-mqtt/",
+   "image": "https://clement880101.github.io/sd-mqtt/social.png",
+   "applicationCategory": "DeveloperApplication",
+   "applicationSubCategory": "MQTT broker",
+   "operatingSystem": "Linux, macOS",
+   "softwareVersion": "0.7.1",
+   "license": "https://opensource.org/licenses/MIT",
+   "downloadUrl": "https://github.com/clement880101/sd-mqtt/releases",
+   "installUrl": "https://github.com/clement880101/sd-mqtt/blob/main/docs/setup.md",
+   "releaseNotes": "https://github.com/clement880101/sd-mqtt/blob/main/CHANGELOG.md",
+   "featureList": [
+    "MQTT 3.1.1 and MQTT 5",
+    "Clustering with session migration",
+    "Replicated message queues with failover",
+    "Durable sessions in an embedded store",
+    "Rules and connectors to and from HTTP",
+    "Bridging to other MQTT brokers",
+    "SCRAM-SHA-256 and argon2 password authentication",
+    "Access control rules and scoped API keys",
+    "Built-in admin interface, REST API and Prometheus metrics",
+    "TLS and WebSocket listeners"
+   ],
+   "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+   },
+   "sameAs": [
+    "https://github.com/clement880101/sd-mqtt"
+   ]
+  },
+  {
+   "@type": "SoftwareSourceCode",
+   "@id": "https://clement880101.github.io/sd-mqtt/#source",
+   "name": "sd-mqtt",
+   "codeRepository": "https://github.com/clement880101/sd-mqtt",
+   "programmingLanguage": "Rust",
+   "license": "https://opensource.org/licenses/MIT",
+   "targetProduct": {
+    "@id": "https://clement880101.github.io/sd-mqtt/#software"
+   }
+  },
+  {
+   "@type": "FAQPage",
+   "@id": "https://clement880101.github.io/sd-mqtt/#faq",
+   "mainEntity": [
+    {
+     "@type": "Question",
+     "name": "Is sd-mqtt free for commercial use?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Yes. The whole repository and the whole binary are under the MIT licence, including clustering, queue replication, rules, authentication and the admin interface. There is no enterprise edition and no feature behind a commercial licence."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Which MQTT versions does sd-mqtt support?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "MQTT 3.1.1 and MQTT 5, over TCP, TLS, WebSocket and secure WebSocket. Shared subscriptions, retained messages, wills, topic aliases and enhanced authentication with SCRAM-SHA-256 are included, and the broker is checked against Eclipse Paho's interoperability suite."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "How is sd-mqtt different from Mosquitto?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Mosquitto is a single-node broker that links brokers by bridging. sd-mqtt is a cluster: nodes route publications to each other's subscribers, a session follows its client to whichever node it reconnects to, and each queue is kept on more than one node. It also ships rules to and from HTTP and an admin interface in the same binary."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "How is sd-mqtt different from EMQX?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "From version 5.9, EMQX is under the Business Source License 1.1, which allows one node in production and needs a commercial licence to run a cluster. sd-mqtt is MIT licensed and its clustering is free to run at any size."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Does sd-mqtt need a database or other services?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "No. It is one static binary with an embedded store: give it a directory and sessions, subscriptions, queued messages, retained messages, rules and users survive a restart. Without a directory it runs in memory."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Which platforms does sd-mqtt run on?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Linux on x86_64 and aarch64 as a static binary, macOS on Apple silicon and Intel, and a container image for amd64 and arm64. There is no Windows build."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "How do I run an MQTT cluster with sd-mqtt?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Start three nodes with the same cluster name and secret, each listing the others as seeds. The setup guide in the repository takes a Docker Compose file from nothing to a three-node cluster in six steps."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Is sd-mqtt ready for production?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "It is at version 0.7.1, before 1.0. The protocol and clustering are tested, but until 1.0 the stored format may change between releases, and a store written by an earlier build is refused rather than migrated. Read the changelog before upgrading."
+     }
+    }
+   ]
+  }
+ ]
+}
+</script>
 <meta name="google-site-verification" content="j07u6Cb6tYxqLmcuOS92N2Lo7XMwJvGOvt4ot2_LiZM" />
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -165,6 +303,7 @@
       <li><a href="#measured">Measured</a></li>
       <li><a href="#compared">Beside the others</a></li>
       <li><a href="#run">Run it</a></li>
+      <li><a href="#faq">Questions</a></li>
       <li><a href="https://github.com/clement880101/sd-mqtt">GitHub</a></li>
     </ul>
   </nav>
@@ -195,7 +334,7 @@
 
   <section class="part" id="does" aria-labelledby="does-title">
     <div class="wrap">
-      <h2 id="does-title">What it does</h2>
+      <h2 id="does-title">What the sd-mqtt broker does</h2>
       <dl class="does">
         <dt>MIT licensed, every feature</dt>
         <dd>One licence over the whole repository and the whole binary. Clustering, replication, rules, authentication and the interface are not an upgrade; they are the product. The notices for everything compiled in ship inside every archive and image.</dd>
@@ -217,7 +356,7 @@
 
   <section class="part" id="measured" aria-labelledby="measured-title">
     <div class="wrap">
-      <h2 id="measured-title">Measured</h2>
+      <h2 id="measured-title">Measured on one node</h2>
       <ul class="stats">
         <li class="stat"><b data-figure="100,000">100,000</b><span>MQTT connections held on one node for a minute, every one still answering a ping at the end</span></li>
         <li class="stat"><b data-figure="2.5 s">2.5 s</b><span>to open all 100,000 of them, about 40,000 a second, none refused</span></li>
@@ -232,7 +371,7 @@
 
   <section class="part" id="compared" aria-labelledby="compared-title">
     <div class="wrap">
-      <h2 id="compared-title">Beside the other brokers</h2>
+      <h2 id="compared-title">sd-mqtt beside Mosquitto, NanoMQ, EMQX, VerneMQ and HiveMQ</h2>
       <p>What each project says about its own licence and what it ships for free, and the size of its container image. Nothing here is a speed comparison: no two published benchmarks ran on the same machine, so none is quoted.</p>
       <div class="table">
         <table>
@@ -255,7 +394,7 @@
 
   <section class="part" id="run" aria-labelledby="run-title">
     <div class="wrap">
-      <h2 id="run-title">Run it</h2>
+      <h2 id="run-title">Run the MQTT broker</h2>
       <p>Either way you get a broker on port 1883 and its admin interface on port 1884.</p>
       <div class="runs">
         <div class="run">
@@ -280,6 +419,30 @@ cd sdmqtt-0.7.1-x86_64-unknown-linux-musl
           </div>
         </div>
       </div>
+    </div>
+  </section>
+
+  <section class="part" id="faq" aria-labelledby="faq-title">
+    <div class="wrap">
+      <h2 id="faq-title">Questions</h2>
+      <dl class="does">
+        <dt>Is sd-mqtt free for commercial use?</dt>
+        <dd>Yes. The whole repository and the whole binary are under the MIT licence, including clustering, queue replication, rules, authentication and the admin interface. There is no enterprise edition and no feature behind a commercial licence.</dd>
+        <dt>Which MQTT versions does sd-mqtt support?</dt>
+        <dd>MQTT 3.1.1 and MQTT 5, over TCP, TLS, WebSocket and secure WebSocket. Shared subscriptions, retained messages, wills, topic aliases and enhanced authentication with SCRAM-SHA-256 are included, and the broker is checked against Eclipse Paho&#x27;s interoperability suite.</dd>
+        <dt>How is sd-mqtt different from Mosquitto?</dt>
+        <dd>Mosquitto is a single-node broker that links brokers by bridging. sd-mqtt is a cluster: nodes route publications to each other&#x27;s subscribers, a session follows its client to whichever node it reconnects to, and each queue is kept on more than one node. It also ships rules to and from HTTP and an admin interface in the same binary.</dd>
+        <dt>How is sd-mqtt different from EMQX?</dt>
+        <dd>From version 5.9, EMQX is under the Business Source License 1.1, which allows one node in production and needs a commercial licence to run a cluster. sd-mqtt is MIT licensed and its clustering is free to run at any size.</dd>
+        <dt>Does sd-mqtt need a database or other services?</dt>
+        <dd>No. It is one static binary with an embedded store: give it a directory and sessions, subscriptions, queued messages, retained messages, rules and users survive a restart. Without a directory it runs in memory.</dd>
+        <dt>Which platforms does sd-mqtt run on?</dt>
+        <dd>Linux on x86_64 and aarch64 as a static binary, macOS on Apple silicon and Intel, and a container image for amd64 and arm64. There is no Windows build.</dd>
+        <dt>How do I run an MQTT cluster with sd-mqtt?</dt>
+        <dd>Start three nodes with the same cluster name and secret, each listing the others as seeds. The setup guide in the repository takes a Docker Compose file from nothing to a three-node cluster in six steps.</dd>
+        <dt>Is sd-mqtt ready for production?</dt>
+        <dd>It is at version 0.7.1, before 1.0. The protocol and clustering are tested, but until 1.0 the stored format may change between releases, and a store written by an earlier build is refused rather than migrated. Read the changelog before upgrading.</dd>
+      </dl>
     </div>
   </section>
 
