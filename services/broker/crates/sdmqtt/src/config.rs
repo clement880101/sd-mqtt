@@ -1723,6 +1723,33 @@ impl Config {
                 why: "the longest wait cannot be shorter than the first one",
             });
         }
+        // The same loop as a reconnect backoff of nothing, against a
+        // peer that will refuse again for as long as the two secrets
+        // differ: section 8.1 makes this wait the longer of the two
+        // because the fault does not fix itself.
+        if self.cluster.refused_backoff_ms == 0 {
+            return Err(ConfigError::Unusable {
+                key: "cluster.refused_backoff_ms",
+                value: "0".to_string(),
+                why: "a backoff of nothing is a dial in a loop against a peer that \
+                      refused this node's secret and will refuse it again; write the \
+                      milliseconds to wait, or leave the key out for five minutes",
+            });
+        }
+        // A drain bound of nothing runs out before the first chunk can
+        // arrive, so every claim is accepted with an empty queue and
+        // the whole backlog is counted as a shortfall. Section 8.4
+        // means the bound as a trade between connect latency and
+        // shortfall, and zero is not a point on that trade.
+        if self.cluster.drain_timeout_ms == 0 {
+            return Err(ConfigError::Unusable {
+                key: "cluster.drain_timeout_ms",
+                value: "0".to_string(),
+                why: "a drain given no time at all completes every claim with nothing \
+                      drained; write the milliseconds a handover may take, or leave the \
+                      key out for two seconds",
+            });
+        }
         Ok(())
     }
 
@@ -4053,6 +4080,34 @@ mod tests {
             let mut config = clustering(directory.path());
             mutate(&mut config);
             let said = config.validate().unwrap_err().to_string();
+            assert!(said.contains(key), "expected {key} to be named: {said}");
+        }
+    }
+
+    /// The two other cluster waits that zero turns into something else:
+    /// a refused-secret backoff of nothing redials a peer that will
+    /// refuse again at link speed, and a drain bound of nothing
+    /// completes every claim before a single message has arrived.
+    #[test]
+    fn a_cluster_wait_of_nothing_is_refused() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        for (key, mutate) in [
+            (
+                "cluster.refused_backoff_ms",
+                Box::new(|c: &mut Config| c.cluster.refused_backoff_ms = 0)
+                    as Box<dyn Fn(&mut Config)>,
+            ),
+            (
+                "cluster.drain_timeout_ms",
+                Box::new(|c: &mut Config| c.cluster.drain_timeout_ms = 0),
+            ),
+        ] {
+            let mut config = clustering(directory.path());
+            mutate(&mut config);
+            let said = config
+                .validate()
+                .expect_err("a wait of nothing is not a wait")
+                .to_string();
             assert!(said.contains(key), "expected {key} to be named: {said}");
         }
     }
