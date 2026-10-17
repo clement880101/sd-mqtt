@@ -31,6 +31,16 @@ hold; raise it (`ulimit -n`, or `LimitNOFILE=` under systemd), since each
 connection is one descriptor. `sdmqtt_build_info{version, allocator}`
 names the build a node runs.
 
+**A client that stops reading is cut off.** A write to a connection
+that makes no progress for thirty seconds, or for one and a half times
+the keep-alive the client negotiated when that is shorter, ends the
+connection, so a peer that subscribes and never reads cannot hold a
+task, a descriptor and a place under `max_connections` for ever. Each
+is counted on `sdmqtt_writes_stalled_total`. How every connection ended
+is on `sdmqtt_sockets_closed_total{outcome}`: `closed` when the broker
+closed it (a keep-alive timeout, a takeover), `stalled` when it stopped
+reading, and `clean` only when the client said goodbye.
+
 `[listener]` is the default listener and is named `mqtt`. More
 listeners share the same broker — the same sessions, subscriptions,
 retained messages and store — and each carries its own policy:

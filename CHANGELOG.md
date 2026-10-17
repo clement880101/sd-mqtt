@@ -33,6 +33,18 @@ the milestone you are moving to.** Everything else is description.
   conclusions were already in the design's sections 15 and 17. The design
   is now `docs/design.md` and the component selection `docs/components.md`.
 
+### Before you upgrade a cluster
+
+- **Two replication frames are new**, `Snapshot` and `SnapshotFrom`.
+  They are sent only to a node that is behind its peers' log
+  truncation, which is a new node joining or one rebuilt from an empty
+  store. A node from an earlier release cannot read them and closes the
+  link, so upgrade every existing node before adding or rebuilding one.
+  No other frame changed and the store format did not change.
+- **A peer whose clock is more than sixty seconds ahead is refused.**
+  Its replication frames are logged and dropped rather than letting it
+  win every conflict. Run NTP on every node.
+
 ### Fixed
 
 - **At the node a session is moving to**, a forward that arrives right
@@ -40,6 +52,108 @@ the milestone you are moving to.** Everything else is description.
   seconds and tried again, rather than dropped: `sdmqtt_forwards_held_total`.
   Only after a drain, so a new subscriber is never given a message published
   before it subscribed.
+
+Found by a review of every crate, each fixed with a test that failed
+first.
+
+- **Security.**
+  - A will is authorised as a publication at CONNECT. A client refused
+    a topic could publish to it by setting it as its will and dropping
+    the connection.
+  - An access rule for `fleet/+` no longer admits a subscription to
+    `fleet/#`. A subscribe is covered only by a rule whose filter
+    covers every topic the requested filter does.
+  - A password login for an unknown user costs what a wrong password
+    costs, so timing no longer tells which user names exist.
+  - SCRAM data with a multi-byte character where an attribute name
+    belongs is refused as malformed instead of panicking the
+    connection.
+  - A WebSocket message or frame is bounded by the packet limit. It was
+    bounded by the library's 64 MiB default.
+  - The admin `Authorization` scheme is read without regard to case. On
+    a loopback listener with no token, `bearer <key>` was treated as no
+    key and admitted with every right.
+- **Connections.**
+  - A connection displaced by a takeover stops acting on the session.
+    One whose writer was blocked could subscribe, and receive
+    acknowledgements, on behalf of the client that replaced it.
+  - A write that makes no progress ends the connection, so a client
+    that stops reading cannot hold its task, descriptor and connection
+    slot for ever. See the listeners page.
+  - A session's outbox exists from the moment the session does, so a
+    publication arriving in between is no longer dropped.
+  - Packets the shell answers itself, a refused publication during a
+    partition or an AUTH step, count as keep-alive activity.
+  - A takeover of a connection whose session expiry is zero starts a
+    new session, as the specification says, instead of resuming one
+    that ended.
+  - A PUBCOMP or PUBACK for an identifier not outstanding is ignored
+    instead of closing the connection without a reason it could encode.
+  - A connection the broker closed is counted `closed`, not `clean`.
+- **Clustering.**
+  - Peers' stamps advance the local clock, so a node with a fast clock
+    no longer wins every conflict, session ownership included.
+  - A node joining after its peers truncated their logs is sent the
+    registers it missed, and the exchange can no longer loop at link
+    speed.
+  - After a session moves, followers of the old owner start over under
+    the new one instead of discarding its stream while acknowledging
+    synchronous publications.
+  - A drain is complete only when every message it announced arrived.
+    One whose first chunk was lost was counted complete, with its queue
+    and subscriptions gone.
+  - An old owner that no longer holds a session says so, and the
+    claimer pulls from a copy, instead of being told the drain was
+    complete and empty.
+  - The pull after a short drain waits under its own key, and a drain
+    it makes whole keeps the drain's subscriptions, inflight window and
+    inbound identifiers.
+  - A follower stalled behind a missed change is repaired with a
+    snapshot, and a stopped session's synchronous waiters are answered.
+  - A late forward is redirected at most once and never back to the
+    node that sent it.
+  - Dialling and accepting a cluster link are bounded by the dead
+    window.
+  - A batch that removes a session carries no stream position for it,
+    which the store would refuse along with the batch.
+- **Rules and the admin API.**
+  - Replacing or re-enabling a running rule leaves no window in which
+    matching publications miss it.
+  - Changing a rule's action kind is refused with `409` while its outbox
+    holds envelopes, which would otherwise be stranded and make the
+    rule undeletable.
+  - A tap on a broker that refuses anonymous clients is answered `403`
+    instead of panicking the request.
+  - A replicated rule this node refuses still stores its register.
+  - The events stream tags each event with the run it came from, so a
+    browser reconnecting after a restart is told to resynchronise
+    instead of being replayed another run's events. A bare number is
+    still accepted.
+- **Protocol.**
+  - A client PUBLISH carrying a Subscription Identifier is a protocol
+    error.
+  - A property not permitted on its packet type is a Malformed Packet,
+    `0x81`, as the specification says. It was `0x82`.
+  - A Response Topic with a wildcard is refused.
+  - An invalid filter in a SUBSCRIBE is refused on its own, `0x8F`,
+    and the other filters in the packet are granted. It closed the
+    connection.
+  - A DISCONNECT followed by the socket closing no longer stamps the
+    session's expiry and will delay twice.
+- **Storage and configuration.**
+  - A stream position or replica mark for a session the store does not
+    hold is refused, as every other per-session record is.
+  - Finishing an outbox envelope after its rule was removed is a no-op
+    instead of refusing the batch and leaking the payload.
+  - A store from a later format is refused with the version message
+    before any table is opened.
+  - `max_connections` above what the runtime can count, and cluster
+    waits of zero milliseconds, are refused by name at startup instead
+    of panicking or looping.
+  - A second SIGINT or SIGTERM during shutdown ends the process at
+    once.
+- **The interface.** Editing one rule and then another edits the
+  second. It kept the first rule's values and saved them over it.
 
 ## 0.7.1 — 2026-10-16
 
@@ -286,7 +400,7 @@ rejoin and be repaired before the next.
   which hung most first connects, and a close that dropped the
   DISCONNECT the broker had just sent.
 
-## Unreleased — milestone 6: queue replication
+## Before 0.7.0 — milestone 6: queue replication
 
 ### Before you upgrade: a store written before this milestone is refused
 
@@ -546,7 +660,7 @@ on purpose.
   make failover prefer the copy with a message missing from the
   middle.
 
-## Unreleased — milestone 5: the cluster mesh
+## Before 0.7.0 — milestone 5: the cluster mesh
 
 ### Before you upgrade: a store written before this milestone is refused
 
@@ -865,7 +979,7 @@ deleted.
   forbids is one that does not compile. Nothing an operator can see
   changes while there is one node.
 
-## Unreleased — milestone 4: the hook interface and four connectors
+## Before 0.7.0 — milestone 4: the hook interface and four connectors
 
 ### Before you upgrade: a store written before this milestone is refused
 
