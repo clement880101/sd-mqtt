@@ -28,6 +28,26 @@ fn check_topic_alias(topic: &str, properties: &Properties) -> Result<(), CodecEr
     Ok(())
 }
 
+/// Refuse a Response Topic that carries a wildcard.
+///
+/// [MQTT-3.3.2-14]: "The Response Topic MUST NOT contain wildcard
+/// characters", and the clause names it a Protocol Error. The property
+/// is a topic name a responder will publish to, so a wildcard in it is
+/// never valid. A will's properties are checked by the same rule,
+/// because they travel on the PUBLISH the will becomes.
+pub(crate) fn check_response_topic(properties: &Properties) -> Result<(), CodecError> {
+    if properties
+        .response_topic
+        .as_deref()
+        .is_some_and(|topic| topic.contains('+') || topic.contains('#'))
+    {
+        return Err(CodecError::ProtocolError(
+            "response topic must not contain wildcard characters",
+        ));
+    }
+    Ok(())
+}
+
 /// An application message travelling in either direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Publish {
@@ -107,6 +127,7 @@ impl Publish {
 
         if version == Version::V5 {
             check_topic_alias(&topic, &properties)?;
+            check_response_topic(&properties)?;
         }
 
         let payload = reader.take_rest();
@@ -146,6 +167,7 @@ impl Publish {
         }
         if version == Version::V5 {
             check_topic_alias(&self.topic, &self.properties)?;
+            check_response_topic(&self.properties)?;
         } else if self.topic.is_empty() {
             return Err(CodecError::InvalidTopicName);
         }
@@ -610,6 +632,57 @@ mod tests {
             encode_err(&qos_zero_publish(""), Version::V311),
             CodecError::InvalidTopicName
         );
+    }
+
+    /// [MQTT-3.3.2-14]: "The Response Topic MUST NOT contain wildcard
+    /// characters", a Protocol Error. It is a topic name a responder will
+    /// publish to, and a wildcard in a topic name is never valid.
+    #[test]
+    fn rejects_a_response_topic_with_a_wildcard() {
+        for response in ["replies/+", "replies/#", "+", "#"] {
+            let mut out = Vec::new();
+            crate::writer::put_string(&mut out, "a").unwrap();
+            let mut block = Vec::new();
+            crate::writer::put_u8(&mut block, 0x08); // response topic
+            crate::writer::put_string(&mut block, response).unwrap();
+            crate::writer::put_u8(&mut out, u8::try_from(block.len()).unwrap());
+            out.extend_from_slice(&block);
+            let mut reader = Reader::new(&out);
+
+            let err = Publish::decode_body(&mut reader, 0x00, Version::V5, &Limits::default())
+                .unwrap_err();
+            assert_eq!(
+                err,
+                CodecError::ProtocolError("response topic must not contain wildcard characters"),
+                "{response}"
+            );
+        }
+    }
+
+    /// The same rule on the way out, so this side never sends what the
+    /// other side must refuse.
+    #[test]
+    fn rejects_encoding_a_response_topic_with_a_wildcard() {
+        let packet = Publish {
+            properties: crate::Properties {
+                response_topic: Some("replies/+".into()),
+                ..Default::default()
+            },
+            ..qos_zero_publish("a")
+        };
+        assert_eq!(
+            encode_err(&packet, Version::V5),
+            CodecError::ProtocolError("response topic must not contain wildcard characters")
+        );
+        // A plain one is fine, so the refusal is about the wildcard.
+        let packet = Publish {
+            properties: crate::Properties {
+                response_topic: Some("replies/7".into()),
+                ..Default::default()
+            },
+            ..qos_zero_publish("a")
+        };
+        assert_eq!(round_trip(&packet, Version::V5), packet);
     }
 
     #[test]

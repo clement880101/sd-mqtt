@@ -133,7 +133,12 @@ impl Connect {
 
         let will = if has_will {
             let will_properties = if version == Version::V5 {
-                Properties::decode_for(reader, PropertyScope::Will)?
+                let properties = Properties::decode_for(reader, PropertyScope::Will)?;
+                // These travel on the PUBLISH the will becomes, so what
+                // [MQTT-3.3.2-14] refuses there is refused here, while
+                // there is still a client to tell.
+                super::publish::check_response_topic(&properties)?;
+                properties
             } else {
                 Properties::default()
             };
@@ -217,6 +222,7 @@ impl Connect {
 
         if let Some(will) = &self.will {
             if version == Version::V5 {
+                super::publish::check_response_topic(&will.properties)?;
                 will.properties.encode_for(PropertyScope::Will, out)?;
             }
             put_string(out, &will.topic)?;
@@ -331,6 +337,65 @@ mod tests {
     use crate::reason::ReasonCode;
     use crate::Version;
     use bytes::Bytes;
+
+    /// A will's Response Topic travels on the PUBLISH the will becomes,
+    /// and [MQTT-3.3.2-14] forbids a wildcard there, so the connect that
+    /// carries one is refused rather than stored to be refused later by
+    /// every subscriber it reaches.
+    #[test]
+    fn rejects_a_will_whose_response_topic_has_a_wildcard() {
+        let connect = Connect {
+            version: Version::V5,
+            client_id: "c".into(),
+            clean_start: true,
+            keep_alive: 0,
+            username: None,
+            password: None,
+            will: Some(Will {
+                topic: "status/c".into(),
+                payload: Bytes::from_static(b"offline"),
+                qos: QoS::AtMostOnce,
+                retain: false,
+                properties: crate::Properties {
+                    response_topic: Some("replies/#".into()),
+                    ..Default::default()
+                },
+            }),
+            properties: crate::Properties::default(),
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            connect.encode_body(Version::V5, &mut out).unwrap_err(),
+            CodecError::ProtocolError("response topic must not contain wildcard characters")
+        );
+
+        // And on the wire: the same connect with a plain response topic
+        // encodes, and swapping the topic's last byte for a wildcard is
+        // the one defect.
+        let plain = Connect {
+            will: Some(Will {
+                properties: crate::Properties {
+                    response_topic: Some("replies/7".into()),
+                    ..Default::default()
+                },
+                ..connect.will.clone().unwrap()
+            }),
+            ..connect
+        };
+        let mut wire = Vec::new();
+        plain.encode_body(Version::V5, &mut wire).expect("encodes");
+        let at = wire
+            .windows(9)
+            .position(|window| window == b"replies/7")
+            .expect("the response topic is on the wire")
+            + 8;
+        wire[at] = b'#';
+        let mut reader = Reader::new(&wire);
+        assert_eq!(
+            Connect::decode_body(&mut reader, &Limits::default()).unwrap_err(),
+            CodecError::ProtocolError("response topic must not contain wildcard characters")
+        );
+    }
 
     fn round_trip_connect(packet: &Connect, version: Version) -> Connect {
         let mut out = Vec::new();
