@@ -1469,6 +1469,23 @@ impl Broker {
         outcome
     }
 
+    /// Credit a connected client with keep-alive activity for a packet
+    /// the shell answered without handing it down.
+    ///
+    /// [MQTT-3.1.2-22] measures the keep-alive from the last Control
+    /// Packet the client sent, any Control Packet. Two kinds never
+    /// reach [`Broker::handle`]: section 8.5's refusals, which the
+    /// shell answers so that nothing below it retains or queues what
+    /// was refused, and section 12.2's AUTH, which the broker never
+    /// sees at all. Without this a client publishing steadily on a
+    /// gated node was cut for a silence it never kept. The same one
+    /// relaxed store an arriving packet makes, and nothing else.
+    pub fn note_activity(&self, subscriber: SubscriberId) {
+        if let Some(activity) = self.activities.get(&subscriber) {
+            activity.touch(self.clock.now());
+        }
+    }
+
     fn handle_inner(
         &mut self,
         subscriber: SubscriberId,
@@ -2212,11 +2229,16 @@ impl Broker {
             // lose. Without this, a second call — and there are two
             // paths that can make one, a disconnect packet followed
             // by the socket closing — would tell the hooks the same
-            // client left twice.
+            // client left twice, and would tell the session too: its
+            // expiry and its will deadline run from the departure,
+            // 3.1.2.11.2 and 3.1.3.2.2, and a second stamp from the
+            // socket going away a while later would move both.
             departed = session.is_connected();
-            match packet {
-                Some(reason) => session.on_disconnect_packet(reason, now),
-                None => session.on_disconnected(false, now),
+            if departed {
+                match packet {
+                    Some(reason) => session.on_disconnect_packet(reason, now),
+                    None => session.on_disconnected(false, now),
+                }
             }
         }
         // A departure changes when the session expires and whether it
@@ -2787,6 +2809,45 @@ mod tests {
             broker.handle(client, &publish, &mut out),
             Err(ReasonCode::ProtocolError),
             "[MQTT-3.3.4-6]"
+        );
+    }
+
+    #[test]
+    fn the_socket_closing_after_a_disconnect_packet_does_not_restart_the_expiry() {
+        // A DISCONNECT packet and the socket closing are two events the
+        // shell reports separately, and both reach the session. The
+        // session's expiry runs from the departure, 3.1.2.11.2, and the
+        // departure happened once: a second stamp from the socket going
+        // away a while later would keep a session alive past the
+        // interval the client asked for.
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let mut connect = connect_v5("c");
+        connect.properties.session_expiry_interval = Some(10);
+        let client = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates")
+            .subscriber;
+
+        broker
+            .handle(
+                client,
+                &Packet::Disconnect(Disconnect {
+                    reason: ReasonCode::Success,
+                    properties: Properties::default(),
+                }),
+                &mut out,
+            )
+            .expect("a well formed disconnect");
+        run_to(&mut broker, 8, &mut out);
+        // The shell notices the socket is gone a while later.
+        broker.disconnect(client, &mut out);
+
+        run_to(&mut broker, 12, &mut out);
+        assert_eq!(
+            broker.session_count(),
+            0,
+            "the session expired ten seconds after the disconnect packet, not after the close"
         );
     }
 
