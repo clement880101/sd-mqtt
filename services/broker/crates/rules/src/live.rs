@@ -212,16 +212,22 @@ pub enum InstallError {
     ///
     /// See the module note: deleting a rule deletes its outbox, and
     /// the contents of that outbox are messages this broker accepted.
+    /// Changing what the rule does is refused for the same reason: the
+    /// envelopes were accepted for the connector the rule had, and an
+    /// action with no outbox would leave them in the store with
+    /// nothing to deliver them and a depth that never falls.
     #[error(
-        "the rule {id:?} still has {waiting} envelope(s) waiting in its outbox, and \
-         deleting a rule deletes its outbox; disable it instead, or wait for the outbox \
-         to drain — every envelope in it ends at the endpoint or in a dead letter"
+        "the rule {id:?} still has {waiting} envelope(s) waiting in its outbox, and {why}; \
+         disable it instead, or wait for the outbox to drain — every envelope in it ends \
+         at the endpoint or in a dead letter"
     )]
     OutboxNotEmpty {
         /// Which rule.
         id: String,
         /// How many envelopes are still waiting.
         waiting: u64,
+        /// What the request would have done to them.
+        why: String,
     },
     /// This rule and another this node holds loop through one remote.
     ///
@@ -777,6 +783,9 @@ impl Registry {
         // refusal with this node exactly as it was.
         self.check_for_a_loop(&rule)?;
         self.check_it_fits(&rule)?;
+        if matches!(origin, Origin::Ours) {
+            self.check_the_outbox_keeps_its_connector(&rule)?;
+        }
         // **Before anything changes.** An address something else is
         // already on is then a refusal with the node exactly as it
         // was, rather than a stored rule nothing can reach.
@@ -898,6 +907,53 @@ impl Registry {
             self.ingest.withdraw(id.as_str());
         }
         Ok(())
+    }
+
+    /// Refuse a change of action while the outbox holds envelopes.
+    ///
+    /// `docs/features/rules.md` promises that deleting a rule is
+    /// refused while its outbox holds anything, because what is in
+    /// one is messages this broker told somebody it had accepted, and
+    /// that the way to stop a connector without losing them is to
+    /// disable it. A replacement whose action is of another kind got
+    /// round that promise: an `http_out` rule made into an `http_in`
+    /// one left its envelopes in the store with no pump to deliver
+    /// them, a depth that never fell, and a rule that could therefore
+    /// never be deleted. The envelopes were accepted for the connector
+    /// the rule had, so the kind of action is what a rule with a
+    /// non-empty outbox keeps; everything else about it may change,
+    /// and switching it off is still what the refusal recommends.
+    ///
+    /// An **operator's** refusal, like the one on delete, and skipped
+    /// for a peer's register for the reason [`Registry::remove_locked`]
+    /// gives: the comparison that decided it has already happened.
+    fn check_the_outbox_keeps_its_connector(&self, rule: &Rule) -> Result<(), InstallError> {
+        let held = self.get(&rule.id);
+        let Some(held) = held else {
+            return Ok(());
+        };
+        if std::mem::discriminant(&held.action) == std::mem::discriminant(&rule.action) {
+            return Ok(());
+        }
+        // A maintained number in the store rather than a walk of the
+        // outbox: see `Storage::outbox_depth`.
+        let waiting = self
+            .store
+            .outbox_depth(rule.id.as_str())
+            .map_err(|error| InstallError::storage(&rule.id, error))?;
+        if waiting == 0 {
+            return Ok(());
+        }
+        Err(InstallError::OutboxNotEmpty {
+            id: rule.id.as_str().to_owned(),
+            waiting,
+            why: format!(
+                "they were accepted for an `{}` connector, which changing the rule to \
+                 `{}` would take away from them",
+                kind_of(&held.action),
+                kind_of(&rule.action)
+            ),
+        })
     }
 
     /// Refuse a bridge that loops through a remote with one this node
@@ -1184,6 +1240,7 @@ impl Registry {
                 return Err(InstallError::OutboxNotEmpty {
                     id: id.as_str().to_owned(),
                     waiting,
+                    why: "deleting a rule deletes its outbox".to_owned(),
                 });
             }
         }
@@ -1702,6 +1759,17 @@ impl DeadLetters for BrokerDeadLetters {
 }
 
 /// A live level as the store spells it.
+/// The name an action's kind goes by in a rule's table and in the API,
+/// for a refusal that has to say which two it is talking about.
+fn kind_of(action: &Action) -> &'static str {
+    match action {
+        Action::HttpOut(_) => "http_out",
+        Action::HttpIn(_) => "http_in",
+        Action::HttpPoll(_) => "http_poll",
+        Action::MqttBridge(_) => "mqtt_bridge",
+    }
+}
+
 fn stored_qos(qos: QoS) -> Qos {
     match qos {
         QoS::AtMostOnce => Qos::AtMostOnce,
@@ -2129,6 +2197,78 @@ mod tests {
             "an edit took the rule out of the map before the replacement was in it; a \
              publication in that window fires nothing"
         );
+        registry.shutdown().await;
+    }
+
+    /// A rule whose outbox holds envelopes keeps the action they were
+    /// accepted for.
+    ///
+    /// `docs/features/rules.md`: a delete is refused while the outbox
+    /// holds anything, because what is in one is messages this broker
+    /// told somebody it had accepted, and the way to stop a connector
+    /// without losing them is to disable it. A `PUT` that changed the
+    /// action to one with no outbox got round that: the envelopes
+    /// stayed in the store with nothing to deliver them, the depth
+    /// never fell, and the rule could never be deleted. So the same
+    /// refusal applies to a change of action kind, and switching the
+    /// rule off is still allowed, because that keeps the outbox.
+    #[tokio::test]
+    async fn an_action_change_is_refused_while_the_outbox_holds_envelopes() {
+        let (registry, store) = registry();
+        let rule = a_rule();
+        registry
+            .install(rule.clone())
+            .await
+            .expect("the first install");
+
+        // One envelope, written the way the hook writes one.
+        let outbox = Outbox::open(rule.id.clone(), store.as_ref()).expect("the outbox opens");
+        let (_, records) = outbox.append(
+            MessageId([1; 16]),
+            MessageId([2; 16]),
+            BodyRecord {
+                topic: "sensor/1".to_owned(),
+                payload: Bytes::from_static(b"21.5"),
+                qos: Qos::AtLeastOnce,
+                retain: false,
+                expires_at: None,
+                properties: Bytes::new(),
+            },
+            "sensor-1",
+            1_700_000_000,
+        );
+        store.apply(&records).expect("the envelope is storable");
+        assert_eq!(store.outbox_depth("held").expect("a depth"), 1);
+
+        let mut ingest = rule.clone();
+        ingest.trigger = None;
+        ingest.action = Action::HttpIn(crate::rule::HttpIn {
+            token: storage::record::Secret::new("a-secret"),
+            topic: "ingest/held".to_owned(),
+            topic_from: None,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+        });
+        let refused = registry.install(ingest).await;
+        assert!(
+            matches!(
+                refused,
+                Err(InstallError::OutboxNotEmpty { waiting: 1, .. })
+            ),
+            "a change of action with an envelope waiting: {refused:?}"
+        );
+        let held = registry.get(&rule.id).expect("the rule is still held");
+        assert!(
+            matches!(held.action, Action::HttpOut(_)),
+            "the rule is as it was: {held:?}"
+        );
+
+        // Switching it off keeps the outbox, and is what the refusal
+        // tells the operator to do instead.
+        registry
+            .set_enabled(&rule.id, false)
+            .await
+            .expect("disabling keeps the outbox and is allowed");
         registry.shutdown().await;
     }
 

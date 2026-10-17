@@ -308,6 +308,10 @@ logged when it is installed.
 rule — `DELETE /api/v1/rules/<id>`, or the button on the Rules page —
 which is refused while its outbox still holds anything, because
 deleting a rule deletes its outbox and what is in one is messages this
-broker told somebody it had accepted. Turning a connector off while an
-endpoint is down is `enabled = false`, or the disable button, which
-keeps the outbox.
+broker told somebody it had accepted. For the same reason a `PUT` that
+changes the *kind* of action — `http_out` to `http_in`, say — is
+refused while envelopes wait: they were accepted for the connector the
+rule had, and an action with no outbox would leave them with nothing to
+deliver them. Everything else about the rule may change. Turning a
+connector off while an endpoint is down is `enabled = false`, or the
+disable button, which keeps the outbox.
