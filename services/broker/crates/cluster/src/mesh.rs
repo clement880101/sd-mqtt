@@ -722,19 +722,33 @@ async fn accepting(state: Arc<State>) {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             let mut stream = stream;
-            match handshake::accept(
-                &mut stream,
-                &state.config,
-                &state.identity,
-                &state.settings.advertise,
+            // **Bounded by the dead window.** Anything that opened a
+            // connection and then said nothing held this task and the
+            // socket for as long as it liked; a peer silent for as long
+            // as it takes to be declared dead is dead by section 8.1's
+            // own rule, whether or not it ever finished greeting.
+            let accepted = tokio::time::timeout(
+                state.settings.detection.dead_after,
+                handshake::accept(
+                    &mut stream,
+                    &state.config,
+                    &state.identity,
+                    &state.settings.advertise,
+                ),
             )
-            .await
-            {
-                Ok(peer) => {
+            .await;
+            match accepted {
+                Ok(Ok(peer)) => {
                     install(&state, stream, peer, Role::Listener);
                 }
-                Err(why) => {
+                Ok(Err(why)) => {
                     refuse(&state, None, &why);
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "an inbound cluster connection did not finish its handshake within the \
+                         dead window and was closed"
+                    );
                 }
             }
         });
@@ -844,29 +858,47 @@ enum Refusal {
 }
 
 async fn attempt_dial(state: &Arc<State>, address: &str) -> Result<NodeId, Refusal> {
-    let mut stream = match state.transport.dial(address).await {
-        Ok(stream) => stream,
-        Err(why) => {
-            tracing::debug!(address, %why, "a cluster peer could not be dialled");
-            return Err(Refusal::Transport);
+    // **The connect and the handshake together are bounded by the dead
+    // window.** Unbounded, a peer that accepted and then said nothing —
+    // a wedged process, a half-open socket, an address that swallows
+    // packets — held this attempt for ever, and `consider` never dials
+    // an address whose attempt is still running, so the peer was never
+    // dialled again. Timing out is a transport failure, and backs off
+    // like one.
+    let bound = state.settings.detection.dead_after;
+    let attempt = async {
+        let mut stream = match state.transport.dial(address).await {
+            Ok(stream) => stream,
+            Err(why) => {
+                tracing::debug!(address, %why, "a cluster peer could not be dialled");
+                return Err(Refusal::Transport);
+            }
+        };
+        match handshake::dial(
+            &mut stream,
+            &state.config,
+            &state.identity,
+            &state.settings.advertise,
+        )
+        .await
+        {
+            Ok(peer) => Ok((stream, peer)),
+            Err(why) => Err(refuse(state, Some(address), &why)),
         }
     };
-    match handshake::dial(
-        &mut stream,
-        &state.config,
-        &state.identity,
-        &state.settings.advertise,
-    )
-    .await
-    {
-        Ok(peer) => {
+    match tokio::time::timeout(bound, attempt).await {
+        Ok(Ok((stream, peer))) => {
             let id = peer.identity.id();
             install(state, stream, peer, Role::Dialler);
             Ok(id)
         }
-        Err(why) => {
-            let refusal = refuse(state, Some(address), &why);
-            Err(refusal)
+        Ok(Err(refusal)) => Err(refusal),
+        Err(_) => {
+            tracing::debug!(
+                address,
+                "a cluster peer did not finish its handshake within the dead window"
+            );
+            Err(Refusal::Transport)
         }
     }
 }
@@ -1549,6 +1581,66 @@ mod tests {
             || a.stats().links == 0 && a.members().is_empty(),
         )
         .await;
+    }
+
+    /// A dial whose peer accepts and never answers is given up on and
+    /// tried again.
+    ///
+    /// The handshake had no bound. A peer that accepted the connection
+    /// and then said nothing — a wedged process, a half-open socket —
+    /// held the dial inside `handshake::dial` for ever, and the attempt
+    /// stayed marked running, so the address was never dialled again.
+    /// Bounded by the dead window: a peer silent for that long is dead
+    /// by section 8.1's own rule.
+    #[tokio::test]
+    async fn a_dial_whose_peer_never_answers_is_given_up_on_and_retried() {
+        let switch = Switch::new();
+        let silent = switch.listen("silent");
+        let _a = node(&switch, "a", &["silent"], &NodeIdentity::mint("a"), SECRET);
+
+        // The first connection, held open and never answered.
+        let first = tokio::time::timeout(PATIENCE, silent.accept())
+            .await
+            .expect("a dials its seed")
+            .expect("the switch delivers it");
+        // Without a bound on the handshake there is never a second.
+        let second = tokio::time::timeout(PATIENCE, silent.accept()).await;
+        assert!(
+            second.is_ok(),
+            "a stayed inside a handshake with a peer that never answered, and never dialled again"
+        );
+        drop(first);
+    }
+
+    /// A connection that never greets is closed rather than held.
+    ///
+    /// The listener's half of the same bound: before it, anything that
+    /// opened a connection to the cluster port and sent nothing held a
+    /// task and a socket on this node for as long as it liked.
+    #[tokio::test]
+    async fn a_connection_that_never_greets_is_closed() {
+        use tokio::io::AsyncReadExt;
+        let switch = Switch::new();
+        let _a = node(&switch, "a", &[], &NodeIdentity::mint("a"), SECRET);
+        let mute = switch.listen("mute");
+        let mut stream = mute.dial("a").await.expect("a is listening");
+
+        // `a` greets first and then waits for ours. Read until it gives
+        // up on us, which is the end of the stream.
+        let mut buffer = [0_u8; 512];
+        let closed = tokio::time::timeout(PATIENCE, async {
+            loop {
+                match stream.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "a held a connection that never greeted it for the whole patience"
+        );
     }
 
     /// Two nodes dialling each other at once settle on one link.
