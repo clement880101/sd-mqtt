@@ -334,10 +334,22 @@ pub enum SocketOutcome {
     /// that a cancelled connection is an ending like any other rather
     /// than a socket that is open forever in the exposition.
     Abandoned,
+    /// The broker ended the connection: a keep-alive that lapsed, a
+    /// session taken over, an administrative disconnect. The reason
+    /// is counted against the DISCONNECT that carried it; this is
+    /// the ending. **Not `Clean`**, which these were counted as: a
+    /// client the broker cut off did not say goodbye, and a
+    /// dashboard reading the clean count as clients leaving on their
+    /// own terms would have read every keep-alive timeout that way.
+    Closed,
+    /// A write to the client made no progress within the bound, so
+    /// the peer had stopped reading. See
+    /// [`crate::connection::ConnectionConfig::write_timeout`].
+    Stalled,
 }
 
 /// Every socket outcome, in the order the handles are indexed in.
-const SOCKET_OUTCOMES: [SocketOutcome; 11] = [
+const SOCKET_OUTCOMES: [SocketOutcome; 13] = [
     SocketOutcome::Clean,
     SocketOutcome::ConnectTimeout,
     SocketOutcome::NotAConnect,
@@ -353,6 +365,8 @@ const SOCKET_OUTCOMES: [SocketOutcome; 11] = [
     // renumbers every outcome after it and relabels their counters.
     SocketOutcome::NotWhole,
     SocketOutcome::NotConfirmed,
+    SocketOutcome::Closed,
+    SocketOutcome::Stalled,
 ];
 
 /// The label value for a socket outcome.
@@ -369,6 +383,8 @@ fn outcome_label(outcome: SocketOutcome) -> &'static str {
         SocketOutcome::NotWhole => "not_whole",
         SocketOutcome::NotConfirmed => "not_confirmed",
         SocketOutcome::Abandoned => "abandoned",
+        SocketOutcome::Closed => "closed",
+        SocketOutcome::Stalled => "stalled",
     }
 }
 
@@ -386,6 +402,8 @@ fn outcome_index(outcome: SocketOutcome) -> usize {
         SocketOutcome::Abandoned => 8,
         SocketOutcome::NotWhole => 9,
         SocketOutcome::NotConfirmed => 10,
+        SocketOutcome::Closed => 11,
+        SocketOutcome::Stalled => 12,
     }
 }
 

@@ -323,6 +323,32 @@ pub enum ConnectionError {
     /// other is a thing that was configured.
     #[error("refused because no copy confirmed it")]
     NotConfirmed,
+    /// The broker ended the connection, with the reason its DISCONNECT
+    /// carried: a keep-alive that lapsed, a session taken over, an
+    /// administrative disconnect. An ending the broker chose, which
+    /// is why it is not `Ok(())`: that is the client closing or
+    /// saying goodbye, and these were counted as if it had.
+    #[error("closed by the broker: {0:?}")]
+    Closed(ReasonCode),
+    /// A write made no progress within the bound; the peer had
+    /// stopped reading. See [`ConnectionConfig::write_timeout`].
+    #[error("the peer stopped reading")]
+    Stalled,
+}
+
+/// How the writer ended, reported to the read loop so the connection
+/// ends with the same answer the writer found.
+#[derive(Debug)]
+enum WriterEnd {
+    /// The outbox closed with nothing written to end it: the handle
+    /// was taken over, or released after the read loop had gone.
+    Displaced,
+    /// The broker ended the connection with this reason.
+    Closed(ReasonCode),
+    /// The socket refused a write.
+    Failed(std::io::Error),
+    /// A write made no progress within the bound.
+    Stalled,
 }
 
 /// Serve one connection until it ends, whatever ends it.
@@ -1351,7 +1377,7 @@ impl Attached {
             .inc();
         self.metrics.reason_sent(PacketKind::ConnAck, reason).inc();
 
-        let (gone, mut writer_gone) = oneshot::channel();
+        let (gone, mut writer_gone) = oneshot::channel::<WriterEnd>();
         let version = self.version;
         let limit = SizeLimit {
             limit: self.maximum_packet_size,
@@ -1363,8 +1389,10 @@ impl Attached {
         let metrics = Arc::clone(&self.metrics);
         let stall = self.write_stall();
         tokio::spawn(async move {
-            write_loop(write_half, outbox, version, limit, metrics, stall).await;
-            drop(gone);
+            let end = write_loop(write_half, outbox, version, limit, metrics, stall).await;
+            // The read loop may have returned on its own first, in
+            // which case nobody is listening and that is fine.
+            let _ = gone.send(end);
         });
 
         self.read_loop(reader, &mut writer_gone).await
@@ -1375,16 +1403,29 @@ impl Attached {
     async fn read_loop<R: AsyncRead + Unpin>(
         &self,
         reader: &mut FrameReader<R>,
-        writer_gone: &mut oneshot::Receiver<()>,
+        writer_gone: &mut oneshot::Receiver<WriterEnd>,
     ) -> Result<(), ConnectionError> {
         let mut aliases = TopicAliases::new(self.topic_alias_maximum);
         loop {
             let mut packet = tokio::select! {
                 // The writer stops when its outbox closes, which is how
                 // a displaced connection learns it has been replaced, or
-                // when it has written a close. Either way there is
-                // nothing left to read for.
-                _ = &mut *writer_gone => return Ok(()),
+                // when it has written a close, or when the socket would
+                // not take one. Either way there is nothing left to
+                // read for, and the ending is the writer's: none of
+                // these is the client saying goodbye.
+                ended = &mut *writer_gone => return Err(match ended {
+                    Ok(WriterEnd::Closed(reason)) => ConnectionError::Closed(reason),
+                    Ok(WriterEnd::Stalled) => ConnectionError::Stalled,
+                    Ok(WriterEnd::Failed(error)) => ConnectionError::Io(error),
+                    // An outbox that closes under a live read loop was
+                    // replaced by a newcomer's; the close it carried
+                    // was written before the replacement was seen, so
+                    // this arm is the rare order and the same ending.
+                    Ok(WriterEnd::Displaced) | Err(_) => {
+                        ConnectionError::Closed(ReasonCode::SessionTakenOver)
+                    }
+                }),
                 next = reader.next(self.version) => match next {
                     Ok(Some(packet)) => packet,
                     Ok(None) => return Ok(()),
@@ -1505,7 +1546,7 @@ impl Attached {
                 // not this connection's to close: the newcomer's
                 // close is already in the old outbox, and the writer
                 // delivers it when the peer lets it.
-                return Ok(());
+                return Err(ConnectionError::Closed(ReasonCode::SessionTakenOver));
             };
 
             // Whether the wait below is a wait at all. A batch that
@@ -1530,7 +1571,7 @@ impl Attached {
                     .shell_dropped(ShellDrop::Displaced)
                     .inc_by(mine.len() as u64);
                 self.shared.deliver(theirs);
-                return Ok(());
+                return Err(ConnectionError::Closed(ReasonCode::SessionTakenOver));
             }
 
             // Section 8.6, before the durability outcome is handled:
@@ -1905,8 +1946,9 @@ async fn write_loop<W: AsyncWrite + Unpin>(
     limit: SizeLimit,
     metrics: Arc<Metrics>,
     stall: Duration,
-) {
+) -> WriterEnd {
     let mut buf = BytesMut::new();
+    let mut end = WriterEnd::Displaced;
     while let Some(action) = outbox.recv().await {
         buf.clear();
         let rendered = render(&action, version, &mut buf, &metrics);
@@ -1920,14 +1962,17 @@ async fn write_loop<W: AsyncWrite + Unpin>(
         }
         if !buf.is_empty() {
             if let Err(error) = write_within(&mut writer, &buf, stall).await {
-                if error.kind() == std::io::ErrorKind::TimedOut {
+                end = if error.kind() == std::io::ErrorKind::TimedOut {
                     metrics.write_stalled().inc();
                     tracing::debug!(
                         subscriber = limit.subscriber.0,
                         ?stall,
                         "a write made no progress within the bound; the peer has stopped reading"
                     );
-                }
+                    WriterEnd::Stalled
+                } else {
+                    WriterEnd::Failed(error)
+                };
                 break;
             }
             // After the write, not before it: what is counted as sent
@@ -1944,6 +1989,9 @@ async fn write_loop<W: AsyncWrite + Unpin>(
             }
         }
         if rendered.last {
+            if let Action::Close(reason) = &action {
+                end = WriterEnd::Closed(*reason);
+            }
             break;
         }
     }
@@ -1955,6 +2003,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
         let _ = writer.shutdown().await;
     })
     .await;
+    end
 }
 
 /// Write all of `buf`, failing with `TimedOut` when no byte of it is
@@ -2236,6 +2285,8 @@ impl OpenSocket {
             Err(ConnectionError::NotDurable(_)) => SocketOutcome::NotDurable,
             Err(ConnectionError::NotWhole(_)) => SocketOutcome::NotWhole,
             Err(ConnectionError::NotConfirmed) => SocketOutcome::NotConfirmed,
+            Err(ConnectionError::Closed(_)) => SocketOutcome::Closed,
+            Err(ConnectionError::Stalled) => SocketOutcome::Stalled,
         });
     }
 }
@@ -4381,6 +4432,35 @@ mod tests {
         let (shared, mut client, advertised) = proposing(Version::V5, 30, 30).await;
         assert_eq!(advertised, None, "thirty is not more than thirty");
         expires_in_the_second_after(&shared, &mut client, Version::V5, 45).await;
+    }
+
+    /// A connection the broker closes is an ending the broker chose.
+    /// It was counted `clean`, beside clients that said goodbye, so a
+    /// node cutting every client for keep-alive looked like a node
+    /// whose clients were all leaving politely.
+    #[tokio::test]
+    async fn a_connection_the_broker_closes_is_not_counted_as_a_clean_ending() {
+        let (shared, mut client, _) = proposing(Version::V5, 2, 60).await;
+        advance(&shared, 4);
+        assert_eq!(
+            ending(&mut client, Version::V5).await,
+            Ending::Closed(Some(ReasonCode::KeepAliveTimeout))
+        );
+        let counted = |outcome| shared.metrics().socket_closed(outcome).get();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while counted(SocketOutcome::Clean) + counted(SocketOutcome::Closed) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the socket was never counted closed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            counted(SocketOutcome::Clean),
+            0,
+            "the client did not close; the broker did"
+        );
+        assert_eq!(counted(SocketOutcome::Closed), 1);
     }
 
     #[tokio::test]
