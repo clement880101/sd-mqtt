@@ -285,6 +285,15 @@ pub enum ReplicationError {
     /// at zero would be an entry no watermark could ever be past.
     #[error("a peer sent a log entry numbered zero, and a log numbers from one")]
     SequenceZero,
+    /// An entry's stamp is further ahead of this node's clock than
+    /// section 8.2's drift bound allows.
+    ///
+    /// Refused rather than clamped, and the whole frame with it: taking
+    /// the reading would advance this node's clock to it, and every
+    /// write this node made afterwards would carry the wrong clock on to
+    /// every node it reached. See [`crate::clock`].
+    #[error("a peer's write is refused for its clock: {0}")]
+    Clock(#[from] crate::clock::ClockError),
 }
 
 /// What a peer's frame changed, and what to do about it.
@@ -656,11 +665,22 @@ impl Replicator {
         entries: Vec<LoggedRecord>,
     ) -> Result<Handled, ReplicationError> {
         let mut logged = Vec::with_capacity(entries.len());
+        // One wall-clock read for the batch, so that every entry is
+        // judged against the same moment and the refusal names it.
+        let wall = crate::clock::wall_millis();
+        let clock = self.replicated.clock();
         for record in entries {
             if record.sequence == 0 {
                 return Err(ReplicationError::SequenceZero);
             }
-            logged.push(Logged::from_record(record)?);
+            let entry = Logged::from_record(record)?;
+            // Section 8.2: a peer further ahead than the bound is
+            // refused, not clamped. Checked here, before the merge,
+            // for every entry, so that a batch is refused whole and the
+            // clock has taken nothing from it; the merge below is what
+            // then observes each reading.
+            clock.check(wall, entry.write().stamp().reading())?;
+            logged.push(entry);
         }
         let Taken {
             applied, records, ..

@@ -988,9 +988,23 @@ impl Replicated {
         // advances the watermark over whatever run it holds.
         let mut entries = entries;
         entries.sort_by_key(Logged::sequence);
+        let wall = crate::clock::wall_millis();
         for entry in entries {
             let sequence = entry.sequence();
             let write = entry.into_write();
+            // Section 8.2: the peer's reading is taken into this node's
+            // clock, so that whatever this node writes afterwards is
+            // stamped later than what arrived and wins the conflict
+            // causality says it should. Whether the write itself wins is
+            // a separate question, answered by the merge below: a copy
+            // that lost still said what time it is. A reading beyond
+            // the drift bound is refused by `Replicator` before it gets
+            // here; one that reaches here anyway is left out of the
+            // merge and the watermark stops below it, so the frame is
+            // asked for again rather than quietly taken.
+            if self.clock.observe(wall, write.stamp().reading()).is_err() {
+                break;
+            }
             if merge(&mut state, &write) {
                 // The third of [`index`]'s four paths, and only for a
                 // write that won: a copy that lost told this node
@@ -1490,6 +1504,16 @@ impl Replicated {
     /// not to pass it on.
     pub fn observed(&self, write: MetadataWrite) -> bool {
         let mut state = self.held();
+        // Section 8.2's clock, the same as in `observed_from`: a peer's
+        // reading is taken before its write is weighed, and one beyond
+        // the bound is refused and tells this node nothing.
+        if self
+            .clock
+            .observe(crate::clock::wall_millis(), write.stamp().reading())
+            .is_err()
+        {
+            return false;
+        }
         let won = merge(&mut state, &write);
         if won {
             index(

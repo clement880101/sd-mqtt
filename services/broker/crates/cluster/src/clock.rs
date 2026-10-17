@@ -322,20 +322,37 @@ impl HybridClock {
     /// exactly as it was**, which is the whole difference between
     /// refusing and clamping: see the module documentation.
     pub fn observe(&self, wall_millis: u64, peer: Reading) -> Result<Reading, ClockError> {
+        // Before the lock is taken, so there is no path on which a
+        // refused peer has touched anything.
+        self.check(wall_millis, peer)?;
+        let mut held = self.held();
+        let next = advance_past(std::cmp::max(*held, peer), wall_millis);
+        *held = next;
+        Ok(next)
+    }
+
+    /// Whether `peer` is a reading this node would take, without taking it.
+    ///
+    /// The bound half of [`HybridClock::observe`] on its own, for a
+    /// caller holding a batch of readings that must be refused whole or
+    /// taken whole: checking every one first and observing them
+    /// afterwards is what keeps a batch whose last entry is beyond the
+    /// bound from having advanced the clock over its first. Touches
+    /// nothing, and takes no lock.
+    ///
+    /// # Errors
+    ///
+    /// [`ClockError::PeerTooFarAhead`] under the same rule as `observe`.
+    pub fn check(&self, wall_millis: u64, peer: Reading) -> Result<(), ClockError> {
         let bound = wall_millis.saturating_add(self.max_drift_millis);
         if peer.millis > bound {
-            // Before the lock is taken, so there is no path on which a
-            // refused peer has touched anything.
             return Err(ClockError::PeerTooFarAhead {
                 peer,
                 wall_millis,
                 max_drift_millis: self.max_drift_millis,
             });
         }
-        let mut held = self.held();
-        let next = advance_past(std::cmp::max(*held, peer), wall_millis);
-        *held = next;
-        Ok(next)
+        Ok(())
     }
 
     /// The reading behind the lock, recovering from a poisoned one.

@@ -1326,3 +1326,134 @@ fn a_write_already_held_changes_nothing() {
         "a register already held was stored and applied again: {again:?}"
     );
 }
+
+// ---- the clock, section 8.2 ----------------------------------------------
+
+/// A broadcast of a retained message on `topic`, stamped `millis` by
+/// node one of a cluster, numbered `sequence` in its log.
+///
+/// Built by hand rather than through [`Node::retain`] because the point
+/// is the stamp: a node's own clock reads the wall and cannot be told
+/// to be ahead, and what these tests are about is a peer that is.
+fn stamped_at(topic: &str, millis: u64, sequence: u64) -> Replication {
+    Replication::Broadcast {
+        entry: LoggedRecord {
+            sequence,
+            entry: MetadataRecord {
+                key: MetadataKeyRecord::Retained {
+                    topic: topic.to_owned(),
+                },
+                stamp: StampRecord {
+                    millis,
+                    counter: 0,
+                    node: [1; 16],
+                },
+                value: Some(MetadataValueRecord::Retained(retained("ahead"))),
+            },
+        },
+    }
+}
+
+/// A peer's stamp advances this node's clock, so that what this node
+/// writes afterwards wins against what arrived.
+///
+/// Section 8.2 orders every register by its stamp, so a node whose clock
+/// never learnt from its peers would lose every conflict to a node a
+/// few seconds ahead — including the session-owner register, which is
+/// double ownership. The peer here is half a minute ahead, well inside
+/// the bound, and the local write that follows must beat it.
+#[test]
+fn a_peers_stamp_within_the_bound_advances_the_local_clock() {
+    let mut cluster = Cluster::of(2);
+    let ahead = crate::clock::wall_millis() + 30_000;
+    let frame = stamped_at("a", ahead, 1);
+    cluster.say(0, 1, frame);
+    cluster.settle();
+    assert_eq!(cluster.nodes[1].text("a").as_deref(), Some("ahead"));
+    assert!(
+        cluster.nodes[1].replicated().clock().high_water().millis() >= ahead,
+        "the local clock did not take the peer's reading"
+    );
+
+    let frame = cluster.nodes[1].retain("a", "later, locally");
+    assert_eq!(
+        cluster.nodes[1].text("a").as_deref(),
+        Some("later, locally"),
+        "a write made after the peer's arrived lost to it"
+    );
+    cluster.say(1, 0, frame);
+    cluster.settle();
+    assert_eq!(
+        cluster.nodes[0].text("a").as_deref(),
+        Some("later, locally"),
+        "the peer did not take the later write"
+    );
+}
+
+/// A peer further ahead than the drift bound is refused, not clamped.
+///
+/// Section 8.2: clamping would still advance the local clock to the
+/// peer's reading, and one node with a wrong year would then poison
+/// every node it reached. The frame changes nothing — not the register,
+/// not the clock, not the watermark — and the refusal names the numbers.
+#[test]
+fn a_peer_further_ahead_than_the_drift_bound_is_refused() {
+    let cluster = Cluster::of(2);
+    let before = cluster.nodes[1].replicated().clock().high_water();
+    let far = crate::clock::wall_millis() + DEFAULT_MAX_DRIFT_MILLIS + 60_000;
+    let error = cluster.nodes[1]
+        .replicator
+        .received(cluster.nodes[0].id(), stamped_at("a", far, 1))
+        .expect_err("a peer a year ahead is refused");
+    assert!(
+        matches!(
+            error,
+            ReplicationError::Clock(crate::clock::ClockError::PeerTooFarAhead { .. })
+        ),
+        "refused as {error:?}"
+    );
+    assert_eq!(
+        cluster.nodes[1].text("a"),
+        None,
+        "a refused frame was applied"
+    );
+    assert_eq!(
+        cluster.nodes[1].replicated().clock().high_water(),
+        before,
+        "a refused frame moved the clock"
+    );
+    assert_eq!(
+        cluster.nodes[1]
+            .replicated()
+            .seen_through(cluster.nodes[0].id()),
+        0,
+        "a refused frame moved the watermark"
+    );
+}
+
+/// A batch with one entry beyond the bound is refused whole, before any
+/// of it is merged.
+#[test]
+fn a_batch_with_one_entry_beyond_the_bound_is_refused_whole() {
+    let cluster = Cluster::of(2);
+    let wall = crate::clock::wall_millis();
+    let frame = Replication::Batch {
+        entries: vec![
+            match stamped_at("a", wall, 1) {
+                Replication::Broadcast { entry } => entry,
+                _ => unreachable!(),
+            },
+            match stamped_at("b", wall + DEFAULT_MAX_DRIFT_MILLIS + 60_000, 2) {
+                Replication::Broadcast { entry } => entry,
+                _ => unreachable!(),
+            },
+        ],
+        more: false,
+    };
+    cluster.nodes[1]
+        .replicator
+        .received(cluster.nodes[0].id(), frame)
+        .expect_err("one entry beyond the bound refuses the batch");
+    assert_eq!(cluster.nodes[1].text("a"), None, "half the batch was taken");
+    assert_eq!(cluster.nodes[1].text("b"), None);
+}
