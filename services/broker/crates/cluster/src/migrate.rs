@@ -230,6 +230,17 @@ impl Drained {
     }
 }
 
+/// The bit that marks a routing number as a pull's rather than a claim's.
+///
+/// Section 8.6's pull is answered with the same chunks a drain is, and
+/// the far node echoes whatever routing number it is sent. A pull that
+/// waited under the claim's own epoch — as it did — had a drain chunk
+/// arriving late land in its channel and taken for part of the copy.
+/// The pull asks under the epoch with this bit set, which no claim's
+/// epoch reaches, so the two are told apart on arrival without a word
+/// on the wire changing.
+const PULL_TAG: u64 = 1 << 63;
+
 /// What a bounded wait came back with.
 ///
 /// A handover on every path. See the module note: a drain that did not
@@ -389,6 +400,16 @@ impl Migrations {
             chunks,
             counted: true,
         }
+    }
+
+    /// Start waiting for the answer to a pull, section 8.6.
+    ///
+    /// Under a routing number of its own, so that a drain chunk arriving
+    /// late lands nowhere near it; see [`PULL_TAG`]. Uncounted, because
+    /// the caller counts the drain and the pull together.
+    #[must_use]
+    pub fn begin_pull(self: &Arc<Self>, session: &SessionKey, epoch: u64) -> Awaiting {
+        self.begin(session, epoch | PULL_TAG).uncounted()
     }
 
     /// Start asking the replica set how far their copies of `session`
@@ -572,6 +593,15 @@ impl Drop for Awaiting {
 }
 
 impl Awaiting {
+    /// The routing number the chunks this waits for carry.
+    ///
+    /// The claim's epoch for a drain, and the epoch with [`PULL_TAG`]
+    /// set for a pull; what the far node is asked to echo.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// Collect chunks until the drain finishes or `patience` runs out.
     ///
     /// **The deadline is over the whole drain and not over each chunk.**
@@ -677,6 +707,50 @@ impl Stats {
 }
 
 impl Drain {
+    /// This drain, made whole by `pulled`, section 8.6.
+    ///
+    /// **The queue is the copy's, and everything else is the drain's.**
+    /// A copy is the queue and nothing more — the stream carries appends,
+    /// acknowledgements and removals — while the drain carried the
+    /// filters, the inflight window and the inbound identifiers, which
+    /// nothing else can supply. Taking the pull whole, as this did, gave
+    /// a client whose drain fell short its queue and none of its
+    /// subscriptions.
+    ///
+    /// An inflight entry the copy already holds as queued is left out:
+    /// it is the same message under the same sequence, and the store
+    /// refuses a reused sequence and would refuse the whole connect with
+    /// it. It is redelivered from the queue instead, which is what the
+    /// window would have done.
+    #[must_use]
+    pub fn made_whole_by(self, pulled: Self) -> Self {
+        let Handover {
+            subscriptions,
+            inflight,
+            inbound,
+            highest_sequence,
+            ..
+        } = self.handover;
+        let mut handover = pulled.handover;
+        handover.subscriptions = subscriptions;
+        handover.inbound = inbound;
+        handover.inflight = inflight
+            .into_iter()
+            .filter(|(entry, _)| {
+                !handover
+                    .queued
+                    .iter()
+                    .any(|(queued, _)| queued.sequence == entry.sequence)
+            })
+            .collect();
+        handover.highest_sequence = handover.highest_sequence.max(highest_sequence);
+        Self {
+            handover,
+            complete: pulled.complete,
+            missing: pulled.missing,
+        }
+    }
+
     /// A drain that brought nothing and did not finish: what an owner
     /// that could not be asked amounts to.
     #[must_use]
@@ -889,12 +963,14 @@ impl Migrator {
                 }
             }
             Choice::Remote(node) => {
-                let awaiting = self.migrations.begin(session, epoch).uncounted();
+                // Under the pull's own routing number, which the far
+                // node echoes; see `PULL_TAG`.
+                let awaiting = self.migrations.begin_pull(session, epoch);
                 let asked = self.mesh.send(
                     node,
                     &mesh::Message::PullCopy {
                         session: session.clone(),
-                        epoch,
+                        epoch: awaiting.epoch(),
                     },
                 );
                 if !matches!(asked, Some(Ok(crate::link::Sent::Queued))) {
@@ -1021,9 +1097,12 @@ impl Migrator {
             };
         }
         // Short. Section 8.6: a copy may hold the rest, and a complete
-        // copy is the whole queue — it is taken whole rather than merged
-        // with the partial drain, because the two describe the same
-        // queue and the copy's description is the one that finished.
+        // copy is the whole queue — the queue is taken from it rather
+        // than merged with the partial drain's, because the two describe
+        // the same queue and the copy's description is the one that
+        // finished. What the copy never held — the filters, the window,
+        // the inbound identifiers — stays the drain's; see
+        // `Drain::made_whole_by`.
         let pulled = self.pull(session, claim.epoch).await;
         self.migrations.stats.account(&drain, pulled.as_ref());
         match pulled {
@@ -1040,7 +1119,7 @@ impl Migrator {
                     epoch: claim.epoch,
                     previous: Some(previous),
                     write: claim.write,
-                    drain: Some(pulled),
+                    drain: Some(drain.made_whole_by(pulled)),
                 }
             }
             None => {

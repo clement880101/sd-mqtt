@@ -487,6 +487,101 @@ async fn bounded_ask<F: std::future::Future<Output = Vec<(NodeId, u64)>>>(
         .expect("a bounded ask returns")
 }
 
+/// A pull's chunks are routed apart from the drain's.
+///
+/// The pull after a short drain used to wait under the drain's own key,
+/// so a drain chunk arriving late landed in the pull's channel and was
+/// taken for part of the copy. The far node echoes whatever routing
+/// number it is sent, so the pull asks under a number no claim's epoch
+/// can be, and a late drain chunk is counted late like any other.
+#[tokio::test]
+async fn a_late_drain_chunk_does_not_land_in_the_pull() {
+    let migrations = Arc::new(Migrations::default());
+    let pulling = migrations.begin_pull(&key(), 4);
+    assert_ne!(pulling.epoch(), 4, "the pull is asked under its own number");
+    // A chunk of the drain, late.
+    for chunk in Drained::chunks(&key(), 4, handover(2)) {
+        migrations.arrived(chunk);
+    }
+    assert_eq!(migrations.stats().late(), 1, "counted late, not pulled");
+    // And the copy, under the pull's number.
+    for chunk in Drained::chunks(&key(), pulling.epoch(), handover(3)) {
+        migrations.arrived(chunk);
+    }
+    let pulled = bounded(pulling.collect(Duration::from_secs(5))).await;
+    assert!(pulled.complete);
+    assert_eq!(
+        pulled.handover.queued.len(),
+        3,
+        "the copy's three and not the drain's two"
+    );
+}
+
+/// A drain made whole by a pull keeps what only the drain carried.
+///
+/// A copy is the queue and nothing else — section 8.6 says so — while
+/// the drain carried the filters, the inflight window and the inbound
+/// identifiers. Taking the pull whole used to drop all three, so a
+/// client whose drain fell short came back with its queue and none of
+/// its subscriptions. The queue is the copy's; an inflight entry the
+/// copy already holds as queued is not kept twice, because the store
+/// refuses a reused sequence and would refuse the whole connect.
+#[test]
+fn a_pull_made_whole_keeps_the_drains_filters_window_and_inbound_ids() {
+    let drain = Drain {
+        handover: Handover {
+            subscriptions: vec![subscription("site/+/temp")],
+            inflight: vec![outstanding(1), outstanding(2)],
+            queued: vec![queued(3)],
+            inbound: vec![7, 9],
+            highest_sequence: 3,
+        },
+        complete: false,
+        missing: 4,
+    };
+    let pulled = Drain {
+        handover: Handover {
+            subscriptions: Vec::new(),
+            inflight: Vec::new(),
+            queued: (2..=7).map(queued).collect(),
+            inbound: Vec::new(),
+            highest_sequence: 7,
+        },
+        complete: true,
+        missing: 0,
+    };
+    let whole = drain.made_whole_by(pulled);
+    assert!(whole.complete);
+    assert_eq!(whole.missing, 0);
+    assert_eq!(
+        whole.handover.subscriptions.len(),
+        1,
+        "the filters came from the drain"
+    );
+    assert_eq!(whole.handover.inbound, vec![7, 9]);
+    assert_eq!(
+        whole
+            .handover
+            .queued
+            .iter()
+            .map(|(entry, _)| entry.sequence)
+            .collect::<Vec<_>>(),
+        vec![2, 3, 4, 5, 6, 7],
+        "the queue is the copy's"
+    );
+    assert_eq!(
+        whole
+            .handover
+            .inflight
+            .iter()
+            .map(|(entry, _)| entry.sequence)
+            .collect::<Vec<_>>(),
+        vec![1],
+        "an inflight entry the copy holds as queued is not kept twice"
+    );
+    assert_eq!(whole.handover.highest_sequence, 7);
+}
+
 #[test]
 fn a_short_drain_made_whole_by_a_pull_has_no_shortfall() {
     // **The number section 8.6 says an operator alerts on.** A drain
