@@ -664,6 +664,24 @@ rather than a log line. The window was found by the migration test failing
 once under load on GitHub's runners, and is now made to happen on purpose by
 a test that stalls the link.
 
+The new owner has a window too. The old owner answers the claim and then
+sends the late forward on, down the same link, so at the new node the forward
+lands right behind the drain, while the connection that claimed the session
+is still installing it. A forward nobody here wants that arrives within two
+seconds of a drain is held and tried again every hundred milliseconds, then
+counted as `sdmqtt_forwards_held_total` when delivered or
+`sdmqtt_forwards_unroutable_total` when not. Held only after a drain, because
+a hold is also a window in which a subscriber made after the publication would
+be given it; the moving session's subscription is older than the publication.
+A message delivered after a hold may follow messages published after it: late
+rather than lost is the trade. This half is the hypothesis for the migration
+test failing a second time on a loaded runner with the redirect in place. The
+window is a race between two tasks on one node, which no stalled link makes
+certain, so it is pinned by a unit test on the handler itself: a drain, a
+forward, no session, then the session, and the message must arrive. The
+cluster test prints both nodes' forward counters when it fails, so the next
+failure on a runner says which half it was.
+
 ### 8.5 Partitions
 
 The default policy is availability: a partitioned node keeps serving its

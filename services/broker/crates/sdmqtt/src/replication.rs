@@ -127,6 +127,9 @@ pub struct Replication {
     /// links, so a forward can land after the session it was for has
     /// gone; this is what says where to send it on.
     departed: Mutex<Vec<Departed>>,
+    /// When a drain last arrived here: a session is moving to this
+    /// node, and a forward for it may land before it is installed.
+    last_drain: Mutex<Option<Instant>>,
 }
 
 /// A session this node gave up, as a forward arriving late needs it.
@@ -145,6 +148,14 @@ struct Departed {
 
 /// How long a hand-over is remembered for late forwards.
 const DEPARTED_HOLDS_FOR: Duration = Duration::from_secs(30);
+
+/// How long a forward nobody here wants yet is held before it is given
+/// up on, and how often it is tried again meanwhile. The hold covers
+/// the moment between a claim's drain arriving and the connection that
+/// asked for it installing the session, which is two tasks on one node
+/// and takes milliseconds; two seconds is the loaded-machine version.
+const HELD_FOR: Duration = Duration::from_secs(2);
+const HELD_RETRY: Duration = Duration::from_millis(100);
 
 /// Writes a peer sent that won, and the records that go with them.
 #[derive(Debug)]
@@ -175,6 +186,7 @@ impl Replication {
                 store,
                 mesh: OnceLock::new(),
                 departed: Mutex::new(Vec::new()),
+                last_drain: Mutex::new(None),
             }),
             waiting,
         )
@@ -304,6 +316,10 @@ impl Deliver for Replication {
             // One instalment of an answer. Routed to the connection
             // waiting for it, or counted as late and dropped.
             Message::Drained(chunk) => {
+                *self
+                    .last_drain
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
                 self.migrations.arrived(chunk);
                 return Vec::new();
             }
@@ -461,7 +477,7 @@ impl Replication {
         // and section 11.3 says nothing disappears uncounted.
         let metrics = self.shared.metrics();
         if let (Some(to), Some(mesh)) = (self.gone_to(&topic), self.mesh.get()) {
-            match mesh.send(to, &Message::Forward(frame)) {
+            match mesh.send(to, &Message::Forward(frame.clone())) {
                 Some(Ok(cluster::link::Sent::Queued)) => {
                     metrics.forward_redirected().inc();
                     tracing::info!(
@@ -480,11 +496,63 @@ impl Replication {
                 ),
             }
         }
-        metrics.forward_unroutable().inc();
-        tracing::debug!(
-            topic,
-            "a peer forwarded a publication this node has no subscriber for"
-        );
+        // **Or the session is arriving.** This node may be the one a
+        // session is moving to: the drain has landed and the connection
+        // that claimed it has not yet installed it, which is two tasks
+        // here and a window of milliseconds that a redirected forward
+        // from the old owner falls into — the old owner answered the
+        // claim and then sent the forward on, down the same link, so it
+        // arrives right behind the drain. Held and tried again for a
+        // bounded time; delivered late rather than lost, or given up on
+        // and counted. **Only when a drain has just arrived**, because
+        // a hold is also a window in which a subscriber made after the
+        // publication would be given it; the moving session's
+        // subscription is older than the publication, a new one is not.
+        let drained_lately = self
+            .last_drain
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|at| at.elapsed() < HELD_FOR);
+        if !drained_lately {
+            metrics.forward_unroutable().inc();
+            tracing::debug!(
+                topic,
+                "a peer forwarded a publication this node has no subscriber for"
+            );
+            return;
+        }
+        let shared = Arc::clone(&self.shared);
+        tokio::spawn(async move {
+            let deadline = Instant::now() + HELD_FOR;
+            while Instant::now() < deadline {
+                tokio::time::sleep(HELD_RETRY).await;
+                let (reached, actions) = shared.with_broker(|broker| {
+                    let now = broker.clock().now();
+                    let mut out = Vec::new();
+                    let reached = broker.accept_forwarded(
+                        frame.clone().into_message(),
+                        &groups,
+                        now,
+                        &mut out,
+                    );
+                    (reached, out)
+                });
+                shared.deliver(actions);
+                if reached > 0 {
+                    shared.metrics().forward_held().inc();
+                    tracing::info!(
+                        topic,
+                        "a forwarded publication nobody wanted on arrival was delivered after a hold"
+                    );
+                    return;
+                }
+            }
+            shared.metrics().forward_unroutable().inc();
+            tracing::debug!(
+                topic,
+                "a peer forwarded a publication this node has no subscriber for"
+            );
+        });
     }
 }
 
@@ -1098,5 +1166,183 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["removed", "session", "body", "pushed"]);
+    }
+
+    /// A handler over a broker with nothing in it, and the broker.
+    fn handler() -> (Arc<Replication>, Arc<Shared>) {
+        let shared = Arc::new(Shared::new(Default::default()));
+        let replicated = Arc::new(
+            cluster::metadata::Replicated::open(
+                NodeId::mint(),
+                cluster::clock::HybridClock::resume(None, 500),
+                &storage::Restored::default(),
+            )
+            .expect("an empty store opens"),
+        );
+        let replicator = Arc::new(Replicator::new(
+            replicated,
+            cluster::ReplicationSettings::default(),
+        ));
+        let store: Arc<dyn storage::Storage> = Arc::new(storage::MemoryStorage::new());
+        let (handler, _applying) = Replication::new(
+            replicator,
+            Arc::clone(&shared),
+            Arc::new(Migrations::default()),
+            store,
+        );
+        (handler, shared)
+    }
+
+    /// The last chunk of a drain of an empty session.
+    fn drain() -> Message {
+        let chunk = Drained::chunks(
+            &storage::SessionKey::new("", "rover"),
+            1,
+            broker_core::handover::Handover::default(),
+        )
+        .pop()
+        .expect("a drain is at least one chunk");
+        Message::Drained(chunk)
+    }
+
+    /// A forwarded publication on `topic`, for no shared group.
+    fn forward(topic: &str) -> Message {
+        Message::Forward(cluster::Forwarded {
+            id: [9; 16],
+            body: BodyRecord {
+                topic: topic.to_owned(),
+                payload: bytes::Bytes::from_static(b"behind the drain"),
+                qos: Qos::AtLeastOnce,
+                retain: false,
+                expires_at: None,
+                properties: bytes::Bytes::new(),
+            },
+            groups: Vec::new(),
+        })
+    }
+
+    /// Connect "rover" to the broker and subscribe it to `filter`,
+    /// returning the outbox its deliveries land in.
+    fn subscribe(shared: &Shared, filter: &str) -> mpsc::Receiver<broker_core::session::Action> {
+        use mqtt_codec::packet::{Connect, RetainHandling, Subscribe, SubscriptionOptions};
+        use mqtt_codec::{Packet, Properties, QoS, Version};
+        let subscriber = shared.with_broker(|broker| {
+            let mut out = Vec::new();
+            let registration = broker
+                .connect(
+                    "",
+                    &Connect {
+                        version: Version::V5,
+                        client_id: "rover".to_owned(),
+                        clean_start: false,
+                        keep_alive: 0,
+                        username: None,
+                        password: None,
+                        will: None,
+                        properties: Properties::default(),
+                    },
+                    &mut out,
+                )
+                .expect("the default decision authenticates");
+            registration.subscriber
+        });
+        let inbox = shared.register_outbox(subscriber, 8);
+        shared.with_broker(|broker| {
+            let mut out = Vec::new();
+            broker
+                .handle(
+                    subscriber,
+                    &Packet::Subscribe(Subscribe {
+                        packet_id: 1,
+                        filters: vec![SubscriptionOptions {
+                            filter: filter.to_owned(),
+                            qos: QoS::AtLeastOnce,
+                            no_local: false,
+                            retain_as_published: false,
+                            retain_handling: RetainHandling::SendAlways,
+                        }],
+                        properties: Properties::default(),
+                    }),
+                    &mut out,
+                )
+                .expect("a subscribe is accepted");
+        });
+        inbox
+    }
+
+    /// Wait for `counter` to reach `value`, for a few holds' worth.
+    async fn until(counter: impl Fn() -> u64, value: u64) -> u64 {
+        let deadline = Instant::now() + HELD_FOR * 2;
+        while counter() != value && Instant::now() < deadline {
+            tokio::time::sleep(HELD_RETRY).await;
+        }
+        counter()
+    }
+
+    /// A forward that lands behind a drain, before the session the
+    /// drain is for is installed, is delivered once it is.
+    ///
+    /// Section 8.4's other window, made without a connection task: the
+    /// drain arrives, the forward arrives, and nobody is here yet. The
+    /// subscriber is installed a moment later, the way the connection
+    /// that claimed the session installs it; the message must reach it
+    /// and the hold must be counted. Without the hold the forward is
+    /// counted unroutable on arrival and the subscriber never sees it.
+    #[tokio::test]
+    async fn a_forward_behind_a_drain_is_held_until_the_session_is_installed() {
+        let (handler, shared) = handler();
+        let peer = NodeId::mint();
+        handler.delivered(peer, drain());
+        handler.delivered(peer, forward("fleet/0043/telemetry"));
+        let metrics = shared.metrics();
+        assert_eq!(
+            (
+                metrics.forward_held().get(),
+                metrics.forward_unroutable().get()
+            ),
+            (0, 0),
+            "neither delivered nor dropped yet: held"
+        );
+
+        let mut inbox = subscribe(&shared, "fleet/+/telemetry");
+        assert_eq!(
+            until(|| metrics.forward_held().get(), 1).await,
+            1,
+            "the hold was counted"
+        );
+        assert_eq!(metrics.forward_unroutable().get(), 0);
+        let topics: Vec<String> = std::iter::from_fn(|| inbox.try_recv().ok())
+            .filter_map(|action| match action {
+                broker_core::session::Action::Send(mqtt_codec::Packet::Publish(publish)) => {
+                    Some(publish.topic)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(topics, vec!["fleet/0043/telemetry".to_owned()]);
+    }
+
+    /// A forward nobody wants is dropped and counted, unless a drain has
+    /// just arrived: a hold is a window a later subscriber could fall
+    /// into, and only a moving session has a subscription older than
+    /// the publication.
+    #[tokio::test]
+    async fn a_forward_nobody_wants_is_not_held_without_a_drain() {
+        let (handler, shared) = handler();
+        handler.delivered(NodeId::mint(), forward("fleet/0043/telemetry"));
+        let metrics = shared.metrics();
+        assert_eq!(metrics.forward_unroutable().get(), 1, "dropped on arrival");
+
+        // Even a subscriber arriving within the hold's span gets nothing.
+        let mut inbox = subscribe(&shared, "fleet/+/telemetry");
+        tokio::time::sleep(HELD_RETRY * 3).await;
+        assert_eq!(metrics.forward_held().get(), 0);
+        assert!(
+            !std::iter::from_fn(|| inbox.try_recv().ok()).any(|action| matches!(
+                action,
+                broker_core::session::Action::Send(mqtt_codec::Packet::Publish(_))
+            )),
+            "a subscriber made after the publication was not given it"
+        );
     }
 }

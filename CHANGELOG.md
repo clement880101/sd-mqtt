@@ -20,6 +20,14 @@ the milestone you are moving to.** Everything else is description.
   `docs/README.md` indexes it all. `scripts/test_docs_links.py` follows
   every relative link.
 
+### Fixed
+
+- **At the node a session is moving to**, a forward that arrives right
+  behind the drain, before the session is installed, is held for up to two
+  seconds and tried again, rather than dropped: `sdmqtt_forwards_held_total`.
+  Only after a drain, so a new subscriber is never given a message published
+  before it subscribed.
+
 ## 0.7.1 — 2026-10-16
 
 ### Fixed

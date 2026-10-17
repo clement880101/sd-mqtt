@@ -1984,10 +1984,21 @@ async fn a_session_moves_to_the_node_its_client_returns_to() {
         "the session was found, which is section 8.4: the node it returned to claimed \
          it and drained it from alpha rather than making a new one"
     );
+    let delivered = rover.delivered_within(PATIENCE);
     assert_eq!(
-        rover.delivered_within(PATIENCE),
+        delivered,
         Some((TOPIC.to_owned(), WHILE_AWAY.to_owned())),
-        "what was queued on alpha was delivered where the client returned"
+        "what was queued on alpha was delivered where the client returned; forwards on \
+         alpha: redirected {:?} held {:?} unroutable {:?}; on gamma: redirected {:?} held {:?} \
+         unroutable {:?}; alpha's log:\n{}\ngamma's log:\n{}",
+        nodes[0].counter("sdmqtt_forwards_redirected_total"),
+        nodes[0].counter("sdmqtt_forwards_held_total"),
+        nodes[0].counter("sdmqtt_forwards_unroutable_total"),
+        nodes[2].counter("sdmqtt_forwards_redirected_total"),
+        nodes[2].counter("sdmqtt_forwards_held_total"),
+        nodes[2].counter("sdmqtt_forwards_unroutable_total"),
+        nodes[0].logged(),
+        nodes[2].logged(),
     );
 
     // The session is on the holder and **not on alpha**, which is the half

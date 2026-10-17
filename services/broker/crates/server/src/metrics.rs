@@ -806,6 +806,10 @@ pub struct Metrics {
     /// Section 8.3 forwards that found no subscriber here and nowhere
     /// to send them on: dropped, and counted rather than only logged.
     forwards_unroutable: Counter,
+    /// Section 8.3 forwards that found no subscriber here while this
+    /// node was claiming a session, were held until the claim settled,
+    /// and then found one.
+    forwards_held: Counter,
     /// Section 9's connectors, by why a publication one of them made
     /// went nowhere. One family rather than a counter per refusal,
     /// because an operator wants one number for "a connector lost a
@@ -1087,6 +1091,12 @@ impl Metrics {
             "Forwarded publications that found no subscriber here and no node to send them on to",
             forwards_unroutable.clone(),
         );
+        let forwards_held = Counter::default();
+        registry.register(
+            "forwards_held",
+            "Forwarded publications held while this node was claiming a session, and delivered once it had",
+            forwards_held.clone(),
+        );
         let accept_pauses = Counter::default();
         registry.register(
             "accept_pauses",
@@ -1237,6 +1247,7 @@ impl Metrics {
             accept_pauses,
             forwards_redirected,
             forwards_unroutable,
+            forwards_held,
             publications_refused,
             dropped_by_queue,
             dropped_by_shell,
@@ -1435,6 +1446,14 @@ impl Metrics {
     /// to send on. Section 11.3: counted, where before it was a debug line.
     pub fn forward_unroutable(&self) -> &Counter {
         &self.forwards_unroutable
+    }
+
+    /// A forwarded publication that arrived while this node was still
+    /// claiming the session it was for, waited for the claim, and was
+    /// then delivered. The other half of section 8.4's move meeting
+    /// section 8.3's forward: the new node's half.
+    pub fn forward_held(&self) -> &Counter {
+        &self.forwards_held
     }
 
     /// A publication a connector made that went nowhere, by why.

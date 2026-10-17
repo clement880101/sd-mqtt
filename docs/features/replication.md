@@ -144,9 +144,11 @@ session moves with it: the new node claims it, the old one closes the
 old connection and hands over the queue, and the subscriptions follow.
 A publication forwarded to the old node while that was happening finds
 the session gone and is sent on to the node that took it, counted on
-`sdmqtt_forwards_redirected_total`. A forwarded publication nothing on a
-node wants and nothing can be done with is counted on
-`sdmqtt_forwards_unroutable_total`; a steady stream of those means a
+`sdmqtt_forwards_redirected_total`; one that reaches the new node before
+the session is installed there is held for up to two seconds and then
+delivered, counted on `sdmqtt_forwards_held_total`. A forwarded
+publication nothing on a node wants and nothing can be done with is
+counted on `sdmqtt_forwards_unroutable_total`; a steady stream of those means a
 node's view of who subscribes where has stopped converging.
 
 Messages published on either side of a partition are not exchanged
