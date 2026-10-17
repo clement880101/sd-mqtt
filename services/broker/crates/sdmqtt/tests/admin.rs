@@ -358,3 +358,100 @@ fn the_admin_listener_serves_beside_the_broker_and_stops_with_it() {
         broker.logged()
     );
 }
+
+/// How long the second signal may take to end the process.
+///
+/// Well inside the admin listener's ten-second grace, which is what
+/// the first stop alone would run to here, and long enough that a
+/// slow machine cannot fail this for being slow.
+const TO_STOP_NOW: Duration = Duration::from_secs(5);
+
+/// Hold an admin request open by never finishing its body.
+///
+/// The route reads the body before it answers, so hyper counts the
+/// request as in flight and the graceful shutdown waits for it — for
+/// the whole of the listener's grace, since the body never comes.
+/// This is the lever that makes the first stop slow enough to send a
+/// second signal into.
+fn stall_a_request(address: SocketAddr) -> TcpStream {
+    let mut socket =
+        TcpStream::connect_timeout(&address, PATIENCE).expect("the admin listener accepts");
+    socket
+        .write_all(
+            format!(
+                "PUT /api/v1/rules/stalled HTTP/1.1\r\nHost: {address}\r\n\
+                 Content-Type: application/json\r\nContent-Length: 4096\r\n\r\n{{\"id\":"
+            )
+            .as_bytes(),
+        )
+        .expect("the request head is written");
+    socket
+}
+
+/// Wait for a line to appear in the broker's log.
+fn wait_for_log(broker: &Broker, fragment: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline {
+        if broker.logged().contains(fragment) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "{fragment:?} never appeared in the log: {}",
+        broker.logged()
+    );
+}
+
+/// A second signal during the stop ends the process now.
+///
+/// The first signal starts an orderly stop, and an orderly stop is
+/// bounded but not instant: the admin listener alone may wait its
+/// ten-second grace for a connection that does not finish. An operator
+/// who presses Ctrl-C again, or a supervisor sending its second
+/// `SIGTERM` before it escalates to `SIGKILL`, is saying the wait is
+/// over. Before this test the second signal reached nothing: tokio's
+/// handler stays installed once it is, so the signal neither stopped
+/// the process by default nor interrupted the stop, and the operator
+/// waited out the grace anyway.
+///
+/// The exit status is the one a shell reports for a process the signal
+/// killed, because that is what was asked for; it is checked so that
+/// a stop that merely finished on its own cannot pass this.
+#[test]
+fn a_second_signal_during_the_stop_ends_the_process_now() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let mut broker = Broker::start(
+        directory.path().join("broker.log"),
+        directory.path().join("store"),
+    );
+
+    // The connection the first stop will wait for. A moment for the
+    // head to be parsed, so the request is in flight when the signal
+    // arrives rather than still in a socket buffer.
+    let stalled = stall_a_request(broker.admin);
+    std::thread::sleep(Duration::from_millis(300));
+
+    broker.terminate();
+    wait_for_log(&broker, "signalled, stopping");
+
+    let again = Instant::now();
+    broker.terminate();
+    let status = broker
+        .wait_for_exit()
+        .expect("a broker signalled twice exits");
+    let took = again.elapsed();
+    assert!(
+        took < TO_STOP_NOW,
+        "the second signal took {took:?} to end the process; the first stop alone would \
+         have waited out the admin listener's grace: {}",
+        broker.logged()
+    );
+    assert_eq!(
+        status.code(),
+        Some(128 + 15),
+        "the exit status says the second SIGTERM ended it: {status}, {}",
+        broker.logged()
+    );
+    drop(stalled);
+}

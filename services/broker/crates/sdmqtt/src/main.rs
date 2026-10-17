@@ -539,6 +539,19 @@ async fn stop_signal() -> Result<&'static str, std::io::Error> {
     tokio::signal::ctrl_c().await.map(|()| "SIGINT")
 }
 
+/// The exit status a shell reports for a process `signal` killed.
+///
+/// 128 plus the signal's number, which is the convention every shell
+/// and supervisor reads: a second signal during the stop ends the
+/// process the way the signal would have with no handler installed,
+/// and the status says so rather than claiming an orderly stop.
+fn killed_by(signal: &str) -> i32 {
+    match signal {
+        "SIGTERM" => 128 + 15,
+        _ => 128 + 2,
+    }
+}
+
 /// The wall clock in whole seconds, as the broker counts time.
 ///
 /// Section 7.5: the clock a restored broker starts with decides which
@@ -1469,6 +1482,25 @@ async fn run(serve: Serve) -> Result<(), StartupError> {
         // signal that will never arrive is worse than stopping.
         Err(error) => tracing::error!(%error, "cannot listen for a stop signal; stopping"),
     }
+
+    // **A second signal ends the process now.** The stop below is
+    // bounded but not instant — the admin listener alone may wait its
+    // grace for a connection that does not finish — and an operator
+    // pressing Ctrl-C again, or a supervisor sending its second
+    // SIGTERM before it escalates to SIGKILL, is saying the wait is
+    // over. Tokio's handler stays installed once it is, so without
+    // this the second signal reached nothing: it neither stopped the
+    // process by default nor interrupted anything. The status is the
+    // one a shell reports for a process the signal killed, because
+    // that is what was asked for; whatever the stop had not yet
+    // written is what a crash would not have written either, and the
+    // store is built to come back from that.
+    tokio::spawn(async {
+        if let Ok(signal) = stop_signal().await {
+            tracing::warn!(signal, "signalled again during the stop; stopping now");
+            std::process::exit(killed_by(signal));
+        }
+    });
 
     // **Both stop on the same signal**, and the admin listener stops
     // first. It is the one with a mutating endpoint, so nothing can
