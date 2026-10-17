@@ -144,7 +144,7 @@ def main() -> int:
     sitemap = (ROOT / "site/sitemap.xml").read_text() if (ROOT / "site/sitemap.xml").is_file() else ""
     check("the sitemap lists the page", f"<loc>{site}</loc>" in sitemap)
     llms = (ROOT / "site/llms.txt").read_text() if (ROOT / "site/llms.txt").is_file() else ""
-    check("llms.txt says what it is", llms.startswith("# sd-mqtt\n") and "MIT" in llms)
+    check("llms.txt says what it is", llms.startswith("# sd-mqtt\n") and "Apache License 2.0" in llms)
     named = re.findall(rf"https://github.com/{REPO}/blob/main/([^)#\s]+)", llms)
     check("every repository path llms.txt names exists",
           bool(named) and all((ROOT / n).exists() for n in named), str([n for n in named if not (ROOT / n).exists()]))

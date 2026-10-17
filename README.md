@@ -1,6 +1,6 @@
 # sd-mqtt
 
-A distributed MQTT broker under the **MIT licence, all of it**: clustering,
+A distributed MQTT broker under the **Apache License 2.0, all of it**: clustering,
 replicated queues, rules and connectors, authentication and the admin
 interface are in the one binary, with no enterprise edition and no
 open-core line. No external dependencies.
@@ -119,9 +119,11 @@ The `[[listeners]]`, `[[acl]]` and `[[rules]]` tables are file-only.
 
 ## Licensing
 
-sd-mqtt is MIT licensed; see `LICENSE`. It includes third-party
-components under other permissive licenses, and does not claim they are
-all MIT. Two of them are Apache-2.0 with no alternative branch this
+sd-mqtt is licensed under the Apache License 2.0; see `LICENSE`.
+Copyright 2026 Clement Chang. Releases made before the change were
+published under the MIT licence and remain available under it; the
+changelog says which. It includes third-party components under other
+permissive licenses, and does not claim they are all Apache-2.0. Two of them are Apache-2.0 with no alternative branch this
 project's allow list accepts, which asks for the license text to travel
 with the binary.
 

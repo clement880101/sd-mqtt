@@ -72,8 +72,8 @@ enum Command {
     ///
     /// Section 3 and the licence policy in
     /// `docs/components.md`: the code compiled into
-    /// this binary is not all MIT, and the licences it is under ask
-    /// for their text to travel with it. Until this existed nothing
+    /// this binary is not all under the project's licence, and the
+    /// licences it is under ask for their text to travel with it. Until this existed nothing
     /// in the repository carried a single one of them, and the readme
     /// pointed at a file in a release artifact that has never been
     /// built.

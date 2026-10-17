@@ -1,7 +1,7 @@
 # Component selection
 
 Decisions for every third-party component in sd-mqtt, ranked on three
-criteria in order: MIT-compatible permissive license, light dependency tree,
+criteria in order: a permissive license compatible with the project's Apache-2.0, light dependency tree,
 and capability at scale.
 
 Facts were verified against crates.io, lib.rs, docs.rs, npm, bundlephobia

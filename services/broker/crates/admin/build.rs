@@ -215,9 +215,9 @@ fn notices(services: &Path, built: bool) -> String {
         "Third-party notices for sd-mqtt\n\
          ===============================\n\
          \n\
-         sd-mqtt is MIT licensed and its own licence is not this file. This is\n\
+         sd-mqtt is Apache-2.0 licensed and its own licence is not this file. This is\n\
          the attribution for the third-party code inside this binary, which is\n\
-         not all MIT and is never claimed to be.\n\
+         not all Apache-2.0 and is never claimed to be.\n\
          \n\
          It is in two halves, produced by two different things from two\n\
          different kinds of artifact, and joined here because a user of the\n\

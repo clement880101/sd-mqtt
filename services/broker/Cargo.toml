@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.7.1"
 edition = "2021"
 rust-version = "1.90"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/clement880101/sd-mqtt"
 
 [workspace.dependencies]

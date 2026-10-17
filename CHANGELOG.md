@@ -12,6 +12,13 @@ the milestone you are moving to.** Everything else is description.
 
 ### Changed
 
+- **The licence is now the Apache License 2.0.** It was MIT. Apache 2.0
+  is as permissive and adds an explicit patent grant from contributors.
+  Releases before this one remain available under MIT for anyone who
+  has them; this release and everything after it are Apache-2.0. Every
+  crate, the web package, the image label and the notices headers say
+  so.
+
 - **The documentation is split into features and a setup guide.** The
   README is the licence, a table of features, a quick start and the
   configuration reference. Each feature has a page under

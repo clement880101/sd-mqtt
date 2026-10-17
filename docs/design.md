@@ -3,7 +3,7 @@
 Status: approved 2026-09-19.
 
 A distributed MQTT broker in Rust with a built-in admin UI and
-UI-configurable integrations, distributed under the MIT license.
+UI-configurable integrations, distributed under the Apache License 2.0.
 
 ## 1. Goals
 
@@ -41,7 +41,8 @@ Where those analyses identified a behavior required by the MQTT
 specification, that requirement is implemented independently from the
 specification text.
 
-The project is MIT licensed. Dependencies must be MIT-compatible permissive.
+The project is licensed under the Apache License 2.0; releases before the
+change were MIT. Dependencies must be permissive and compatible with it.
 The full policy, including the distinction between distributed code and
 build-time tooling, is in `docs/components.md`.
 

@@ -1,10 +1,10 @@
 # sd-mqtt
 
-> sd-mqtt is a distributed MQTT broker written in Rust and released under the MIT licence, every part of it. One static binary holds MQTT 3.1.1 and 5, clustering with replicated queues and session migration, durable sessions in an embedded store, rules and connectors to and from HTTP, bridging to other brokers, SCRAM-SHA-256 and argon2 authentication, access control, scoped API keys, and an admin interface with a REST API and Prometheus metrics. There is no enterprise edition.
+> sd-mqtt is a distributed MQTT broker written in Rust and released under the Apache License 2.0, every part of it. One static binary holds MQTT 3.1.1 and 5, clustering with replicated queues and session migration, durable sessions in an embedded store, rules and connectors to and from HTTP, bridging to other brokers, SCRAM-SHA-256 and argon2 authentication, access control, scoped API keys, and an admin interface with a REST API and Prometheus metrics. There is no enterprise edition.
 
 Key facts:
 
-- Licence: MIT for the whole repository and binary, clustering included.
+- Licence: Apache License 2.0 for the whole repository and binary, clustering included. Releases before the change were published under MIT and remain available under it.
 - Protocols: MQTT 3.1.1 and MQTT 5 over TCP, TLS, WebSocket and secure WebSocket.
 - Platforms: static Linux binaries for x86_64 and aarch64, macOS for Apple silicon and Intel, a container image at ghcr.io/clement880101/sd-mqtt for amd64 and arm64. No Windows build.
 - Measured on one node: 100,000 MQTT connections held, opened in 2.5 s, about 32 KB of broker memory each; 19.4 MB resident when idle on Linux; a 9.88 MB release binary; a 10 MB container image.
