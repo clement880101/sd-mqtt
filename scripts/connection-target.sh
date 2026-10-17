@@ -103,7 +103,7 @@ else
 fi
 peak=$(cat /tmp/peak 2>/dev/null || echo "$idle")
 kill "$sampler" 2>/dev/null || true
-echo "  broker resident: idle $((idle / 1024)) MB, peak $((peak / 1024)) MB," \
+echo "  broker resident: idle $((idle / 1024)) MiB, peak $((peak / 1024)) MiB," \
      "$(( (peak - idle) * 1024 / connections )) bytes a connection"
 stop
 
