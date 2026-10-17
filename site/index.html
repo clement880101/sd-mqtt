@@ -133,13 +133,10 @@
     dl.does dd { border-top: 0; padding-top: 0; }
   }
 
-  /* Measured: each figure with where it came from. */
-  table { border-collapse: collapse; width: 100%; max-width: 62rem; font-variant-numeric: tabular-nums; }
-  th, td { text-align: left; padding: 0.8rem 1rem 0.8rem 0; border-bottom: 1px solid var(--rule); vertical-align: baseline; }
-  th { font-weight: 500; color: var(--steel); font-size: 0.9rem; }
-  td.figure { font: 500 1.0625rem var(--mono); white-space: nowrap; }
-  td.source { font-size: 0.95rem; }
-  .table { overflow-x: auto; }
+  /* Measured: the figures, nothing else. */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: 2.25rem 2.5rem; max-width: 62rem; margin: 0; padding: 0; list-style: none; }
+  .stat b { display: block; font: 500 clamp(1.75rem, 3.2vw, 2.375rem) / 1.1 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+  .stat span { display: block; margin-top: 0.4rem; color: var(--steel); font-size: 0.95rem; max-width: 16rem; }
 
   footer { border-top: 1px solid var(--rule); padding-block: 2rem 3rem; color: var(--steel); font-size: 0.95rem; }
   footer .wrap { display: flex; gap: 1rem 2rem; flex-wrap: wrap; justify-content: space-between; }
@@ -240,20 +237,14 @@ cd sdmqtt-0.7.1-x86_64-unknown-linux-musl
   <section class="part" id="measured" aria-labelledby="measured-title">
     <div class="wrap">
       <h2 id="measured-title">Measured</h2>
-      <p>Each figure links to how it was measured, on what machine, and what it does not cover.</p>
-      <div class="table">
-        <table>
-          <thead><tr><th scope="col">What</th><th scope="col">Figure</th><th scope="col">Where it comes from</th></tr></thead>
-          <tbody>
-            <tr><td>Concurrent connections held on one node</td><td class="figure" data-figure="100,000">100,000</td><td class="source"><a href="https://github.com/clement880101/sd-mqtt/blob/main/docs/design.md#15-budgets">Decision 0001</a></td></tr>
-            <tr><td>Time to open them</td><td class="figure" data-figure="2.5 s">2.5 s</td><td class="source"><a href="https://github.com/clement880101/sd-mqtt/blob/main/docs/design.md#15-budgets">Decision 0001</a></td></tr>
-            <tr><td>Broker memory per connection</td><td class="figure" data-figure="32 KB">32 KB</td><td class="source"><a href="https://github.com/clement880101/sd-mqtt/blob/main/docs/design.md#15-budgets">Decision 0001</a></td></tr>
-            <tr><td>Idle memory, Linux, with a store</td><td class="figure" data-figure="19.4 MB">19.4 MB</td><td class="source"><a href="https://github.com/clement880101/sd-mqtt/blob/main/docs/design.md">The design's budgets</a></td></tr>
-            <tr><td>Release binary</td><td class="figure" data-figure="9.88 MB">9.88 MB</td><td class="source"><a href="https://github.com/clement880101/sd-mqtt/blob/main/docs/design.md">The design's budgets</a></td></tr>
-            <tr><td>Container image</td><td class="figure" data-figure="10 MB">10 MB</td><td class="source"><a href="https://github.com/clement880101/sd-mqtt/blob/main/README.md">The README</a></td></tr>
-          </tbody>
-        </table>
-      </div>
+      <ul class="stats">
+        <li class="stat"><b data-figure="100,000">100,000</b><span>connections held on one node</span></li>
+        <li class="stat"><b data-figure="2.5 s">2.5 s</b><span>to open them</span></li>
+        <li class="stat"><b data-figure="32 KB">32 KB</b><span>broker memory per connection</span></li>
+        <li class="stat"><b data-figure="19.4 MB">19.4 MB</b><span>idle on Linux with a store</span></li>
+        <li class="stat"><b data-figure="9.88 MB">9.88 MB</b><span>release binary</span></li>
+        <li class="stat"><b data-figure="10 MB">10 MB</b><span>container image</span></li>
+      </ul>
     </div>
   </section>
 </main>
