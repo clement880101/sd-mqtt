@@ -127,6 +127,9 @@ pub struct Replication {
     /// links, so a forward can land after the session it was for has
     /// gone; this is what says where to send it on.
     departed: Mutex<Vec<Departed>>,
+    /// Forwards this node has sent on lately, by identifier, so that
+    /// one is sent on at most once; see [`Replication::redirect`].
+    redirected: Mutex<Vec<([u8; 16], Instant)>>,
     /// When a drain last arrived here: a session is moving to this
     /// node, and a forward for it may land before it is installed.
     last_drain: Mutex<Option<Instant>>,
@@ -148,6 +151,14 @@ struct Departed {
 
 /// How long a hand-over is remembered for late forwards.
 const DEPARTED_HOLDS_FOR: Duration = Duration::from_secs(30);
+
+/// How many redirected forwards are remembered at once.
+///
+/// What bounds the memory [`Replication::redirect`] keeps when a burst
+/// of late forwards arrives inside one window. Past it the oldest is
+/// forgotten first, and a forgotten one can be redirected once more,
+/// which is a hop rather than a loop.
+const REDIRECTED_HELD: usize = 4_096;
 
 /// How long a forward nobody here wants yet is held before it is given
 /// up on, and how often it is tried again meanwhile. The hold covers
@@ -186,6 +197,7 @@ impl Replication {
                 store,
                 mesh: OnceLock::new(),
                 departed: Mutex::new(Vec::new()),
+                redirected: Mutex::new(Vec::new()),
                 last_drain: Mutex::new(None),
             }),
             waiting,
@@ -211,6 +223,38 @@ impl Replication {
             to,
             until: now + DEPARTED_HOLDS_FOR,
         });
+    }
+
+    /// Where to send on a forward nobody here wanted, if anywhere.
+    ///
+    /// [`Self::gone_to`], with the hop bound section 8.4's redirect was
+    /// missing. A session that moved B to C and back, then ended inside
+    /// the window, leaves each node remembering it went to the other,
+    /// and a forward for it went round between them at link speed until
+    /// both forgot. Two rules bound it, and neither needs a word on the
+    /// wire, so a node from before this is not broken by a frame it
+    /// cannot read: **never back to `from`**, which is the two-node loop
+    /// at once; and **at most once per forward identifier inside the
+    /// window**, which bounds any longer cycle to one hop per node.
+    fn redirect(&self, id: [u8; 16], from: NodeId, topic: &str) -> Option<NodeId> {
+        let to = self.gone_to(topic)?;
+        if to == from {
+            return None;
+        }
+        let now = Instant::now();
+        let mut redirected = self
+            .redirected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        redirected.retain(|(_, until)| *until > now);
+        if redirected.iter().any(|(held, _)| *held == id) {
+            return None;
+        }
+        if redirected.len() >= REDIRECTED_HELD {
+            redirected.remove(0);
+        }
+        redirected.push((id, now + DEPARTED_HOLDS_FOR));
+        Some(to)
     }
 
     /// The node a late forward for `topic` should go to, if a session
@@ -290,7 +334,7 @@ impl Deliver for Replication {
             // subscribers, and nothing is owed back: a publication is
             // not a question.
             Message::Forward(forwarded) => {
-                self.forwarded(forwarded);
+                self.forwarded(from, forwarded);
                 return Vec::new();
             }
             // A heartbeat. Membership was updated before this was called;
@@ -464,7 +508,7 @@ impl Replication {
     /// nobody anything: there is no publisher here to acknowledge, and
     /// the node that did acknowledge one made its own batch durable
     /// before it answered its client.
-    fn forwarded(&self, forwarded: cluster::Forwarded) {
+    fn forwarded(&self, from: NodeId, forwarded: cluster::Forwarded) {
         let topic = forwarded.body.topic.clone();
         // **The groups the sending node chose this one for**, which is
         // the whole of section 8.3's answer to the shared-subscription
@@ -498,7 +542,7 @@ impl Replication {
         // standing stream of these is a map that has stopped converging,
         // and section 11.3 says nothing disappears uncounted.
         let metrics = self.shared.metrics();
-        if let (Some(to), Some(mesh)) = (self.gone_to(&topic), self.mesh.get()) {
+        if let (Some(to), Some(mesh)) = (self.redirect(frame.id, from, &topic), self.mesh.get()) {
             match mesh.send(to, &Message::Forward(frame.clone())) {
                 Some(Ok(cluster::link::Sent::Queued)) => {
                     metrics.forward_redirected().inc();
@@ -1347,6 +1391,45 @@ mod tests {
             }
             other => panic!("a claim is answered with one chunk, not {other:?}"),
         }
+    }
+
+    /// A late forward is redirected once and never back to its sender,
+    /// so a stale one cannot circle between two nodes.
+    ///
+    /// A session that moved B to C and back to B leaves each node
+    /// remembering that it went to the other. When it then ends within
+    /// the thirty seconds, a forward for it arriving at B was sent on to
+    /// C, which sent it back to B, at link speed, until both forgot. The
+    /// bound needs nothing on the wire, so an older node is not broken by
+    /// it: a node redirects a given forward at most once inside the
+    /// window, and not to the node that sent it.
+    #[tokio::test]
+    async fn a_late_forward_is_redirected_once_and_not_back_to_its_sender() {
+        let (handler, _shared) = handler();
+        let b = NodeId::mint();
+        let c = NodeId::mint();
+        handler.departed(vec!["fleet/+/telemetry".to_owned()], c);
+
+        assert_eq!(
+            handler.redirect([1; 16], b, "fleet/0043/telemetry"),
+            Some(c),
+            "a forward that arrived late goes where the session went"
+        );
+        assert_eq!(
+            handler.redirect([1; 16], b, "fleet/0043/telemetry"),
+            None,
+            "the same forward arriving again has been round once already"
+        );
+        assert_eq!(
+            handler.redirect([2; 16], c, "fleet/0043/telemetry"),
+            None,
+            "a forward from the node the session went to is not sent back to it"
+        );
+        assert_eq!(
+            handler.redirect([3; 16], b, "fleet/0043/telemetry"),
+            Some(c),
+            "and another forward is redirected as the first was"
+        );
     }
 
     /// A forward that lands behind a drain, before the session the
