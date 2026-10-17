@@ -654,6 +654,10 @@ impl Shared {
             // called from anywhere before this line existed.
             if let Record::SessionRemoved { session } = record {
                 copies.stop(session);
+                // And no position for it rides the batch: the store
+                // refuses a `StreamAt` for a session it no longer holds,
+                // and the whole batch with it, removal included.
+                reached.retain(|(key, _)| key != session);
                 continue;
             }
             let Some((session, change)) = cluster::change_for(record) else {
@@ -1915,6 +1919,48 @@ mod tests {
     use storage::Record;
 
     use crate::metrics::{drop_label, shell_label, ShellDrop, ALL_DROP_REASONS, ALL_SHELL_DROPS};
+
+    /// A batch that appends to a session and then removes it carries
+    /// no position for it.
+    ///
+    /// The store refuses a `StreamAt` for a session it does not hold,
+    /// and refuses the whole batch with it, so a position left in the
+    /// batch after the session's removal would throw away the removal
+    /// and everything beside it. No path journals that pair today; the
+    /// guard is what keeps a future one from finding out the hard way.
+    #[test]
+    fn a_session_removed_in_the_batch_that_streamed_it_leaves_no_position() {
+        let shared = Shared::new(Default::default());
+        let copies = Arc::new(cluster::Copies::new());
+        shared.install_copies(Arc::clone(&copies));
+        let session = SessionKey::new("", "rover");
+        let mut records = vec![
+            Record::QueuePushed {
+                session: session.clone(),
+                entry: storage::record::QueueEntry {
+                    sequence: 1,
+                    packet_id: None,
+                    delivery: storage::record::DeliveryRecord {
+                        body: MessageId([9; 16]),
+                        qos: storage::record::Qos::AtLeastOnce,
+                        retain: false,
+                        subscription_ids: Vec::new(),
+                        dup: false,
+                    },
+                },
+            },
+            Record::SessionRemoved {
+                session: session.clone(),
+            },
+        ];
+        shared.with_broker(|broker| shared.stream_changes(broker, &mut records));
+        assert!(
+            !records.iter().any(
+                |record| matches!(record, Record::StreamAt { session: s, .. } if *s == session)
+            ),
+            "a position for a removed session makes the store refuse the batch: {records:?}"
+        );
+    }
 
     /// What travels with an append, and what travels only once.
     ///
