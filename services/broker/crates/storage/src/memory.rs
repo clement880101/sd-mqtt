@@ -224,6 +224,26 @@ impl State {
             })
     }
 
+    /// The same refusal, for a record that files its row beside the
+    /// session rather than inside it.
+    ///
+    /// The stream and replica rows are keyed by session but held in
+    /// their own maps, so they could be written for a session the store
+    /// does not hold; a late mark after a removal would then be
+    /// inherited by the next session under that key, as a position in
+    /// a stream it has none of or as a replica row that makes restore
+    /// hand the broker nothing. Held to the rule every other
+    /// per-session record is held to.
+    fn holds(&self, session: &SessionKey) -> Result<(), Rejection> {
+        if self.sessions.contains_key(session) {
+            Ok(())
+        } else {
+            Err(Rejection::NoSuchSession {
+                session: session.clone(),
+            })
+        }
+    }
+
     /// The outbox of the rule a record names, or a refusal saying the
     /// rule is not held.
     ///
@@ -388,14 +408,17 @@ impl State {
             } => {
                 // Overwritten, not appended to: one row per followed
                 // session holding where its stream has got to.
+                self.holds(session)?;
                 self.replicas.insert(session.clone(), (*owner, *through));
             }
             Record::ReplicaDropped { session } => {
                 // **The session stays.** Becoming its owner keeps every
                 // queue entry and changes only whose it is.
+                self.holds(session)?;
                 self.replicas.remove(session);
             }
             Record::StreamAt { session, at } => {
+                self.holds(session)?;
                 self.streams.insert(session.clone(), *at);
             }
             Record::RuleRemoved { id } => {

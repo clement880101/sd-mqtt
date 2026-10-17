@@ -976,25 +976,28 @@ impl<'txn> Tables<'txn> {
             } => {
                 // Overwritten, not appended to: one row per followed
                 // session holding where its stream has got to, in the
-                // same batch as the queue record it is about.
+                // same batch as the queue record it is about. Through
+                // `prefix_of`, like every other per-session record: a
+                // row under a key no session holds would be inherited
+                // by the next session under it.
+                let prefix = self.prefix_of(session)?;
                 self.replicas
-                    .insert(
-                        session_prefix(session).as_slice(),
-                        encode(&(*owner, *through)).as_slice(),
-                    )
+                    .insert(prefix.as_slice(), encode(&(*owner, *through)).as_slice())
                     .map_err(StorageError::from)?;
             }
             Record::StreamAt { session, at } => {
+                let prefix = self.prefix_of(session)?;
                 self.streams
-                    .insert(session_prefix(session).as_slice(), encode(at).as_slice())
+                    .insert(prefix.as_slice(), encode(at).as_slice())
                     .map_err(StorageError::from)?;
             }
             Record::ReplicaDropped { session } => {
                 // **The session stays.** Becoming its owner keeps every
                 // queue entry and changes only whose it is, so this
                 // removes one row and nothing else.
+                let prefix = self.prefix_of(session)?;
                 self.replicas
-                    .remove(session_prefix(session).as_slice())
+                    .remove(prefix.as_slice())
                     .map_err(StorageError::from)?;
             }
             Record::RuleRemoved { id } => {

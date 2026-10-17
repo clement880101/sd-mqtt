@@ -3040,6 +3040,79 @@ mod contract {
         assert_eq!(session_of(&restore(&store), "mine").stream_at, 0);
     }
 
+    /// A stream mark or a replica row for a session the store does not
+    /// hold is refused, by name, like every other per-session record.
+    ///
+    /// The realistic trigger is a mark that arrives late: the session
+    /// was removed, and a `StreamAt` or `ReplicaFollows` written after
+    /// the removal would put a row under a key no session holds. The
+    /// next session under that key would then inherit it — a stream
+    /// numbered from where a stranger's stopped, or a replica row that
+    /// makes restore treat an owned session as a copy and hand the
+    /// broker nothing. Refused rather than filed, for the reason
+    /// `a_record_for_an_unknown_session_is_refused` gives.
+    pub fn a_mark_for_an_unknown_session_is_refused<S: Storage>(new: impl Fn() -> S) {
+        let store = new();
+        for record in [
+            Record::StreamAt {
+                session: key("ghost"),
+                at: 3,
+            },
+            Record::ReplicaFollows {
+                session: key("ghost"),
+                owner: [0xbb; 16],
+                through: 3,
+            },
+            Record::ReplicaDropped {
+                session: key("ghost"),
+            },
+        ] {
+            assert_eq!(
+                refusal(store.apply(std::slice::from_ref(&record))),
+                Rejection::NoSuchSession {
+                    session: key("ghost")
+                },
+                "{record:?} named a session the store does not hold"
+            );
+        }
+
+        // The late mark, after the session it was about has gone, and
+        // then a new session under the same key: it inherits nothing.
+        apply(&store, &[Record::SessionPut(session("mine"))]);
+        apply(
+            &store,
+            &[Record::SessionRemoved {
+                session: key("mine"),
+            }],
+        );
+        assert_eq!(
+            refusal(store.apply(&[Record::StreamAt {
+                session: key("mine"),
+                at: 7,
+            }])),
+            Rejection::NoSuchSession {
+                session: key("mine")
+            }
+        );
+        assert_eq!(
+            refusal(store.apply(&[Record::ReplicaFollows {
+                session: key("mine"),
+                owner: [0xbb; 16],
+                through: 7,
+            }])),
+            Rejection::NoSuchSession {
+                session: key("mine")
+            }
+        );
+        apply(&store, &[Record::SessionPut(session("mine"))]);
+        let restored = restore(&store);
+        assert_eq!(session_of(&restored, "mine").stream_at, 0);
+        assert!(
+            restored.replicas.is_empty(),
+            "the new session is this node's own, not a copy"
+        );
+    }
+
     /// A session this node merely holds a copy of comes back as a
     /// copy, and **not in the list the broker is handed**.
     ///
@@ -3256,6 +3329,7 @@ macro_rules! every_contract_test {
             a_followed_session_restores_as_a_copy_and_not_as_a_session,
             a_replica_mark_is_overwritten_and_dropping_it_keeps_the_session,
             the_owners_stream_position_survives_and_goes_with_the_session,
+            a_mark_for_an_unknown_session_is_refused,
         }
     };
 }
