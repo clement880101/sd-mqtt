@@ -75,10 +75,13 @@
     font: 400 clamp(0.95rem, 2.2vw, 1.15rem)/1.9 var(--mono);
     color: var(--steel);
   }
-  .topics li { display: flex; column-gap: 1rem; row-gap: 0; align-items: baseline; flex-wrap: wrap; transition: color 300ms ease, opacity 300ms ease; }
+  .topics li { display: grid; grid-template-columns: 6ch minmax(16ch, 28ch) 1fr; column-gap: 1.25rem; align-items: baseline; transition: color 300ms ease, opacity 300ms ease; }
+  .topics .node { color: var(--signal); font-weight: 500; }
+  .topics .verdict { min-width: 0; }
   @media (max-width: 40rem) {
     .topics { line-height: 1.45; }
-    .topics li { margin-bottom: 0.55rem; }
+    .topics li { grid-template-columns: 6ch 1fr; margin-bottom: 0.6rem; }
+    .topics .verdict { grid-column: 2; }
   }
   .topics .verdict { font-family: var(--sans); font-size: 0.85em; }
   .topics li.match .verdict { color: var(--signal); }
@@ -162,14 +165,14 @@
 
 <main>
   <section class="hero wrap" aria-labelledby="title">
-    <p class="filter" aria-label="The topic filter sensors/+/temperature">
-      <span class="level">sensors</span><span class="sep">/</span><wbr><span class="wild">+</span><span class="sep">/</span><wbr><span class="level">temperature</span>
+    <p class="filter" aria-label="The topic fleet/+/telemetry, subscribed to on one node of a cluster">
+      <span class="level">fleet</span><span class="sep">/</span><wbr><span class="wild">+</span><span class="sep">/</span><wbr><span class="level">telemetry</span>
     </p>
-    <ul class="topics" id="topics" aria-label="Topics, and whether that filter matches them">
-      <li class="match"><span class="topic">sensors/kitchen/temperature</span><span class="verdict">matches</span></li>
-      <li><span class="topic">sensors/kitchen/humidity</span><span class="verdict">does not match</span></li>
-      <li class="match"><span class="topic">sensors/greenhouse-2/temperature</span><span class="verdict">matches</span></li>
-      <li><span class="topic">sensors/roof/wind/temperature</span><span class="verdict">does not match: two levels where + takes one</span></li>
+    <ul class="topics" id="topics" aria-label="One message's path through a three-node cluster">
+      <li><span class="node">alpha</span><span class="topic">subscribe fleet/+/telemetry</span><span class="verdict">a client subscribes on one node, then goes offline</span></li>
+      <li><span class="node">beta</span><span class="topic">publish fleet/0042/telemetry</span><span class="verdict">published on another node; forwarded to the one that holds the session</span></li>
+      <li><span class="node">alpha</span><span class="topic">queue, copy to gamma</span><span class="verdict">queued for the absent client, and copied to a second node</span></li>
+      <li class="match"><span class="node">gamma</span><span class="topic">connect, deliver</span><span class="verdict">the client reconnects anywhere; the session moves and the message arrives</span></li>
     </ul>
 
     <div class="lede">
