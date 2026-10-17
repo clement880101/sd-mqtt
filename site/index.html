@@ -138,7 +138,6 @@
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: 2.25rem 2.5rem; max-width: 62rem; margin: 0; padding: 0; list-style: none; }
   .stat b { display: block; font: 500 clamp(1.75rem, 3.2vw, 2.375rem) / 1.1 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
   .stat span { display: block; margin-top: 0.4rem; color: var(--steel); font-size: 0.95rem; max-width: 18rem; }
-  .measured-note { max-width: var(--measure); color: var(--steel); font-size: 0.95rem; margin: 2.5rem 0 0; }
   #compared .table + p { margin-top: 1.25rem; }
   .table { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; max-width: 62rem; font-variant-numeric: tabular-nums; font-size: 0.95rem; }
@@ -204,7 +203,6 @@
         <li class="stat"><b data-figure="9.88 MB">9.88 MB</b><span>release binary, static, with clustering, rules and the interface inside it</span></li>
         <li class="stat"><b data-figure="10 MB">10 MB</b><span>container image on disk, the binary and its notices and nothing else</span></li>
       </ul>
-      <p class="measured-note">Measured on one node in the development image on an Apple M2 Pro. How, and what the figures do not cover, is in <a href="https://github.com/clement880101/sd-mqtt/blob/main/docs/design.md#15-budgets">section 15 of the design</a>.</p>
 
     </div>
   </section>
