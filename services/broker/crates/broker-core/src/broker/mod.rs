@@ -813,6 +813,40 @@ impl Broker {
             .then_some(Authenticated(()))
     }
 
+    /// Whether the client may publish the will it is asking to leave.
+    ///
+    /// Design section 5.2 puts the will through [`Hook::authorize_publish`]
+    /// as an ordinary publish, at CONNECT. A will is a message the client
+    /// publishes in advance, and a client that is denied a topic must not
+    /// reach it by naming the topic as its will and dropping the socket.
+    /// The hook sees the message exactly as it would go out, so a rule
+    /// about the topic, the level or the retain flag judges both the same
+    /// way. A connect with no will has nothing to judge.
+    ///
+    /// The handle is `None`: the session is not registered yet, which is
+    /// the one fact that makes this the right moment, and a hook that
+    /// wanted to look a handle up would find nothing to look up.
+    fn will_authorized(&self, mountpoint: &str, connect: &Connect) -> bool {
+        let Some(will) = connect.will.as_ref() else {
+            return true;
+        };
+        let client = ClientInfo {
+            subscriber: None,
+            mountpoint,
+            client_id: &connect.client_id,
+            username: connect.username.as_deref(),
+        };
+        let message = will_message(&StoredWill {
+            topic: will.topic.clone(),
+            payload: will.payload.clone(),
+            qos: will.qos,
+            retain: will.retain,
+            delay: 0,
+            properties: will.properties.clone(),
+        });
+        self.hooks.authorize_publish(&client, &message)
+    }
+
     /// The same, for a session the cluster has already claimed.
     ///
     /// Section 8.4: the node a client connects to claims the session by
@@ -848,6 +882,14 @@ impl Broker {
             // server will not serve. [MQTT-3.1.4-6] requires the
             // network connection to be closed after it, which is the
             // caller's half.
+            return Err(ReasonCode::NotAuthorized);
+        }
+        if !self.will_authorized(mountpoint, connect) {
+            // Design section 5.2: the will topic is authorized as an
+            // ordinary publish at CONNECT, and this is the one moment
+            // there is still somebody to tell. Refused before anything
+            // is claimed, for the same reason the chain above is: a
+            // rejected connection must not displace an incumbent.
             return Err(ReasonCode::NotAuthorized);
         }
 
@@ -1314,12 +1356,12 @@ impl Broker {
     /// work than a hook call, so the sweep was never bounded in the
     /// number of wills due and this does not change its order.
     ///
-    /// **[`Hook::authorize_publish`] is not asked**, and that half is
-    /// deliberate too. [MQTT-3.1.2-8] makes publishing the will the
+    /// **[`Hook::authorize_publish`] is not asked here**, and that half
+    /// is deliberate too. [MQTT-3.1.2-8] makes publishing the will the
     /// server's obligation once the connection ended abnormally, and
     /// the client is gone and cannot be told it was refused. Judging a
-    /// will belongs at CONNECT, where there is still somebody to answer;
-    /// that is section 12.1's and milestone 7's.
+    /// will belongs at CONNECT, where there is still somebody to answer,
+    /// and that is where [`Broker::will_authorized`] asks.
     ///
     /// A hook may still **drop** a will, which is a power worth having:
     /// suppressing the will of a client being taken down deliberately.

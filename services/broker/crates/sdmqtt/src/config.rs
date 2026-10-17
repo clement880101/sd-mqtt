@@ -2000,6 +2000,24 @@ impl Config {
                     why: "a quality of service is 0, 1 or 2",
                 });
             }
+            // The listener counts its connections with a tokio
+            // semaphore, whose constructor panics above its permit
+            // ceiling. That panic would come at bind, after this
+            // configuration had been accepted and the node had said it
+            // was starting, so the ceiling is held here and named like
+            // every other value out of range.
+            if listener.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
+                return Err(ConfigError::Unusable {
+                    key: leak(format!("{prefix}.max_connections")),
+                    value: listener.max_connections.to_string(),
+                    why: leak(format!(
+                        "a listener can hold at most {} connections; a limit above that \
+                         is one it could never reach, so write a smaller one or leave \
+                         the key out",
+                        tokio::sync::Semaphore::MAX_PERMITS
+                    )),
+                });
+            }
             match (&listener.tls, listener.kind.encrypted()) {
                 (Some(_), false) => {
                     return Err(ConfigError::Unusable {
@@ -4270,6 +4288,46 @@ dead_after_ms = 4000
         config
             .validate()
             .expect("one is strict ordering, not an error");
+    }
+
+    /// A connection limit the listener cannot hold is refused here,
+    /// with the key named, rather than panicking at bind.
+    ///
+    /// The listener counts connections with a tokio semaphore, and a
+    /// semaphore holds at most `usize::MAX >> 3` permits; above that
+    /// its constructor panics, after the configuration had been
+    /// accepted and the node had said it was starting. The default
+    /// listener and a named one are both held to it.
+    #[test]
+    fn a_connection_limit_above_the_permit_ceiling_is_refused() {
+        let over = (usize::MAX >> 3) + 1;
+        for (text, key) in [
+            (
+                format!("[listener]\nmax_connections = {over}\n"),
+                "listener.max_connections",
+            ),
+            (
+                format!(
+                    "[[listeners]]\nname = \"second\"\naddress = \"127.0.0.1:1884\"\n\
+                     max_connections = {over}\n"
+                ),
+                "listeners[0].max_connections",
+            ),
+        ] {
+            let config = Config::from_toml(&text).expect("the file parses");
+            let error = config
+                .validate()
+                .expect_err("no listener can hold that many permits");
+            assert!(
+                error.to_string().contains(key),
+                "the message names the key at fault: {error}"
+            );
+        }
+        let config = Config::from_toml(&format!("[listener]\nmax_connections = {}\n", over - 1))
+            .expect("the file parses");
+        config
+            .validate()
+            .expect("the ceiling itself is a limit the listener can hold");
     }
 
     #[test]

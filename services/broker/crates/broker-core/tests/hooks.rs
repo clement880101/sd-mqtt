@@ -1242,14 +1242,14 @@ fn a_will_fires_the_message_hook() {
     );
 }
 
-/// The other half of that ruling: the client is gone and cannot be told
-/// it was refused, so the chain that would refuse it is not asked.
+/// The other half of that ruling: the will is judged at CONNECT, where
+/// there is still somebody to answer, and not again when it falls due.
+/// The client is gone by then and cannot be told it was refused, so a
+/// rule installed after the connect does not take a will the connect
+/// admitted.
 #[test]
 fn a_will_does_not_ask_the_authorizing_chain() {
-    let mut denier = Authorizer::new();
-    denier.publish = Decision::Deny;
     let mut broker = Broker::new(BrokerConfig::default());
-    broker.hooks_mut().install(Arc::new(denier));
 
     let subscriber = join(&mut broker, "s");
     let mut out = Vec::new();
@@ -1266,6 +1266,11 @@ fn a_will_does_not_ask_the_authorizing_chain() {
         .connect("", &connect_with_will("d", "device/1/status"), &mut out)
         .expect("the default decision authenticates")
         .subscriber;
+    // Installed once the connect has been answered, so the only place
+    // it could be asked is when the will falls due.
+    let mut denier = Authorizer::new();
+    denier.publish = Decision::Deny;
+    broker.hooks_mut().install(Arc::new(denier));
     out.clear();
     broker.disconnect(publisher, &mut out);
     broker.tick(&mut out);
@@ -1274,6 +1279,48 @@ fn a_will_does_not_ask_the_authorizing_chain() {
         published(&out),
         vec![(subscriber, "device/1/status".to_owned())],
         "[MQTT-3.1.2-8] owes this will whatever an authorizing hook thinks: {out:?}"
+    );
+}
+
+/// Design section 5.2: the will topic is authorized as an ordinary
+/// publish at CONNECT. A client that may not publish to a topic must
+/// not reach it by naming it as its will and dropping the socket, so
+/// the connect is refused with 3.2.2.2's "not authorized" and nothing
+/// is registered.
+#[test]
+fn a_will_the_client_may_not_publish_refuses_the_connect() {
+    let mut denier = Authorizer::new();
+    denier.publish = Decision::Deny;
+    let mut broker = Broker::new(BrokerConfig::default());
+    broker.hooks_mut().install(Arc::new(denier));
+
+    let subscriber = join(&mut broker, "s");
+    let mut out = Vec::new();
+    broker
+        .handle(
+            subscriber,
+            &subscribe_packet("device/1/status", QoS::AtMostOnce),
+            &mut out,
+        )
+        .expect("a well formed subscribe");
+
+    let mut out = Vec::new();
+    let refused = broker.connect("", &connect_with_will("d", "device/1/status"), &mut out);
+    assert_eq!(
+        refused.map(|registration| registration.subscriber),
+        Err(ReasonCode::NotAuthorized),
+        "a will the client may not publish is a connect the broker will not serve"
+    );
+    assert_eq!(
+        broker.session_count(),
+        1,
+        "nothing was registered for the refused client; only the subscriber remains"
+    );
+
+    broker.tick(&mut out);
+    assert!(
+        published(&out).is_empty(),
+        "and no will is owed by a connection that was never accepted: {out:?}"
     );
 }
 
