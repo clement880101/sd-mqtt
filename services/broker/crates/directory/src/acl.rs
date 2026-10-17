@@ -19,13 +19,16 @@
 //! the shape every broker's operator already knows, and it lets a
 //! narrow deny sit above a broad allow.
 //!
-//! # Matching is the topic crate's
+//! # Publishes are matched, subscriptions are covered
 //!
 //! A rule's filter matches a published topic the way a subscription
-//! does, wildcards and all. A requested subscription filter is matched
-//! against the rule's filter as a topic name would be — `fleet/+/temp`
-//! is covered by a rule for `fleet/#`, and a request for `#` is covered
-//! by a rule for `#` and by nothing narrower.
+//! does, wildcards and all. A requested subscription filter is a filter
+//! in its own right, and a rule covers it only when every topic the
+//! request would receive is one the rule matches: `fleet/+/temp` is
+//! covered by a rule for `fleet/#`, a request for `#` is covered by a
+//! rule for `#` and by nothing narrower, and a request for `fleet/#` is
+//! not covered by a rule for `fleet/+`, which reaches one level where
+//! the request reaches them all. See [`covers`].
 //!
 //! # Subjects are names or prefixes
 //!
@@ -162,11 +165,60 @@ pub fn decide(
         if !subject.covers(client) {
             continue;
         }
-        if broker_core::topic::reference::matches(&rule.filter, topic) {
+        let matched = match operation {
+            Operation::Publish => broker_core::topic::reference::matches(&rule.filter, topic),
+            Operation::Subscribe => covers(&rule.filter, topic),
+        };
+        if matched {
             return Some(opinion);
         }
     }
     Some(false)
+}
+
+/// Whether every topic `requested` would receive is one `rule` matches.
+///
+/// A subscribe request is a filter, not a topic name, and the two are
+/// not interchangeable in the direction that matters. Read as a topic
+/// name, `fleet/#` is matched by `fleet/+`, because `#` is a level like
+/// any other; read as a filter, `fleet/#` reaches `fleet/7/secret`,
+/// which `fleet/+` never does. So a rule covers a request only when
+/// the rule's filter subsumes the requested one, level by level:
+///
+/// - `#` in the rule covers whatever remains, including nothing, which
+///   is why `fleet/#` covers `fleet`.
+/// - `#` in the request is covered by nothing narrower than `#` at the
+///   same place in the rule: the request reaches both the level above
+///   and every level below, and no single level does.
+/// - `+` in the rule covers one level, literal or `+`.
+/// - A literal in the rule covers only the same literal.
+/// - A request that runs out of levels while the rule still has some
+///   reaches a topic the rule does not: `fleet/+` does not cover
+///   `fleet`.
+///
+/// The dollar rule from 4.7.2 is kept too: a rule beginning with a
+/// wildcard never matches a topic beginning with `$`, so it cannot
+/// cover a request that names one. The other way round falls out of
+/// the walk, because a `$` literal in the rule covers no wildcard.
+fn covers(rule: &str, requested: &str) -> bool {
+    let rule_levels: Vec<&str> = rule.split('/').collect();
+    let requested_levels: Vec<&str> = requested.split('/').collect();
+    let rule_starts_wild = matches!(rule_levels.first(), Some(&"+") | Some(&"#"));
+    if rule_starts_wild && requested.starts_with('$') {
+        return false;
+    }
+    subsumes(&rule_levels, &requested_levels)
+}
+
+fn subsumes(rule: &[&str], requested: &[&str]) -> bool {
+    match (rule.first(), requested.first()) {
+        (Some(&"#"), _) => true,
+        (_, Some(&"#")) => false,
+        (Some(&"+"), Some(_)) => subsumes(&rule[1..], &requested[1..]),
+        (Some(&level), Some(&asked)) => level == asked && subsumes(&rule[1..], &requested[1..]),
+        (None, None) => true,
+        (Some(_), None) | (None, Some(_)) => false,
+    }
 }
 
 /// Sort rules the way they are consulted: by order, then identifier.
@@ -420,6 +472,83 @@ mod tests {
         assert!(Subject::parse("client:sen*sor").is_err());
         assert!(Subject::parse("user:**").is_err());
         assert!(Subject::parse("client:*").is_ok());
+    }
+
+    /// A subscribe request is covered only when every topic it would
+    /// receive is one the rule's filter matches. Reading the request as
+    /// a topic name gets the multi-level wildcard wrong in the direction
+    /// that opens the door: `fleet/#` is "every level below fleet", and
+    /// a rule for one level below it must not admit that.
+    #[test]
+    fn a_rule_ending_in_a_single_level_does_not_admit_every_level() {
+        let rules = [rule("r", 1, "anyone", "fleet/+", None, Some(true))];
+        let c = client("c", None);
+        assert_eq!(
+            decide(&rules, &c, Operation::Subscribe, "fleet/7"),
+            Some(true)
+        );
+        assert_eq!(
+            decide(&rules, &c, Operation::Subscribe, "fleet/+"),
+            Some(true)
+        );
+        assert_eq!(
+            decide(&rules, &c, Operation::Subscribe, "fleet/#"),
+            Some(false),
+            "`fleet/#` reaches `fleet/7/secret`, which `fleet/+` never matches"
+        );
+    }
+
+    /// The function itself, case by case.
+    #[test]
+    fn a_filter_covers_a_filter_only_when_it_matches_everything_it_does() {
+        let allowed = [
+            ("fleet/#", "fleet/+/temp"),
+            ("fleet/#", "fleet/#"),
+            ("fleet/#", "fleet"),
+            ("fleet/#", "fleet/7"),
+            ("#", "#"),
+            ("#", "+/x"),
+            ("#", "a/b/c"),
+            ("fleet/+", "fleet/7"),
+            ("fleet/+", "fleet/+"),
+            ("fleet/+/temp", "fleet/+/temp"),
+            ("fleet/+/temp", "fleet/7/temp"),
+            ("$SYS/#", "$SYS/broker/uptime"),
+            ("$SYS/#", "$SYS/#"),
+            ("a//b", "a//b"),
+            ("a/+/b", "a//b"),
+        ];
+        for (rule, requested) in allowed {
+            assert!(covers(rule, requested), "{rule} should cover {requested}");
+        }
+        let denied = [
+            ("fleet/+", "fleet/#"),
+            ("+/x", "#"),
+            ("fleet/#", "#"),
+            ("fleet/#", "+/#"),
+            ("fleet/7", "fleet/+"),
+            ("fleet/+", "fleet"),
+            ("fleet/+", "fleet/7/temp"),
+            ("fleet/+/temp", "fleet/#"),
+            ("fleet/+/temp", "fleet/7/status"),
+            ("fleet", "fleet/#"),
+            ("a/b", "a//b"),
+            // A rule beginning with a wildcard never matches a dollar
+            // topic, so it cannot cover a request that names one.
+            ("#", "$SYS/#"),
+            ("#", "$SYS/broker/uptime"),
+            ("+/broker/uptime", "$SYS/broker/uptime"),
+            // And a dollar rule matches no ordinary topic, which a
+            // request beginning with a wildcard would receive.
+            ("$SYS/#", "#"),
+            ("$SYS/#", "+/broker/uptime"),
+        ];
+        for (rule, requested) in denied {
+            assert!(
+                !covers(rule, requested),
+                "{rule} should not cover {requested}"
+            );
+        }
     }
 
     #[test]
