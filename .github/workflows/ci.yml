@@ -112,7 +112,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: services/broker
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - uses: taiki-e/install-action@cargo-deny
@@ -161,7 +161,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Build and test the image
@@ -175,7 +175,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: services/broker
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Build the broker under test
@@ -193,7 +193,7 @@ jobs:
         run: services/broker/conformance/run.sh
       - name: Upload the suite's output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: conformance-output
           path: |
@@ -215,7 +215,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: services/broker
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - uses: actions/setup-node@v5
@@ -275,7 +275,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: services/broker
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Build the binary that ships
@@ -306,7 +306,7 @@ jobs:
         run: cargo +nightly fuzz run decode -- -max_total_time=600
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: fuzz-artifacts
           path: services/broker/crates/mqtt-codec/fuzz/artifacts/
