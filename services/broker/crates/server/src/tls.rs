@@ -246,9 +246,16 @@ impl Acceptor {
             if last_seen == Some((certificate, key)) {
                 continue;
             }
-            last_seen = Some((certificate, key));
             match read_pair(&self.settings) {
                 Ok(pair) => {
+                    // Recorded on success and not before the read: a
+                    // renewal caught half-written is read again on
+                    // the next poll whether or not its stamp moves,
+                    // because on a filesystem with one-second stamps
+                    // the rest of the write can land under the same
+                    // one, and a stamp recorded first would have made
+                    // that renewal the one never served.
+                    last_seen = Some((certificate, key));
                     *self
                         .resolver
                         .current
@@ -357,6 +364,72 @@ pub(crate) mod tests {
             matches!(&refused, Error::Unreadable { path, .. } if *path == missing),
             "{refused:?}"
         );
+    }
+
+    /// A renewal whose rest lands under the stamp its half-written
+    /// state was seen with is still picked up. Forced here by
+    /// stamping the finished files with the half-written ones' times,
+    /// which is what a filesystem with one-second stamps does on its
+    /// own.
+    #[tokio::test]
+    async fn a_renewal_finished_under_the_stamp_it_was_caught_half_written_with_is_read() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let (certificate, key) = minted(directory.path(), "first");
+        let counters = TlsCounters::detached();
+        let acceptor = Arc::new(
+            Acceptor::load(
+                &settings(certificate.clone(), key.clone(), Duration::from_millis(30)),
+                Arc::clone(&counters),
+            )
+            .expect("loads"),
+        );
+        let before = acceptor.certificate_der();
+        let reloader = tokio::spawn({
+            let acceptor = Arc::clone(&acceptor);
+            async move { acceptor.reloading().await }
+        });
+
+        std::fs::write(&certificate, b"").expect("emptied");
+        let seen = (
+            modified(&certificate).expect("a stamp"),
+            modified(&key).expect("a stamp"),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while counters.reload_failed().get() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the half-written renewal was never noticed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(acceptor.certificate_der(), before, "the old pair is kept");
+
+        // The rest of the renewal lands, under the stamps already seen.
+        let (renewed_cert, renewed_key) = minted(directory.path(), "second");
+        std::fs::copy(&renewed_key, &key).expect("key replaced");
+        std::fs::copy(&renewed_cert, &certificate).expect("certificate replaced");
+        std::fs::File::options()
+            .write(true)
+            .open(&certificate)
+            .expect("opens")
+            .set_modified(seen.0)
+            .expect("stamped");
+        std::fs::File::options()
+            .write(true)
+            .open(&key)
+            .expect("opens")
+            .set_modified(seen.1)
+            .expect("stamped");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while acceptor.certificate_der() == before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the renewal was never picked up: its stamp had already been recorded"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        reloader.abort();
     }
 
     /// A renewal half-written keeps the old pair; a renewal that lands
