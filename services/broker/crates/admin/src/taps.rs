@@ -1029,9 +1029,31 @@ pub fn open(state: &AdminState, filter: &str) -> Result<Arc<Tap>, ApiError> {
         };
         let connect = tap_connect(&client_id);
         let mut out = Vec::new();
+        // The authenticate chain is asked about this connect as it is
+        // about every other, and it may say no: the directory's hook
+        // denies a connect with no username on a broker with
+        // `auth.anonymous = false`, which is every
+        // authenticated deployment. That is a refusal to answer, not
+        // an invariant to assume. Nothing has happened when the chain
+        // refuses — no session, no displacement — so the slot simply
+        // goes back when this returns. Admitting a tap past the chain
+        // would need the broker to hand out an [`Authenticated`] it
+        // deliberately keeps private; see `broker_core::handover`.
+        //
+        // [`Authenticated`]: broker_core::handover::Authenticated
         let registration = broker
             .connect(MOUNTPOINT, &connect, &mut out)
-            .expect("the default decision authenticates");
+            .map_err(|reason| {
+                ApiError::new(
+                    ErrorCode::Forbidden,
+                    format!(
+                        "this broker's authentication refused the session a tap would hold \
+                         ({reason:?}): a tap connects as an anonymous client, and this broker \
+                         admits no anonymous client. Set `auth.anonymous = true`, \
+                         or watch the topic with an authenticated client instead."
+                    ),
+                )
+            })?;
         Ok((client_id, registration, out, depth))
     })?;
     let (client_id, registration, connect_actions, depth) = connected;
@@ -1985,6 +2007,60 @@ mod tests {
                 "tap {index} after four refusals: {}",
                 answer.body
             );
+        }
+        both.stop().await;
+    }
+
+    /// A broker that admits no anonymous session refuses a tap in
+    /// JSON, and the refusal costs no slot.
+    ///
+    /// A tap connects with no username, and the directory's hook
+    /// denies that connect on every deployment with
+    /// `auth.anonymous = false`, which is every
+    /// authenticated one. The handler used to `expect` the connect to
+    /// succeed, so the refusal was a panic and the caller saw a cut
+    /// connection instead of an answer. The chain is asked through
+    /// the hook defaults rather than through the directory, because
+    /// what is being tested is the handler's answer to a refusal and
+    /// not who refused.
+    #[tokio::test]
+    async fn a_tap_the_authenticate_chain_refuses_is_answered_and_costs_no_slot() {
+        let both = Both::start().await;
+        both.shared().with_broker(|broker| {
+            broker
+                .hooks_mut()
+                .set_defaults(broker_core::hooks::Defaults {
+                    authenticate: false,
+                    ..broker_core::hooks::Defaults::default()
+                });
+        });
+
+        let refused = both.open("sensor/#").await;
+        assert_eq!(refused.status, 403, "{}", refused.body);
+        let body = json(&refused.body);
+        assert_eq!(body["error"]["code"], "forbidden");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("anonymous")),
+            "the message names what to change: {}",
+            refused.body
+        );
+        let sessions = both
+            .shared()
+            .with_broker(|broker: &mut Broker| broker.session_count());
+        assert_eq!(sessions, 0, "no session was left behind");
+
+        // The slot went back, and the broker is as it was: with the
+        // chain admitting again, every slot is still there.
+        both.shared().with_broker(|broker| {
+            broker
+                .hooks_mut()
+                .set_defaults(broker_core::hooks::Defaults::default());
+        });
+        for index in 0..MAX_TAPS {
+            let answer = both.open(&format!("still/{index}")).await;
+            assert_eq!(answer.status, 200, "tap {index}: {}", answer.body);
         }
         both.stop().await;
     }

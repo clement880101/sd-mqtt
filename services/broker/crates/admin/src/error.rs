@@ -105,6 +105,13 @@ pub enum ErrorCode {
     /// because the caller's next move is different — not a credential
     /// to find but a wider one to ask for — and the message names the
     /// scope the key has and the one the endpoint needs.
+    ///
+    /// Also the answer when the key was wide enough and the broker's
+    /// own authenticate chain refused what the request asked for: a
+    /// tap connects as an anonymous client, and a broker with
+    /// `auth.anonymous = false` admits none. The caller did nothing
+    /// wrong and retrying will not help; what has to change is a
+    /// configuration, and the message says which.
     Forbidden,
     /// The request is well formed and disagrees with what is there.
     ///
