@@ -893,7 +893,24 @@ impl Broker {
             return Err(ReasonCode::NotAuthorized);
         }
 
-        let displaced = self.displace_incumbent(&identity, connect.clean_start, now, out);
+        // Whether the incumbent's session ends with this connect, which
+        // is not only the newcomer's clean start. 3.1.2.11.2: a Session
+        // Expiry Interval of zero ends the session when the network
+        // connection closes, and a takeover closes it, so a live
+        // incumbent with no expiry leaves no session for the newcomer
+        // to resume. Section 3.1.4's commentary reads the pair the
+        // same way: with clean start or an expiry of zero the will is
+        // sent "because the original Session is ended on the takeover".
+        // A resumed `session_present` for a session that has ended would
+        // hand the newcomer subscriptions the spec says are gone.
+        let incumbent_ends = self
+            .registry
+            .subscriber_of(&identity)
+            .and_then(|subscriber| self.registry.get(subscriber))
+            .is_some_and(|session| session.is_connected() && session.expiry_interval() == 0);
+        let discards = connect.clean_start || incumbent_ends;
+
+        let displaced = self.displace_incumbent(&identity, discards, now, out);
         // What the handle was subscribed to before any of this, read
         // while the session that held it still exists. Section 8.2
         // needs a departure per filter and the registry is about to
@@ -904,7 +921,7 @@ impl Broker {
             .and_then(|subscriber| self.registry.get(subscriber))
             .map(|session| session.filters().map(str::to_string).collect())
             .unwrap_or_default();
-        if connect.clean_start {
+        if discards {
             // The registry is about to replace this session wholesale,
             // taking its queue and its window with it. What it was
             // holding is reported before it goes.
@@ -916,20 +933,21 @@ impl Broker {
                 // reach the shell, and it can only reach it from here.
                 self.drain_session(existing);
             }
-            // [MQTT-3.1.2-4]: a clean start discards the session. The
-            // record takes its subscriptions, its queue, its window and
-            // its inbound identifiers with it, so nothing else needs to
-            // be said about them, and it must come before the record
-            // that creates the replacement. A session the store does
-            // not hold is a no-op, which is what this is for a client
-            // that has never connected.
+            // [MQTT-3.1.2-4]: a clean start discards the session, and
+            // an incumbent whose session ended with its connection has
+            // nothing left to keep. The record takes its subscriptions,
+            // its queue, its window and its inbound identifiers with
+            // it, so nothing else needs to be said about them, and it
+            // must come before the record that creates the replacement.
+            // A session the store does not hold is a no-op, which is
+            // what this is for a client that has never connected.
             self.journal.push(Record::SessionRemoved {
                 session: journal::key_of(&identity),
             });
         }
-        let mut registration =
-            self.registry
-                .register_claimed(identity, connect.clean_start, now, claimed);
+        let mut registration = self
+            .registry
+            .register_claimed(identity, discards, now, claimed);
         // The registry judges takeover by whether the session was still
         // connected, and this layer disconnected it a moment ago on
         // purpose, so the registry now says no. The observation above is
@@ -937,8 +955,9 @@ impl Broker {
         registration.took_over = displaced;
 
         if !registration.session_present {
-            // A clean start discards the session [MQTT-3.1.2-4], and the
-            // registry did: the handle now names a new one. Its
+            // The session was discarded, by a clean start [MQTT-3.1.2-4]
+            // or by ending with the incumbent's connection, and the
+            // registry did it: the handle now names a new one. Its
             // subscriptions do not live in the session, though, they live
             // in the trie keyed by that same handle, so only this layer
             // can discard them. A no-op for a handle never seen before.
@@ -1266,15 +1285,18 @@ impl Broker {
     ///   already knows this and forces the delay to zero for that
     ///   version.
     ///
-    /// # Clean start
+    /// # A takeover that ends the session
     ///
-    /// A clean-start takeover publishes the will whatever the delay
-    /// says. [MQTT-3.1.2-8] fires the will when "the Will Delay Interval
-    /// has elapsed **or the Session ends**", and clean start ends the
-    /// incumbent's session rather than resuming it. Section 3.1.4's own
-    /// commentary reads the pair the same way: with clean start set, or
-    /// a session expiry interval of zero, the will "will be sent because
-    /// the original Session is ended on the takeover".
+    /// `ends_session` is the newcomer's clean start, or an incumbent
+    /// whose session expiry interval is zero; the caller decides which.
+    /// Either publishes the will whatever the delay says. [MQTT-3.1.2-8]
+    /// fires the will when "the Will Delay Interval has elapsed **or
+    /// the Session ends**", and clean start ends the incumbent's session
+    /// rather than resuming it, as an expiry of zero does the moment
+    /// the connection closes. Section 3.1.4's own commentary reads the
+    /// pair the same way: with clean start set, or a session expiry
+    /// interval of zero, the will "will be sent because the original
+    /// Session is ended on the takeover".
     ///
     /// That does not contradict [MQTT-3.1.3-9], whose operative words
     /// are "to this Session". A clean start is not a new connection to
@@ -1289,7 +1311,7 @@ impl Broker {
     fn displace_incumbent(
         &mut self,
         identity: &SessionId,
-        clean_start: bool,
+        ends_session: bool,
         now: u32,
         out: &mut Vec<Addressed>,
     ) -> bool {
@@ -1313,7 +1335,7 @@ impl Broker {
 
         let due = {
             let session = self.registry.get_mut(incumbent).expect("just looked it up");
-            if clean_start {
+            if ends_session {
                 // The session ends now, so it outlives its connection by
                 // nothing and the delay has nothing left to cap.
                 session.set_expiry_interval(0);
@@ -2551,6 +2573,86 @@ mod tests {
         assert!(
             !second.session_present,
             "3.1.2.11.2: an absent Session Expiry Interval is zero, not forever"
+        );
+    }
+
+    #[test]
+    fn taking_over_an_incumbent_with_session_expiry_zero_starts_a_new_session() {
+        // 3.1.2.11.2: a Session Expiry Interval of zero ends the session
+        // when the network connection closes, and a takeover closes it.
+        // Section 3.1.4's commentary says the same of this exact case:
+        // with clean start or an expiry of zero, the will is sent
+        // "because the original Session is ended on the takeover". So
+        // the newcomer, which did not ask for a clean start, must still
+        // find no session: not the subscriptions, and not a `session
+        // present` that claims it resumed one that has ended.
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+
+        let watcher = broker
+            .connect("", &connect_v5("w"), &mut out)
+            .expect("the default decision authenticates")
+            .subscriber;
+        broker
+            .handle(watcher, &subscribe_to("device/c/status"), &mut out)
+            .expect("a well formed subscribe");
+
+        let mut incumbent = connect_v5("c");
+        assert!(
+            incumbent.properties.session_expiry_interval.is_none(),
+            "an absent interval is zero, which is the case under test"
+        );
+        incumbent.will = Some(mqtt_codec::packet::Will {
+            topic: "device/c/status".to_string(),
+            payload: Bytes::from_static(b"offline"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            properties: Properties::default(),
+        });
+        let first = broker
+            .connect("", &incumbent, &mut out)
+            .expect("the default decision authenticates")
+            .subscriber;
+        broker
+            .handle(first, &subscribe_to("a/b"), &mut out)
+            .expect("a well formed subscribe");
+
+        out.clear();
+        let second = broker
+            .connect("", &connect_v5("c"), &mut out)
+            .expect("the default decision authenticates");
+        assert!(second.took_over, "the incumbent was live");
+        assert!(
+            !second.session_present,
+            "3.1.2.11.2: the incumbent's session ended with its connection, so there is              nothing to resume"
+        );
+
+        broker.tick(&mut out);
+        assert_eq!(
+            publishes_to(&out, watcher).len(),
+            1,
+            "and the will goes out, because the session ended: {out:?}"
+        );
+
+        out.clear();
+        broker
+            .handle(
+                watcher,
+                &Packet::Publish(Publish {
+                    dup: false,
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                    topic: "a/b".to_string(),
+                    packet_id: None,
+                    payload: Bytes::from_static(b"body"),
+                    properties: Properties::default(),
+                }),
+                &mut out,
+            )
+            .expect("a well formed publish");
+        assert!(
+            publishes_to(&out, second.subscriber).is_empty(),
+            "the ended session's subscriptions did not carry over: {out:?}"
         );
     }
 
