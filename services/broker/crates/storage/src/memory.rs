@@ -256,6 +256,20 @@ impl State {
         Ok(self.outboxes.entry(id.to_owned()).or_default())
     }
 
+    /// The same outbox, or nothing for a rule the store does not hold.
+    ///
+    /// For the records that take an envelope out or mark an attempt on
+    /// it: a rule that has gone took its outbox with it, so the envelope
+    /// those records name has already left, and what they ask for is
+    /// already true. Refusing them would refuse the body release the
+    /// rules engine sends in the same batch as the removal, and leak
+    /// the payload for the life of the file.
+    fn outbox_if_held(&mut self, id: &str) -> Option<&mut OutboxState> {
+        self.rules
+            .contains_key(id)
+            .then(|| self.outboxes.entry(id.to_owned()).or_default())
+    }
+
     /// Apply one record, or refuse it without having changed anything.
     ///
     /// Every arm either succeeds or returns before it writes. That is not
@@ -451,7 +465,12 @@ impl State {
                 // A no-op for an envelope that has left: it was
                 // delivered or dead-lettered, and recording an attempt
                 // on it would resurrect a row nothing would ever remove.
-                if let Some(entry) = self.outbox_mut(rule)?.entries.get_mut(sequence) {
+                // A rule that has gone is the same envelope having left
+                // by another door.
+                if let Some(entry) = self
+                    .outbox_if_held(rule)
+                    .and_then(|held| held.entries.get_mut(sequence))
+                {
                     entry.attempts = *attempts;
                     entry.next_attempt_at = *next_attempt_at;
                 }
@@ -518,12 +537,15 @@ impl State {
                 self.oplog_collected_through = self.oplog_collected_through.max(*through);
             }
             Record::OutboxRemoved { rule, sequence } => {
-                let held = self.outbox_mut(rule)?;
                 // Only what was actually there is subtracted, for the
                 // reason a queue pop gives: an outbox reporting empty
-                // while holding envelopes stops draining.
-                if held.entries.remove(sequence).is_some() {
-                    held.depth -= 1;
+                // while holding envelopes stops draining. A rule that
+                // has gone took the envelope with it, so there is
+                // nothing to subtract and nothing to refuse.
+                if let Some(held) = self.outbox_if_held(rule) {
+                    if held.entries.remove(sequence).is_some() {
+                        held.depth -= 1;
+                    }
                 }
                 // The high-water mark is untouched. The number is spent.
             }

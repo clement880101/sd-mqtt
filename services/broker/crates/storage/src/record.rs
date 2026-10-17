@@ -1336,7 +1336,9 @@ pub enum Record {
     /// the backoff is the caller's policy and the store holds a fact.
     /// An attempt on a sequence the outbox no longer holds is a no-op:
     /// the envelope left, which is the one outcome that makes further
-    /// attempts pointless.
+    /// attempts pointless. So is one for a rule the store no longer
+    /// holds, because a deleted rule took its outbox with it and that
+    /// is the same envelope having left.
     OutboxAttempted {
         /// Whose outbox.
         rule: String,
@@ -1352,6 +1354,12 @@ pub enum Record {
     /// **Does not release the body it named.** See [`OutboxRecord`] and
     /// [`crate::Storage::apply`]: the release is the caller's, and it is
     /// owed.
+    ///
+    /// A no-op for an envelope already gone, and for a rule already
+    /// gone: the rules engine writes this record and the body's release
+    /// in one batch, and a delete of the rule that raced ahead of that
+    /// batch must not refuse the release along with a removal that is
+    /// already true.
     OutboxRemoved {
         /// Whose outbox.
         rule: String,

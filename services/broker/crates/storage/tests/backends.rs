@@ -2783,12 +2783,16 @@ mod contract {
         );
     }
 
-    /// An envelope for a rule the store does not hold is refused.
+    /// An envelope for a rule the store does not hold is refused, and
+    /// an attempt on one, or its removal, is a no-op.
     ///
-    /// The same argument as a record for an unknown session: an outbox
-    /// is read through the rule that owns it, so one filed under a rule
-    /// that is not there would be neither stored usefully nor reported
-    /// missing.
+    /// The append is the same argument as a record for an unknown
+    /// session: an outbox is read through the rule that owns it, so one
+    /// filed under a rule that is not there would be neither stored
+    /// usefully nor reported missing. The other two ask for a
+    /// postcondition that already holds — an outbox nothing holds has
+    /// no envelope at that sequence — and `Record::OutboxAttempted`
+    /// documents that as a no-op, not a refusal.
     pub fn an_envelope_for_an_unknown_rule_is_refused<S: Storage>(new: impl Fn() -> S) {
         let store = new();
         assert_eq!(
@@ -2800,26 +2804,91 @@ mod contract {
                 id: "ghost".to_owned()
             }
         );
-        assert_eq!(
-            refusal(store.apply(&[Record::OutboxAttempted {
+        let before = restore(&store);
+        apply(
+            &store,
+            &[Record::OutboxAttempted {
                 rule: "ghost".to_owned(),
                 sequence: 1,
                 attempts: 1,
                 next_attempt_at: 5,
-            }])),
-            Rejection::NoSuchRule {
-                id: "ghost".to_owned()
-            }
+            }],
         );
-        assert_eq!(
-            refusal(store.apply(&[Record::OutboxRemoved {
+        apply(
+            &store,
+            &[Record::OutboxRemoved {
                 rule: "ghost".to_owned(),
                 sequence: 1,
-            }])),
-            Rejection::NoSuchRule {
-                id: "ghost".to_owned()
-            }
+            }],
         );
+        assert_eq!(
+            restore(&store),
+            before,
+            "a no-op on a rule the store does not hold left something behind"
+        );
+        assert_eq!(store.outbox_depth("ghost").expect("depth"), 0);
+    }
+
+    /// An envelope finished after its rule was deleted leaves cleanly,
+    /// and the body release that rides with it is kept.
+    ///
+    /// The rules engine finishes an envelope with `OutboxRemoved` and
+    /// `BodyReleased` in one batch, because either without the other
+    /// is a leak or a payload deleted under a live reference. A delete
+    /// of the rule that races ahead of that batch must not refuse it:
+    /// the removal is already true, and refusing it would throw the
+    /// release away with it and leak the body for the life of the file.
+    /// The same for an attempt recorded after the rule has gone.
+    pub fn finishing_an_envelope_after_its_rule_is_gone_keeps_the_release<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = with_rule(new, "a");
+        apply(
+            &store,
+            &[
+                Record::BodyPut {
+                    id: body_id(1),
+                    body: body(1),
+                },
+                Record::OutboxAppended {
+                    rule: "a".to_owned(),
+                    entry: envelope(1, body_id(1)),
+                },
+            ],
+        );
+        apply(&store, &[Record::RuleRemoved { id: "a".to_owned() }]);
+
+        // The attempt that was in flight when the rule went.
+        apply(
+            &store,
+            &[Record::OutboxAttempted {
+                rule: "a".to_owned(),
+                sequence: 1,
+                attempts: 1,
+                next_attempt_at: 5,
+            }],
+        );
+        // And the delivery that finishes it, release and all.
+        apply(
+            &store,
+            &[
+                Record::OutboxRemoved {
+                    rule: "a".to_owned(),
+                    sequence: 1,
+                },
+                Record::BodyReleased { id: body_id(1) },
+            ],
+        );
+
+        let restored = restore(&store);
+        assert_eq!(
+            restored.bodies.get(&body_id(1)),
+            None,
+            "the release rode the batch and was kept"
+        );
+        assert!(restored.rules.is_empty(), "the rule stayed gone");
+        assert_eq!(store.outbox_depth("a").expect("depth"), 0);
+        assert_eq!(store.outbox_head("a", 0).expect("head"), None);
     }
 
     /// An outbox survives its rule being edited, and goes with its rule
@@ -3330,6 +3399,7 @@ macro_rules! every_contract_test {
             a_replica_mark_is_overwritten_and_dropping_it_keeps_the_session,
             the_owners_stream_position_survives_and_goes_with_the_session,
             a_mark_for_an_unknown_session_is_refused,
+            finishing_an_envelope_after_its_rule_is_gone_keeps_the_release,
         }
     };
 }

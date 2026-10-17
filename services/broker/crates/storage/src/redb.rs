@@ -752,6 +752,23 @@ impl<'txn> Tables<'txn> {
         Ok(rule_prefix(id))
     }
 
+    /// The same prefix, or `None` for a rule the store does not hold.
+    ///
+    /// For the records that take an envelope out or mark an attempt on
+    /// it: a rule that has gone took its outbox with it, so the envelope
+    /// those records name has already left, and what they ask for is
+    /// already true. Refusing them would refuse the body release the
+    /// rules engine sends in the same batch as the removal, and leak
+    /// the payload for the life of the file.
+    fn rule_prefix_if_held(&self, id: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self
+            .rules
+            .get(id)
+            .map_err(StorageError::from)?
+            .is_some()
+            .then(|| rule_prefix(id)))
+    }
+
     /// Apply one record.
     #[allow(clippy::too_many_lines)]
     fn apply_one(&mut self, record: &Record) -> Result<(), StorageError> {
@@ -1127,11 +1144,14 @@ impl<'txn> Tables<'txn> {
                 attempts,
                 next_attempt_at,
             } => {
-                let prefix = self.rule_prefix_of(rule)?;
-                let key = queue_key(&prefix, *sequence);
                 // A no-op for an envelope that has left: recording an
                 // attempt on it would write back a row nothing would
-                // ever remove.
+                // ever remove. A rule that has gone is the same
+                // envelope having left by another door.
+                let Some(prefix) = self.rule_prefix_if_held(rule)? else {
+                    return Ok(());
+                };
+                let key = queue_key(&prefix, *sequence);
                 let held = self
                     .outboxes
                     .get(key.as_slice())
@@ -1147,7 +1167,11 @@ impl<'txn> Tables<'txn> {
                 }
             }
             Record::OutboxRemoved { rule, sequence } => {
-                let prefix = self.rule_prefix_of(rule)?;
+                // A rule that has gone took the envelope with it, so
+                // there is nothing to subtract and nothing to refuse.
+                let Some(prefix) = self.rule_prefix_if_held(rule)? else {
+                    return Ok(());
+                };
                 let mut state = read_queue_state(&self.outbox_state, &prefix)?;
                 // Only what was actually there is subtracted, for the
                 // reason a queue pop gives.
