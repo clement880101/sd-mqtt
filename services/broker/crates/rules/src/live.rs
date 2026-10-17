@@ -863,24 +863,40 @@ impl Registry {
             |held| Arc::clone(&held.stats),
         );
 
-        // Out of the map, and stopped, before the replacement starts:
-        // two supervisors for one bridge would be two connections to
-        // the remote under one client identifier, which the remote
-        // resolves by closing one of them. This is also what withdraws
-        // an ingest route the replacement may not want back.
-        self.uninstall(&rule.id);
-
-        // Whatever the insert hands back is dropped here, and a
-        // dropped [`Installed`] aborts its pump. Under
-        // [`Registry::changing`] there is never anything to hand back;
-        // see the [`Drop`] implementation for why it is written down
-        // anyway.
+        // **The old entry leaves the map in the same lock acquisition
+        // that puts the new one in.** The hook decides what a
+        // publication fires by reading this map, so any moment with
+        // the rule absent is a publication that matched it and was
+        // written nowhere — the one thing the module note promises
+        // cannot happen. Taking the old entry out first and inserting
+        // the new one after the build was exactly such a moment, and
+        // the build spawned a task in the middle of it.
+        //
+        // The cost is that for the length of one lock acquisition the
+        // old pump is still running beside the new one. For a bridge
+        // that is two connections to the remote under one client
+        // identifier, which the remote resolves by closing one; the
+        // supervisor reconnects from that, where a lost publication
+        // is lost for good. The old pump is stopped **outside** the
+        // lock, because aborting a task can wake a scheduler and
+        // nothing that could take time belongs inside a lock a hook
+        // reads.
+        //
+        // An enabled ingest rule registers its route in `start`,
+        // replacing the old one in place. Anything else serves no
+        // route, so whatever route is held under this identifier is
+        // the old installation's and goes with it.
+        let serves_a_route = rule.enabled
+            && matches!(&rule.action, Action::HttpIn(action) if !action.token.is_empty());
         let installed = self.start(rule, outbox, stats, dlq);
-        drop(
-            self.installed
-                .write()
-                .insert(installed.rule.id.clone(), installed),
-        );
+        let id = installed.rule.id.clone();
+        let replaced = self.installed.write().insert(id.clone(), installed);
+        if let Some(mut replaced) = replaced {
+            replaced.stop();
+        }
+        if !serves_a_route {
+            self.ingest.withdraw(id.as_str());
+        }
         Ok(())
     }
 
@@ -2049,6 +2065,71 @@ mod tests {
             ),
         );
         (registry, store)
+    }
+
+    /// Replacing a running rule never leaves a moment with no rule
+    /// in the map.
+    ///
+    /// The hook decides what a publication fires by reading the map,
+    /// so a moment with the rule absent is a publication that matched
+    /// it and was never written to its outbox — which contradicts the
+    /// promise that a message firing a rule is written down before
+    /// the publisher is answered. The install used to remove the old
+    /// entry, build the new one and then insert it, and the build in
+    /// between spawned a task.
+    ///
+    /// Watched from a thread of its own rather than through a hook,
+    /// because what is being measured is the map the hook reads and
+    /// a thread that does nothing but read it is the widest net for a
+    /// window that is a few microseconds long. Two hundred edits,
+    /// because one would be luck either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacing_a_rule_never_leaves_a_window_without_it() {
+        let (registry, _store) = registry();
+        let rule = a_rule();
+        let id = rule.id.clone();
+        registry
+            .install(rule.clone())
+            .await
+            .expect("the first install");
+
+        let absent = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher = std::thread::spawn({
+            let registry = Arc::clone(&registry);
+            let absent = Arc::clone(&absent);
+            let done = Arc::clone(&done);
+            move || {
+                while !done.load(Ordering::SeqCst) {
+                    if !registry.installed.read().contains_key(&id) {
+                        absent.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        });
+
+        for round in 0..200 {
+            let mut edited = rule.clone();
+            edited.name = format!("Held, edit {round}");
+            // Every other round switches it off and on, which is the
+            // other way an operator replaces a running rule.
+            edited.enabled = round % 2 == 0;
+            registry.install(edited).await.expect("an edit installs");
+            if absent.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        done.store(true, Ordering::SeqCst);
+        watcher.join().expect("the watcher ends");
+
+        assert!(
+            !absent.load(Ordering::SeqCst),
+            "an edit took the rule out of the map before the replacement was in it; a \
+             publication in that window fires nothing"
+        );
+        registry.shutdown().await;
     }
 
     /// A bridge to `address` that carries one filter outwards.
