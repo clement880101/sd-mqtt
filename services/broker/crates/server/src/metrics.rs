@@ -529,6 +529,12 @@ pub enum ShellDrop {
     /// that produced them could not be made durable and the client is
     /// being closed instead.
     NotDurable,
+    /// This connection's own actions, discarded because a newcomer
+    /// took the session over while the batch that produced them was
+    /// waiting on the store. The outbox under the handle is the
+    /// newcomer's, and an acknowledgement for a packet it never sent
+    /// is not something it should read. [MQTT-3.1.4-3].
+    Displaced,
 }
 
 reason_table!(ShellDrop, ALL_SHELL_DROPS, shell_label, shell_index, {
@@ -537,6 +543,7 @@ reason_table!(ShellDrop, ALL_SHELL_DROPS, shell_label, shell_index, {
     NotEncodable => "not_encodable",
     TooLargeToReport => "too_large_to_report",
     NotDurable => "not_durable",
+    Displaced => "displaced",
 });
 
 /// Why a journal record went nowhere.

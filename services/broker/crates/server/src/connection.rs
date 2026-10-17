@@ -48,7 +48,7 @@ use crate::framing::{FrameError, FrameReader};
 use crate::metrics::{AuthOutcome, Limiter, Metrics, ShellDrop, SocketOutcome};
 use crate::rate::PublishLimit;
 use crate::scram;
-use crate::shared::{promises_durability, Shared};
+use crate::shared::{promises_durability, Committed, Shared};
 use storage::SessionKey;
 
 /// What a client's receive maximum is when it does not say.
@@ -1424,17 +1424,59 @@ impl Attached {
             // decided from what came out beside them, under the same
             // lock. The wait is here, after the lock is gone and
             // before a single action is delivered.
-            let ((outcome, actions), committed) = self.shared.with_broker_committed_as(
+            let ((handled, actions), committed) = self.shared.with_broker_committed_as(
                 self.durability,
                 |broker| {
                     let mut out = Vec::new();
+                    // [MQTT-3.1.4-3] and design 8.4: a newcomer on the
+                    // same identifier has taken the session, and the
+                    // handle now names its connection. This one learns
+                    // of that from its outbox closing, but a writer
+                    // blocked on a peer that has stopped reading never
+                    // reaches the close, so the read loop is still
+                    // here. Checked under the same lock `handle` would
+                    // run under, so there is no gap between the two.
+                    if !self.holds(broker) {
+                        return (None, out);
+                    }
                     let outcome = broker.handle(self.subscriber, &packet, &mut out);
-                    (outcome, out)
+                    (Some(outcome), out)
                 },
                 |(_, actions)| promises_durability(actions),
             );
+            let Some(outcome) = handled else {
+                // Displaced. The broker was never told about this
+                // packet, nothing is owed for it, and the session is
+                // not this connection's to close: the newcomer's
+                // close is already in the old outbox, and the writer
+                // delivers it when the peer lets it.
+                return Ok(());
+            };
 
+            // Whether the wait below is a wait at all. A batch that
+            // promised nothing settles at once and the lock span above
+            // is the whole of it; one that waited has let go of the
+            // lock, and the session may have changed hands meanwhile.
+            let waited = !matches!(committed, Committed::Nothing);
             let (durable, confirmed) = committed.settled().await;
+
+            if waited && !self.shared.with_broker(|broker| self.holds(broker)) {
+                // A newcomer took the session over while the store was
+                // keeping this batch's promise. Everything addressed to
+                // somebody else still goes, for the reason given under
+                // the durability failure below; ours would land in the
+                // newcomer's outbox as answers to packets it never
+                // sent, so they are dropped and counted. Not closed:
+                // the close is the newcomer's to send and has been.
+                let (theirs, mine): (Vec<_>, Vec<_>) = actions
+                    .into_iter()
+                    .partition(|(to, _)| *to != self.subscriber);
+                self.metrics
+                    .shell_dropped(ShellDrop::Displaced)
+                    .inc_by(mine.len() as u64);
+                self.shared.deliver(theirs);
+                return Ok(());
+            }
 
             // Section 8.6, before the durability outcome is handled:
             // an acknowledgement no copy confirmed. The publish is
@@ -1735,6 +1777,19 @@ impl Attached {
     /// now that connection's, and disconnecting it here would detach a
     /// live client and arm a will nobody is owed. The same for the
     /// outbox, which by then is the newcomer's.
+    /// Whether the session under the handle is still this connection's.
+    ///
+    /// A takeover raises the session's epoch past the one this
+    /// connection was given, and from then on everything under the
+    /// handle — the outbox, the acknowledgements, the close — is the
+    /// newcomer's. Asked under the broker lock, so the answer is good
+    /// for as long as the caller holds it.
+    fn holds(&self, broker: &Broker) -> bool {
+        broker
+            .session(self.subscriber)
+            .is_some_and(|session| session.epoch() == self.epoch)
+    }
+
     fn detach(&self) {
         let (actions, ours) = self.shared.with_broker(|broker| {
             let superseded = broker
@@ -3191,6 +3246,163 @@ mod tests {
         };
         ours.discard(&action);
         assert_eq!(outstanding(), 0, "and the writer that owns it does settle");
+    }
+
+    /// Wait until the broker has counted `expected` packets of `kind`
+    /// as received on `version`, which is the first thing the read
+    /// loop does with one and so says the packet has been read, whether
+    /// or not anything was done with it.
+    async fn received(shared: &Shared, kind: PacketKind, expected: u64) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if shared.metrics().packet_received(Version::V5, kind).get() >= expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the broker never read the {kind:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The filters the session named `client_id` holds.
+    fn filters_of(shared: &Shared, client_id: &str) -> Vec<String> {
+        shared.with_broker(|broker| {
+            broker
+                .sessions()
+                .find(|(_, session)| &*session.id().client_id == client_id)
+                .map(|(_, session)| session.filters().map(str::to_owned).collect())
+                .unwrap_or_default()
+        })
+    }
+
+    /// [MQTT-3.1.4-3] and design 8.4: a connection displaced by a
+    /// newcomer on the same identifier has no further say over the
+    /// session. The displaced connection learns of it from its outbox
+    /// closing, but a writer blocked on a peer that has stopped
+    /// reading never reaches the close that displaced it, so its read
+    /// loop runs on. A SUBSCRIBE it then sends must neither change the
+    /// session, which is the newcomer's now, nor land its SUBACK in
+    /// the newcomer's outbox. The newcomer's ping is what makes the
+    /// absence a discrimination: its reply must be the next thing the
+    /// newcomer reads.
+    #[tokio::test]
+    async fn a_displaced_connection_whose_writer_is_blocked_does_not_act_on_the_newcomers_session()
+    {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let mut incumbent = serve_one(Arc::clone(&shared));
+        attach(
+            &mut incumbent,
+            "same",
+            Properties::default(),
+            QoS::AtMostOnce,
+        )
+        .await;
+
+        // The incumbent stops reading, and a publisher fills its
+        // socket: the duplex holds 8 KiB, so four times that much
+        // leaves its writer blocked in a write that cannot complete.
+        let mut publisher = serve_one(Arc::clone(&shared));
+        connect_v5(&mut publisher, "publisher").await;
+        for _ in 0..8 {
+            write(
+                &mut publisher,
+                &publication(&[0_u8; 4096], QoS::AtMostOnce, None),
+                Version::V5,
+            )
+            .await;
+        }
+        write(&mut publisher, &Packet::PingReq, Version::V5).await;
+        assert!(matches!(
+            read(&mut publisher, Version::V5).await,
+            Packet::PingResp
+        ));
+
+        let mut newcomer = serve_one(Arc::clone(&shared));
+        connect_v5(&mut newcomer, "same").await;
+
+        // The displaced connection speaks again.
+        write(
+            &mut incumbent,
+            &Packet::Subscribe(mqtt_codec::packet::Subscribe {
+                packet_id: 7,
+                filters: vec![mqtt_codec::packet::SubscriptionOptions {
+                    filter: "stray/#".into(),
+                    qos: QoS::AtMostOnce,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: mqtt_codec::packet::RetainHandling::DoNotSend,
+                }],
+                properties: Properties::default(),
+            }),
+            Version::V5,
+        )
+        .await;
+        received(&shared, PacketKind::Subscribe, 2).await;
+
+        write(&mut newcomer, &Packet::PingReq, Version::V5).await;
+        match read(&mut newcomer, Version::V5).await {
+            Packet::PingResp => {}
+            other => panic!("the newcomer was sent something it never asked for: {other:?}"),
+        }
+        assert!(
+            !filters_of(&shared, "same")
+                .iter()
+                .any(|filter| filter == "stray/#"),
+            "the displaced connection changed the newcomer's session"
+        );
+    }
+
+    /// The same rule after a durability wait. An acknowledgement whose
+    /// flush completed after a newcomer took the session over belongs
+    /// to nobody: the connection that earned it has been displaced,
+    /// and the outbox under the handle is the newcomer's, which would
+    /// read it as a PUBACK for a publication it never sent.
+    #[tokio::test]
+    async fn an_acknowledgement_settled_after_a_takeover_does_not_reach_the_newcomer() {
+        let (shared, store) = with_gated_store();
+        let mut incumbent = serve_one(Arc::clone(&shared));
+        connect_v5(&mut incumbent, "same").await;
+
+        store.hold();
+        write(
+            &mut incumbent,
+            &publication(b"x", QoS::AtLeastOnce, Some(1)),
+            Version::V5,
+        )
+        .await;
+        received(&shared, PacketKind::Publish, 1).await;
+
+        let mut newcomer = serve_one(Arc::clone(&shared));
+        connect_v5(&mut newcomer, "same").await;
+        match read(&mut incumbent, Version::V5).await {
+            Packet::Disconnect(disconnect) => {
+                assert_eq!(disconnect.reason, ReasonCode::SessionTakenOver);
+            }
+            other => panic!("expected the incumbent to be told, got {other:?}"),
+        }
+
+        let flushed = store.flushes();
+        store.release();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while store.flushes() == flushed {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the flush never ran"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The acknowledgement, if it is going anywhere, goes the
+        // moment the flush completes; this is a generous window for
+        // it, and the ping behind it makes the absence a
+        // discrimination rather than a wait.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        write(&mut newcomer, &Packet::PingReq, Version::V5).await;
+        match read(&mut newcomer, Version::V5).await {
+            Packet::PingResp => {}
+            other => panic!("the newcomer was sent something it never asked for: {other:?}"),
+        }
     }
 
     #[tokio::test]
