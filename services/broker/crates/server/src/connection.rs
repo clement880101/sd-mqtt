@@ -1425,6 +1425,7 @@ impl Attached {
                     self.close_with(reason);
                     return Err(ConnectionError::Protocol(reason));
                 }
+                self.note_activity();
                 continue;
             }
             // Before the broker sees it, so that nothing below this
@@ -1459,8 +1460,12 @@ impl Attached {
                 None => {}
                 // Refused and answered. The next packet is read from a
                 // connection that is still open, and the broker was
-                // never told about this one.
-                Some(Refusal::Answered) => continue,
+                // never told about this one — except that it arrived,
+                // which is the one thing keep-alive wants to know.
+                Some(Refusal::Answered) => {
+                    self.note_activity();
+                    continue;
+                }
                 // Refused with nowhere to put a reason but a close.
                 Some(Refusal::Closed) => return Err(ConnectionError::NotWhole(NOT_WHOLE)),
             }
@@ -1715,6 +1720,20 @@ impl Attached {
     fn close_with(&self, reason: ReasonCode) {
         self.shared
             .deliver(vec![(self.subscriber, Action::Close(reason))]);
+    }
+
+    /// Credit the client with a packet this shell answered itself.
+    ///
+    /// [MQTT-3.1.2-22] measures the keep-alive from the last Control
+    /// Packet the client sent, and `Broker::handle` credits every
+    /// packet it is given; the two kinds answered above it, section
+    /// 8.5's refusals and section 12.2's AUTH, must be credited here
+    /// or a client sending nothing else is cut for a silence it never
+    /// kept. A lock acquisition, on paths that are not the packet
+    /// path: a node is gated rarely and re-authenticates rarely.
+    fn note_activity(&self) {
+        self.shared
+            .with_broker(|broker| broker.note_activity(self.subscriber));
     }
 
     /// One AUTH packet from the client, mid-session. Section 12.2.
@@ -5748,17 +5767,20 @@ mod tests {
         username: &str,
         password: &[u8],
     ) -> (ConnAck, bool) {
+        connect_with_scram_keeping(client, username, password, 0).await
+    }
+
+    /// The same, proposing `keep_alive`.
+    async fn connect_with_scram_keeping(
+        client: &mut tokio::io::DuplexStream,
+        username: &str,
+        password: &[u8],
+        keep_alive: u16,
+    ) -> (ConnAck, bool) {
         let (scram, first) = crate::scram::Client::first(username, "client-nonce-0001");
-        write(
-            client,
-            &Packet::Connect(Box::new(scram_connect(
-                "secure",
-                crate::scram::METHOD,
-                first,
-            ))),
-            Version::V5,
-        )
-        .await;
+        let mut connect = scram_connect("secure", crate::scram::METHOD, first);
+        connect.keep_alive = keep_alive;
+        write(client, &Packet::Connect(Box::new(connect)), Version::V5).await;
         let server_first = match read(client, Version::V5).await {
             Packet::Auth(auth) => {
                 assert_eq!(auth.reason, ReasonCode::ContinueAuthentication);
@@ -5883,6 +5905,51 @@ mod tests {
             ),
             other => panic!("expected a connack, got {other:?}"),
         }
+    }
+
+    /// [MQTT-3.1.2-22]: the keep-alive is measured from the last
+    /// Control Packet the client sent, and an AUTH is one, though the
+    /// broker never sees it. A client that does nothing but renew its
+    /// credentials every second on a two second keep-alive was cut in
+    /// the fourth, for a silence it never kept.
+    #[tokio::test]
+    async fn a_client_that_only_re_authenticates_is_still_alive_for_keep_alive() {
+        let shared = with_scram_user("alice", b"pencil");
+        let mut client = serve_one(Arc::clone(&shared));
+        let (ack, _) = connect_with_scram_keeping(&mut client, "alice", b"pencil", 2).await;
+        assert_eq!(ack.reason, ReasonCode::Success);
+
+        for second in 1..=6 {
+            let (scram, first) =
+                crate::scram::Client::first("alice", &format!("client-nonce-{second:04}"));
+            write(
+                &mut client,
+                &auth_packet(ReasonCode::ReAuthenticate, first),
+                Version::V5,
+            )
+            .await;
+            let server_first = match read(&mut client, Version::V5).await {
+                Packet::Auth(auth) => auth.properties.authentication_data.expect("first"),
+                other => panic!("in second {second} the client was sent {other:?}"),
+            };
+            let (_, client_final) = scram.finish(&server_first, b"pencil").expect("finishes");
+            write(
+                &mut client,
+                &auth_packet(ReasonCode::ContinueAuthentication, client_final),
+                Version::V5,
+            )
+            .await;
+            match read(&mut client, Version::V5).await {
+                Packet::Auth(auth) => assert_eq!(auth.reason, ReasonCode::Success),
+                other => panic!("in second {second} the client was sent {other:?}"),
+            }
+            advance(&shared, 1);
+        }
+        assert_eq!(
+            ending(&mut client, Version::V5).await,
+            Ending::Open,
+            "six seconds of AUTH on a two second keep-alive, and the client is still here"
+        );
     }
 
     /// Re-authentication: the same exchange mid-session, answered with
@@ -6279,6 +6346,45 @@ mod tests {
     /// `cluster.strict.publishes` was the only flag set, so the
     /// subscribe must be granted — a flag refusing all three
     /// operations is the third mutation this task names.
+    /// [MQTT-3.1.2-22], on the other packet the shell answers itself:
+    /// a refused publish is still a Control Packet the client sent. A
+    /// client publishing steadily on a node that refuses publishes
+    /// while short was cut for keep-alive in the fourth second.
+    #[tokio::test]
+    async fn a_client_whose_publishes_the_gate_refuses_is_still_alive_for_keep_alive() {
+        let shared = short_by(1, 2, refusing_publishes());
+        let mut client = serve_one(Arc::clone(&shared));
+        write(
+            &mut client,
+            &Packet::Connect(Box::new(connect("sensor", 2))),
+            Version::V5,
+        )
+        .await;
+        assert!(matches!(
+            read(&mut client, Version::V5).await,
+            Packet::ConnAck(_)
+        ));
+
+        for second in 1..=6 {
+            write(
+                &mut client,
+                &publication(b"21.5", QoS::AtLeastOnce, Some(second)),
+                Version::V5,
+            )
+            .await;
+            match read(&mut client, Version::V5).await {
+                Packet::PubAck(ack) => assert_eq!(ack.reason, NOT_WHOLE),
+                other => panic!("in second {second} the client was sent {other:?}"),
+            }
+            advance(&shared, 1);
+        }
+        assert_eq!(
+            ending(&mut client, Version::V5).await,
+            Ending::Open,
+            "six seconds of refused publishes on a two second keep-alive, and the client is still here"
+        );
+    }
+
     #[tokio::test]
     async fn a_refused_publish_is_acknowledged_with_a_reason_and_goes_no_further() {
         let shared = short_by(1, 2, refusing_publishes());

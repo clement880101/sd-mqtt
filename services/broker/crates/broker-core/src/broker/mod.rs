@@ -2527,6 +2527,46 @@ mod tests {
         }
     }
 
+    /// [MQTT-3.1.2-22]: a packet the shell answered itself is still a
+    /// packet the client sent. Credited each second, a two second
+    /// keep-alive survives six; uncredited, the ring gives up in the
+    /// fourth.
+    #[test]
+    fn activity_the_shell_credits_keeps_a_client_alive() {
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let mut connect = connect_v5("gated");
+        connect.keep_alive = 2;
+        let registration = broker
+            .connect("", &connect, &mut out)
+            .expect("the default decision authenticates");
+        let timed_out = |out: &[Addressed]| {
+            out.iter()
+                .any(|(_, action)| matches!(action, Action::Close(ReasonCode::KeepAliveTimeout)))
+        };
+
+        for second in 1..=6 {
+            broker.note_activity(registration.subscriber);
+            out.clear();
+            broker.tick(&mut out);
+            assert!(
+                !timed_out(&out),
+                "cut in second {second} with activity credited every second"
+            );
+        }
+
+        let mut cut = false;
+        for _ in 0..4 {
+            out.clear();
+            broker.tick(&mut out);
+            if timed_out(&out) {
+                cut = true;
+                break;
+            }
+        }
+        assert!(cut, "and without the credit the ring gives up as before");
+    }
+
     #[test]
     fn a_three_one_one_session_with_clean_session_clear_outlives_its_connection() {
         let mut broker = Broker::new(BrokerConfig::default());
@@ -2849,6 +2889,50 @@ mod tests {
             0,
             "the session expired ten seconds after the disconnect packet, not after the close"
         );
+    }
+
+    #[test]
+    fn an_invalid_filter_refuses_only_itself() {
+        // [MQTT-3.8.4-5]: a subscribe of several filters is handled as
+        // a sequence of single-filter subscribes with their answers
+        // combined, so a bad filter earns 0x8F in its slot and the
+        // good one beside it is granted. The codec hands filters
+        // through unjudged for this to be reachable from the network;
+        // this is the contract it hands them to.
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let client = broker
+            .connect("", &connect_v5("c"), &mut out)
+            .expect("the default decision authenticates")
+            .subscriber;
+        let options = |filter: &str| SubscriptionOptions {
+            filter: filter.to_string(),
+            qos: QoS::AtMostOnce,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: RetainHandling::SendAlways,
+        };
+        broker
+            .handle(
+                client,
+                &Packet::Subscribe(Subscribe {
+                    packet_id: 1,
+                    filters: vec![options("a/#/b"), options("ok/+")],
+                    properties: Properties::default(),
+                }),
+                &mut out,
+            )
+            .expect("one bad filter is not a reason to close");
+        let reasons = out.iter().find_map(|(_, action)| match action {
+            Action::Send(Packet::SubAck(ack)) => Some(ack.reasons.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            reasons,
+            Some(vec![ReasonCode::TopicFilterInvalid, ReasonCode::Success]),
+            "{out:?}"
+        );
+        assert_eq!(broker.connected_count(), 1);
     }
 
     /// Advance the broker's clock to `seconds`, running every tick on
