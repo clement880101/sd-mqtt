@@ -12,6 +12,7 @@ import { LocationProvider, Route, Router, useLocation } from 'preact-iso';
 import { useEffect } from 'preact/hooks';
 
 import { lastEventId, start, status } from './live.js';
+import { eventNumber } from './event-id.js';
 import { Clients } from './pages/clients.js';
 import { Cluster } from './pages/cluster.js';
 import { Overview } from './pages/overview.js';
@@ -94,7 +95,7 @@ const SAID = {
  */
 function LiveStatus() {
   const state = status.value;
-  const seen = lastEventId.value;
+  const seen = eventNumber(lastEventId.value);
   return (
     <p class={`live live-${state}`} role="status" aria-live="polite">
       <span class="live-dot" aria-hidden="true" />
