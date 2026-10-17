@@ -53,7 +53,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
@@ -87,13 +87,30 @@ impl Refused {
 }
 
 /// Perform the server handshake, insisting on the `mqtt` subprotocol.
+///
+/// `max_packet_size` is the listener's packet limit, and bounds what
+/// tungstenite will hold of one frame or one message: left at the
+/// library's defaults of 16 and 64 MiB, a client could make the node
+/// buffer that much per connection before the codec ever saw the
+/// packet's declared length and refused it. A frame may carry several
+/// packets, but the connection's reader pulls them from one frame as
+/// a stream, so a frame larger than the largest packet is not
+/// something a client needs to send.
 // The callback's error type is tungstenite's `ErrorResponse`, an HTTP
 // response, and its size is the library's choice rather than ours.
 #[allow(clippy::result_large_err)]
-pub async fn upgrade<S>(socket: S, timeout: Duration) -> Result<Bytes<S>, Refused>
+pub async fn upgrade<S>(
+    socket: S,
+    timeout: Duration,
+    max_packet_size: u32,
+) -> Result<Bytes<S>, Refused>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let limit = usize::try_from(max_packet_size).unwrap_or(usize::MAX);
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(limit))
+        .max_frame_size(Some(limit));
     let offered = Arc::new(AtomicBool::new(false));
     let seen = Arc::clone(&offered);
     let callback = move |request: &Request, mut response: Response| {
@@ -119,7 +136,7 @@ where
     };
     let stream = tokio::time::timeout(
         timeout,
-        tokio_tungstenite::accept_hdr_async(socket, callback),
+        tokio_tungstenite::accept_hdr_async_with_config(socket, callback, Some(config)),
     )
     .await
     .map_err(|_| Refused::TimedOut(timeout))?
@@ -274,15 +291,31 @@ mod tests {
         tokio::task::JoinHandle<Result<(), String>>,
         WebSocketStream<tokio::io::DuplexStream>,
     ) {
+        served_with(protocols, ConnectionConfig::default()).await
+    }
+
+    /// [`served`], with the connection configured by the test.
+    async fn served_with(
+        protocols: &[&str],
+        config: ConnectionConfig,
+    ) -> (
+        StdArc<Shared>,
+        tokio::task::JoinHandle<Result<(), String>>,
+        WebSocketStream<tokio::io::DuplexStream>,
+    ) {
         let shared = StdArc::new(Shared::new(BrokerConfig::default()));
         let (client_half, server_half) = tokio::io::duplex(16 * 1024);
         let serving = tokio::spawn({
             let shared = StdArc::clone(&shared);
             async move {
-                let upgraded = upgrade(server_half, Duration::from_secs(5))
-                    .await
-                    .map_err(|why| why.to_string())?;
-                serve(upgraded, shared, ConnectionConfig::default())
+                let upgraded = upgrade(
+                    server_half,
+                    Duration::from_secs(5),
+                    config.limits.max_packet_size,
+                )
+                .await
+                .map_err(|why| why.to_string())?;
+                serve(upgraded, shared, config)
                     .await
                     .map_err(|why| why.to_string())
             }
@@ -385,16 +418,49 @@ mod tests {
         );
     }
 
+    /// A frame declaring more than the packet limit is refused from its
+    /// header, before any of the body is held: tungstenite's own
+    /// defaults would have buffered up to 64 MiB per connection whatever
+    /// `max_packet_size` said. The duplex holds 16 KiB, so the client's
+    /// send can only complete if the server drains the frame.
+    #[tokio::test]
+    async fn a_frame_above_the_packet_limit_is_refused_before_it_is_buffered() {
+        let config = ConnectionConfig {
+            limits: Limits {
+                max_packet_size: 64,
+                ..Limits::default()
+            },
+            ..ConnectionConfig::default()
+        };
+        let (_shared, serving, mut client) = served_with(&["mqtt"], config).await;
+        let oversized = bytes::Bytes::from(vec![0_u8; 1 << 20]);
+        let sent = client.send(Message::Binary(oversized)).await;
+        let ended = serving.await.expect("the task finishes");
+        assert!(
+            ended.is_err(),
+            "the connection ended in an error: {ended:?}"
+        );
+        assert!(
+            sent.is_err(),
+            "the server stopped reading at the frame header, so the send could not drain"
+        );
+    }
+
     /// Without the subprotocol the upgrade is refused with 400 and
     /// nothing is served.
     #[tokio::test]
     async fn an_upgrade_without_the_mqtt_subprotocol_is_refused() {
         let shared = StdArc::new(Shared::new(BrokerConfig::default()));
         let (client_half, server_half) = tokio::io::duplex(16 * 1024);
-        let upgrading =
-            tokio::spawn(
-                async move { upgrade(server_half, Duration::from_secs(5)).await.map(drop) },
-            );
+        let upgrading = tokio::spawn(async move {
+            upgrade(
+                server_half,
+                Duration::from_secs(5),
+                Limits::default().max_packet_size,
+            )
+            .await
+            .map(drop)
+        });
         drop(shared);
         let request = "ws://localhost/".into_client_request().expect("a request");
         let refused = tokio_tungstenite::client_async(request, client_half)

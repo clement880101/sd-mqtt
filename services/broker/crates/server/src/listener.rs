@@ -436,7 +436,13 @@ async fn upgraded<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    match websocket::upgrade(socket, config.connect_timeout).await {
+    match websocket::upgrade(
+        socket,
+        config.connect_timeout,
+        config.limits.max_packet_size,
+    )
+    .await
+    {
         Ok(stream) => Some(stream),
         Err(refused) => {
             shared.metrics().websocket_refused(refused.label()).inc();
