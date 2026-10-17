@@ -1206,12 +1206,18 @@ is replayed from the ring, and a browser asking for an identifier that has
 fallen out of it is sent a resynchronise event telling it to refetch rather
 than a quiet gap. Every dropped event is counted.
 
-**A stream must end when the broker stops.** Graceful shutdown waits for
-every open connection, and the body of an events stream never ends on its
-own, so one browser tab left open on the Overview page would stop the broker
-exiting. Since a clean stop is how sessions reach disk, that is not a
-cosmetic bug. Each stream selects on the same shutdown signal the listener
-does, and the whole admin server is bounded by a timeout as a backstop.
+**A stream must end when the broker stops.** The admin server's graceful
+shutdown waits for every open HTTP connection, and the body of an events
+stream never ends on its own, so one browser tab left open on the Overview
+page would stop the broker exiting. Since a clean stop is how sessions reach
+disk, that is not a cosmetic bug. Each stream selects on the same shutdown
+signal the listener does, and the whole admin server is bounded by a timeout
+as a backstop. As built, that wait is the admin listener's alone: the MQTT
+listener stops accepting, releases its port and signals every connection,
+but waits for none of them — each discharges its disconnect obligation as it
+unwinds, and an idle client must not be able to hold the process open. A
+second stop signal during the stop ends the process at once, with the exit
+status of a process that signal killed.
 
 **The admin listener speaks HTTP/1.1, and the stream costs a connection.**
 Browsers allow six per origin and an events stream holds one for the life of
