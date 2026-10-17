@@ -141,6 +141,20 @@ use serde::{Deserialize, Serialize};
 /// number says which one it is. Redefining a number already written to
 /// somebody's disk is how a silent misread happens.
 ///
+/// Version 11 added the directory, sections 11.1 and 12: users first,
+/// as [`Record::UserPut`] and [`Record::UserDeleted`], and then, within
+/// the same unreleased milestone and under the same number, access
+/// control rules and API keys as [`Record::AclPut`],
+/// [`Record::AclDeleted`], [`Record::ApiKeyPut`] and
+/// [`Record::ApiKeyDeleted`]. Six variants at the end of [`Record`],
+/// the matching variants of [`MetadataKeyRecord`] and
+/// [`MetadataValueRecord`] for the registers that replicate them, and a
+/// table each in each backend. **A version 10 store opened by this build
+/// holds no users, no rules and no keys**, which on a broker that
+/// refuses anonymous clients is a broker nobody can log in to and no
+/// key can administer — louder than version 7's failure, and refused
+/// for the same reason.
+///
 /// # Why the owner's position is stored at all
 ///
 /// A follower refuses anything at or below its mark, which is what
