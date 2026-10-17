@@ -32,18 +32,18 @@ UI-configurable integrations, distributed under the MIT license.
 
 ## 3. Provenance and licensing
 
-VerneMQ and Mosquitto were studied as reference implementations. Their
-observable behavior and documented configuration are summarized in
-`docs/research/vernemq-analysis.md` and
-`docs/research/mosquitto-analysis.md`. No source code, comments, or
-distinctive implementation structures from either project were copied or
-translated. Where those analyses identify a behavior required by the MQTT
+VerneMQ and Mosquitto were studied as reference implementations: their
+observable behavior and documented configuration were summarized in two
+analyses written before this design, which were working notes and are not
+part of the repository. No source code, comments, or distinctive
+implementation structures from either project were copied or translated.
+Where those analyses identified a behavior required by the MQTT
 specification, that requirement is implemented independently from the
 specification text.
 
 The project is MIT licensed. Dependencies must be MIT-compatible permissive.
 The full policy, including the distinction between distributed code and
-build-time tooling, is in `docs/research/component-selection.md`.
+build-time tooling, is in `docs/components.md`.
 
 **The attribution is inside the binary, because that is what a user
 receives.** `sdmqtt licenses` prints it and the admin listener serves it at
@@ -84,9 +84,13 @@ sd-mqtt/
     web/                     Preact admin UI, built into the binary
       .devcontainer/devcontainer.json
   docs/
-    research/                reference analyses, component selection
-    superpowers/specs/       this document
-    adr/                     decisions made during implementation
+    design.md                this document
+    components.md            every third-party component and why
+    setup.md                 from nothing to a three-node cluster
+    features/                one page per feature
+    decisions/               decisions made during implementation
+    conventions.md           the rules the project works by
+    development.md           building, conformance, the containers
 ```
 
 Crate dependencies point one way: `mqtt-codec` depends on nothing in the
@@ -1219,7 +1223,7 @@ interface therefore opens exactly one stream for the whole application
 rather than one per page, and the limit is revisited when TLS lands.
 **Revisited in milestone 7 and kept:** TLS landed on the MQTT listeners,
 not the admin listener, so there is still nothing for a browser to
-negotiate HTTP/2 over. See [decision 0004](../../decisions/0004-admin-http2.md).
+negotiate HTTP/2 over. See [decision 0004](decisions/0004-admin-http2.md).
 
 ### 11.2 UI
 
@@ -1278,7 +1282,7 @@ stream.
 **The sparklines are deferred to milestone 4.** There is no such element in
 the interface and there was no note saying why, which convention 8's walk
 found. The technique was chosen deliberately — one SVG path per row rather
-than one canvas per row, in `docs/research/component-selection.md` — and then
+than one canvas per row, in `docs/components.md` — and then
 vanished without a trace, which is the shape of a forgotten feature rather
 than a deferred one.
 
@@ -1651,7 +1655,7 @@ with a store and no clients — and 19.4 MB for the static musl build that
 ships, idle on Linux, which is the figure the table carries, the bundle at 67.4 KB with the Settings page,
 and thirty-one direct dependencies. The connection target is met: 100,000
 held for a minute on one node, measured by `scripts/connection-target.sh` on
-the machine [decision 0001](../../decisions/0001-connection-target.md)
+the machine [decision 0001](decisions/0001-connection-target.md)
 names, at about 32 KB of broker memory each. The column had gone stale a second
 time, reading milestone 3's figures against a binary two and a half times
 that size; the paragraphs below are kept as the record of the first
@@ -1750,7 +1754,7 @@ shippable.
    the authentication and access control UI, rate limits, a configurable
    maximum quality of service and retain availability, the container image,
    cross-compiled release artifacts and documentation (the platforms are
-   [decision 0005](../../decisions/0005-platforms.md)). Carries section 12.3's
+   [decision 0005](decisions/0005-platforms.md)). Carries section 12.3's
    refusal of a client publishing to a dollar-prefixed topic, deferred from
    milestone 3: it needs a reason code per protocol version and it adds a
    classified line to the conformance baseline, both of which belong with the
@@ -1872,10 +1876,10 @@ needs it, and the resolution is recorded as an architecture decision record.
 - **SCRAM iteration count default — settled.** 4,096, measured and kept:
   the server never pays it at connect, a laptop pays 0.3 ms, and a verifier
   exists only for users explicitly enrolled. See
-  [decision 0002](../../decisions/0002-scram-iterations.md).
+  [decision 0002](decisions/0002-scram-iterations.md).
 - **Channel binding — settled.** Not offered in this release: where TLS ends
   at a proxy the broker cannot bind to the client's channel at all. See
-  [decision 0003](../../decisions/0003-channel-binding.md).
+  [decision 0003](decisions/0003-channel-binding.md).
 - **Conformance suite choice — settled.** Eclipse Paho's interoperability
   tests, `eclipse-paho/paho.mqtt.testing`, pinned at commit
   `9d7bb80bb8b9d9cfc0b52f8cb4c1916401281103`. It is maintained by the Paho

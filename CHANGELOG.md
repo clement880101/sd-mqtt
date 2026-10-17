@@ -20,6 +20,11 @@ the milestone you are moving to.** Everything else is description.
   `docs/README.md` indexes it all. `scripts/test_docs_links.py` follows
   every relative link.
 
+- **The working documents are gone from the repository.** The milestone
+  plans, the reference-broker analyses and the milestone 3 demonstration
+  were how it was built, not what ships. The design is now
+  `docs/design.md` and the component selection `docs/components.md`.
+
 ### Fixed
 
 - **At the node a session is moving to**, a forward that arrives right

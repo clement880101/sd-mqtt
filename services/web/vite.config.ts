@@ -35,7 +35,7 @@ const KNOWN_IN_BUNDLE = 'preact';
  *
  * The same policy as `deny.toml` applies to the Rust side, minus the
  * identifiers that only ever appear on a crate. Section "License
- * policy" of docs/research/component-selection.md: the project's own
+ * policy" of docs/components.md: the project's own
  * code is MIT and third-party code is MIT-compatible permissive,
  * which is a broader statement and not the same one.
  */

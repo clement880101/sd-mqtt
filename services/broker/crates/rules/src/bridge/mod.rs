@@ -63,7 +63,7 @@
 //!
 //! # No client library, and the reason is not weight
 //!
-//! Recorded in `docs/research/component-selection.md`: the one
+//! Recorded in `docs/components.md`: the one
 //! considered fails this project's advisory gate today through a pin
 //! only its maintainer can move, would link a second cryptography
 //! provider, a second root-trust mechanism, a second logging facade and

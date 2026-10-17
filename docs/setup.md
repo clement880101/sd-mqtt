@@ -193,4 +193,4 @@ setting trades.
 
 - [Features](README.md#features), one page each.
 - [Every setting](../README.md#configuration-reference).
-- [The design](superpowers/specs/2026-09-19-sd-mqtt-design.md), for why.
+- [The design](design.md), for why.

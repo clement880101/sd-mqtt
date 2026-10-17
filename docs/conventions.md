@@ -1,7 +1,7 @@
 # Conventions
 
-Rules this project works by, each earned by a specific failure. Plans
-reference this rather than restating it, so the list can grow.
+Rules this project works by, each earned by a specific failure. The code and the design cite these by number rather than restating
+them, so the list only grows.
 
 ## 1. The writer refuses what the reader rejects
 

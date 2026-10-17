@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """A very small MQTT 3.1.1 client, for driving a broker by hand.
 
-This exists because `docs/milestone-3-demonstration.md` gives numbers
-that nobody can reproduce without a client, and this repository has
+This exists because milestone 3's demonstration gave numbers that
+nobody could reproduce without a client, and this repository has
 none: the conformance suite in `services/broker/conformance` is a
 conformance suite, not a tool, and it cannot be pointed at a port or
 asked to hold four hundred connections open.

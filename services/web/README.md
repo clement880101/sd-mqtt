@@ -223,7 +223,7 @@ and milestone three deferred them to milestone four because until
 per-rule statistics existed there was nothing to draw.
 
 **One SVG path per row, not one chart per row.** That is what
-`docs/research/component-selection.md` chose and the reason it gave:
+`docs/components.md` chose and the reason it gave:
 a chart library instance per table row does not scale, and a table of
 two hundred rules is two hundred of whatever is picked. uPlot stays on
 the Overview page, where there are two plots and both want axes, a

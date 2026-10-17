@@ -48,7 +48,7 @@ uuid = { version = "1", default-features = false, features = ["v7", "std"] }
 #
 # **Already linked, transitively, through the TLS stack**, so naming it
 # here costs one more direct dependency of the thirty-five allowed and
-# no new crates at all: `docs/research/component-selection.md` measured
+# no new crates at all: `docs/components.md` measured
 # a byte-identical lock file and this build reproduced it, which is the
 # check worth doing rather than the claim worth repeating.
 #

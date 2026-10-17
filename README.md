@@ -5,9 +5,9 @@ replicated queues, rules and connectors, authentication and the admin
 interface are in the one binary, with no enterprise edition and no
 open-core line. No external dependencies.
 
-Status: **0.7.1**. See `docs/superpowers/specs/` for
-the design, `docs/superpowers/plans/` for how it was built and
-`docs/decisions/` for the questions that were settled by measurement.
+Status: **0.7.1**. [The design](docs/design.md) is what it was built
+against, and [the decisions](docs/decisions/README.md) are the questions
+that were settled by measurement.
 `CHANGELOG.md` is what to read before upgrading: before 1.0 the stored
 format may move, and a store written by an earlier build is refused
 rather than migrated.
@@ -157,4 +157,4 @@ green local suite says nothing about either.
 
 The policy behind all of this — which code is distributed, which is
 build tooling, and what each license asks for — is in
-`docs/research/component-selection.md`.
+`docs/components.md`.

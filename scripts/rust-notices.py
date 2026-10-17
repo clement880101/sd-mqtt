@@ -23,7 +23,7 @@ Not build-dependencies, which run and are thrown away. Not
 procedural-macro crates, which run in the compiler: what reaches the
 binary is the code they expand to, which is the expanding crate's own
 output, and the macro crate itself is a build tool by any reading of
-the two categories in docs/research/component-selection.md.
+the two categories in docs/components.md.
 
 A dependency graph is still a manifest, though, and the point of
 section 11.2's rule is to not trust one. So `--check` reads the
@@ -62,7 +62,7 @@ two it is saying.
 
 # Why not cargo-about
 
-docs/research/component-selection.md named `cargo-about`. It was
+docs/components.md named `cargo-about`. It was
 configured nowhere, and adopting it now would put a second tool in
 every contributor's path and in three CI jobs to produce a file this
 does in one script, with only `cargo` and `python3` — which is what

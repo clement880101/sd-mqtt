@@ -29,8 +29,7 @@ def anchors(markdown: Path) -> set[str]:
     return found
 
 
-# The specs and plans under docs/superpowers are working documents that
-# use rustdoc-style links; the pages a reader is sent to are these.
+# The pages a reader is sent to; every relative link in them resolves.
 PAGES = [ROOT / "README.md", ROOT / "CHANGELOG.md", ROOT / "services/web/README.md",
          *ROOT.glob("docs/*.md"), *ROOT.glob("docs/features/*.md"), *ROOT.glob("docs/decisions/*.md")]
 for page in PAGES:

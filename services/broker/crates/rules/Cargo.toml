@@ -58,7 +58,7 @@ axum = { version = "0.8", default-features = false, features = [
 # HTTPS endpoint pulls it forward by three milestones. The client half
 # of `hyper-util` is nearly free because axum already brought hyper;
 # everything else in the jump is TLS. Measured, recorded and accepted in
-# `docs/research/component-selection.md`.
+# `docs/components.md`.
 hyper = { version = "1", default-features = false, features = ["client", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client", "client-legacy", "http1", "tokio"] }
 # `webpki-tokio` rather than `native-tokio`: a distroless image has no

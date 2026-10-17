@@ -1,7 +1,7 @@
 /**
  * A sparkline: one SVG path per table row, hand drawn.
  *
- * **One path, not one chart.** `docs/research/component-selection.md`
+ * **One path, not one chart.** `docs/components.md`
  * chose this over a chart instance per row and gave the reason: a
  * chart library instance per table row does not scale, and a table of
  * two hundred rules is two hundred of whatever is chosen. uPlot is on

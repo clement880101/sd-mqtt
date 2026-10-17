@@ -35,7 +35,7 @@ storage = { path = "../storage", version = "0.7.1", default-features = false }
 # `tower-log` routes tower's internals through a second logging facade
 # beside the tracing this project standardised on, and the form
 # extractor widens the surface of a JSON-only API. See the "Verified
-# again before milestone 3" notes in docs/research/component-selection.md.
+# again before milestone 3" notes in docs/components.md.
 #
 # What is kept: `http1` because section 11.1 says HTTP/2 is deliberately
 # absent until TLS lands, `tokio` for `axum::serve` and its graceful

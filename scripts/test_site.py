@@ -87,7 +87,7 @@ def main() -> int:
     missing = [p for p in paths if not (ROOT / p.split("#")[0]).exists()]
     check("every repository path linked exists", not missing, str(missing))
 
-    evidence = (ROOT / "docs/superpowers/specs/2026-09-19-sd-mqtt-design.md").read_text()
+    evidence = (ROOT / "docs/design.md").read_text()
     evidence += "".join(p.read_text() for p in (ROOT / "docs/decisions").glob("*.md"))
     evidence += (ROOT / "README.md").read_text()
     evidence += "".join(p.read_text() for p in (ROOT / "docs").glob("**/*.md"))

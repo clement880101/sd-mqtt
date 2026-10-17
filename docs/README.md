@@ -33,10 +33,10 @@ reports.
 
 ## Design
 
-- [The design](superpowers/specs/2026-09-19-sd-mqtt-design.md) — the
-  specification every milestone was built against, with as-built notes.
+- [The design](design.md) — the specification every milestone was built
+  against, with as-built notes.
 - [Decisions](decisions/README.md) — the questions settled by measurement.
+- [Components](components.md) — every third-party component, why it was
+  chosen, and what its licence asks.
 - [Conventions](conventions.md) — the rules the project works by, each
   earned by a failure.
-- [Research](research/) — the component selection and the brokers read
-  before this one was designed.
