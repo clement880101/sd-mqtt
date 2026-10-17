@@ -161,10 +161,10 @@
   <a class="brand" href="#">sd-mqtt</a>
   <nav aria-label="Sections">
     <ul>
+      <li><a href="#does">What it does</a></li>
       <li><a href="#measured">Measured</a></li>
       <li><a href="#compared">Beside the others</a></li>
       <li><a href="#run">Run it</a></li>
-      <li><a href="#does">What it does</a></li>
       <li><a href="https://github.com/clement880101/sd-mqtt">GitHub</a></li>
     </ul>
   </nav>
@@ -189,6 +189,28 @@
         <a class="button primary" href="https://github.com/clement880101/sd-mqtt/releases/tag/v0.7.1">Download 0.7.1</a>
         <a class="button" href="https://github.com/clement880101/sd-mqtt/blob/main/README.md">Read the documentation</a>
       </div>
+    </div>
+  </section>
+
+  <section class="part" id="does" aria-labelledby="does-title">
+    <div class="wrap">
+      <h2 id="does-title">What it does</h2>
+      <dl class="does">
+        <dt>MIT licensed, every feature</dt>
+        <dd>One licence over the whole repository and the whole binary. Clustering, replication, rules, authentication and the interface are not an upgrade; they are the product. The notices for everything compiled in ship inside every archive and image.</dd>
+        <dt>MQTT 3.1.1 and 5</dt>
+        <dd>Shared subscriptions, retained messages, wills, topic aliases and enhanced authentication, checked against Eclipse Paho's interoperability suite over TCP, TLS and WebSocket.</dd>
+        <dt>Durable when you give it a directory</dt>
+        <dd>Sessions, their subscriptions and their queued messages survive a restart, and no publisher is acknowledged before its message is on the disk.</dd>
+        <dt>Clustering</dt>
+        <dd>Nodes route to each other's subscribers, move a session to wherever its client reconnects, and keep each queue on more than one node. In synchronous mode, losing the node that owns a queue loses none of it.</dd>
+        <dt>Rules and connectors</dt>
+        <dd>Send matching messages to HTTP endpoints, accept HTTP posts as publications, poll an API, or bridge to another broker, with a durable outbox and dead letters for what could not be delivered.</dd>
+        <dt>Who may do what</dt>
+        <dd>Users with argon2 passwords or SCRAM-SHA-256, access control rules by user or client, API keys with read, write and admin scopes, and limits on publish rate and failed logins.</dd>
+        <dt>An interface in the broker</dt>
+        <dd>Live rates, connected clients, a topic browser that watches messages as they arrive, rule statistics, cluster health, and settings, served by the broker itself.</dd>
+      </dl>
     </div>
   </section>
 
@@ -257,28 +279,6 @@ cd sdmqtt-0.7.1-x86_64-unknown-linux-musl
           </div>
         </div>
       </div>
-    </div>
-  </section>
-
-  <section class="part" id="does" aria-labelledby="does-title">
-    <div class="wrap">
-      <h2 id="does-title">What it does</h2>
-      <dl class="does">
-        <dt>MIT licensed, every feature</dt>
-        <dd>One licence over the whole repository and the whole binary. Clustering, replication, rules, authentication and the interface are not an upgrade; they are the product. The notices for everything compiled in ship inside every archive and image.</dd>
-        <dt>MQTT 3.1.1 and 5</dt>
-        <dd>Shared subscriptions, retained messages, wills, topic aliases and enhanced authentication, checked against Eclipse Paho's interoperability suite over TCP, TLS and WebSocket.</dd>
-        <dt>Durable when you give it a directory</dt>
-        <dd>Sessions, their subscriptions and their queued messages survive a restart, and no publisher is acknowledged before its message is on the disk.</dd>
-        <dt>Clustering</dt>
-        <dd>Nodes route to each other's subscribers, move a session to wherever its client reconnects, and keep each queue on more than one node. In synchronous mode, losing the node that owns a queue loses none of it.</dd>
-        <dt>Rules and connectors</dt>
-        <dd>Send matching messages to HTTP endpoints, accept HTTP posts as publications, poll an API, or bridge to another broker, with a durable outbox and dead letters for what could not be delivered.</dd>
-        <dt>Who may do what</dt>
-        <dd>Users with argon2 passwords or SCRAM-SHA-256, access control rules by user or client, API keys with read, write and admin scopes, and limits on publish rate and failed logins.</dd>
-        <dt>An interface in the broker</dt>
-        <dd>Live rates, connected clients, a topic browser that watches messages as they arrive, rule statistics, cluster health, and settings, served by the broker itself.</dd>
-      </dl>
     </div>
   </section>
 
