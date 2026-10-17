@@ -246,6 +246,16 @@ impl Replication {
         };
         let session = change.session.clone();
         let (taken, through) = copies.arrived(&session, from.to_bytes(), change.at, change.change);
+        let Some(through) = through else {
+            // **Not this copy's stream, and nothing is said.** The
+            // session has a new owner, or its owner has started it over,
+            // and the copy this node held is of a stream that ended. A
+            // mark answered here would be read against the new stream
+            // and would make the owner believe a copy exists; silence is
+            // a follower with no mark, which is what `repairing` sends
+            // the whole queue to. See `Copies::arrived`.
+            return Vec::new();
+        };
 
         // **Written aside, not through the broker.** A copy is not a
         // session this node serves: putting it through the broker

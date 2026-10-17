@@ -254,7 +254,7 @@ fn a_stream_for_a_session_this_node_has_never_heard_of_starts_following_it() {
 
     let (taken, through) = copies.arrived(&session, ALPHA, 1, appended(1));
     assert_eq!(taken.len(), 1);
-    assert_eq!(through, 1);
+    assert_eq!(through, Some(1));
     assert!(copies.follows(&session));
     assert_eq!(copies.through(&session), Some(1));
 }
@@ -271,7 +271,8 @@ fn a_change_behind_a_hole_takes_nothing_and_still_reports_the_mark() {
     let (taken, through) = copies.arrived(&session, ALPHA, 3, appended(3));
     assert!(taken.is_empty(), "three is not next");
     assert_eq!(
-        through, 1,
+        through,
+        Some(1),
         "and the mark says so rather than saying nothing"
     );
 
@@ -282,7 +283,7 @@ fn a_change_behind_a_hole_takes_nothing_and_still_reports_the_mark() {
         vec![2, 3],
         "the one offered, then what was waiting behind it"
     );
-    assert_eq!(through, 3);
+    assert_eq!(through, Some(3));
 }
 
 #[test]
@@ -513,7 +514,8 @@ fn a_snapshot_replaces_whatever_copy_was_held_and_sets_the_mark() {
     let (taken, through) = copies.arrived(&session, ALPHA, 9, snapshot);
     assert_eq!(taken.len(), 1, "the snapshot itself is what to apply");
     assert_eq!(
-        through, 9,
+        through,
+        Some(9),
         "the mark is the owner's position, not the next one"
     );
     assert_eq!(copies.through(&session), Some(9));
@@ -528,6 +530,80 @@ fn a_snapshot_replaces_whatever_copy_was_held_and_sets_the_mark() {
         [(10, _)]
     ));
     assert_eq!(copies.through(&session), Some(10));
+}
+
+/// A stream from a new owner is not measured against the old owner's
+/// mark. Section 8.6's failover, after section 8.4's migration.
+///
+/// A session that moved is streamed by its new owner from position one.
+/// Before this the follower kept the entry it had for the old owner and
+/// offered the new stream to it, so position one was a duplicate of a
+/// mark at five, nothing was applied, and the mark it answered with made
+/// the new owner believe a copy existed: every synchronous publish was
+/// acknowledged against a copy frozen at the pre-move queue. Now a change
+/// from a node other than the recorded owner — or at position one for a
+/// session already followed, which is only ever the start of a stream —
+/// ends this copy: nothing is applied, and nothing is said, so the new
+/// owner sees a follower with no mark and sends the snapshot that starts
+/// it over.
+#[test]
+fn a_stream_from_a_new_owner_ends_the_old_copy_and_waits_for_a_snapshot() {
+    use storage::record::{ProtocolVersion, SessionRecord};
+    let copies = Copies::new();
+    let session = key("rover");
+    for at in 1..=5 {
+        copies.arrived(&session, ALPHA, at, appended(at));
+    }
+    assert_eq!(copies.through(&session), Some(5));
+
+    // Beta claimed the session and streams it from one.
+    let (taken, through) = copies.arrived(&session, BETA, 1, appended(6));
+    assert!(
+        taken.is_empty(),
+        "a stream this copy is not of is not applied"
+    );
+    assert_eq!(
+        through, None,
+        "and no mark is answered: the old mark would be read as a copy of the new stream"
+    );
+    assert_eq!(
+        copies.through(&session),
+        None,
+        "this node no longer holds a copy failover could be offered"
+    );
+    // Beta's next change is not picked up partway either: following
+    // from two would answer a mark, and a mark is what stops the owner
+    // repairing.
+    let (taken, through) = copies.arrived(&session, BETA, 2, appended(7));
+    assert!(taken.is_empty());
+    assert_eq!(through, None, "silence, so the owner sends the snapshot");
+    assert!(!copies.follows(&session));
+
+    // Beta's snapshot starts the follower over, at Beta's position.
+    let snapshot = Change::Snapshot {
+        session: Box::new(SessionRecord {
+            key: session.clone(),
+            version: ProtocolVersion::V5,
+            expiry_interval: 300,
+            expires_at: None,
+            will: None,
+            will_at: None,
+        }),
+        entries: vec![],
+    };
+    let (taken, through) = copies.arrived(&session, BETA, 1, snapshot);
+    assert_eq!(taken.len(), 1);
+    assert_eq!(through, Some(1));
+    let (taken, through) = copies.arrived(&session, BETA, 2, appended(8));
+    assert_eq!(taken.len(), 1, "the next change is next");
+    assert_eq!(through, Some(2));
+
+    // A frame from the old owner arriving late is the same thing the
+    // other way round, and does not flip the copy back.
+    let (taken, through) = copies.arrived(&session, ALPHA, 6, appended(9));
+    assert!(taken.is_empty());
+    assert_eq!(through, None);
+    assert_eq!(copies.through(&session), Some(2), "Beta's copy stands");
 }
 
 /// A follower placement names, that has not reported yet, is waited

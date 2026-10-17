@@ -2419,6 +2419,122 @@ async fn killing_the_owner_does_not_lose_the_queue() {
     }
 }
 
+/// A session that moved is copied under its new owner. Section 8.6,
+/// after section 8.4.
+///
+/// The session chosen is one rendezvous ranks gamma first for, because
+/// gamma is then the node that follows it both before and after a move
+/// from alpha to beta: the follower is the highest-ranked node that is
+/// not the owner. That is the case that failed. The follower kept the
+/// entry it had for alpha's stream, read beta's stream from position
+/// one as a duplicate of its own mark, applied nothing and answered the
+/// old mark, so beta believed the copy was current while it was frozen
+/// at the pre-move queue. Killing beta and coming back to alpha is what
+/// makes that visible: the message published after the move has to come
+/// from gamma's copy, and before the fix it was not in it.
+///
+/// The ranking is computed here with the crate's own `place`, from the
+/// identities the nodes report, because a session whose copy merely
+/// *lands* on gamma under alpha may rank alpha first and gamma second,
+/// and under beta that session's follower is alpha — which never held
+/// a copy and is not the case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_that_moved_is_copied_under_its_new_owner() {
+    const BEFORE: &str = "before-the-move";
+    const AFTER: &str = "after-the-move";
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let mut cluster = Cluster::start(directory.path()).await;
+    cluster.settle();
+
+    let identities: Vec<cluster::NodeId> = cluster
+        .nodes
+        .iter()
+        .map(|node| cluster::NodeId::parse(&node.identity()).expect("a node reports a UUID"))
+        .collect();
+    let weighted: Vec<cluster::Weighted> = identities
+        .iter()
+        .map(|id| cluster::Weighted::new(*id))
+        .collect();
+    let (client, topic) = (0..64u64)
+        .map(|nth| (format!("rover-{nth}"), format!("fleet/{nth}/telemetry")))
+        .find(|(client, _)| {
+            let ranked = cluster::place(
+                &storage::SessionKey::new("", client),
+                &weighted,
+                cluster::Factor::default(),
+            );
+            ranked.first() == Some(&identities[2])
+        })
+        .expect("of sixty-four sessions, rendezvous ranks gamma first for one");
+
+    let held = |cluster: &Cluster, at: usize| {
+        cluster.nodes[at]
+            .counter("sdmqtt_replica_sessions")
+            .unwrap_or(0)
+    };
+    // The session on alpha, with one queued message, copied to gamma.
+    let (mut rover, _) = Client::resuming(cluster.nodes[0].mqtt, &client);
+    rover.subscribe(&topic);
+    drop(rover);
+    until("beta learns that somebody wants the filter", || {
+        cluster.nodes[1].publish_reaching(&topic, BEFORE) > 0
+    });
+    until("gamma holds the copy", || held(&cluster, 2) == 1);
+    let on_gamma = 1;
+
+    // ---- the client comes back to beta, and the session moves ----
+    let (mut rover, present) = Client::resuming(cluster.nodes[1].mqtt, &client);
+    assert!(present, "the session moved with the client");
+    assert_eq!(
+        rover.delivered_within(PATIENCE),
+        Some((topic.clone(), BEFORE.to_owned())),
+        "what the session held before the move was drained to beta"
+    );
+    drop(rover);
+    until("alpha routes to the session's new node", || {
+        cluster.nodes[0].publish_reaching(&topic, AFTER) > 0
+    });
+
+    // Gamma's copy was of alpha's stream. It must be started over for
+    // beta's, and the only way that happens is beta sending it the
+    // queue as a repair, because the copy said nothing to beta's
+    // stream. Before the fix nothing here was ever repaired.
+    until("beta starts gamma's copy over", || {
+        cluster.nodes[1].counter("sdmqtt_replica_repairs_done_total") >= Some(1)
+    });
+    until("the copy is back and current", || {
+        held(&cluster, 2) == on_gamma
+            && cluster.nodes[1].counter("sdmqtt_replication_lag") == Some(0)
+    });
+
+    // ---- the new owner dies, and the client comes back to alpha ----
+    let beta = cluster.nodes[1].kill();
+    until("the survivors declare beta dead", || {
+        [0, 2]
+            .iter()
+            .all(|at| cluster.nodes[*at].how(&beta).as_deref() == Some("down"))
+    });
+    let (mut rover, present) = Client::resuming(cluster.nodes[0].mqtt, &client);
+    assert!(present, "the session was found: pulled from gamma's copy");
+    let mut delivered = Vec::new();
+    while let Some(delivery) = rover.delivered_within(Duration::from_secs(5)) {
+        delivered.push(delivery);
+        if delivered.len() == 2 {
+            break;
+        }
+    }
+    assert!(
+        delivered.contains(&(topic.clone(), AFTER.to_owned())),
+        "the message published after the move was not in the copy: {delivered:?}"
+    );
+    assert_eq!(
+        cluster.nodes[0].counter("sdmqtt_sessions_pulled_total"),
+        Some(1),
+        "alpha pulled the queue from the copy"
+    );
+}
+
 /// Of two copies, the one furthest ahead is the one taken.
 ///
 /// **This is the test the chooser exists for.** With a factor of three

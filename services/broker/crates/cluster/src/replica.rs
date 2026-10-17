@@ -501,13 +501,40 @@ impl Copies {
     /// `owner` is taken so that a stream arriving for a session this
     /// node has never heard of begins following it, which is what makes
     /// a new replica set start without a handshake of its own.
+    ///
+    /// # A copy is of one stream, and a stream has one owner
+    ///
+    /// A mark of `None` is this node holding no copy of the stream
+    /// that `change` belongs to, and the caller says nothing to the
+    /// owner. Two things mean that. **A change from a node other than
+    /// the recorded owner**: section 8.4 moved the session, and the
+    /// new owner streams it from position one, so a copy kept from the
+    /// old owner would read position one as a duplicate of its own
+    /// mark, apply nothing, and answer a mark the new owner would take
+    /// as a copy of *its* stream — which is a synchronous publish
+    /// acknowledged against a copy frozen at the pre-move queue. **A
+    /// change at position one for a session already followed**: a
+    /// position is never reused, so one is only ever the start of a
+    /// stream, and a stream starting over under the same owner is a
+    /// session that ended and came back under its identifier. Position
+    /// one is what tells the two apart: it is the new stream beginning,
+    /// so the copy held is of one that is over and it goes; a change
+    /// from a non-owner above one is a frame of the old stream arriving
+    /// late over its own link, and the copy stands. In both the owner
+    /// of the new stream hears nothing from this node, sees a follower
+    /// with no mark, and sends the snapshot that starts it over — the
+    /// same repair as for a follower placed after the queue was
+    /// streamed. A snapshot from any node is taken as it always was: it
+    /// carries the owner and the position both. And a session this node
+    /// does not follow is begun only at position one or by a snapshot,
+    /// never partway, for the same reason: see the body.
     pub fn arrived(
         &self,
         session: &SessionKey,
         owner: [u8; 16],
         at: u64,
         change: Change,
-    ) -> (Vec<(u64, Change)>, u64) {
+    ) -> (Vec<(u64, Change)>, Option<u64>) {
         let mut tables = locked(&self.inner);
         let mut taken = Vec::new();
         if matches!(change, Change::Snapshot { .. }) {
@@ -520,6 +547,29 @@ impl Copies {
                 .insert(session.clone(), (owner, Follower::resuming(at)));
             taken.push((at, change));
         } else {
+            if let Some((held_by, _)) = tables.followed.get(session) {
+                // See the method's documentation: a stream beginning
+                // ends the copy held, and a stale frame of another
+                // stream is ignored; nothing is said about either.
+                if at == 1 {
+                    tables.followed.remove(session);
+                    return (taken, None);
+                }
+                if *held_by != owner {
+                    return (taken, None);
+                }
+            } else if at != 1 {
+                // **A stream this node did not see begin is not picked up
+                // partway.** Following it from here would hold a hole from
+                // one to `at` that no later change fills, and the mark of
+                // zero it answered with would tell the owner a copy exists
+                // — which is exactly what stops `repairing` sending the
+                // snapshot, because repair looks for a follower with no
+                // mark. Silence is that follower. Reached by a copy dropped
+                // above for a new stream, and by a node placement has just
+                // named for a session already streaming.
+                return (taken, None);
+            }
             let (_, follower) = tables
                 .followed
                 .entry(session.clone())
@@ -532,7 +582,7 @@ impl Copies {
         let through = tables
             .followed
             .get(session)
-            .map_or(0, |(_, follower)| follower.through());
+            .map(|(_, follower)| follower.through());
         self.applied
             .fetch_add(taken.len() as u64, std::sync::atomic::Ordering::Relaxed);
         (taken, through)
