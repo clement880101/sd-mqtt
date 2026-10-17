@@ -744,7 +744,40 @@ where
                 .inbound
                 .set_receive_maximum(usize::from(config.receive_maximum));
         }
-        Some(Ok((registration, out, assigned)))
+
+        // A takeover addresses two connections by one handle, and the
+        // broker's rule is that everything up to and including the
+        // close belongs to the incumbent and everything after it to
+        // us. So the incumbent's share goes out while its outbox is
+        // still the registered one, and only then do we claim the
+        // handle.
+        //
+        // **Under this lock, not after it.** The session is routable
+        // from the moment `connect_claimed` put it in the registry,
+        // and the next connection to take the lock may address a
+        // publication to it. Registered after the lock was released,
+        // the outbox was missing for the few hundred nanoseconds in
+        // between, and that publication was dropped as having no
+        // reader — with its inflight slot still held at quality of
+        // service one or two.
+        let mine = if registration.took_over {
+            let mut actions = out;
+            match actions
+                .iter()
+                .position(|(_, action)| matches!(action, Action::Close(_)))
+            {
+                Some(at) => {
+                    let mine = actions.split_off(at + 1);
+                    shared.deliver(actions);
+                    mine
+                }
+                None => actions,
+            }
+        } else {
+            out
+        };
+        let outbox = shared.register_outbox(registration.subscriber, config.outbox_depth);
+        Some(Ok((registration, mine, assigned, outbox)))
     });
 
     let Some(outcome) = registered else {
@@ -762,7 +795,7 @@ where
         ));
     };
 
-    let (registration, actions, assigned) = match outcome {
+    let (registration, mine, assigned, outbox) = match outcome {
         Ok(accepted) => accepted,
         Err(reason) => {
             if matches!(
@@ -796,28 +829,9 @@ where
         write_timeout: config.write_timeout,
     };
 
-    // A takeover addresses two connections by one handle, and the
-    // broker's rule is that everything up to and including the close
-    // belongs to the incumbent and everything after it to us. So the
-    // incumbent's share goes out while its outbox is still the
-    // registered one, and only then do we claim the handle.
-    let mine = if registration.took_over {
-        let mut actions = actions;
-        match actions
-            .iter()
-            .position(|(_, action)| matches!(action, Action::Close(_)))
-        {
-            Some(at) => {
-                let mine = actions.split_off(at + 1);
-                shared.deliver(actions);
-                mine
-            }
-            None => actions,
-        }
-    } else {
-        actions
-    };
-    let outbox = shared.register_outbox(attached.subscriber, config.outbox_depth);
+    // Ours, addressed to an outbox that exists: everything after the
+    // close that displaced any incumbent, which the lock span above
+    // split off and registered for.
     shared.deliver(mine);
 
     // [MQTT-3.2.2-22]: an absent Server Keep Alive means the client's
@@ -2679,6 +2693,62 @@ mod tests {
             }
             other => panic!("expected the publication, got {other:?}"),
         }
+    }
+
+    /// A session is reachable from the moment `connect` registers it:
+    /// another connection's publish routed to it under the next lock
+    /// span is addressed to a subscriber whose outbox must already be
+    /// there, or it is dropped as having no reader — and at quality
+    /// of service one or two the inflight slot it took stays held.
+    /// So the outbox is registered under the same lock span as the
+    /// session, and a connected session without one is a state nobody
+    /// can observe. The checkers look for it under the broker lock
+    /// while connections come and go. A probe rather than a proof in
+    /// the failing direction: with the registration outside the lock,
+    /// four checkers saw the gap 32 times in 3,000 connections, and
+    /// the gap is a few hundred nanoseconds wide; in the passing
+    /// direction it is exact, because nothing can take the lock
+    /// between the session and its outbox.
+    #[tokio::test]
+    async fn a_session_has_its_outbox_from_the_moment_it_is_registered() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let stop = Arc::new(AtomicU64::new(0));
+        let gaps = Arc::new(AtomicU64::new(0));
+        let checkers: Vec<_> = (0..2)
+            .map(|_| {
+                std::thread::spawn({
+                    let shared = Arc::clone(&shared);
+                    let stop = Arc::clone(&stop);
+                    let gaps = Arc::clone(&gaps);
+                    move || {
+                        while stop.load(Ordering::Relaxed) == 0 {
+                            let gap = shared.with_broker(|broker| {
+                                broker.sessions().any(|(id, session)| {
+                                    session.is_connected() && !shared.has_outbox(id)
+                                })
+                            });
+                            if gap {
+                                gaps.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for n in 0..1000 {
+            let mut client = serve_one(Arc::clone(&shared));
+            connect_v5(&mut client, &format!("gap-{n}")).await;
+            drop(client);
+        }
+        stop.store(1, Ordering::Relaxed);
+        for checker in checkers {
+            checker.join().expect("the checker thread finishes");
+        }
+        assert_eq!(
+            gaps.load(Ordering::Relaxed),
+            0,
+            "a connected session was seen with no outbox"
+        );
     }
 
     #[tokio::test]

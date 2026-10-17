@@ -1562,6 +1562,12 @@ impl Shared {
         }
     }
 
+    /// Whether a session has an outbox: whether something the broker
+    /// addresses to it has anywhere to go.
+    pub fn has_outbox(&self, subscriber: SubscriberId) -> bool {
+        self.outboxes.read().contains_key(&subscriber)
+    }
+
     /// How many sessions have an outbox.
     pub fn outbox_count(&self) -> usize {
         self.outboxes.read().len()
