@@ -1,7 +1,9 @@
 # sd-mqtt
 
-A distributed MQTT broker with a built-in admin UI and UI-configurable
-integrations. One binary, no external dependencies.
+A distributed MQTT broker under the **MIT licence, all of it**: clustering,
+replicated queues, rules and connectors, authentication and the admin
+interface are in the one binary, with no enterprise edition and no
+open-core line. No external dependencies.
 
 Status: **0.7.1**. See `docs/superpowers/specs/` for
 the design, `docs/superpowers/plans/` for how it was built and
