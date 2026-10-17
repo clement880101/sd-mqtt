@@ -1624,7 +1624,22 @@ impl Broker {
         // acknowledgement may still have produced packets the peer is
         // waiting for.
         self.emit(subscriber, actions, out);
-        result
+        match result {
+            // An acknowledgement, receipt or completion naming an
+            // identifier this side does not hold is the end of an
+            // exchange it is not part of. The specification defines no
+            // answer to it, and 0x92 may travel only on a release or a
+            // completion, neither of which follows; so it is not a
+            // reason to close either, and a caller handed it would
+            // have to close with a reason the DISCONNECT encoder
+            // refuses. The broker's own release for a stray receipt
+            // carries 0x92 and the peer answers it with a completion
+            // that lands here, so this is the common case rather than
+            // the odd one. A packet out of sequence for an entry that
+            // is held stays a protocol error.
+            Err(ReasonCode::PacketIdentifierNotFound) => Ok(()),
+            other => other,
+        }
     }
 
     fn on_publish(
@@ -2654,6 +2669,83 @@ mod tests {
             publishes_to(&out, second.subscriber).is_empty(),
             "the ended session's subscriptions did not carry over: {out:?}"
         );
+    }
+
+    #[test]
+    fn a_stray_completion_or_acknowledgement_is_not_a_reason_to_close() {
+        // A PUBCOMP or PUBACK naming an identifier that is not
+        // outstanding is the last packet of an exchange this side does
+        // not hold. The specification defines no answer to it, and 0x92
+        // may travel only on a release or a completion, so the one
+        // thing the broker must not do is hand the shell a close with a
+        // reason the DISCONNECT encoder refuses. The broker's own
+        // release for a stray receipt provokes exactly this: it carries
+        // 0x92, and the client answers it with a completion the broker
+        // does not hold either.
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let client = broker
+            .connect("", &connect_v5("c"), &mut out)
+            .expect("the default decision authenticates")
+            .subscriber;
+
+        let stray = |packet_id: u16, reason: ReasonCode| mqtt_codec::packet::Ack {
+            packet_id,
+            reason,
+            properties: Properties::default(),
+        };
+        assert_eq!(
+            broker.handle(
+                client,
+                &Packet::PubComp(stray(7, ReasonCode::Success)),
+                &mut out
+            ),
+            Ok(()),
+            "a stray completion is swallowed"
+        );
+        assert_eq!(
+            broker.handle(
+                client,
+                &Packet::PubAck(stray(8, ReasonCode::Success)),
+                &mut out
+            ),
+            Ok(()),
+            "and so is a stray acknowledgement"
+        );
+        assert_eq!(
+            broker.handle(
+                client,
+                &Packet::PubRec(stray(9, ReasonCode::NotAuthorized)),
+                &mut out
+            ),
+            Ok(()),
+            "and a stray receipt whose reason ends the exchange, which has no release to answer"
+        );
+
+        // The round trip the broker itself starts.
+        out.clear();
+        broker
+            .handle(
+                client,
+                &Packet::PubRec(stray(10, ReasonCode::Success)),
+                &mut out,
+            )
+            .expect("[MQTT-4.3.3-4]: a receipt below 0x80 is answered with a release");
+        let release = out.iter().find_map(|(_, action)| match action {
+            Action::Send(Packet::PubRel(ack)) => Some(ack.reason),
+            _ => None,
+        });
+        assert_eq!(release, Some(ReasonCode::PacketIdentifierNotFound));
+        assert_eq!(
+            broker.handle(
+                client,
+                &Packet::PubComp(stray(10, ReasonCode::PacketIdentifierNotFound)),
+                &mut out
+            ),
+            Ok(()),
+            "the completion that answers the broker's 0x92 release is not a protocol error"
+        );
+        assert_eq!(broker.connected_count(), 1, "the connection is still up");
     }
 
     /// Advance the broker's clock to `seconds`, running every tick on
