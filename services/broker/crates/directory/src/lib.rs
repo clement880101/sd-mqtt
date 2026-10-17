@@ -116,6 +116,9 @@ pub struct Directory {
     /// One change at a time, so two puts of one name cannot interleave
     /// their records and their registers.
     changing: tokio::sync::Mutex<()>,
+    /// What a password login for a name nobody has is checked against,
+    /// so that it costs what a real one costs. See [`user::decoy`].
+    decoy: UserRecord,
 }
 
 impl std::fmt::Debug for Directory {
@@ -163,6 +166,7 @@ impl Directory {
                     .collect(),
             ),
             changing: tokio::sync::Mutex::new(()),
+            decoy: user::decoy(),
         })
     }
 
@@ -417,12 +421,20 @@ impl Directory {
     /// Whether `password` is `name`'s. False for a name nobody has: a
     /// missing user and a wrong password are one answer, so a caller
     /// cannot tell which names exist by trying.
+    ///
+    /// One answer in time as well as in word. A name the directory does
+    /// not hold, or holds without a password, is verified against the
+    /// decoy, so the argon2 work is done either way and the refusal
+    /// takes as long as a wrong password's. The SCRAM exchange runs
+    /// against a decoy verifier for the same reason.
     #[must_use]
     pub fn check_password(&self, name: &str, password: &[u8]) -> bool {
         let users = self.users.read().unwrap_or_else(PoisonError::into_inner);
-        users
+        let user = users
             .get(name)
-            .is_some_and(|user| user::check_password(user, password))
+            .filter(|user| user.password.is_some())
+            .unwrap_or(&self.decoy);
+        user::check_password(user, password)
     }
 
     /// `name`'s SCRAM verifier, for the AUTH exchange.

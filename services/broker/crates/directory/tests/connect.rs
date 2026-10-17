@@ -115,6 +115,45 @@ async fn a_user_with_the_right_password_connects_and_the_wrong_one_is_refused() 
     );
 }
 
+/// The median of a few timings of `check`, so one slow run does not
+/// decide.
+fn median_cost(check: impl Fn() -> bool) -> std::time::Duration {
+    let mut costs: Vec<_> = (0..5)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            assert!(!check(), "every timed check is a refusal");
+            started.elapsed()
+        })
+        .collect();
+    costs.sort();
+    costs[2]
+}
+
+/// A name nobody has must cost what a wrong password costs. Returning
+/// early for an unknown name answers in microseconds where argon2 takes
+/// tens of milliseconds, and that difference tells a caller which names
+/// exist by trying them — exactly what the one-answer refusal above is
+/// meant to hide. The SCRAM exchange runs against a decoy verifier for
+/// the same reason; the password path must too.
+#[tokio::test]
+async fn an_unknown_name_costs_as_much_as_a_wrong_password() {
+    let (_shared, directory) = broker_with(Settings::default());
+    directory
+        .put_user("alice", &Secret::new("hunter2"), false)
+        .await
+        .expect("created");
+    // Warm both paths once, so neither pays for first use.
+    assert!(!directory.check_password("alice", b"wrong"));
+    assert!(!directory.check_password("nobody", b"wrong"));
+
+    let known = median_cost(|| directory.check_password("alice", b"wrong"));
+    let unknown = median_cost(|| directory.check_password("nobody", b"wrong"));
+    assert!(
+        unknown * 2 >= known,
+        "an unknown name answered in {unknown:?} where a wrong password took {known:?}"
+    );
+}
+
 /// Anonymous is the switch, and nothing else.
 #[tokio::test]
 async fn anonymous_is_admitted_by_the_switch_and_refused_without_it() {

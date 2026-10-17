@@ -52,10 +52,34 @@ pub fn with_password(
     }
 }
 
+/// A user nobody is, with a password nobody knows, for a login naming
+/// a user the directory does not hold.
+///
+/// Verifying against it costs what verifying against a real hash costs,
+/// so an unknown name and a wrong password answer in the same time as
+/// well as with the same word; returning early for the unknown name
+/// would let a caller list the users by timing refusals. The password
+/// is random, so the verification is a refusal by construction, the
+/// same way the SCRAM exchange's decoy verifier refuses: there is no
+/// separate "was this a real user" flag for a mutation to drop.
+///
+/// # Panics
+///
+/// If the platform's random source fails, as [`with_password`] does.
+#[must_use]
+pub fn decoy() -> UserRecord {
+    let mut password = [0u8; 32];
+    rand::fill(&mut password).expect("the random source answers");
+    let password: String = password.iter().map(|byte| format!("{byte:02x}")).collect();
+    with_password("", &Secret::new(password), 0, 0, false)
+}
+
 /// Whether `password` is the one `user`'s hash was made from.
 ///
 /// False for a user with no password: SCRAM-only users log in through
 /// the AUTH exchange, and a password login for one is a wrong password.
+/// A caller that must not say so by timing hands such a user to
+/// [`decoy`] rather than here; see `Directory::check_password`.
 #[must_use]
 pub fn check_password(user: &UserRecord, password: &[u8]) -> bool {
     let Some(hash) = &user.password else {
