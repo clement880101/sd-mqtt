@@ -175,11 +175,12 @@
     <p class="filter" aria-label="The topic fleet/+/telemetry, subscribed to on one node of a cluster">
       <span class="level">fleet</span><span class="sep">/</span><wbr><span class="wild">+</span><span class="sep">/</span><wbr><span class="level">telemetry</span>
     </p>
-    <ul class="topics" id="topics" aria-label="One message's path through a three-node cluster">
-      <li><span class="node">alpha</span><span class="topic">subscribe fleet/+/telemetry</span><span class="verdict">a client subscribes on one node, then goes offline</span></li>
-      <li><span class="node">beta</span><span class="topic">publish fleet/0042/telemetry</span><span class="verdict">published on another node; forwarded to the one that holds the session</span></li>
-      <li><span class="node">alpha</span><span class="topic">queue, copy to gamma</span><span class="verdict">queued for the absent client, and copied to a second node</span></li>
-      <li class="match"><span class="node">gamma</span><span class="topic">connect, deliver</span><span class="verdict">the client reconnects anywhere; the session moves and the message arrives</span></li>
+    <ul class="topics" id="topics" aria-label="One message's path through a three-node cluster and out to your API">
+      <li><span class="node">alpha</span><span class="topic">subscribe fleet/+/telemetry</span><span class="verdict">a device connects to any node; its session is durable, so going offline loses nothing</span></li>
+      <li><span class="node">beta</span><span class="topic">publish fleet/0042/telemetry</span><span class="verdict">publish to any node; the cluster routes it to the node that holds the subscriber</span></li>
+      <li><span class="node">alpha</span><span class="topic">queue, replicate to gamma</span><span class="verdict">queued for the absent device and copied to a second node, so one node dying loses nothing</span></li>
+      <li class="match"><span class="node">gamma</span><span class="topic">reconnect, deliver</span><span class="verdict">the device returns on any node; the session moves there and the message arrives</span></li>
+      <li class="match"><span class="node">rule</span><span class="topic">POST to your API</span><span class="verdict">the same message reaches your HTTP service through a rule, with a durable outbox and retries, no plugin</span></li>
     </ul>
 
     <div class="lede">
