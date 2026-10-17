@@ -380,6 +380,40 @@ async fn no_token_and_a_wrong_token_are_refused_and_publish_nothing() {
     node.stop().await;
 }
 
+/// The scheme is matched the way RFC 7235 says: without regard to
+/// case. `bearer <token>` presents the token; another scheme presents
+/// something that is not it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bearer_scheme_is_read_without_regard_to_case() {
+    let node = Node::start(fixed_topic_rule(QoS::AtMostOnce)).await;
+
+    for spelling in ["bearer", "BEARER", "bEaReR"] {
+        let authorization = format!("{spelling} {TOKEN}");
+        let accepted = post(
+            node.ingest,
+            "/ingest/fixed",
+            None,
+            &[("Authorization", &authorization)],
+            b"x",
+        )
+        .await;
+        assert_eq!(accepted.status, 200, "{spelling}: {}", accepted.body);
+    }
+
+    let basic = format!("Basic {TOKEN}");
+    let refused = post(
+        node.ingest,
+        "/ingest/fixed",
+        None,
+        &[("Authorization", &basic)],
+        b"x",
+    )
+    .await;
+    assert_eq!(refused.status, 401, "{}", refused.body);
+
+    node.stop().await;
+}
+
 /// A rule with no token has no route, and the path says so as though it
 /// does not exist.
 ///

@@ -728,7 +728,7 @@ async fn ingest_one(
     let presented = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(bearer_of)
         .unwrap_or("");
     if !secret_eq(presented, &action.token) {
         // The same sentence whether the header was missing, the scheme
@@ -881,6 +881,25 @@ async fn ingest_one(
             )
         }
     }
+}
+
+/// The credential in an `Authorization` value, if its scheme is
+/// `Bearer`.
+///
+/// RFC 7235 makes the scheme case-insensitive and allows more than
+/// one space before the credential, so `bearer <token>` presents the
+/// same token `Bearer <token>` does. A value with another scheme
+/// presents no bearer, and the comparison above then fails as it
+/// should. `strip_prefix("Bearer ")` refused a client whose library
+/// spelled the scheme in lower case, which the standard permits it to.
+fn bearer_of(value: &str) -> Option<&str> {
+    let (scheme, credential) = value
+        .trim_start()
+        .split_once(' ')
+        .unwrap_or((value.trim_start(), ""));
+    scheme
+        .eq_ignore_ascii_case("Bearer")
+        .then(|| credential.trim_start())
 }
 
 /// How many connectors the caller says this body has already been

@@ -163,12 +163,30 @@ pub(crate) async fn with_host(
     token: Option<&str>,
     body: Option<&str>,
 ) -> Response {
+    let authorization = token.map(|token| format!("Bearer {token}"));
+    with_authorization(address, method, path, host, authorization.as_deref(), body).await
+}
+
+/// The same, with the whole `Authorization` value spelled out.
+///
+/// Every other helper writes `Bearer <token>`, which is the one
+/// spelling a client that is not testing the scheme would send. This
+/// is for the tests that are: the scheme in another case, or a scheme
+/// that is not `Bearer` at all.
+pub(crate) async fn with_authorization(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    host: Option<&str>,
+    authorization: Option<&str>,
+    body: Option<&str>,
+) -> Response {
     let host = host.map_or_else(|| address.to_string(), ToOwned::to_owned);
     let mut stream = TcpStream::connect(address)
         .await
         .expect("the admin listener accepts");
-    let authorization = match token {
-        Some(token) => format!("Authorization: Bearer {token}\r\n"),
+    let authorization = match authorization {
+        Some(value) => format!("Authorization: {value}\r\n"),
         None => String::new(),
     };
     // A content length rather than a chunked body, because the point

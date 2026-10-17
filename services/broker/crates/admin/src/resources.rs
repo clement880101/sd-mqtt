@@ -1196,11 +1196,18 @@ impl<N: Needs> FromRequestParts<AdminState> for Authorized<N> {
         parts: &mut Parts,
         state: &AdminState,
     ) -> Result<Self, Self::Rejection> {
+        // A header that is there is something presented, whatever it
+        // says. Reading a header the scheme match did not recognise
+        // as *nothing* presented would admit it on a loopback
+        // listener with no token, which is what `strip_prefix("Bearer
+        // ")` did for `bearer <key>`: a key that is refused under one
+        // spelling of the scheme was admitted with full rights under
+        // another. So an unreadable or non-bearer header is a bearer
+        // of nothing, which `scope_of` judges wrong.
         let presented = parts
             .headers
             .get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "));
+            .map(|value| value.to_str().ok().and_then(bearer_of).unwrap_or(""));
         match scope_of(state, presented) {
             Presented::Nothing if state.token.is_none() => Ok(Self(std::marker::PhantomData)),
             Presented::Scope(scope) if scope >= N::SCOPE => Ok(Self(std::marker::PhantomData)),
@@ -1232,6 +1239,25 @@ enum Presented {
     Scope(directory::Scope),
     /// A bearer that is neither.
     Wrong,
+}
+
+/// The credential in an `Authorization` value, if its scheme is
+/// `Bearer`.
+///
+/// RFC 7235 makes the scheme case-insensitive and allows more than
+/// one space before the credential, so `bearer <key>` and
+/// `BEARER  <key>` present the same key `Bearer <key>` does. A value
+/// with another scheme, or with none, presents no bearer at all.
+/// `Bearer` on its own, or followed by nothing, is an empty
+/// credential rather than a missing one.
+fn bearer_of(value: &str) -> Option<&str> {
+    let (scheme, credential) = value
+        .trim_start()
+        .split_once(' ')
+        .unwrap_or((value.trim_start(), ""));
+    scheme
+        .eq_ignore_ascii_case("Bearer")
+        .then(|| credential.trim_start())
 }
 
 /// Judge a bearer: the configured token first, in constant time, then
@@ -2844,6 +2870,61 @@ mod tests {
         .await;
         assert_eq!(response.status, 200, "{}", response.body);
         admin.shutdown().await;
+    }
+
+    /// The scheme is matched the way RFC 7235 says: without regard
+    /// to case. `bearer <token>` is the token presented, not nothing.
+    ///
+    /// The second half is the one that matters. On a loopback
+    /// listener with no token, a request that presents nothing is
+    /// admitted; a `strip_prefix("Bearer ")` read `bearer <key>` as
+    /// nothing presented, so a key that would have been refused
+    /// under its own spelling was admitted with full rights under
+    /// another. Something presented that is not a bearer is judged
+    /// as wrong, never as absent.
+    #[tokio::test]
+    async fn the_bearer_scheme_is_read_without_regard_to_case() {
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let admin = admin_with_token(shared, Some("the-right-one")).await;
+        let body = publication("guarded/topic", "x", 0);
+        for spelling in ["bearer", "BEARER", "bEaReR"] {
+            let accepted = testing::with_authorization(
+                admin.address(),
+                "POST",
+                "/api/v1/publish",
+                None,
+                Some(&format!("{spelling} the-right-one")),
+                Some(&body),
+            )
+            .await;
+            assert_eq!(accepted.status, 200, "{spelling}: {}", accepted.body);
+        }
+        admin.shutdown().await;
+
+        let shared = Arc::new(Shared::new(BrokerConfig::default()));
+        let open = admin_with_token(shared, None).await;
+        for presented in [
+            "bearer not-a-key",
+            "Basic bm90OmFrZXk=",
+            "Bearer",
+            "Bearer ",
+        ] {
+            let refused = testing::with_authorization(
+                open.address(),
+                "POST",
+                "/api/v1/publish",
+                None,
+                Some(presented),
+                Some(&body),
+            )
+            .await;
+            assert_eq!(
+                refused.status, 401,
+                "{presented:?} is something presented, and it is wrong: {}",
+                refused.body
+            );
+        }
+        open.shutdown().await;
     }
 
     /// A reader is not a mutation and is not guarded by the token.
