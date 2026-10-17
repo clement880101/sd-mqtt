@@ -1649,6 +1649,16 @@ impl Broker {
         now: u32,
         out: &mut Vec<Addressed>,
     ) -> Result<(), ReasonCode> {
+        if !publish.properties.subscription_identifiers.is_empty() {
+            // [MQTT-3.3.4-6]: a PUBLISH from a client to a server must
+            // not carry a Subscription Identifier. The codec cannot
+            // refuse it, because the same property on a PUBLISH going
+            // the other way is the server's to attach and may appear
+            // several times; this is the one place that knows the
+            // packet came in. Refused before the receive path counts
+            // it, so it costs no receive-maximum slot.
+            return Err(ReasonCode::ProtocolError);
+        }
         let received = {
             let session = self
                 .registry
@@ -2746,6 +2756,38 @@ mod tests {
             "the completion that answers the broker's 0x92 release is not a protocol error"
         );
         assert_eq!(broker.connected_count(), 1, "the connection is still up");
+    }
+
+    #[test]
+    fn a_publish_from_a_client_with_a_subscription_identifier_is_a_protocol_error() {
+        // [MQTT-3.3.4-6]: a PUBLISH from a client to a server must not
+        // carry a Subscription Identifier; the identifier is the
+        // server's to attach on the way out. The codec decodes both
+        // directions and a server's PUBLISH carries several, so the
+        // broker is the one that knows this one came in.
+        let mut broker = Broker::new(BrokerConfig::default());
+        let mut out = Vec::new();
+        let client = broker
+            .connect("", &connect_v5("c"), &mut out)
+            .expect("the default decision authenticates")
+            .subscriber;
+        let publish = Packet::Publish(Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: "a/b".to_string(),
+            packet_id: None,
+            payload: Bytes::from_static(b"body"),
+            properties: Properties {
+                subscription_identifiers: vec![1],
+                ..Properties::default()
+            },
+        });
+        assert_eq!(
+            broker.handle(client, &publish, &mut out),
+            Err(ReasonCode::ProtocolError),
+            "[MQTT-3.3.4-6]"
+        );
     }
 
     /// Advance the broker's clock to `seconds`, running every tick on
