@@ -778,19 +778,19 @@ impl Registry {
     /// held.
     async fn install_locked(&self, rule: Rule, origin: Origin) -> Result<(), InstallError> {
         let id = rule.id.clone();
-        // **Before anything changes**, like the route below and for
-        // the same reason: a pair of bridges that would loop is a
-        // refusal with this node exactly as it was.
-        self.check_for_a_loop(&rule)?;
-        self.check_it_fits(&rule)?;
-        if matches!(origin, Origin::Ours) {
-            self.check_the_outbox_keeps_its_connector(&rule)?;
-        }
-        // **Before anything changes.** An address something else is
-        // already on is then a refusal with the node exactly as it
-        // was, rather than a stored rule nothing can reach.
-        if Self::wants_a_route(&rule) {
-            self.reconcile_ingest(&id, true).await?;
+        if let Err(refused) = self.check_before_anything_changes(&rule, &origin).await {
+            // **A peer's register is stored even so.** It is the
+            // cluster's answer, and [`Registry::apply_replicated`]
+            // promises it is held whether or not this node can run
+            // the rule: a node that refused the rule *and* forgot the
+            // register would be handed the same rule by the next peer
+            // it spoke to, and would refuse it again, for ever. The
+            // refusal is still the answer; the register is what makes
+            // the disagreement visible in the API instead of silent.
+            if let Origin::Replicated(registers) = origin {
+                self.hold_registers(&id, registers).await?;
+            }
+            return Err(refused);
         }
         let installed = self.install_now(rule, origin).await;
         // And again afterwards, because installing a rule can take a
@@ -801,6 +801,54 @@ impl Registry {
         // rule, so that the socket follows what is actually served.
         let settled = self.reconcile_ingest(&id, !self.ingest.is_empty()).await;
         installed.and(settled)
+    }
+
+    /// Every refusal that leaves the node exactly as it was.
+    ///
+    /// A pair of bridges that would loop, a poller over the packet
+    /// size, an operator's change of connector with envelopes waiting,
+    /// and an ingest address something else is already on: each is
+    /// asked **before anything is stored**, so that the usual reading
+    /// of an error from an install is that nothing about this node
+    /// changed. The bind is the one of these that does something — it
+    /// opens the socket a route will need — and an install that then
+    /// fails is followed by the reconcile in [`Registry::install_locked`],
+    /// which closes a socket nothing needs.
+    async fn check_before_anything_changes(
+        &self,
+        rule: &Rule,
+        origin: &Origin,
+    ) -> Result<(), InstallError> {
+        self.check_for_a_loop(rule)?;
+        self.check_it_fits(rule)?;
+        if matches!(origin, Origin::Ours) {
+            self.check_the_outbox_keeps_its_connector(rule)?;
+        }
+        if Self::wants_a_route(rule) {
+            self.reconcile_ingest(&rule.id, true).await?;
+        }
+        Ok(())
+    }
+
+    /// Write a peer's registers for a rule this node is not going to
+    /// run, and wait for them.
+    ///
+    /// Nothing to write is nothing to wait for: the shell stores the
+    /// registers itself and hands this registry an empty list, and an
+    /// empty batch is not a batch worth a flush.
+    async fn hold_registers(
+        &self,
+        id: &RuleId,
+        registers: Vec<Record>,
+    ) -> Result<(), InstallError> {
+        if registers.is_empty() {
+            return Ok(());
+        }
+        self.writer
+            .apply_durable(registers)
+            .map_err(|error| InstallError::storage(id, error))?
+            .await
+            .map_err(|error| InstallError::storage(id, error))
     }
 
     /// Store `rule`, start it, and put it in the map.
@@ -2101,6 +2149,67 @@ mod tests {
             held[0].value.is_some(),
             "a refused removal tombstoned the rule"
         );
+    }
+
+    /// A replicated rule this node refuses to run still leaves its
+    /// register in the store.
+    ///
+    /// [`Registry::apply_replicated`]'s contract: the register is the
+    /// cluster's answer, and a node that disagrees with it silently
+    /// would be worse than one that holds a rule it is not running.
+    /// The refusals that happen before anything is stored — a loop, a
+    /// poller over the packet size, an address something else is on —
+    /// returned before the registers were written, so a node that
+    /// could not run a rule also forgot that the cluster had decided
+    /// on it, and the next exchange handed it the same rule again.
+    #[tokio::test]
+    async fn a_replicated_rule_this_node_refuses_still_leaves_its_register() {
+        let (registry, store) = registry();
+        let peer = NodeId::mint();
+        let peers = Replicated::open(
+            peer,
+            HybridClock::resume(None, DEFAULT_MAX_DRIFT_MILLIS),
+            &storage::Restored::default(),
+        )
+        .expect("an empty store holds nothing to refuse");
+
+        // A poller allowed to read more than this broker's packet
+        // size can carry, which `check_it_fits` refuses before anything
+        // is stored.
+        let rule = Rule {
+            id: RuleId::new("feed").expect("a valid identifier"),
+            name: "Feed".to_owned(),
+            enabled: true,
+            trigger: None,
+            action: Action::HttpPoll(crate::rule::HttpPoll {
+                url: "http://127.0.0.1:1/feed".to_owned(),
+                max_body_bytes: u32::MAX,
+                topic: "feed".to_owned(),
+                ..crate::rule::HttpPoll::default()
+            }),
+        };
+        let write = peers.rule(rule.to_record());
+        let registers = peers.records(&write);
+        assert!(!registers.is_empty(), "a peer's write carries its register");
+
+        let refused = registry.apply_replicated(&write, registers).await;
+        assert!(
+            matches!(refused, Err(InstallError::Unusable { .. })),
+            "this node cannot run that poller: {refused:?}"
+        );
+        assert!(
+            registry.get(&rule.id).is_none(),
+            "a rule this node refused is not running here"
+        );
+
+        let held = rule_registers(&store);
+        assert_eq!(
+            held.len(),
+            1,
+            "the register the cluster decided on is held whether or not this node runs \
+             the rule: {held:?}"
+        );
+        registry.shutdown().await;
     }
 
     /// A registry over a memory store, with nothing installed.
