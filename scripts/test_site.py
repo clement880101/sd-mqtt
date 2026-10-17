@@ -88,7 +88,6 @@ def main() -> int:
     check("every repository path linked exists", not missing, str(missing))
 
     evidence = (ROOT / "docs/design.md").read_text()
-    evidence += "".join(p.read_text() for p in (ROOT / "docs/decisions").glob("*.md"))
     evidence += (ROOT / "README.md").read_text()
     evidence += "".join(p.read_text() for p in (ROOT / "docs").glob("**/*.md"))
     quoted = re.findall(r'data-figure="([^"]+)"', text)

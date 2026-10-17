@@ -88,7 +88,6 @@ sd-mqtt/
     components.md            every third-party component and why
     setup.md                 from nothing to a three-node cluster
     features/                one page per feature
-    decisions/               decisions made during implementation
     conventions.md           the rules the project works by
     development.md           building, conformance, the containers
 ```
@@ -1223,7 +1222,7 @@ interface therefore opens exactly one stream for the whole application
 rather than one per page, and the limit is revisited when TLS lands.
 **Revisited in milestone 7 and kept:** TLS landed on the MQTT listeners,
 not the admin listener, so there is still nothing for a browser to
-negotiate HTTP/2 over. See [decision 0004](decisions/0004-admin-http2.md).
+negotiate HTTP/2 over.
 
 ### 11.2 UI
 
@@ -1654,9 +1653,12 @@ binary at 9.88 MB with mimalloc in it, the idle broker at 8.39 MB resident
 with a store and no clients — and 19.4 MB for the static musl build that
 ships, idle on Linux, which is the figure the table carries, the bundle at 67.4 KB with the Settings page,
 and thirty-one direct dependencies. The connection target is met: 100,000
-held for a minute on one node, measured by `scripts/connection-target.sh` on
-the machine [decision 0001](decisions/0001-connection-target.md)
-names, at about 32 KB of broker memory each. The column had gone stale a second
+opened in 2.5 s and held for a minute on one node, every one answering a
+ping at the end, measured by `scripts/connection-target.sh` in the
+development image on an Apple M2 Pro (Docker Desktop's Linux VM, 12 cores,
+11.7 GB, aarch64), at about 32 KB of broker memory each; the script is
+rerun before a release rather than run in CI, because a hosted runner's
+descriptor limits are not this project's to set. The column had gone stale a second
 time, reading milestone 3's figures against a binary two and a half times
 that size; the paragraphs below are kept as the record of the first
 time. Recorded at the close of
@@ -1753,8 +1755,9 @@ shippable.
 7. **Hardening.** TLS with certificate hot reload, WebSocket, SCRAM-SHA-256,
    the authentication and access control UI, rate limits, a configurable
    maximum quality of service and retain availability, the container image,
-   cross-compiled release artifacts and documentation (the platforms are
-   [decision 0005](decisions/0005-platforms.md)). Carries section 12.3's
+   cross-compiled release artifacts and documentation (four archives,
+   static musl for Linux x86_64 and aarch64 and native for both macOS
+   architectures, and no Windows build). Carries section 12.3's
    refusal of a client publishing to a dollar-prefixed topic, deferred from
    milestone 3: it needs a reason code per protocol version and it adds a
    classified line to the conformance baseline, both of which belong with the
@@ -1875,11 +1878,9 @@ needs it, and the resolution is recorded as an architecture decision record.
   should only be added if a real deployment wants it.
 - **SCRAM iteration count default — settled.** 4,096, measured and kept:
   the server never pays it at connect, a laptop pays 0.3 ms, and a verifier
-  exists only for users explicitly enrolled. See
-  [decision 0002](decisions/0002-scram-iterations.md).
+  exists only for users explicitly enrolled.
 - **Channel binding — settled.** Not offered in this release: where TLS ends
-  at a proxy the broker cannot bind to the client's channel at all. See
-  [decision 0003](decisions/0003-channel-binding.md).
+  at a proxy the broker cannot bind to the client's channel at all.
 - **Conformance suite choice — settled.** Eclipse Paho's interoperability
   tests, `eclipse-paho/paho.mqtt.testing`, pinned at commit
   `9d7bb80bb8b9d9cfc0b52f8cb4c1916401281103`. It is maintained by the Paho

@@ -31,7 +31,7 @@ def anchors(markdown: Path) -> set[str]:
 
 # The pages a reader is sent to; every relative link in them resolves.
 PAGES = [ROOT / "README.md", ROOT / "CHANGELOG.md", ROOT / "services/web/README.md",
-         *ROOT.glob("docs/*.md"), *ROOT.glob("docs/features/*.md"), *ROOT.glob("docs/decisions/*.md")]
+         *ROOT.glob("docs/*.md"), *ROOT.glob("docs/features/*.md")]
 for page in PAGES:
     for target in LINK.findall(page.read_text()):
         if target.startswith(("http://", "https://", "mailto:")) or "::" in target:

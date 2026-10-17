@@ -10,7 +10,7 @@
 # broker is cross-compiled there too, as a static musl binary for the
 # platform asked for, with cargo-zigbuild; and the image is `scratch`
 # with the binary, its licence and both notices files, and nothing else
-# — no shell, no package manager, nothing to patch (decision 0005).
+# — no shell, no package manager, nothing to patch.
 #
 # The same builder stage is what `scripts/package.sh` exports the Linux
 # release archives from (target `export`), so the binary in an archive

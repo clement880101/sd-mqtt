@@ -425,8 +425,8 @@ mod tests {
 
     /// Section 17's measurement, by hand: how long the derivation a
     /// client must run takes at three iteration counts. Ignored, because
-    /// it is a timing and not a check; `docs/decisions/0002` records
-    /// what it printed and where.
+    /// it is a timing and not a check; section 17 of `docs/design.md`
+    /// records what it printed and where.
     ///
     ///     cargo test -p sdmqtt-server --release --lib scram_cost -- --ignored --nocapture
     #[test]

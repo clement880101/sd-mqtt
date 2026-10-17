@@ -6,8 +6,8 @@ interface are in the one binary, with no enterprise edition and no
 open-core line. No external dependencies.
 
 Status: **0.7.1**. [The design](docs/design.md) is what it was built
-against, and [the decisions](docs/decisions/README.md) are the questions
-that were settled by measurement.
+against; the questions it left open are settled, by measurement, in its
+last two sections.
 `CHANGELOG.md` is what to read before upgrading: before 1.0 the stored
 format may move, and a store written by an earlier build is refused
 rather than migrated.

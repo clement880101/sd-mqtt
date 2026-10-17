@@ -69,7 +69,7 @@ case "$target" in
         cp services/web/THIRD-PARTY-NOTICES.txt "$stage/$name/web-THIRD-PARTY-NOTICES.txt"
         ;;
     *)
-        echo "no release target $target; see docs/decisions/0005-platforms.md" >&2
+        echo "no release target $target; the four that ship are listed in docs/design.md, milestone 7" >&2
         exit 2
         ;;
 esac

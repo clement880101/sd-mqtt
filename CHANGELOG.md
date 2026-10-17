@@ -22,8 +22,9 @@ the milestone you are moving to.** Everything else is description.
 
 - **The working documents are gone from the repository.** The milestone
   plans, the reference-broker analyses and the milestone 3 demonstration
-  were how it was built, not what ships. The design is now
-  `docs/design.md` and the component selection `docs/components.md`.
+  were how it was built, not what ships, and the decision records'
+  conclusions were already in the design's sections 15 and 17. The design
+  is now `docs/design.md` and the component selection `docs/components.md`.
 
 ### Fixed
 

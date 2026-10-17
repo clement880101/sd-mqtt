@@ -35,7 +35,6 @@ reports.
 
 - [The design](design.md) — the specification every milestone was built
   against, with as-built notes.
-- [Decisions](decisions/README.md) — the questions settled by measurement.
 - [Components](components.md) — every third-party component, why it was
   chosen, and what its licence asks.
 - [Conventions](conventions.md) — the rules the project works by, each
