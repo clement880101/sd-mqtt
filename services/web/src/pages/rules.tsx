@@ -1604,7 +1604,13 @@ export function Rules() {
       </div>
 
       {composing.value || editing.value ? (
+        // Keyed by the rule being edited. The editor seeds its draft
+        // from `existing` once, when it mounts; without a key Preact
+        // keeps the same instance across a switch from one rule to
+        // another, and the second rule's form shows the first rule's
+        // draft under the second rule's heading, and saves it there.
         <Editor
+          key={editing.value ? editing.value.id : 'new'}
           existing={editing.value}
           onDone={(rule) => {
             composing.value = false;
