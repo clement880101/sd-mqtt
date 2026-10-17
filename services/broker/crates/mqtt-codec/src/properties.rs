@@ -121,7 +121,10 @@ pub struct Properties {
 fn push_id(body: &mut Vec<u8>, id: u8, scope: Option<PropertyScope>) -> Result<(), CodecError> {
     if let Some(scope) = scope {
         if !scope.permits(u32::from(id)) {
-            return Err(CodecError::ProtocolError(
+            // Malformed rather than a protocol error, as on decode: the
+            // encoder refuses exactly what the decoder would, and the
+            // two must say it the same way.
+            return Err(CodecError::MalformedPacket(
                 "property is not permitted on this packet type",
             ));
         }
@@ -201,7 +204,12 @@ impl Properties {
             let id = inner.varint()?;
             if let Some(scope) = scope {
                 if !scope.permits(id) {
-                    return Err(CodecError::ProtocolError(
+                    // 2.2.2.2: a packet "which contains an Identifier
+                    // which is not valid for its packet type" is a
+                    // Malformed Packet, answered with 0x81, where a
+                    // property repeated is a Protocol Error and gets
+                    // 0x82 below.
+                    return Err(CodecError::MalformedPacket(
                         "property is not permitted on this packet type",
                     ));
                 }
@@ -573,7 +581,7 @@ mod tests {
         let err = Properties::decode_for(&mut reader, PropertyScope::Connect).unwrap_err();
         assert_eq!(
             err,
-            CodecError::ProtocolError("property is not permitted on this packet type")
+            CodecError::MalformedPacket("property is not permitted on this packet type")
         );
     }
 
@@ -675,7 +683,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err,
-            CodecError::ProtocolError("property is not permitted on this packet type")
+            CodecError::MalformedPacket("property is not permitted on this packet type")
         );
         assert!(out.is_empty(), "a refused block must write nothing");
     }
