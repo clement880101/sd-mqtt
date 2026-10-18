@@ -22,7 +22,7 @@
 //! reason about.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use broker_core::hooks::{Credentials, Decision, Hook};
 use cluster::{MetadataKey, MetadataValue, MetadataWrite, Replicated};
@@ -118,7 +118,16 @@ pub struct Directory {
     changing: tokio::sync::Mutex<()>,
     /// What a password login for a name nobody has is checked against,
     /// so that it costs what a real one costs. See [`user::decoy`].
-    decoy: UserRecord,
+    ///
+    /// **Made on the first such login, not when the directory is.**
+    /// Hashing the decoy is an argon2 run, and argon2 takes nineteen
+    /// mebibytes to do it; made at startup, every broker held them
+    /// whether or not it had a user, and section 15's idle budget went
+    /// from 19.4 MB to 42.8 MB. The first unknown-name login pays the
+    /// hash once, which a wrong password for a real name never does,
+    /// so that one refusal is slower than the rest; every later one is
+    /// as slow as a wrong password, which is the property.
+    decoy: OnceLock<UserRecord>,
 }
 
 impl std::fmt::Debug for Directory {
@@ -166,7 +175,7 @@ impl Directory {
                     .collect(),
             ),
             changing: tokio::sync::Mutex::new(()),
-            decoy: user::decoy(),
+            decoy: OnceLock::new(),
         })
     }
 
@@ -433,7 +442,7 @@ impl Directory {
         let user = users
             .get(name)
             .filter(|user| user.password.is_some())
-            .unwrap_or(&self.decoy);
+            .unwrap_or_else(|| self.decoy.get_or_init(user::decoy));
         user::check_password(user, password)
     }
 

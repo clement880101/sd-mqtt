@@ -64,7 +64,9 @@ first.
     `fleet/#`. A subscribe is covered only by a rule whose filter
     covers every topic the requested filter does.
   - A password login for an unknown user costs what a wrong password
-    costs, so timing no longer tells which user names exist.
+    costs, so timing no longer tells which user names exist. The decoy
+    it is checked against is made on the first such login, not at
+    startup, so an idle broker does not hold argon2's working memory.
   - SCRAM data with a multi-byte character where an attribute name
     belongs is refused as malformed instead of panicking the
     connection.
