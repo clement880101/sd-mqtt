@@ -1043,8 +1043,8 @@ pub async fn repairing(
                     // next sweep will not list it.
                     continue;
                 };
-                let handover = match cluster::copy_as_handover(store.as_ref(), &session) {
-                    Ok(handover) => handover,
+                let copy = match store.session_copy(&session) {
+                    Ok(copy) => copy,
                     Err(why) => {
                         tracing::error!(
                             client = %session.client_id,
@@ -1054,12 +1054,20 @@ pub async fn repairing(
                         continue;
                     }
                 };
+                // **Stamped with the position the store's queue reflects,
+                // read with it**, not with this node's own position: the
+                // store can be a batch behind, and a snapshot of an older
+                // queue stamped as current told a follower it held a
+                // message it did not. A follower already past the stamp
+                // keeps its copy; one behind it takes this and is sent
+                // the rest by the stream.
+                let at = copy.stream_at.unwrap_or_else(|| copies.position(&session));
                 let snapshot = cluster::Streamed {
                     session: session.clone(),
-                    at: copies.position(&session),
+                    at,
                     change: cluster::Change::Snapshot {
                         session: Box::new(record),
-                        entries: handover.queued,
+                        entries: copy.queued,
                     },
                 };
                 match mesh.send(follower, &Message::Replicated(snapshot)) {

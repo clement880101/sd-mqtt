@@ -606,6 +606,76 @@ fn a_stream_from_a_new_owner_ends_the_old_copy_and_waits_for_a_snapshot() {
     assert_eq!(copies.through(&session), Some(2), "Beta's copy stands");
 }
 
+fn snapshot_of(
+    session: &SessionKey,
+    entries: Vec<(QueueEntry, storage::record::BodyRecord)>,
+) -> Change {
+    use storage::record::{ProtocolVersion, SessionRecord};
+    Change::Snapshot {
+        session: Box::new(SessionRecord {
+            key: session.clone(),
+            version: ProtocolVersion::V5,
+            expiry_interval: 300,
+            expires_at: None,
+            will: None,
+            will_at: None,
+        }),
+        entries,
+    }
+}
+
+/// A snapshot from this copy's owner that is no newer than the copy is
+/// not taken.
+///
+/// The owner's repair can cross the follower's mark on the wire: it
+/// sees no mark yet, sends the session whole, and the follower has
+/// meanwhile applied the change the mark was for. Taken, a snapshot
+/// cut a batch behind replaces a copy holding the newest message with
+/// one that lacks it; a synchronous publish was acknowledged against
+/// that copy and lost when the owner died.
+#[test]
+fn a_snapshot_no_newer_than_the_copy_from_its_owner_is_not_taken() {
+    let copies = Copies::new();
+    let session = key("rover");
+    let (taken, through) = copies.arrived(&session, ALPHA, 1, appended(1));
+    assert_eq!((taken.len(), through), (1, Some(1)));
+
+    let (taken, through) = copies.arrived(&session, ALPHA, 0, snapshot_of(&session, vec![]));
+    assert!(
+        taken.is_empty(),
+        "an empty snapshot at zero would erase the message the copy holds"
+    );
+    assert_eq!(through, Some(1), "and the mark the copy has is answered");
+    let (taken, through) = copies.arrived(&session, ALPHA, 1, snapshot_of(&session, vec![]));
+    assert!(
+        taken.is_empty(),
+        "a snapshot at the copy's own position adds nothing"
+    );
+    assert_eq!(through, Some(1));
+
+    // One that is newer is taken: that is the repair of a follower
+    // stalled behind a change it missed.
+    let (taken, through) = copies.arrived(&session, ALPHA, 3, snapshot_of(&session, vec![]));
+    assert_eq!((taken.len(), through), (1, Some(3)));
+}
+
+/// The first change after a snapshot taken at position zero is the
+/// stream's own beginning, not a stream starting over.
+///
+/// A snapshot is stamped with the position the store's copy reflects,
+/// and the store can be a batch behind the owner, so a session's first
+/// snapshot can be at zero with its first change still to come.
+#[test]
+fn the_first_change_after_a_snapshot_at_zero_is_applied() {
+    let copies = Copies::new();
+    let session = key("rover");
+    let (taken, through) = copies.arrived(&session, ALPHA, 0, snapshot_of(&session, vec![]));
+    assert_eq!((taken.len(), through), (1, Some(0)));
+    let (taken, through) = copies.arrived(&session, ALPHA, 1, appended(1));
+    assert_eq!(taken.len(), 1, "the stream's first change is applied");
+    assert_eq!(through, Some(1));
+}
+
 /// A follower placement names, that has not reported yet, is waited
 /// for rather than written off.
 ///

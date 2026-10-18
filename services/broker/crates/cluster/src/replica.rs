@@ -540,7 +540,20 @@ impl Copies {
     ) -> (Vec<(u64, Change)>, Option<u64>) {
         let mut tables = locked(&self.inner);
         let mut taken = Vec::new();
-        if matches!(change, Change::Snapshot { .. }) {
+        let stale_snapshot = matches!(change, Change::Snapshot { .. })
+            && tables
+                .followed
+                .get(session)
+                .is_some_and(|(held_by, follower)| *held_by == owner && follower.through() >= at);
+        if stale_snapshot {
+            // **A snapshot no newer than the copy, from the copy's own
+            // owner, is not taken.** Repair can cross a mark on the
+            // wire: the owner saw none yet and sent the session whole,
+            // cut where its store was, while this copy applied the
+            // change the mark was for. Taking it replaces a copy that
+            // holds the newest message with one that lacks it; the mark
+            // this copy has is the answer, and nothing is applied.
+        } else if matches!(change, Change::Snapshot { .. }) {
             // A snapshot replaces the copy and sets the mark; see
             // `Change::Snapshot`. Whatever was held — nothing, or a
             // stale copy from before this node left the set — goes
@@ -550,11 +563,18 @@ impl Copies {
                 .insert(session.clone(), (owner, Follower::resuming(at)));
             taken.push((at, change));
         } else {
-            if let Some((held_by, _)) = tables.followed.get(session) {
+            if let Some((held_by, follower)) = tables.followed.get(session) {
                 // See the method's documentation: a stream beginning
                 // ends the copy held, and a stale frame of another
                 // stream is ignored; nothing is said about either.
-                if at == 1 {
+                //
+                // **Except this stream's own beginning.** A snapshot is
+                // stamped with the position its store's copy reflects,
+                // which can be zero for a session whose first change is
+                // still on its way; that change, at one and from the
+                // same owner, is this copy's next one.
+                let first_after_an_empty_copy = *held_by == owner && follower.through() == 0;
+                if at == 1 && !first_after_an_empty_copy {
                     tables.followed.remove(session);
                     return (taken, None);
                 }

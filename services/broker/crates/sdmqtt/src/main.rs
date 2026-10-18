@@ -1947,6 +1947,13 @@ mod tests {
         ) -> Result<Option<storage::BodyRecord>, storage::StorageError> {
             self.inner.body(id)
         }
+
+        fn session_copy(
+            &self,
+            session: &SessionKey,
+        ) -> Result<storage::SessionCopy, storage::StorageError> {
+            self.inner.session_copy(session)
+        }
     }
 
     #[test]

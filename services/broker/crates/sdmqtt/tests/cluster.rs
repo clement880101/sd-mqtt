@@ -2558,12 +2558,17 @@ async fn a_follower_that_missed_a_change_is_repaired() {
     rover.subscribe(FILTER);
     drop(rover);
     assert_eq!(cluster.nodes[0].publish_reaching(TOPIC, "message-0"), 1);
+    // A copy holds the first message when the owner's lag is back to
+    // zero, which needs a follower that has reported a mark at the
+    // message's position. Not a count of applied changes: a repair can
+    // send the session whole before its first message, at position
+    // zero, and that is a change applied too.
     until("the first message has a copy somewhere", || {
-        (1..NODES)
-            .any(|at| cluster.nodes[at].counter("sdmqtt_replica_changes_applied_total") == Some(1))
+        cluster.nodes[0].counter("sdmqtt_replication_lag") == Some(0)
+            && (1..NODES).any(|at| cluster.nodes[at].counter("sdmqtt_replica_sessions") == Some(1))
     });
     let holder = (1..NODES)
-        .find(|at| cluster.nodes[*at].counter("sdmqtt_replica_changes_applied_total") == Some(1))
+        .find(|at| cluster.nodes[*at].counter("sdmqtt_replica_sessions") == Some(1))
         .expect("the wait above found one");
     until("the copy is current", || {
         cluster.nodes[0].counter("sdmqtt_replication_lag") == Some(0)
@@ -3178,12 +3183,17 @@ async fn asynchronous_loss_is_bounded_by_the_lag_metric() {
     rover.subscribe(FILTER);
     drop(rover);
     assert_eq!(cluster.nodes[0].publish_reaching(TOPIC, "message-0"), 1);
+    // A copy holds the first message when the owner's lag is back to
+    // zero, which needs a follower that has reported a mark at the
+    // message's position. Not a count of applied changes: a repair can
+    // send the session whole before its first message, at position
+    // zero, and that is a change applied too.
     until("the first message has a copy somewhere", || {
-        (1..NODES)
-            .any(|at| cluster.nodes[at].counter("sdmqtt_replica_changes_applied_total") == Some(1))
+        cluster.nodes[0].counter("sdmqtt_replication_lag") == Some(0)
+            && (1..NODES).any(|at| cluster.nodes[at].counter("sdmqtt_replica_sessions") == Some(1))
     });
     let holder = (1..NODES)
-        .find(|at| cluster.nodes[*at].counter("sdmqtt_replica_changes_applied_total") == Some(1))
+        .find(|at| cluster.nodes[*at].counter("sdmqtt_replica_sessions") == Some(1))
         .expect("the wait above found one");
     let elsewhere = (1..NODES).find(|at| *at != holder).expect("three nodes");
 

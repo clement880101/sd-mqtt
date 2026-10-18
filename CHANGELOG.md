@@ -116,6 +116,12 @@ first.
     window.
   - A batch that removes a session carries no stream position for it,
     which the store would refuse along with the batch.
+  - A repair snapshot is stamped with the position its queue was read
+    at, from the same read, and a follower ignores one from its owner
+    that is no newer than its copy. A snapshot cut a batch behind could
+    replace a copy holding the newest message with one that lacked it,
+    and a synchronous publish acknowledged against that copy was lost
+    when the owner died. Found by CI.
 - **Rules and the admin API.**
   - Replacing or re-enabling a running rule leaves no window in which
     matching publications miss it.

@@ -1907,6 +1907,10 @@ pub mod gated {
         fn body(&self, id: &MessageId) -> Result<Option<BodyRecord>, StorageError> {
             self.inner.body(id)
         }
+
+        fn session_copy(&self, session: &SessionKey) -> Result<storage::SessionCopy, StorageError> {
+            self.inner.session_copy(session)
+        }
     }
 }
 
