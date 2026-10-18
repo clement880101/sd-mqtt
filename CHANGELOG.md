@@ -122,6 +122,13 @@ first.
     replace a copy holding the newest message with one that lacked it,
     and a synchronous publish acknowledged against that copy was lost
     when the owner died. Found by CI.
+  - A repair snapshot that reaches a follower ahead of a stream frame it
+    already holds no longer makes the follower drop the copy. Frames go
+    out once the store has taken their batch and repairs read the store,
+    so the snapshot can overtake; the follower took the frame for a
+    stream starting over and waited thirty seconds for another repair.
+    A follower that has answered and fallen behind is repaired again
+    after five seconds rather than thirty.
 - **Rules and the admin API.**
   - Replacing or re-enabling a running rule leaves no window in which
     matching publications miss it.

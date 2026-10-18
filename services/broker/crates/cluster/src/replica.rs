@@ -183,6 +183,14 @@ pub struct Follower {
     /// more than it can bridge, and the repair is the owner re-sending
     /// from the mark.
     overflowed: u64,
+    /// The position a snapshot set this copy at, when one did.
+    ///
+    /// A frame at or below it is one the snapshot already holds. Frames
+    /// are sent once the store has taken their batch and a repair reads
+    /// the store, so a snapshot can reach the follower ahead of a frame
+    /// of its own, and that frame is a duplicate rather than a stream
+    /// starting over.
+    snapshot_at: Option<u64>,
 }
 
 impl Follower {
@@ -207,6 +215,23 @@ impl Follower {
             through,
             ..Self::default()
         }
+    }
+
+    /// A follower a snapshot has just set at `at`.
+    #[must_use]
+    pub fn from_snapshot(at: u64) -> Self {
+        Self {
+            through: at,
+            snapshot_at: Some(at),
+            ..Self::default()
+        }
+    }
+
+    /// Whether a frame at `at` is one the snapshot that set this copy
+    /// already holds.
+    #[must_use]
+    pub fn covered(&self, at: u64) -> bool {
+        self.snapshot_at.is_some_and(|snapshot| at <= snapshot)
     }
 
     /// The highest contiguous position applied.
@@ -560,7 +585,7 @@ impl Copies {
             // with it, and anything waiting behind a hole with it.
             tables
                 .followed
-                .insert(session.clone(), (owner, Follower::resuming(at)));
+                .insert(session.clone(), (owner, Follower::from_snapshot(at)));
             taken.push((at, change));
         } else {
             if let Some((held_by, follower)) = tables.followed.get(session) {
@@ -574,6 +599,13 @@ impl Copies {
                 // still on its way; that change, at one and from the
                 // same owner, is this copy's next one.
                 let first_after_an_empty_copy = *held_by == owner && follower.through() == 0;
+                // **And a frame the snapshot holds is a duplicate**, so it
+                // is answered with the mark and nothing is applied; see
+                // `Follower::covered`.
+                if *held_by == owner && follower.covered(at) && follower.through() >= at {
+                    let through = follower.through();
+                    return (taken, Some(through));
+                }
                 if at == 1 && !first_after_an_empty_copy {
                     tables.followed.remove(session);
                     return (taken, None);

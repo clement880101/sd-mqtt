@@ -659,6 +659,39 @@ fn a_snapshot_no_newer_than_the_copy_from_its_owner_is_not_taken() {
     assert_eq!((taken.len(), through), (1, Some(3)));
 }
 
+/// A stream frame the snapshot already holds is not a stream starting
+/// over.
+///
+/// Frames go to followers once the store has taken their batch, and a
+/// repair reads the store, so a snapshot can be built from a batch
+/// whose own frame has not been sent yet and reach the follower first.
+/// That frame, at a position the snapshot covers, is a duplicate; read
+/// as a stream beginning again, it dropped the copy the snapshot had
+/// just made.
+#[test]
+fn a_frame_the_snapshot_already_covers_is_a_duplicate() {
+    let copies = Copies::new();
+    let session = key("rover");
+    let (taken, through) = copies.arrived(&session, ALPHA, 1, snapshot_of(&session, vec![]));
+    assert_eq!((taken.len(), through), (1, Some(1)));
+
+    let (taken, through) = copies.arrived(&session, ALPHA, 1, appended(1));
+    assert!(taken.is_empty(), "the snapshot holds it already");
+    assert_eq!(
+        through,
+        Some(1),
+        "and the copy stands, with its mark answered"
+    );
+    assert!(copies.follows(&session));
+
+    let (taken, through) = copies.arrived(&session, ALPHA, 2, appended(2));
+    assert_eq!(
+        (taken.len(), through),
+        (1, Some(2)),
+        "the next frame is next"
+    );
+}
+
 /// The first change after a snapshot taken at position zero is the
 /// stream's own beginning, not a stream starting over.
 ///

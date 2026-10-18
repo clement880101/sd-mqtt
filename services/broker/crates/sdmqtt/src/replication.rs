@@ -997,6 +997,14 @@ pub async fn repairing(
 ) {
     /// How long a sent snapshot is given before it may be sent again.
     const SENT_HOLDS_FOR: Duration = Duration::from_secs(30);
+    /// The same, for a follower that has answered and fallen behind.
+    /// Its snapshot arrived, since it has a mark; it was cut where the
+    /// owner's store was, which can be a batch behind the owner, and
+    /// the changes past it may have reached the follower before it and
+    /// been set aside. Thirty seconds of that is thirty seconds of a
+    /// copy short of what the owner holds; a few is long enough for a
+    /// snapshot in flight to land.
+    const BEHIND_HOLDS_FOR: Duration = Duration::from_secs(5);
     /// How long a follower may sit behind at one mark before it is
     /// treated as having missed something. Two sweeps: a follower that
     /// is applying moves its mark within a round trip, and one that has
@@ -1004,11 +1012,11 @@ pub async fn repairing(
     /// coming.
     const STALLED_FOR: Duration = Duration::from_secs(2);
 
-    let mut sent: HashMap<(storage::SessionKey, [u8; 16]), Instant> = HashMap::new();
+    let mut sent: HashMap<(storage::SessionKey, [u8; 16]), (Instant, Duration)> = HashMap::new();
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let now = Instant::now();
-        sent.retain(|_, when| now.duration_since(*when) < SENT_HOLDS_FOR);
+        sent.retain(|_, (when, hold)| now.duration_since(*when) < *hold);
 
         let members = placement.members();
         let me = placement.me();
@@ -1072,7 +1080,12 @@ pub async fn repairing(
                 };
                 match mesh.send(follower, &Message::Replicated(snapshot)) {
                     Some(Ok(cluster::link::Sent::Queued)) => {
-                        sent.insert(key, now);
+                        let hold = if copies.has_mark(&session, follower.to_bytes()) {
+                            BEHIND_HOLDS_FOR
+                        } else {
+                            SENT_HOLDS_FOR
+                        };
+                        sent.insert(key, (now, hold));
                         budget -= 1;
                         done += 1;
                         tracing::info!(
