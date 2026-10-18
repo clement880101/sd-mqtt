@@ -34,7 +34,7 @@
    "applicationCategory": "DeveloperApplication",
    "applicationSubCategory": "MQTT broker",
    "operatingSystem": "Linux, macOS",
-   "softwareVersion": "0.7.1",
+   "softwareVersion": "0.8.0",
    "license": "https://www.apache.org/licenses/LICENSE-2.0",
    "downloadUrl": "https://github.com/clement880101/sd-mqtt/releases",
    "installUrl": "https://github.com/clement880101/sd-mqtt/blob/main/docs/setup.md",
@@ -146,7 +146,7 @@
      "name": "Is sd-mqtt ready for production?",
      "acceptedAnswer": {
       "@type": "Answer",
-      "text": "It is at version 0.7.1, before 1.0. The protocol and clustering are tested, but until 1.0 the stored format may change between releases, and a store written by an earlier build is refused rather than migrated. Read the changelog before upgrading."
+      "text": "It is at version 0.8.0, before 1.0. The protocol and clustering are tested, but until 1.0 the stored format may change between releases, and a store written by an earlier build is refused rather than migrated. Read the changelog before upgrading."
      }
     }
    ]
@@ -358,9 +358,9 @@
 
     <div class="lede">
       <h1 id="title">A distributed MQTT broker, Apache 2.0 licensed, all of it</h1>
-      <p>Clustering, replicated queues, rules that carry messages to and from HTTP, and the admin interface are all in the one binary, under the Apache License 2.0. There is no enterprise edition and no open-core line: what is on this page is what you get. MQTT 3.1.1 and 5. Version 0.7.1.</p>
+      <p>Clustering, replicated queues, rules that carry messages to and from HTTP, and the admin interface are all in the one binary, under the Apache License 2.0. There is no enterprise edition and no open-core line: what is on this page is what you get. MQTT 3.1.1 and 5. Version 0.8.0.</p>
       <div class="actions">
-        <a class="button primary" href="https://github.com/clement880101/sd-mqtt/releases/tag/v0.7.1">Download 0.7.1</a>
+        <a class="button primary" href="https://github.com/clement880101/sd-mqtt/releases/tag/v0.8.0">Download 0.8.0</a>
         <a class="button" href="https://github.com/clement880101/sd-mqtt/blob/main/README.md">Read the documentation</a>
       </div>
     </div>
@@ -438,7 +438,7 @@
 <pre><code>docker run -d -p 1883:1883 -p 1884:1884 \
   -v sdmqtt-data:/data \
   -e SDMQTT_ADMIN_TOKEN="$(openssl rand -hex 24)" \
-  ghcr.io/clement880101/sd-mqtt:0.7.1</code></pre>
+  ghcr.io/clement880101/sd-mqtt:0.8.0</code></pre>
             <button class="copy" type="button">Copy</button>
           </div>
         </div>
@@ -446,8 +446,8 @@
           <h3>As a binary</h3>
           <p>Static builds for Linux on x86-64 and ARM, and builds for macOS. Each archive carries its checksum, the licence, and the notices for everything compiled in.</p>
           <div class="code">
-<pre><code>tar -xzf sdmqtt-0.7.1-x86_64-unknown-linux-musl.tar.gz
-cd sdmqtt-0.7.1-x86_64-unknown-linux-musl
+<pre><code>tar -xzf sdmqtt-0.8.0-x86_64-unknown-linux-musl.tar.gz
+cd sdmqtt-0.8.0-x86_64-unknown-linux-musl
 ./sdmqtt serve --store-directory ./data</code></pre>
             <button class="copy" type="button">Copy</button>
           </div>
@@ -475,7 +475,7 @@ cd sdmqtt-0.7.1-x86_64-unknown-linux-musl
         <dt>How do I run an MQTT cluster with sd-mqtt?</dt>
         <dd>Start three nodes with the same cluster name and secret, each listing the others as seeds. The setup guide in the repository takes a Docker Compose file from nothing to a three-node cluster in six steps.</dd>
         <dt>Is sd-mqtt ready for production?</dt>
-        <dd>It is at version 0.7.1, before 1.0. The protocol and clustering are tested, but until 1.0 the stored format may change between releases, and a store written by an earlier build is refused rather than migrated. Read the changelog before upgrading.</dd>
+        <dd>It is at version 0.8.0, before 1.0. The protocol and clustering are tested, but until 1.0 the stored format may change between releases, and a store written by an earlier build is refused rather than migrated. Read the changelog before upgrading.</dd>
       </dl>
     </div>
   </section>

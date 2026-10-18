@@ -13,18 +13,18 @@ docker run -d --name sdmqtt \
   -p 1883:1883 -p 1884:1884 \
   -v sdmqtt-data:/data \
   -e SDMQTT_ADMIN_TOKEN="$(openssl rand -hex 24)" \
-  ghcr.io/clement880101/sd-mqtt:0.7.1
+  ghcr.io/clement880101/sd-mqtt:0.8.0
 ```
 
 **Or with the binary**, on Linux x86-64 (the release has ARM Linux and
 both macOS builds too):
 
 ```bash
-curl -LO https://github.com/clement880101/sd-mqtt/releases/download/v0.7.1/sdmqtt-0.7.1-x86_64-unknown-linux-musl.tar.gz
-curl -LO https://github.com/clement880101/sd-mqtt/releases/download/v0.7.1/sdmqtt-0.7.1-x86_64-unknown-linux-musl.tar.gz.sha256
-sha256sum -c sdmqtt-0.7.1-x86_64-unknown-linux-musl.tar.gz.sha256
-tar -xzf sdmqtt-0.7.1-x86_64-unknown-linux-musl.tar.gz
-./sdmqtt-0.7.1-x86_64-unknown-linux-musl/sdmqtt serve --store-directory ./data
+curl -LO https://github.com/clement880101/sd-mqtt/releases/download/v0.8.0/sdmqtt-0.8.0-x86_64-unknown-linux-musl.tar.gz
+curl -LO https://github.com/clement880101/sd-mqtt/releases/download/v0.8.0/sdmqtt-0.8.0-x86_64-unknown-linux-musl.tar.gz.sha256
+sha256sum -c sdmqtt-0.8.0-x86_64-unknown-linux-musl.tar.gz.sha256
+tar -xzf sdmqtt-0.8.0-x86_64-unknown-linux-musl.tar.gz
+./sdmqtt-0.8.0-x86_64-unknown-linux-musl/sdmqtt serve --store-directory ./data
 ```
 
 Either way: MQTT on port 1883, the admin interface and API on port 1884.
@@ -125,7 +125,7 @@ A cluster is three containers that can reach each other. Save this as
 
 ```yaml
 x-node: &node
-  image: ghcr.io/clement880101/sd-mqtt:0.7.1
+  image: ghcr.io/clement880101/sd-mqtt:0.8.0
   restart: unless-stopped
   environment: &env
     SDMQTT_ADMIN_TOKEN: ${SDMQTT_ADMIN_TOKEN:?set a token for the admin API}

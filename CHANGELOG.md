@@ -8,7 +8,7 @@ it had releases.
 **The one thing to read before upgrading is "Before you upgrade" under
 the milestone you are moving to.** Everything else is description.
 
-## Unreleased
+## 0.8.0 — 2026-10-18
 
 ### Changed
 

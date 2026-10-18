@@ -13,9 +13,9 @@ description = "The admin listener for sd-mqtt: health, metrics, and the read res
 build = "build.rs"
 
 [dependencies]
-broker-core = { path = "../broker-core", version = "0.7.1" }
-mqtt-codec = { path = "../mqtt-codec", version = "0.7.1" }
-sdmqtt-server = { path = "../server", version = "0.7.1" }
+broker-core = { path = "../broker-core", version = "0.8.0" }
+mqtt-codec = { path = "../mqtt-codec", version = "0.8.0" }
+sdmqtt-server = { path = "../server", version = "0.8.0" }
 # Section 11.1 serves rules, and section 9.1 makes what a rule may be
 # the rules crate's to decide. This crate does the HTTP and nothing
 # else about a rule: it reads a `rules::spec::RuleSpec` out of a body
@@ -26,11 +26,11 @@ sdmqtt-server = { path = "../server", version = "0.7.1" }
 # The direction is the layering rather than a cycle: `rules` sits above
 # `sdmqtt-server`, as this crate does, and knows nothing about the
 # administrative interface.
-rules = { path = "../rules", version = "0.7.1" }
+rules = { path = "../rules", version = "0.8.0" }
 # Default features off, as `sdmqtt-server` does and for the same
 # reason: this crate needs the record vocabulary a session's
 # subscriptions are held in, and has no use for a disk.
-storage = { path = "../storage", version = "0.7.1", default-features = false }
+storage = { path = "../storage", version = "0.8.0", default-features = false }
 # Default features off, and not for weight: they cost two crates.
 # `tower-log` routes tower's internals through a second logging facade
 # beside the tracing this project standardised on, and the form
@@ -75,7 +75,7 @@ tokio = { version = "1", default-features = false, features = [
     "macros",
 ] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-directory = { version = "0.7.1", path = "../directory" }
+directory = { version = "0.8.0", path = "../directory" }
 
 # Build-time only, and so not distributed: these run to produce an
 # artifact and never reach a user. They are also invisible to the
@@ -108,9 +108,9 @@ bytes.workspace = true
 # durable, and that is only visible while a flush is in progress. The
 # real writer over a store this crate's tests control, rather than a
 # second one written here.
-sdmqtt-server = { path = "../server", version = "0.7.1", features = ["testing"] }
+sdmqtt-server = { path = "../server", version = "0.8.0", features = ["testing"] }
 # The writer and the in-memory backend the gated store wraps.
-storage = { path = "../storage", version = "0.7.1", default-features = false }
+storage = { path = "../storage", version = "0.8.0", default-features = false }
 # Reading this crate's own answers back. The other tests here assert
 # with `contains` on the body, which is enough for a flat object; a
 # tap answers a ring of messages with sequence numbers, counters and
@@ -120,7 +120,7 @@ storage = { path = "../storage", version = "0.7.1", default-features = false }
 # dev-dependency is not distributed, so this is invisible to the
 # direct-dependency budget of section 15.
 serde_json = "1"
-cluster = { path = "../cluster", version = "0.7.1" }
+cluster = { path = "../cluster", version = "0.8.0" }
 
 [lints]
 workspace = true

@@ -8,11 +8,11 @@ repository.workspace = true
 description = "Users, access control rules and API keys for sd-mqtt: who may connect and what they may do"
 
 [dependencies]
-mqtt-codec = { path = "../mqtt-codec", version = "0.7.1" }
-storage = { path = "../storage", version = "0.7.1", default-features = false }
-cluster = { path = "../cluster", version = "0.7.1" }
-broker-core = { path = "../broker-core", version = "0.7.1" }
-sdmqtt-server = { path = "../server", version = "0.7.1" }
+mqtt-codec = { path = "../mqtt-codec", version = "0.8.0" }
+storage = { path = "../storage", version = "0.8.0", default-features = false }
+cluster = { path = "../cluster", version = "0.8.0" }
+broker-core = { path = "../broker-core", version = "0.8.0" }
+sdmqtt-server = { path = "../server", version = "0.8.0" }
 # argon2id for passwords at rest, PHC strings. The one new direct
 # dependency of this milestone's authentication work.
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "password-hash"] }

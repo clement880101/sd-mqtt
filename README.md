@@ -5,7 +5,7 @@ replicated queues, rules and connectors, authentication and the admin
 interface are in the one binary, with no enterprise edition and no
 open-core line. No external dependencies.
 
-Status: **0.7.1**. [The design](docs/design.md) is what it was built
+Status: **0.8.0**. [The design](docs/design.md) is what it was built
 against; the questions it left open are settled, by measurement, in its
 last two sections.
 `CHANGELOG.md` is what to read before upgrading: before 1.0 the stored
@@ -37,12 +37,12 @@ docker run -d --name sdmqtt \
   -p 1883:1883 -p 1884:1884 \
   -v sdmqtt-data:/data \
   -e SDMQTT_ADMIN_TOKEN="$(openssl rand -hex 24)" \
-  ghcr.io/clement880101/sd-mqtt:0.7.1
+  ghcr.io/clement880101/sd-mqtt:0.8.0
 ```
 
 That is a broker on port 1883 with its admin interface on
 <http://127.0.0.1:1884>, keeping its sessions in a volume. Or download a
-binary from the [release](https://github.com/clement880101/sd-mqtt/releases/tag/v0.7.1):
+binary from the [release](https://github.com/clement880101/sd-mqtt/releases/tag/v0.8.0):
 static Linux builds for x86-64 and ARM, and macOS builds for Intel and
 Apple silicon, each with its checksum, the licence and the notices for
 everything compiled in. `sdmqtt serve --store-directory ./data` runs it.
