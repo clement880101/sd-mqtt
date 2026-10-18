@@ -237,7 +237,20 @@ mod tests {
             "{}",
             listed.body
         );
-        let secret = key.rsplit('_').next().expect("the secret half");
+        // Everything after the identifier, as `directory::key::id_of`
+        // reads it: the secret is URL-safe base64 and may itself hold
+        // `_`, and a cut at the last one left a tail of a character or
+        // two that a listing contains by chance.
+        let secret = key
+            .strip_prefix(directory::key::PREFIX)
+            .and_then(|rest| rest.split_once('_'))
+            .map(|(_, secret)| secret)
+            .expect("a minted key has the shape of one");
+        assert_eq!(
+            secret.len(),
+            43,
+            "thirty-two bytes, URL-safe, unpadded: {key}"
+        );
         assert!(
             !listed.body.contains(secret) && !listed.body.contains("\"key\""),
             "a listing carries no secret: {}",
