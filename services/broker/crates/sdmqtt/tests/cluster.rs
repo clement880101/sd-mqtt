@@ -513,23 +513,40 @@ struct Reported {
     this_node: bool,
 }
 
+/// One admin request, tried up to three times.
+///
+/// **A reset is retried, as a scraper would.** Under the load of a whole
+/// workspace's tests at once a node's admin listener has answered a
+/// connection with a reset now and then, and a test reading a gauge
+/// then failed on the read rather than on what it was checking. Three
+/// tries, and the last failure is the test's.
 fn raw_get(address: SocketAddr, path: &str) -> String {
-    let mut socket = TcpStream::connect_timeout(&address, REPLY).expect("the listener accepts");
-    socket
-        .set_read_timeout(Some(REPLY))
-        .expect("a read deadline");
-    socket
-        .write_all(
-            format!(
-                "GET {path} HTTP/1.1\r\nHost: {address}\r\n\
-                 Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
-            )
-            .as_bytes(),
+    let mut last = None;
+    for _ in 0..3 {
+        match try_get(address, path) {
+            Ok(answer) => return answer,
+            Err(why) => {
+                last = Some(why);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    panic!("the admin listener did not answer {path}: {last:?}");
+}
+
+fn try_get(address: SocketAddr, path: &str) -> std::io::Result<String> {
+    let mut socket = TcpStream::connect_timeout(&address, REPLY)?;
+    socket.set_read_timeout(Some(REPLY))?;
+    socket.write_all(
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: {address}\r\n\
+             Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
         )
-        .expect("the request is written");
+        .as_bytes(),
+    )?;
     let mut raw = Vec::new();
-    socket.read_to_end(&mut raw).expect("the response ends");
-    String::from_utf8_lossy(&raw).into_owned()
+    socket.read_to_end(&mut raw)?;
+    Ok(String::from_utf8_lossy(&raw).into_owned())
 }
 
 /// The lowest port this test will use, and one past the highest.
@@ -2503,9 +2520,14 @@ async fn a_session_that_moved_is_copied_under_its_new_owner() {
     until("beta starts gamma's copy over", || {
         cluster.nodes[1].counter("sdmqtt_replica_repairs_done_total") >= Some(1)
     });
+    // Current means gamma has answered beta and is not behind. The lag
+    // gauge alone reads zero before any follower has answered, so the
+    // repair count is asked too: it counts a placed follower with no
+    // mark, or one behind, until the sweep finds neither.
     until("the copy is back and current", || {
         held(&cluster, 2) == on_gamma
             && cluster.nodes[1].counter("sdmqtt_replication_lag") == Some(0)
+            && cluster.nodes[1].counter("sdmqtt_replica_repairs_pending") == Some(0)
     });
 
     // ---- the new owner dies, and the client comes back to alpha ----
