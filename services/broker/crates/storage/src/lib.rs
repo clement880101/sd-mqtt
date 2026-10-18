@@ -438,6 +438,54 @@ pub trait Storage: Send + Sync + 'static {
     /// own cannot see that, which is what makes taking one explicit worth
     /// the trouble.
     fn body(&self, id: &MessageId) -> Result<Option<BodyRecord>, StorageError>;
+
+    /// A session's queue, its highest sequence and the stream position
+    /// they reflect, read together. Section 8.6's repair.
+    ///
+    /// A snapshot is a queue and a position, and the two have to be one
+    /// moment's: a queue from the store stamped with a position read
+    /// from somewhere else can be a batch apart, and a follower holding
+    /// the newest change is handed a copy without it, marked as current.
+    /// The store writes a session's position in the same batch as the
+    /// change it counts, so a backend that answers from one read gives
+    /// the pair; [`SessionCopy::stream_at`] is `None` from one that
+    /// cannot, and the caller decides what to do without it.
+    ///
+    /// The default reads the parts separately and says `None`. Both
+    /// backends override it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store said.
+    fn session_copy(&self, session: &SessionKey) -> Result<SessionCopy, StorageError> {
+        let mut copy = SessionCopy {
+            highest_sequence: self.highest_sequence(session)?,
+            ..SessionCopy::default()
+        };
+        let mut cursor = 0;
+        while let Some(entry) = self.queue_head(session, cursor)? {
+            cursor = entry.sequence + 1;
+            if let Some(body) = self.body(&entry.delivery.body)? {
+                copy.queued.push((entry, body));
+            }
+        }
+        Ok(copy)
+    }
+}
+
+/// What [`Storage::session_copy`] read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionCopy {
+    /// The waiting messages, oldest first, each with the payload it
+    /// names. An entry whose payload the store no longer holds is left
+    /// out: it is a message that cannot be delivered.
+    pub queued: Vec<(QueueEntry, BodyRecord)>,
+    /// The highest sequence the session ever assigned.
+    pub highest_sequence: u64,
+    /// The stream position the queue above reflects, zero for a session
+    /// never streamed, or `None` when the store could not read it in
+    /// the same read as the queue.
+    pub stream_at: Option<u64>,
 }
 
 #[cfg(test)]

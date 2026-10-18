@@ -3109,6 +3109,85 @@ mod contract {
         assert_eq!(session_of(&restore(&store), "mine").stream_at, 0);
     }
 
+    /// A session's copy is its queue and the stream position that queue
+    /// reflects, from one read.
+    ///
+    /// Section 8.6's repair stamps a snapshot with a position. Read
+    /// from the owner's memory while the queue came from the store, the
+    /// two could be a batch apart, and a follower holding the newest
+    /// message was handed a copy without it, stamped as current. The
+    /// store writes the position in the same batch as the change it
+    /// counts, so reading both in one go is the pair a snapshot needs.
+    pub fn a_session_copy_is_its_queue_and_the_position_it_reflects<S: Storage>(
+        new: impl Fn() -> S,
+    ) {
+        let store = with_session(new, "mine");
+        let copy = store.session_copy(&key("mine")).expect("a copy reads");
+        assert!(copy.queued.is_empty());
+        assert_eq!(
+            copy.stream_at,
+            Some(0),
+            "a session never streamed is at zero"
+        );
+
+        let entry = |sequence: u64, n: u8| QueueEntry {
+            sequence,
+            packet_id: None,
+            delivery: DeliveryRecord {
+                body: body_id(n),
+                qos: Qos::AtLeastOnce,
+                retain: false,
+                subscription_ids: Vec::new(),
+                dup: false,
+            },
+        };
+        apply(
+            &store,
+            &[
+                Record::BodyPut {
+                    id: body_id(1),
+                    body: body(1),
+                },
+                Record::QueuePushed {
+                    session: key("mine"),
+                    entry: entry(1, 1),
+                },
+                Record::StreamAt {
+                    session: key("mine"),
+                    at: 1,
+                },
+            ],
+        );
+        apply(
+            &store,
+            &[
+                Record::BodyPut {
+                    id: body_id(2),
+                    body: body(2),
+                },
+                Record::QueuePushed {
+                    session: key("mine"),
+                    entry: entry(2, 2),
+                },
+                Record::StreamAt {
+                    session: key("mine"),
+                    at: 2,
+                },
+            ],
+        );
+        let copy = store.session_copy(&key("mine")).expect("a copy reads");
+        assert_eq!(
+            copy.queued,
+            vec![(entry(1, 1), body(1)), (entry(2, 2), body(2))],
+            "every entry with the payload it names, in order"
+        );
+        assert_eq!(copy.highest_sequence, 2);
+        assert_eq!(copy.stream_at, Some(2), "the position the queue reflects");
+
+        let unknown = store.session_copy(&key("ghost")).expect("a copy reads");
+        assert!(unknown.queued.is_empty());
+    }
+
     /// A stream mark or a replica row for a session the store does not
     /// hold is refused, by name, like every other per-session record.
     ///
@@ -3399,6 +3478,7 @@ macro_rules! every_contract_test {
             a_replica_mark_is_overwritten_and_dropping_it_keeps_the_session,
             the_owners_stream_position_survives_and_goes_with_the_session,
             a_mark_for_an_unknown_session_is_refused,
+            a_session_copy_is_its_queue_and_the_position_it_reflects,
             finishing_an_envelope_after_its_rule_is_gone_keeps_the_release,
         }
     };
@@ -3499,6 +3579,10 @@ mod on_disk {
 
         fn body(&self, id: &MessageId) -> Result<Option<BodyRecord>, StorageError> {
             self.store.body(id)
+        }
+
+        fn session_copy(&self, session: &SessionKey) -> Result<storage::SessionCopy, StorageError> {
+            self.store.session_copy(session)
         }
     }
 }

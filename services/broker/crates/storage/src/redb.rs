@@ -580,6 +580,41 @@ impl Storage for RedbStorage {
         };
         decode(held.value()).map(Some)
     }
+
+    /// One read transaction for the queue, its counters, its payloads
+    /// and its position: redb's reads see one committed state, so the
+    /// four are one moment's.
+    fn session_copy(&self, session: &SessionKey) -> Result<crate::SessionCopy, StorageError> {
+        let transaction = self.database.begin_read().map_err(StorageError::from)?;
+        let queues = open_read(&transaction, QUEUES)?;
+        let queue_state = open_read(&transaction, QUEUE_STATE)?;
+        let bodies = open_read(&transaction, BODIES)?;
+        let streams = open_read(&transaction, STREAMS)?;
+        let prefix = session_prefix(session);
+        let mut copy = crate::SessionCopy {
+            highest_sequence: read_queue_state(&queue_state, &prefix)?.highest_sequence,
+            stream_at: Some(
+                match streams.get(&prefix[..]).map_err(StorageError::from)? {
+                    Some(at) => decode(at.value())?,
+                    None => 0,
+                },
+            ),
+            ..crate::SessionCopy::default()
+        };
+        for entry in range(&queues, &prefix)? {
+            let (_, value) = entry.map_err(StorageError::from)?;
+            let entry: QueueEntry = decode(value.value())?;
+            let Some(held) = bodies
+                .get(&entry.delivery.body.0[..])
+                .map_err(StorageError::from)?
+            else {
+                continue;
+            };
+            let body = decode(held.value())?;
+            copy.queued.push((entry, body));
+        }
+        Ok(copy)
+    }
 }
 
 impl RedbStorage {

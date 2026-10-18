@@ -697,6 +697,29 @@ impl Storage for MemoryStorage {
             .map_or(0, |held| held.highest_sequence))
     }
 
+    /// Under one lock, which is the memory store's one moment.
+    fn session_copy(&self, session: &SessionKey) -> Result<crate::SessionCopy, StorageError> {
+        let state = self.state();
+        let Some(held) = state.sessions.get(session) else {
+            return Ok(crate::SessionCopy {
+                stream_at: Some(0),
+                ..crate::SessionCopy::default()
+            });
+        };
+        Ok(crate::SessionCopy {
+            queued: held
+                .queue
+                .values()
+                .filter_map(|entry| {
+                    let body = state.bodies.get(&entry.delivery.body)?;
+                    Some((entry.clone(), body.body.clone()))
+                })
+                .collect(),
+            highest_sequence: held.highest_sequence,
+            stream_at: Some(state.streams.get(session).copied().unwrap_or(0)),
+        })
+    }
+
     fn outbox_head(&self, rule: &str, cursor: u64) -> Result<Option<OutboxRecord>, StorageError> {
         Ok(self
             .state()
