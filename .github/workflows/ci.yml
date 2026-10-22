@@ -263,12 +263,13 @@ jobs:
           python3 scripts/test_release_workflow.py
           python3 scripts/test_test_package.py
 
-  # Section 15's fourth budget, idle resident memory under 30 MB. A
-  # process has to start and settle, so it runs on the schedule rather
-  # than on every push, as the section says.
+  # Section 15's fourth budget, idle resident memory under 30 MB, on
+  # every push. It measures the binary that ships, so it needs a release
+  # build, and that is the cost. It ran only on the schedule until a
+  # change that had passed every push for three days left an idle broker
+  # at 42.8 MB, found by 0.8.0's first release run.
   memory:
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

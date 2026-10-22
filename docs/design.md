@@ -1648,7 +1648,7 @@ in CI, not when the code is written.
 | Metric | Target | Today | Checked |
 |---|---|---|---|
 | Release binary, all features, stripped, link-time optimized | under 15 MB | 9.88 MB | every push |
-| Idle resident memory, single node, no clients | under 30 MB | 19.4 MB (Linux, musl) | scheduled |
+| Idle resident memory, single node, no clients | under 30 MB | 19.4 MB (Linux, musl) | every push |
 | UI bundle, gzipped | under 150 KB | 67.4 KB | every push |
 | Direct dependencies across broker crates | under 35 | 31 | every push |
 | Concurrent connections per node, target hardware | 100,000 | 100,000 held, 32 KB each | before a release |
