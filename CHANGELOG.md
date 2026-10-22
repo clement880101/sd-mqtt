@@ -39,6 +39,18 @@ the milestone you are moving to.** Everything else is description.
 - The idle-memory budget is checked on every push rather than on a
   schedule.
 
+### Security
+
+- **Two certificate-verification advisories in dependencies are
+  fixed.** RUSTSEC-2026-0381 (`webpki-roots` 1.0.9 still trusted the
+  emSign ECC Root CA - G3, whose distrusted intermediates' private keys
+  are public) and RUSTSEC-2026-0382 (`rustls-webpki` 0.103.15 accepted
+  certificate paths through those intermediates). They affect what the
+  HTTP connectors trust when posting to or polling an HTTPS endpoint,
+  and what a TLS listener accepts from a client certificate. Updated to
+  `webpki-roots` 1.0.10 and `rustls-webpki` 0.103.16. 0.8.0 and earlier
+  carry the vulnerable versions.
+
 ## 0.8.0 — 2026-10-18
 
 ### Changed

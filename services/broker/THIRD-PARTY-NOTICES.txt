@@ -95,7 +95,7 @@ Summary
   redb 4.3.0 — MIT  (of MIT OR Apache-2.0)
   rustls 0.23.46 — MIT  (of Apache-2.0 OR ISC OR MIT)
   rustls-pki-types 1.15.1 — MIT  (of MIT OR Apache-2.0)
-  rustls-webpki 0.103.15 — ISC
+  rustls-webpki 0.103.16 — ISC
   ryu 1.0.23 — Apache-2.0  (of Apache-2.0 OR BSL-1.0)
   scopeguard 1.2.0 — MIT  (of MIT OR Apache-2.0)
   serde 1.0.229 — MIT  (of MIT OR Apache-2.0)
@@ -132,7 +132,7 @@ Summary
   untrusted 0.9.0 — ISC
   uuid 1.26.1 — MIT  (of Apache-2.0 OR MIT)
   want 0.3.1 — MIT
-  webpki-roots 1.0.9 — CDLA-Permissive-2.0
+  webpki-roots 1.0.10 — CDLA-Permissive-2.0
   winnow 1.0.4 — MIT
   zeroize 1.9.0 — MIT  (of Apache-2.0 OR MIT)
   zmij 1.0.23 — MIT
@@ -2064,7 +2064,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ----------------------------------------------------------------------
-rustls-webpki 0.103.15 (ISC)
+rustls-webpki 0.103.16 (ISC)
 
 Except as otherwise noted, this project is licensed under the following
 (ISC-style) terms:
@@ -2963,7 +2963,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
 ----------------------------------------------------------------------
-webpki-roots 1.0.9 (CDLA-Permissive-2.0)
+webpki-roots 1.0.10 (CDLA-Permissive-2.0)
 
 # Community Data License Agreement - Permissive - Version 2.0
 
