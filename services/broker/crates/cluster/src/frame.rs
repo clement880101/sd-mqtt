@@ -46,7 +46,13 @@ use serde::Serialize;
 /// Its own version, separate from the greeting's: a node that cannot be
 /// greeted must say so before either side has spent anything, and this
 /// is about messages that only flow once a handshake has succeeded.
-pub const FRAME_VERSION: u8 = 1;
+///
+/// **Two since the relay and the member gossip**, which added message
+/// variants a version-one build closes a link on. A cluster is upgraded
+/// whole, every node stopped and started on one build; the version is
+/// what makes a mixed link fail at its first frame and say why, rather
+/// than drop and redial every round.
+pub const FRAME_VERSION: u8 = 2;
 
 /// How wide the length is: 32 bits, little-endian.
 pub const LENGTH_BYTES: usize = 4;
@@ -288,7 +294,7 @@ mod tests {
         // bytes of body, so eight with the version byte.
         let expected: &[u8] = &[
             0x08, 0x00, 0x00, 0x00, // length: version byte and body
-            0x01, // frame version 1
+            0x02, // frame version 2
             0x01, // beat = 1
             0x05, b'h', b'e', b'l', b'l', b'o', // note = "hello"
         ];
@@ -456,6 +462,28 @@ mod tests {
     // -----------------------------------------------------------
     // The version byte
     // -----------------------------------------------------------
+
+    /// A frame from a build before the relay and the gossip is refused.
+    ///
+    /// Those builds read frame version one and close a link on a
+    /// message variant they do not know, which `Relay` and `Members`
+    /// both are. Left at one, a cluster half upgraded would drop and
+    /// redial its mixed links every round, saying only that a frame did
+    /// not decode; refused by version, the first frame says which build
+    /// is which.
+    #[test]
+    fn a_frame_from_a_build_before_the_relay_and_the_gossip_is_refused() {
+        let mut frame = encode(&message(), &FrameLimits::default()).expect("encodes");
+        frame[LENGTH_BYTES] = 1;
+        let mut buffer = BytesMut::new();
+        buffer.extend_from_slice(&frame);
+        match decode::<Message>(&mut buffer, &FrameLimits::default()) {
+            Err(FrameError::UnknownVersion { found: 1, expected }) => {
+                assert!(expected > 1, "this build speaks a later layout");
+            }
+            other => panic!("a version-one frame was {other:?}"),
+        }
+    }
 
     /// An unknown version is refused, saying both numbers.
     ///
