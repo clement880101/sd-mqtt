@@ -128,7 +128,13 @@ impl Node {
                     self.logged()
                 ));
             }
-            if TcpStream::connect_timeout(&self.admin, Duration::from_millis(200)).is_ok() {
+            // **An answer, not a connect.** On macOS a socket another
+            // test thread was creating while this node was spawned can
+            // be inherited by the child and stay listening there; this
+            // node then fails to bind its port and exits, while a
+            // connect to the port still completes against the leaked
+            // backlog. Only the node itself answers HTTP.
+            if answers_live(self.admin) {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -457,6 +463,10 @@ impl Default for Knobs {
 }
 
 fn spawn(config: &Path, store: &Path, log: &Path, knobs: Knobs) -> Child {
+    // Held until the child exists; see `SPAWNING`.
+    let _spawning = SPAWNING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     Command::new(env!("CARGO_BIN_EXE_sdmqtt"))
         .arg("serve")
         .arg("--config")
@@ -513,25 +523,62 @@ struct Reported {
     this_node: bool,
 }
 
-/// One admin request, tried up to three times.
+/// One admin request.
 ///
-/// **A reset is retried, as a scraper would.** Under the load of a whole
-/// workspace's tests at once a node's admin listener has answered a
-/// connection with a reset now and then, and a test reading a gauge
-/// then failed on the read rather than on what it was checking. Three
-/// tries, and the last failure is the test's.
+/// Not retried. A reset here was once retried as a scraper would, which
+/// hid the cause: a node that had failed to start while a leaked socket
+/// held its port. A live node answers; see `answers_live`.
 fn raw_get(address: SocketAddr, path: &str) -> String {
-    let mut last = None;
-    for _ in 0..3 {
-        match try_get(address, path) {
-            Ok(answer) => return answer,
-            Err(why) => {
-                last = Some(why);
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
+    try_get(address, path)
+        .unwrap_or_else(|why| panic!("the admin listener did not answer {path}: {why}"))
+}
+
+/// Whether the node on `address` answers its liveness endpoint.
+///
+/// A short read deadline, because a listener nobody accepts on
+/// completes the connect and then says nothing at all.
+fn answers_live(address: SocketAddr) -> bool {
+    let Ok(mut socket) = TcpStream::connect_timeout(&address, Duration::from_millis(200)) else {
+        return false;
+    };
+    if socket
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .is_err()
+    {
+        return false;
     }
-    panic!("the admin listener did not answer {path}: {last:?}");
+    let asked =
+        format!("GET /health/live HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    if socket.write_all(asked.as_bytes()).is_err() {
+        return false;
+    }
+    let mut answer = Vec::new();
+    let _ = socket.read_to_end(&mut answer);
+    answer.starts_with(b"HTTP/1.1 200")
+}
+
+/// A listener that completes a connect and never answers is not a node.
+///
+/// What a socket leaked into another node looks like from outside: the
+/// handshake completes against its backlog and nothing is ever read.
+/// The harness once took that for a node that had started.
+#[test]
+fn a_listener_that_does_not_answer_is_not_a_live_node() {
+    let silent = TcpListener::bind(("127.0.0.1", 0)).expect("a port");
+    let address = silent.local_addr().expect("its address");
+    assert!(
+        TcpStream::connect(address).is_ok(),
+        "the connect alone succeeds"
+    );
+    let asked = Instant::now();
+    assert!(
+        !answers_live(address),
+        "a silent listener is not a live node"
+    );
+    assert!(
+        asked.elapsed() < Duration::from_secs(3),
+        "and saying so does not hang"
+    );
 }
 
 fn try_get(address: SocketAddr, path: &str) -> std::io::Result<String> {
@@ -604,6 +651,17 @@ fn near_process_ids_start_far_apart() {
 /// Every port this test binary has taken.
 static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
 
+/// Held while a port is probed and while a node is spawned, so the two
+/// never overlap.
+///
+/// Darwin sets close-on-exec on a socket a moment after creating it,
+/// and a node spawned in that moment inherits the socket. A probe socket
+/// inherited that way stays listening in the child after the probe is
+/// dropped, and the node the port was handed to cannot bind it. Other
+/// sockets a test makes can leak the same way; the probe is the one
+/// this harness makes in a loop while other threads spawn.
+static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A port nothing else will be given, with nothing listening on it.
 ///
 /// Drawing from [`PORTS`] removes the kernel as a competitor; remembering
@@ -623,7 +681,13 @@ fn free_port() -> u16 {
         }
         handed.push(port);
         drop(handed);
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        let probed = {
+            let _spawning = SPAWNING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            TcpListener::bind(("127.0.0.1", port)).is_ok()
+        };
+        if probed {
             return port;
         }
         // Something else on the machine has it. Spent either way, so
