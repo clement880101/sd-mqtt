@@ -24,3 +24,12 @@ rebinding gets around that by making the page's request same-origin.
 The name is the one thing the attack cannot forge. If you reach the
 listener through a name of your own, put it in the list; the refusal
 says so.
+
+**The admin listener shares the process's descriptor limit** with every
+MQTT connection. When the limit is reached, a connection the kernel
+completed but the process cannot accept is dropped, which a scraper sees
+as a reset, and accepting backs off for a second after each failure, so
+scrapes slow to a crawl. Raise `nofile` (`ulimit -n`, or `LimitNOFILE=`
+under systemd) to cover `max_connections` and some headroom. A node that
+is running and within its limit does not reset scrapes: one reset means
+the process is exiting, or something else holds the port.

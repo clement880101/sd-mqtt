@@ -8,6 +8,37 @@ it had releases.
 **The one thing to read before upgrading is "Before you upgrade" under
 the milestone you are moving to.** Everything else is description.
 
+## Unreleased
+
+### Before you upgrade a cluster
+
+- **No rolling upgrade.** Two kinds of cluster message are new, and the
+  cluster frame version is now 2. Stop every node, then start them all
+  on the new build. A link between an 0.8.0 node and a new one is
+  refused at its first frame, and the log names both versions.
+- **Nodes now dial addresses they were not configured with.** Every
+  node's advertised address must be reachable from every other node.
+
+### Added
+
+- **One seed is enough.** Nodes tell each other which members they
+  see alive, with the address each member advertised, so a node that
+  lists a single seed ends up linked to every live member. What a node
+  is told is only where to dial: every link still goes through the
+  authenticated handshake, a member's own address is never overridden,
+  and a node an operator forgot is not dialled on a peer's word.
+- **A dead node's writes reach a node that missed them, through any
+  other.** Subscriptions, retained messages, rules, users, access rules
+  and API keys written by a node that has since died are relayed to a
+  node that missed the broadcast by a peer that holds them. An origin
+  the answering node can still hear is not relayed, so a one-way
+  partition does not resend everything every round.
+
+### Changed
+
+- The idle-memory budget is checked on every push rather than on a
+  schedule.
+
 ## 0.8.0 — 2026-10-18
 
 ### Changed
