@@ -79,6 +79,13 @@ the backoff, and the last of those is much longer on purpose: a peer
 that refuses the secret is a configuration error that will not fix
 itself.
 
+A write a node made reaches every node, even one that missed it and
+can no longer ask the writer: every couple of seconds each node asks a
+random peer what it is missing, and a peer answers for a node it cannot
+hear from either — a dead one, or one that died before the asker joined
+— by sending its copy of every replicated record. A node a peer can still
+hear is not answered for; the asker reads that node itself once it can.
+
 `SDMQTT_CLUSTER_NAME`, `SDMQTT_CLUSTER_SECRET`,
 `SDMQTT_CLUSTER_ADDRESS`, `SDMQTT_CLUSTER_ADVERTISE` and
 `SDMQTT_CLUSTER_SEEDS` (comma separated) set the same values.

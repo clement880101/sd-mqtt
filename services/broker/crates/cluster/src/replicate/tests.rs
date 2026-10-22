@@ -208,7 +208,7 @@ struct Cluster {
 impl Cluster {
     fn of(count: usize) -> Self {
         const NAMES: [&str; 3] = ["alpha", "beta", "gamma"];
-        Self {
+        let cluster = Self {
             nodes: (0..count)
                 .map(|index| {
                     Node::new(
@@ -222,6 +222,30 @@ impl Cluster {
             delivered: BTreeMap::new(),
             dropped: BTreeMap::new(),
             answered: Vec::new(),
+        };
+        for one in 0..count {
+            cluster.met(one);
+        }
+        cluster
+    }
+
+    /// Every node and `index` are answering each other, as a link coming
+    /// up says through the mesh's `member_changed`.
+    ///
+    /// Section 8.2's relay is answered only for an origin the answerer
+    /// cannot hear, so a harness in which nobody had ever been heard from
+    /// would relay everything to everybody; this is what a cluster whose
+    /// links are up looks like.
+    fn met(&self, index: usize) {
+        for other in 0..self.nodes.len() {
+            if other != index {
+                self.nodes[other]
+                    .replicated()
+                    .revived(self.nodes[index].id());
+                self.nodes[index]
+                    .replicated()
+                    .revived(self.nodes[other].id());
+            }
         }
     }
 
@@ -235,7 +259,20 @@ impl Cluster {
             u8::try_from(index + 1).expect("a small index"),
             "delta",
         ));
+        self.met(index);
         index
+    }
+
+    /// Node `which` dies: nothing it says arrives, nothing reaches it,
+    /// and every other node has judged it dead.
+    fn kill(&mut self, which: usize) {
+        for other in 0..self.nodes.len() {
+            if other != which {
+                self.cut(which, other);
+                self.cut(other, which);
+                self.nodes[other].replicated().died(self.nodes[which].id());
+            }
+        }
     }
 
     /// Sever what `from` says to `to`, and nothing else.
@@ -319,8 +356,9 @@ impl Cluster {
     /// rather than two frames in total.
     fn exchange(&mut self, from: usize, to: usize) -> usize {
         self.answered.clear();
-        let digest = self.nodes[from].replicator.digest_for(self.nodes[to].id());
-        self.say(from, to, digest);
+        for frame in self.nodes[from].replicator.asks_for(self.nodes[to].id()) {
+            self.say(from, to, frame);
+        }
         self.settle()
     }
 
@@ -662,11 +700,17 @@ fn a_node_that_has_everything_pulls_nothing() {
     }
     assert_eq!(cluster.nodes[1].text("b").as_deref(), Some("two"));
 
+    // The digest and the relay, and neither is answered: the relay names
+    // no origin the holder cannot hear, which is every round of a healthy
+    // cluster.
     let frames = cluster.exchange(1, 0);
-    assert_eq!(frames, 1, "the round should be the digest and no answer");
+    assert_eq!(
+        frames, 2,
+        "the round should be the digest, the relay and no answer"
+    );
     assert_eq!(
         cluster.answers(),
-        &[None],
+        &[None, None],
         "a peer that has everything was sent something"
     );
 
@@ -760,13 +804,13 @@ fn a_batch_that_says_there_is_no_more_ends_the_round() {
     let frames = cluster.exchange(1, 0);
     assert_eq!(
         frames,
-        2,
-        "the round should be a digest and one batch: {:?}",
+        3,
+        "the round should be a digest, a relay and one batch: {:?}",
         cluster.answers()
     );
     assert!(matches!(
         cluster.answers(),
-        [Some(Replication::Batch { more: false, .. }), None]
+        [Some(Replication::Batch { more: false, .. }), None, None]
     ));
 }
 
@@ -1637,5 +1681,138 @@ fn a_batch_that_does_not_move_the_watermark_is_not_asked_for_again() {
         handled.reply.is_none(),
         "asked again for a batch that cannot be counted: {:?}",
         handled.reply
+    );
+}
+
+// ---- a dead origin's writes, through a third node -------------------------
+
+/// A write a dead node made reaches a node that missed it, through a
+/// node that holds it.
+///
+/// Section 8.2's digest is a claim about one log, and before the relay
+/// the only log a node served was its own. So a write alpha broadcast,
+/// that beta took and gamma missed, was repairable only from alpha —
+/// and once alpha was dead, never: beta held the register and had no
+/// way to say so, and gamma's exchange with beta asked only about
+/// beta's own writes.
+#[test]
+fn a_write_a_dead_node_made_reaches_a_node_that_missed_it_through_a_third() {
+    let mut cluster = Cluster::of(NODES);
+    cluster.cut(0, 2);
+    let frame = cluster.nodes[0].retain("t/relayed", "from-alpha");
+    cluster.broadcast(0, &frame);
+    cluster.settle();
+    assert_eq!(
+        cluster.nodes[1].text("t/relayed").as_deref(),
+        Some("from-alpha")
+    );
+    assert_eq!(cluster.nodes[2].text("t/relayed"), None, "gamma missed it");
+
+    cluster.kill(0);
+    cluster.exchange(2, 1);
+
+    let alpha = cluster.nodes[0].id();
+    assert_eq!(
+        cluster.nodes[2].text("t/relayed").as_deref(),
+        Some("from-alpha"),
+        "gamma did not learn the dead node's write from the node that held it"
+    );
+    assert_eq!(
+        cluster.nodes[2].replicated().seen_through(alpha),
+        1,
+        "gamma's watermark for alpha did not move to what beta had read"
+    );
+
+    // And once it has caught up, a round asks for nothing: the relay is a
+    // repair, not a resynchronisation every few seconds.
+    cluster.exchange(2, 1);
+    assert!(
+        cluster.answers().iter().all(Option::is_none),
+        "a caught-up node was answered with something: {:?}",
+        cluster.answers()
+    );
+}
+
+/// An origin the answering node can still hear is not relayed.
+///
+/// The bound on what the relay costs. A node that hears the origin is
+/// ahead of one that does not for as long as the origin keeps writing,
+/// so relaying then would be every register on every round of a partial
+/// partition; the asker reads the origin itself once it can, as it
+/// always has. A dead origin writes nothing more, so the relay that
+/// repairs it happens once.
+#[test]
+fn an_origin_the_answerer_still_hears_is_not_relayed() {
+    let mut cluster = Cluster::of(NODES);
+    cluster.cut(0, 2);
+    let frame = cluster.nodes[0].retain("t/relayed", "from-alpha");
+    cluster.broadcast(0, &frame);
+    cluster.settle();
+
+    // Gamma has judged alpha dead and beta has not.
+    cluster.cut(2, 0);
+    cluster.nodes[2].replicated().died(cluster.nodes[0].id());
+    cluster.exchange(2, 1);
+    assert_eq!(cluster.nodes[2].text("t/relayed"), None);
+    assert!(
+        cluster.answers().iter().all(Option::is_none),
+        "beta relayed an origin it can still hear: {:?}",
+        cluster.answers()
+    );
+}
+
+/// A node that never heard of the dead origin at all is sent its writes.
+///
+/// A node joining after a member died has no row for it and no
+/// watermark, so it cannot name it; the answerer relays every origin it
+/// cannot hear that the asker did not say it holds.
+#[test]
+fn a_node_that_joined_after_the_origin_died_is_sent_its_writes() {
+    let mut cluster = Cluster::of(2);
+    write_many(&mut cluster, 0, 0, 3);
+    cluster.kill(0);
+    let newcomer = cluster.join();
+    cluster.nodes[newcomer]
+        .replicated()
+        .died(cluster.nodes[0].id());
+    cluster.exchange(newcomer, 1);
+    for index in 0..3 {
+        assert_eq!(
+            cluster.nodes[newcomer]
+                .text(&format!("t/{index}"))
+                .as_deref(),
+            Some("v"),
+            "t/{index} did not reach the newcomer"
+        );
+    }
+    assert_eq!(
+        cluster.nodes[newcomer]
+            .replicated()
+            .seen_through(cluster.nodes[0].id()),
+        3
+    );
+}
+
+/// A relay longer than one page arrives whole, and the watermark it
+/// moves to is the one the answerer had when the relay began.
+#[test]
+fn a_relay_of_more_than_one_page_arrives_whole() {
+    let mut cluster = Cluster::of(NODES);
+    cluster.cut(0, 2);
+    write_many(&mut cluster, 0, 0, 2 * DEFAULT_BATCH + 5);
+    cluster.kill(0);
+    cluster.exchange(2, 1);
+    for index in 0..2 * DEFAULT_BATCH + 5 {
+        assert_eq!(
+            cluster.nodes[2].text(&format!("t/{index}")).as_deref(),
+            Some("v"),
+            "t/{index} is missing on gamma"
+        );
+    }
+    assert_eq!(
+        cluster.nodes[2]
+            .replicated()
+            .seen_through(cluster.nodes[0].id()),
+        u64::try_from(2 * DEFAULT_BATCH + 5).expect("small")
     );
 }

@@ -8,18 +8,39 @@
 //!
 //! # The exchange is a pull, one peer at a time, one direction at a time
 //!
-//! A round is three frames at most: this node tells one peer how far it
-//! has read *that peer's* log, the peer answers with the next batch of it,
-//! and this node asks again if there is more. Nothing in a round is about
-//! this node's own log, and nothing in it is about a third node's.
+//! A round starts with two frames to one peer. The digest tells it how
+//! far this node has read *that peer's* log; the peer answers with the
+//! next batch of it, and this node asks again if there is more. The relay
+//! tells it how far this node has read **every other** log, and is the
+//! part about third nodes.
 //!
-//! That is not a simplification, it is what "the digest is a claim about
-//! an operation log" forces. A node holds its peers' **registers** and
+//! The two are separate because "the digest is a claim about an
+//! operation log" forces it. A node holds its peers' **registers** and
 //! only its own **log**, so it can serve entries it originated and
 //! nothing else: asked for node C's log, node B has no entries to send
 //! even where it holds every register C ever wrote. Symmetry comes from
 //! every node running its own rounds against a random peer, which in a
-//! full mesh reaches everybody.
+//! full mesh reaches everybody — **while C is alive**.
+//!
+//! # A dead origin's writes are relayed as registers
+//!
+//! Once C is dead nobody can serve its log, and a write of C's that
+//! reached B and missed A was, before the relay, lost to A for good.
+//! Section 8.2's version counters are per node and say nothing about who
+//! may answer for them, so B answers for C: asked by A's relay, B sends
+//! its registers — the pages of section 8.2's join snapshot, for the same
+//! reason — and A, once the last page is in, moves its watermark for C to
+//! what B had read. The claim is true because a register B holds for one
+//! of C's entries is that entry or a write that beat it, and the merge
+//! keeps whichever wins.
+//!
+//! **Only for an origin B is not hearing.** An origin B hears and A does
+//! not is one A is behind on for as long as it writes, so relaying it
+//! would be every register on every round of a one-way partition; A
+//! reads that origin itself once it can, as it always did. An origin
+//! nobody hears writes nothing more, which is what makes its relay a
+//! repair that happens once rather than a resynchronisation that never
+//! stops. See [`Replication::Relay`].
 //!
 //! # A tombstone collected too early is a delete that never arrives
 //!
@@ -31,9 +52,13 @@
 //!
 //! The plan's worry is that a node which never saw a delete re-broadcasts
 //! its old value and nothing contradicts it. That cannot happen here, for
-//! a stronger reason than the watermark: **a node serves only the log it
-//! originated**, so a register it merely holds is never offered to
-//! anybody. A node that missed a delete does not spread the old value.
+//! a stronger reason than the watermark: **a node broadcasts and batches
+//! only the log it originated**, so a register it merely holds is offered
+//! to nobody except in a snapshot — the join snapshot or the relay — and
+//! a snapshot holds whatever tombstones the sender has not collected. A
+//! sender collects a tombstone only once every node its writer knew of
+//! had read past it, so a node that missed a delete is a node that holds
+//! the watermark below it and nothing is collected.
 //!
 //! What it does do is keep it, for ever. The node that deleted the record
 //! has thrown away both the tombstone and the log entry carrying it, so
@@ -99,7 +124,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use storage::{ClockRecord, LoggedRecord, MetadataKeyRecord, MetadataRecord, Record};
+use storage::{ClockRecord, LoggedRecord, MetadataKeyRecord, MetadataRecord, Record, SeenRecord};
 
 use crate::clock::Reading;
 use crate::identity::NodeId;
@@ -309,6 +334,68 @@ pub enum Replication {
         /// The last key already received.
         after: MetadataKeyRecord,
     },
+    /// "This is how far I hold every log I know of; send me what you
+    /// hold of the ones you cannot hear either." **Section 8.2's relay.**
+    ///
+    /// The digest above is about the receiver's own log, which is all a
+    /// node used to be able to serve, so a write that reached one peer
+    /// and missed another could be repaired only by the node that made
+    /// it — and once that node was dead, never, although the first peer
+    /// held it. Section 8.2's per-node version counters say any node may
+    /// serve what it holds of any origin; this is how it is asked.
+    ///
+    /// Sent with every digest, to the same peer. **Answered only for an
+    /// origin the receiver is not hearing from** and has read further of
+    /// than the sender says it has; an origin the sender does not name
+    /// counts as one it holds nothing of, which is what a node that
+    /// joined after a member died looks like. Nothing to relay is no
+    /// answer at all, which is the ordinary case.
+    ///
+    /// **Added after 0.8.0.** A node from before it will not decode this
+    /// frame and closes the link, and this one is sent on every round,
+    /// so every node of a cluster must run a build that has it.
+    Relay {
+        /// How far the sender has read each log it knows of, its own
+        /// and the receiver's left out.
+        have: Vec<SeenRecord>,
+    },
+    /// One page of the sender's registers, for an asker behind on
+    /// origins neither of them can hear.
+    ///
+    /// The same pages as [`Self::Snapshot`] — every register the sender
+    /// holds, whoever wrote it, tombstones included, in key order — and
+    /// for the same reason: the sender holds the registers rather than
+    /// the other node's log, and a register it holds for an entry is the
+    /// entry or a write that beat it. What differs is what the last page
+    /// lets the asker claim, which is [`Self::RelayPage::through`].
+    ///
+    /// **Added after 0.8.0**; see [`Self::Relay`].
+    RelayPage {
+        /// The registers on this page, in key order.
+        registers: Vec<MetadataRecord>,
+        /// How far the sender had read each relayed origin's log **when
+        /// the relay began**, which is where the asker's watermarks may
+        /// move once the last page has arrived.
+        ///
+        /// Fixed at the first page and carried through every page and
+        /// every [`Self::RelayFrom`], because neither side keeps a
+        /// cursor: an entry the sender took while the pages were going
+        /// out may sit behind a key already sent, and a watermark read
+        /// at the last page would claim it.
+        through: Vec<SeenRecord>,
+        /// Whether this is the last page.
+        last: bool,
+    },
+    /// "Send me the registers after this key": the next page of a
+    /// [`Self::RelayPage`], carrying the watermarks the first page gave.
+    ///
+    /// **Added after 0.8.0**; see [`Self::Relay`].
+    RelayFrom {
+        /// The last key already received.
+        after: MetadataKeyRecord,
+        /// What the first page said, handed back.
+        through: Vec<SeenRecord>,
+    },
 }
 
 /// Why a frame from a peer was refused.
@@ -504,6 +591,41 @@ impl Replicator {
         }
     }
 
+    /// What to ask `peer` about the logs of every other node: section
+    /// 8.2's relay. See [`Replication::Relay`].
+    ///
+    /// Every log this node has read anything of, its own and `peer`'s
+    /// left out: `peer`'s is the digest's question, and nobody holds more
+    /// of this node's than this node does.
+    #[must_use]
+    pub fn relay_for(&self, peer: NodeId) -> Replication {
+        let me = self.replicated.me();
+        Replication::Relay {
+            have: self
+                .replicated
+                .seen()
+                .into_iter()
+                .filter(|(origin, _)| *origin != me && *origin != peer)
+                .map(|(origin, through)| SeenRecord {
+                    node: origin.to_bytes(),
+                    through,
+                })
+                .collect(),
+        }
+    }
+
+    /// One round of section 8.2's exchange with `peer`: the digest about
+    /// its log, and the relay about everybody else's.
+    ///
+    /// Both to the same peer and in that order. The digest is answered
+    /// from the peer's log and the relay from its registers, so neither
+    /// answer depends on the other and a peer with nothing to say to
+    /// either sends nothing back.
+    #[must_use]
+    pub fn asks_for(&self, peer: NodeId) -> Vec<Replication> {
+        vec![self.digest_for(peer), self.relay_for(peer)]
+    }
+
     /// How far `peer` last said it had read this node's log.
     ///
     /// Zero for a peer that has never sent a digest. What section 8.2's
@@ -554,7 +676,120 @@ impl Replicator {
             Replication::SnapshotFrom { after } => {
                 Ok(self.snapshot_page(Some(&MetadataKey::from_record(after))))
             }
+            Replication::Relay { have } => Ok(self.relay(from, &have)),
+            Replication::RelayPage {
+                registers,
+                through,
+                last,
+            } => self.take_relayed(registers, through, last),
+            Replication::RelayFrom { after, through } => Ok(Self::relay_page_reply(
+                self.relay_page(Some(&MetadataKey::from_record(after)), through),
+            )),
         }
+    }
+
+    /// Answer `from`'s relay: the first page of this node's registers,
+    /// if there is an origin to relay, and nothing otherwise.
+    ///
+    /// **An origin is relayed only if this node is not hearing it**, and
+    /// that is the bound on what the relay costs rather than a detail.
+    /// A node that hears an origin the asker does not is ahead of the
+    /// asker for as long as the origin keeps writing, so relaying it
+    /// would be every register on every round of a one-way partition;
+    /// the asker reads that origin itself once it can, as it always has.
+    /// An origin nobody hears writes nothing more, so its relay happens
+    /// once per node that missed something, and then the two agree.
+    ///
+    /// Never this node's own log, which the digest serves, and never the
+    /// asker's, which nobody holds more of than the asker.
+    fn relay(&self, from: NodeId, have: &[SeenRecord]) -> Handled {
+        let me = self.replicated.me();
+        let liveness = self.replicated.liveness();
+        let asked: BTreeMap<NodeId, u64> = have
+            .iter()
+            .map(|seen| (NodeId::from_bytes(seen.node), seen.through))
+            .collect();
+        let through: Vec<SeenRecord> = self
+            .replicated
+            .seen()
+            .into_iter()
+            .filter(|(origin, held)| {
+                *origin != me
+                    && *origin != from
+                    && !liveness.is_answering(*origin)
+                    && *held > asked.get(origin).copied().unwrap_or(0)
+            })
+            .map(|(origin, through)| SeenRecord {
+                node: origin.to_bytes(),
+                through,
+            })
+            .collect();
+        if through.is_empty() {
+            return Handled::default();
+        }
+        Self::relay_page_reply(self.relay_page(None, through))
+    }
+
+    /// One page of this node's registers after `after`, relayed under
+    /// `through`. See [`Replication::RelayPage`].
+    fn relay_page(&self, after: Option<&MetadataKey>, through: Vec<SeenRecord>) -> Replication {
+        let batch = self.settings.batch.max(1);
+        // One more than the page, which is how the last page knows it is.
+        let mut registers = self.replicated.registers_after(after, batch + 1);
+        let last = registers.len() <= batch;
+        registers.truncate(batch);
+        Replication::RelayPage {
+            registers: registers.iter().map(MetadataWrite::to_record).collect(),
+            through,
+            last,
+        }
+    }
+
+    /// A page, as the reply to whatever asked for it.
+    fn relay_page_reply(page: Replication) -> Handled {
+        Handled {
+            reply: Some(page),
+            ..Handled::default()
+        }
+    }
+
+    /// Take a relayed page, and ask for the next one.
+    ///
+    /// Decoded and refused before anything is merged, as
+    /// [`Self::take_snapshot`] does and for the same reason. The last
+    /// page ends the round: what the relay was about is now held, and
+    /// the digest that went with it is answered on its own.
+    fn take_relayed(
+        &self,
+        registers: Vec<MetadataRecord>,
+        through: Vec<SeenRecord>,
+        last: bool,
+    ) -> Result<Handled, ReplicationError> {
+        let wall = crate::clock::wall_millis();
+        let clock = self.replicated.clock();
+        let mut writes = Vec::with_capacity(registers.len());
+        for record in registers {
+            let write = MetadataWrite::from_record(record)?;
+            clock.check(wall, write.stamp().reading())?;
+            writes.push(write);
+        }
+        let continue_from = (!last)
+            .then(|| writes.last().map(|write| write.key().to_record()))
+            .flatten();
+        let watermarks: Vec<(NodeId, u64)> = through
+            .iter()
+            .map(|seen| (NodeId::from_bytes(seen.node), seen.through))
+            .collect();
+        let Taken {
+            applied, records, ..
+        } = self
+            .replicated
+            .observed_relayed(writes, last.then_some(watermarks.as_slice()));
+        Ok(Handled {
+            records,
+            applied,
+            reply: continue_from.map(|after| Replication::RelayFrom { after, through }),
+        })
     }
 
     /// One page of this node's registers, after `after`, for a peer

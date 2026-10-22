@@ -556,6 +556,32 @@ the records. Each node keeps a gapless log of the writes it originated,
 truncated behind a second watermark of its own, distinct from the tombstone
 watermark below.
 
+**Any node answers for an origin nobody can hear, with its registers.**
+A node serves only the log it originated, so as first built a write that
+reached one peer and missed another could be repaired only by its writer,
+and once the writer was dead, never — although the first peer held it.
+(Found by review after 0.8.0.) So each round of the exchange carries a
+second frame beside the digest, the relay: how far the sender has read
+every other log it knows of. The receiver answers it only for an origin it
+is not hearing from and has read further of than the sender, and the
+answer is the join snapshot's pages — every register, in key order —
+carrying the watermarks the receiver had when the first page went out.
+Once the last page is in, the sender moves its own watermarks there. That
+claim is true because a register held for an entry is the entry or a
+write that beat it, and the merge keeps whichever wins; the watermarks are
+the first page's because an entry taken while the pages were going out
+may sit behind a key already sent. An origin named nowhere counts as one
+the sender holds nothing of, which is a node that joined after the origin
+died.
+
+**Only an origin the answerer cannot hear either**, and that is the cost
+bound rather than a detail. A node that hears an origin another does not
+is ahead of it for as long as the origin writes, so relaying then would be
+every register on every round of a one-way partition; the node behind
+reads that origin itself once it can, as it always did. An origin nobody
+hears writes nothing more, so its relay is a repair that happens once per
+node that missed something.
+
 **Subscriptions are replicated at node granularity, not per client.** A
 register per client subscription would be fifty nodes holding a hundred
 thousand registers each at the design ceiling, against an idle memory budget

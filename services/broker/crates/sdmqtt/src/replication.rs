@@ -1164,12 +1164,17 @@ pub async fn exchanging(replicator: Arc<Replicator>, mesh: Arc<Mesh>) {
             // A cluster of one, or every link gone. Nothing to ask.
             continue;
         };
-        let digest = replicator.digest_for(peer);
-        match mesh.send(peer, &Message::Replicate(digest)) {
-            // The link went between choosing it and sending, which is the
-            // next round's problem.
-            None | Some(Ok(_)) => {}
-            Some(Err(why)) => tracing::error!(%why, "a digest could not be framed"),
+        // Section 8.2's digest about the peer's own log, and the relay
+        // about everybody else's: one round, one peer.
+        for frame in replicator.asks_for(peer) {
+            match mesh.send(peer, &Message::Replicate(frame)) {
+                // The link went between choosing it and sending, which is
+                // the next round's problem.
+                None | Some(Ok(_)) => {}
+                Some(Err(why)) => {
+                    tracing::error!(%why, "an exchange frame could not be framed");
+                }
+            }
         }
     }
 }

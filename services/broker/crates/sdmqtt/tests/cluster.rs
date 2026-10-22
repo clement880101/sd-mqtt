@@ -1706,6 +1706,67 @@ async fn three_nodes_converge_after_a_partition_heals() {
     }
 }
 
+/// A write a node made, which one peer missed, reaches that peer from the
+/// third node once the writer is dead.
+///
+/// Section 8.2's digest was a claim about one log, and the only log a node
+/// served was its own: alpha's retained message, broadcast to beta and
+/// lost on the way to gamma, could be repaired only by alpha, so once alpha
+/// was dead gamma never had it although beta did. The relay is what lets
+/// beta answer for alpha.
+///
+/// **Nothing is published after the kill**, so what gamma holds at the
+/// end came through beta.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_nodes_write_reaches_the_node_that_missed_it_through_the_third() {
+    const TOPIC: &str = "written/by/alpha";
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let mut cluster = Cluster::start(directory.path()).await;
+    cluster.settle();
+    let alpha = cluster.nodes[0].identity();
+
+    // Everything alpha says to gamma is thrown away, on both of the gates
+    // the link between them can be on: which of the two the mesh kept
+    // depends on which identity is lower, and that is minted at first
+    // start. Gamma can still speak to alpha, so its digests arrive and the
+    // answers do not.
+    cluster.gates[&(0, 2)].cut(Direction::Forward);
+    cluster.gates[&(2, 0)].cut(Direction::Backward);
+    // **Waited for, not assumed.** Gamma declaring alpha dead is what
+    // proves the cut is on the link the two actually have; a link on some
+    // other gate would leave gamma hearing alpha and fail here, saying so,
+    // rather than later and mysteriously.
+    until("gamma stops hearing alpha", || {
+        cluster.nodes[2].how(&alpha).as_deref() == Some("down")
+    });
+    assert_eq!(
+        cluster.nodes[1].how(&alpha).as_deref(),
+        Some("up"),
+        "beta should still hear alpha"
+    );
+
+    cluster.nodes[0].retain(TOPIC, "only-beta-heard");
+    until("beta holds alpha's write", || {
+        cluster.nodes[1].retained().get(TOPIC).map(String::as_str) == Some("only-beta-heard")
+    });
+    // And gamma does not, across more than one exchange round: alpha's
+    // answers are thrown away, and beta does not relay an origin it can
+    // still hear. This is an assertion about an absence, not a wait.
+    keeps(
+        "gamma lacks alpha's write while alpha is alive",
+        Duration::from_secs(3),
+        || !cluster.nodes[2].retained().contains_key(TOPIC),
+    );
+
+    cluster.nodes[0].kill();
+    until("beta judges alpha dead", || {
+        cluster.nodes[1].how(&alpha).as_deref() == Some("down")
+    });
+    until("gamma learns alpha's write from beta", || {
+        cluster.nodes[2].retained().get(TOPIC).map(String::as_str) == Some("only-beta-heard")
+    });
+}
+
 /// Append whichever workers have `payload` waiting for them.
 ///
 /// One short pass over all of them rather than a long wait on each:

@@ -613,6 +613,32 @@ fn merge(state: &mut State, write: &MetadataWrite) -> bool {
     }
 }
 
+/// Move `state`'s watermark for `origin` up to `through`, and say what
+/// to store for it.
+///
+/// **Never backwards.** A watermark is a claim to hold everything below
+/// it, and a page from a peer that had read less than this node already
+/// has says nothing new. Returns whether it moved.
+fn advance_seen(
+    state: &mut State,
+    origin: NodeId,
+    through: u64,
+    records: &mut Vec<Record>,
+) -> bool {
+    let before = state.seen.get(&origin).copied().unwrap_or(0);
+    if through <= before {
+        return false;
+    }
+    state.seen.insert(origin, through);
+    records.push(Record::MetadataSeenPut {
+        seen: SeenRecord {
+            node: origin.to_bytes(),
+            through,
+        },
+    });
+    true
+}
+
 /// Tell `routes` what a register now says, whatever it is about.
 ///
 /// **One function, called from every path that changes a register**:
@@ -1013,17 +1039,82 @@ impl Replicated {
         through: Option<u64>,
     ) -> Taken {
         let mut state = self.held();
+        let before = state.seen.get(&origin).copied().unwrap_or(0);
+        let mut taken = Taken {
+            through: before,
+            ..Taken::default()
+        };
+        let complete = self.merge_page(&mut state, registers, &mut taken);
+        if let Some(through) = through {
+            // A register left out is a register this node does not hold,
+            // so the claim the watermark makes would be false.
+            if complete && advance_seen(&mut state, origin, through, &mut taken.records) {
+                taken.through = through;
+            }
+        }
+        taken
+    }
+
+    /// Take a page of a peer's registers relayed for origins the peer
+    /// cannot hear, sent because it had read further of their logs than
+    /// this node had. **Section 8.2's relay.**
+    ///
+    /// The same merge as [`Self::observed_snapshot`], and the same
+    /// rule about the watermarks: `through` is given on the last page
+    /// only, and once every register has arrived this node holds
+    /// everything the peer held of those logs, so each watermark may
+    /// move to what the peer had read when the relay began. That is
+    /// what makes the claim true — a register the peer held for an
+    /// entry is that entry or a write that beat it, and a merge by
+    /// stamp keeps whichever wins — and it is why the watermark is the
+    /// one the peer had *when it began*: an entry the peer took while
+    /// the pages were going out may sit behind a key already sent.
+    ///
+    /// This node's own log is never among them: nobody holds more of
+    /// it than this node does.
+    ///
+    /// [`Taken::through`] is zero: there is no one log this is about.
+    pub fn observed_relayed(
+        &self,
+        registers: Vec<MetadataWrite>,
+        through: Option<&[(NodeId, u64)]>,
+    ) -> Taken {
+        let mut state = self.held();
         let mut taken = Taken::default();
+        let complete = self.merge_page(&mut state, registers, &mut taken);
+        if let (true, Some(through)) = (complete, through) {
+            for (origin, through) in through {
+                if *origin != self.me {
+                    advance_seen(&mut state, *origin, *through, &mut taken.records);
+                }
+            }
+        }
+        taken
+    }
+
+    /// Merge a page of registers, as a broadcast's would be, into
+    /// `taken`; and say whether every one of them was taken.
+    ///
+    /// One merge for both of section 8.2's snapshots, so that a join
+    /// snapshot and a relay cannot reach two answers about one register.
+    /// Each register is merged by [`Register::merge`] and [`index`] is
+    /// told about the ones that won.
+    fn merge_page(
+        &self,
+        state: &mut State,
+        registers: Vec<MetadataWrite>,
+        taken: &mut Taken,
+    ) -> bool {
         let wall = crate::clock::wall_millis();
-        let mut refused = false;
+        let mut complete = true;
         for write in registers {
             // Section 8.2's clock, as in `observed_from`; a reading past
             // the bound is refused by `Replicator` before it gets here.
             if self.clock.observe(wall, write.stamp().reading()).is_err() {
-                refused = true;
+                complete = false;
                 continue;
             }
-            if merge(&mut state, &write) {
+            if merge(state, &write) {
                 index(
                     &self.routes,
                     &self.groups,
@@ -1036,23 +1127,7 @@ impl Replicated {
                 taken.applied.push(write);
             }
         }
-        let before = state.seen.get(&origin).copied().unwrap_or(0);
-        taken.through = before;
-        if let Some(through) = through {
-            // A register left out is a register this node does not hold,
-            // so the claim the watermark makes would be false.
-            if !refused && through > before {
-                state.seen.insert(origin, through);
-                taken.records.push(Record::MetadataSeenPut {
-                    seen: SeenRecord {
-                        node: origin.to_bytes(),
-                        through,
-                    },
-                });
-                taken.through = through;
-            }
-        }
-        taken
+        complete
     }
 
     /// How far this node has read `origin`'s log.

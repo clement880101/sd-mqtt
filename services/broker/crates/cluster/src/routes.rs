@@ -107,7 +107,7 @@ struct Table {
     next: u64,
 }
 
-/// Which nodes this one has judged dead.
+/// Which nodes this one has judged dead, and which it is hearing.
 ///
 /// **One answer, shared by both maps.** Section 8.3's routing map and
 /// section 8.3's group map both have to stop choosing a node that has
@@ -118,13 +118,32 @@ struct Table {
 ///
 /// See the [module documentation](crate::routes) for why a dead node's
 /// filters are withheld rather than forgotten.
+///
+/// # Dead and answering are not each other's opposite
+///
+/// The two maps ask "has this node been judged dead?", and a node never
+/// met has not been: routing to it is the mesh's problem, because there
+/// is no link to send on. Section 8.2's relay asks the other question —
+/// "is this node being heard from?" — and a node never met is not,
+/// which is exactly the node a newcomer joining after it died needs
+/// relayed. So both are kept, moved by the same two calls, and a node
+/// this one has never met is neither.
 #[derive(Debug, Default)]
 pub struct Liveness {
-    dead: Mutex<BTreeSet<NodeId>>,
+    judged: Mutex<Judged>,
+}
+
+/// What [`Liveness`] holds.
+#[derive(Debug, Default)]
+struct Judged {
+    /// Judged dead, and not heard from since.
+    dead: BTreeSet<NodeId>,
+    /// Heard from, and not judged dead since.
+    answering: BTreeSet<NodeId>,
 }
 
 impl Liveness {
-    /// Nothing is dead.
+    /// Nothing is dead, and nobody has been heard from.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -132,18 +151,33 @@ impl Liveness {
 
     /// This node has judged `node` dead.
     pub fn died(&self, node: NodeId) {
-        self.held().insert(node);
+        let mut judged = self.held();
+        judged.dead.insert(node);
+        judged.answering.remove(&node);
     }
 
-    /// And `node` is answering again.
+    /// And `node` is answering again, or for the first time.
     pub fn revived(&self, node: NodeId) {
-        self.held().remove(&node);
+        let mut judged = self.held();
+        judged.dead.remove(&node);
+        judged.answering.insert(node);
     }
 
     /// Whether `node` is one this node has judged dead.
     #[must_use]
     pub fn is_dead(&self, node: NodeId) -> bool {
-        self.held().contains(&node)
+        self.held().dead.contains(&node)
+    }
+
+    /// Whether `node` is being heard from: met, and not judged dead
+    /// since.
+    ///
+    /// **Not `!is_dead`.** A node never met is not dead and is not
+    /// answering either; see the type's documentation for which
+    /// question each of section 8's paths asks.
+    #[must_use]
+    pub fn is_answering(&self, node: NodeId) -> bool {
+        self.held().answering.contains(&node)
     }
 
     /// Whether anything is dead at all.
@@ -153,11 +187,11 @@ impl Liveness {
     /// lookup per candidate node.
     #[must_use]
     pub fn all_alive(&self) -> bool {
-        self.held().is_empty()
+        self.held().dead.is_empty()
     }
 
-    fn held(&self) -> MutexGuard<'_, BTreeSet<NodeId>> {
-        self.dead.lock().unwrap_or_else(PoisonError::into_inner)
+    fn held(&self) -> MutexGuard<'_, Judged> {
+        self.judged.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -364,6 +398,29 @@ mod tests {
     /// An empty map with a liveness of its own.
     fn fresh() -> Routes {
         Routes::new(Arc::new(Liveness::new()))
+    }
+
+    /// A node never met is neither dead nor answering, and the two
+    /// calls move both judgements together.
+    #[test]
+    fn a_node_never_met_is_neither_dead_nor_answering() {
+        let liveness = Liveness::new();
+        let a = node("a");
+        assert!(!liveness.is_dead(a));
+        assert!(
+            !liveness.is_answering(a),
+            "never heard from, so not answering"
+        );
+        liveness.revived(a);
+        assert!(!liveness.is_dead(a));
+        assert!(liveness.is_answering(a));
+        liveness.died(a);
+        assert!(liveness.is_dead(a));
+        assert!(!liveness.is_answering(a), "judged dead, so not answering");
+        assert!(!liveness.all_alive());
+        liveness.revived(a);
+        assert!(liveness.all_alive());
+        assert!(liveness.is_answering(a));
     }
 
     #[test]
