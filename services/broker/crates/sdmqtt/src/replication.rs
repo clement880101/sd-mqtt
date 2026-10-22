@@ -340,6 +340,11 @@ impl Deliver for Replication {
             // A heartbeat. Membership was updated before this was called;
             // there is nothing else it means.
             Message::Heartbeat { .. } => return Vec::new(),
+            // Section 8.1's gossip. The mesh takes it before anything is
+            // handed here, because where to dial is the mesh's question;
+            // reaching this arm would be a mesh that stopped doing so, and
+            // the answer is still nothing.
+            Message::Members { .. } => return Vec::new(),
             // Section 8.4. **The one frame that is a question**, and the
             // answer is what the session held — in chunks, so that a
             // drain which stops partway has still moved what it managed

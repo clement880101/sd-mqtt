@@ -1163,6 +1163,23 @@ impl Cluster {
 
     /// The same, with every knob a test may turn.
     async fn start_with(directory: &Path, knobs: Knobs) -> Self {
+        Self::start_seeded_with(directory, knobs, |at| {
+            (0..NODES).filter(|to| *to != at).collect()
+        })
+        .await
+    }
+
+    /// The same, with `seeds(at)` naming the nodes `at` is told about.
+    ///
+    /// Every other test seeds every node with every other, which is the
+    /// one configuration in which section 8.1's mesh needed no gossip to
+    /// be full. A seed is still a gate's address: `at` reaches `to`
+    /// through `gates[&(at, to)]`.
+    async fn start_seeded_with(
+        directory: &Path,
+        knobs: Knobs,
+        seeds: impl Fn(usize) -> Vec<usize>,
+    ) -> Self {
         let labels = LABELS;
 
         // The three cluster ports, chosen before anything starts so that
@@ -1195,8 +1212,8 @@ impl Cluster {
             let label = labels[at];
             let config = directory.join(format!("{label}.toml"));
             let store = directory.join(format!("{label}-store"));
-            let seeds: Vec<SocketAddr> = (0..NODES)
-                .filter(|to| *to != at)
+            let seeds: Vec<SocketAddr> = seeds(at)
+                .into_iter()
                 .map(|to| gates[&(at, to)].address())
                 .collect();
             // A port this binary handed out can still be taken by another
@@ -1704,6 +1721,37 @@ async fn three_nodes_converge_after_a_partition_heals() {
             node.label
         );
     }
+}
+
+/// A node given one seed ends up linked to every member.
+///
+/// Section 8.1: a node learnt through a seed is reached. Beta and gamma
+/// are each told only where alpha is, and alpha is told nothing, so
+/// before members were gossiped beta and gamma never met: each had one
+/// link, to alpha, for as long as the cluster ran. Membership is only
+/// ever learnt from a link that authenticated, so gamma listing beta as
+/// up is gamma having a link to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_given_one_seed_is_linked_to_every_member() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cluster = Cluster::start_seeded_with(directory.path(), Knobs::default(), |at| {
+        if at == 0 {
+            Vec::new()
+        } else {
+            vec![0]
+        }
+    })
+    .await;
+    until("every node sees the other two, up", || {
+        cluster.nodes.iter().all(|node| {
+            let seen = node.nodes();
+            seen.len() == NODES && seen.iter().all(|row| row.state == "up")
+        })
+    });
+    let beta = cluster.nodes[1].identity();
+    let gamma = cluster.nodes[2].identity();
+    assert_eq!(cluster.nodes[2].how(&beta).as_deref(), Some("up"));
+    assert_eq!(cluster.nodes[1].how(&gamma).as_deref(), Some("up"));
 }
 
 /// A write a node made, which one peer missed, reaches that peer from the

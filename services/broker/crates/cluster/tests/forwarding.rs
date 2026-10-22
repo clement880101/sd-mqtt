@@ -80,6 +80,9 @@ struct Node {
     delivered: Mutex<Vec<(SubscriberId, String)>>,
     /// Every topic a rule on this node fired for.
     fired: Arc<Rules>,
+    /// How many forwarded publications peers sent this node, whatever
+    /// became of them.
+    forwards: std::sync::atomic::AtomicUsize,
 }
 
 /// A hook that writes down what it was asked about.
@@ -133,6 +136,7 @@ impl Node {
             broker: Mutex::new(broker),
             delivered: Mutex::new(Vec::new()),
             fired,
+            forwards: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -373,6 +377,8 @@ impl Deliver for Node {
             // tests do that.
             return Vec::new();
         };
+        self.forwards
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let actions = {
             let groups = forwarded.groups.clone();
             let mut broker = locked(&self.broker);
@@ -526,10 +532,6 @@ async fn a_node_with_no_subscriber_is_not_forwarded_to_at_all() {
     let (listener, writes) = it.nodes[2].subscribe("listener", "site/+/temp");
     it.announce(2, &writes);
 
-    // What beta has read before anything is published, so that the
-    // heartbeats it goes on receiving are not mistaken for a forward.
-    let quiet_before = it.meshes[1].stats().bytes_received;
-
     let publisher = it.nodes[0].connect("publisher");
     it.nodes[0].publish(publisher, "site/1/temp", b"21.5");
     until("gamma has it", || !it.nodes[2].topics(listener).is_empty()).await;
@@ -544,14 +546,25 @@ async fn a_node_with_no_subscriber_is_not_forwarded_to_at_all() {
         0,
         "beta has no subscriber and must have been given nothing to deliver"
     );
-    // One frame per interested node and no more: beta's traffic over the
-    // whole of this is heartbeats, which are far smaller than the
-    // publication. A broadcast would have put the payload on this link.
-    let since = it.meshes[1].stats().bytes_received - quiet_before;
-    assert!(
-        since < 64,
-        "beta read {since} bytes while a publication it has no subscriber for was \
-         forwarded to gamma; the frame was broadcast rather than routed"
+    // One frame per interested node and no more: beta was handed no
+    // forward at all. **Counted by kind, not by bytes**, which is what
+    // this asserted until section 8.1's gossip arrived: a link carries
+    // member lists as well as heartbeats now, so a byte count no longer
+    // tells a forward from the traffic a mesh makes on its own.
+    assert_eq!(
+        it.nodes[1]
+            .forwards
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "beta was sent a publication it has no subscriber for while it was forwarded \
+         to gamma; the frame was broadcast rather than routed"
+    );
+    assert_eq!(
+        it.nodes[2]
+            .forwards
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "gamma, which wants it, is sent one copy"
     );
 }
 

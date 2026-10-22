@@ -63,19 +63,47 @@
 //! finds no bugs. It is also what lets a one-way partition heal
 //! without anything reconnecting.
 //!
-//! # What is not here
+//! # Members are gossiped, and gossip only says where to dial
 //!
-//! Nothing gossips. A node learns of a peer by being seeded with its
-//! address or by being dialled by it, and the address it dials it
-//! again at is the one that peer **advertised**, which is not the
-//! address it connected from: section 8.1 says so, and a node behind a
-//! port mapping or behind a test's gate is the reason.
+//! Section 8.1: a node learnt through a seed is reached. A node learns
+//! of a peer by being seeded with its address, by being dialled by it,
+//! or by being told of it by a peer it has a link to; the address it
+//! dials it at is the one that peer **advertised**, which is not the
+//! address it connected from — section 8.1 says so, and a node behind a
+//! port mapping or behind a test's gate is the reason. Before gossip a
+//! mesh was full only when every node listed every other as a seed.
 //!
-//! There is also no way to say a node has left for good. See
-//! [`crate::membership`]: a member is forgotten when this process
-//! restarts, and section 8.5's departure is a later plan's.
+//! So each node tells each peer, a beat after their link comes up, and
+//! one random peer every few beats, which members it is hearing and the address
+//! each gave in its own greeting: [`Message::Members`]. What it is told
+//! is a **rumour**, and a rumour is an address to dial and nothing
+//! more. Three rules keep it that way:
+//!
+//! - **It never vouches.** Every link is still the mutual challenge
+//!   before it is anything else, so a rumour naming a node that does not
+//!   hold the secret, or an address where some other node answers, is a
+//!   dial that fails or meets whoever is really there. Membership is
+//!   only ever what a handshake proved.
+//! - **It never overrides a member's own word.** A member's advertised
+//!   address is the one it gave this node, and a rumour about a node
+//!   already met is ignored; the rumour is for the node not yet met.
+//! - **It never resurrects a node an operator forgot.** See
+//!   [`Mesh::forget`]: a forgotten node that comes back by itself is
+//!   met again like any newcomer, but a peer that still remembers it is
+//!   not a reason to dial it.
+//!
+//! A rumour is dialled under the same backoff as a seed, and not while
+//! a seed is being dialled: a seed is the operator's word and a rumour
+//! is a peer's, and until a seed has answered nobody knows which node
+//! it is, so a rumour of the same node at another address would be a
+//! second connection for the link rule to throw away.
+//!
+//! What gossip is not is a replicated member list. Section 8.2 declines
+//! one, and this is not one: liveness is still each node's own
+//! judgement of its own links, and a rumour says only where a peer heard
+//! a member answering.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -108,6 +136,24 @@ pub const DEFAULT_RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// failure. Five minutes rather than thirty seconds, because retrying
 /// it is not going to work and the attempt costs the peer a handshake.
 pub const DEFAULT_REFUSED_BACKOFF: Duration = Duration::from_secs(300);
+
+/// The most rumours a node holds, and the most members one gossip names.
+///
+/// Five times section 15's fifty-node ceiling. A list longer than this is
+/// a peer that has gone wrong rather than a cluster that has grown, and
+/// a bound is what keeps a peer's mistake from becoming this node's
+/// memory.
+pub const MAX_RUMOURS: usize = 256;
+
+/// How many beats apart the repair gossip to one random peer is.
+///
+/// Section 8.1's gossip has two halves, and this is the slow one. A new
+/// link is told at the first beat after it is up, which is what makes a
+/// join prompt and covers every way a node can arrive; the random peer
+/// is only for a list that was dropped on a full queue. Ten beats keeps
+/// that repair within seconds and keeps a cluster's idle traffic what
+/// it was — heartbeats — on nine beats out of ten.
+pub const GOSSIP_EVERY: u64 = 10;
 
 /// What a cluster link carries.
 ///
@@ -232,6 +278,33 @@ pub enum Message {
         /// chunks to the connection waiting for them.
         epoch: u64,
     },
+    /// Section 8.1's gossip: the members the sender is hearing, and the
+    /// address each gave in its own greeting.
+    ///
+    /// Sent to a peer at the first beat after its link comes up and to
+    /// one random peer every [`GOSSIP_EVERY`] beats, and handled by the
+    /// mesh itself rather than handed to
+    /// [`Deliver`]: it is about where to dial, which is the mesh's.
+    /// **A rumour, not a vouch**; see the module documentation.
+    ///
+    /// **Added after 0.8.0.** A node from before it will not decode this
+    /// frame and closes the link, and it is sent on every link a beat
+    /// after it comes up, so every node of a cluster must run a build
+    /// that has it.
+    Members {
+        /// Who, and where to dial them. The sender and the receiver are
+        /// left out; neither needs telling.
+        members: Vec<Rumour>,
+    },
+}
+
+/// One member, as a peer reports it: who, and where it said to dial.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rumour {
+    /// Its identity's sixteen bytes.
+    pub node: [u8; 16],
+    /// The address it advertised in its own greeting to the sender.
+    pub advertised: String,
 }
 
 /// What something on top of the mesh does with a peer's message.
@@ -378,6 +451,14 @@ struct Link {
     epoch: u64,
     /// Which end of it this node is.
     role: Role,
+    /// Whether the peer has been sent this node's members on this link.
+    ///
+    /// Section 8.1's gossip goes to a new link at the **first beat after
+    /// it is up**, not as it is installed. A simultaneous dial installs
+    /// one link and replaces it with the other a moment later, and a
+    /// frame queued on the first before its writer had run would be
+    /// thrown away and counted as dropped on a link nobody overran.
+    told: bool,
     /// What to hand a message to.
     outgoing: crate::link::Outgoing,
     reader: AbortHandle,
@@ -427,6 +508,21 @@ struct State {
     /// has not established one — taking the identity it offered would
     /// be letting a stranger choose which log line to suppress.
     refused: Mutex<HashSet<String>>,
+    /// Members peers have told this node of and it has not met: where
+    /// each said to dial. See the module documentation.
+    ///
+    /// Keyed by identity, so that a member's address moving replaces
+    /// the rumour rather than adding a second one. Emptied of a node the
+    /// moment a link to it is up, because from then on its own greeting
+    /// is what says where it is.
+    rumoured: Mutex<BTreeMap<NodeId, String>>,
+    /// Nodes an operator forgot, which no rumour may bring back.
+    ///
+    /// Cleared for a node when it is met again — when it dials this
+    /// node, or a configured seed answers as it — because a node that
+    /// came back by itself is a member like any other, and its own
+    /// address is in its greeting.
+    forgotten: Mutex<HashSet<NodeId>>,
     epochs: AtomicU64,
     beats: AtomicU64,
     sent: Arc<AtomicU64>,
@@ -503,6 +599,8 @@ impl Mesh {
             links: Mutex::new(HashMap::new()),
             dialling: Mutex::new(HashMap::new()),
             refused: Mutex::new(HashSet::new()),
+            rumoured: Mutex::new(BTreeMap::new()),
+            forgotten: Mutex::new(HashSet::new()),
             epochs: AtomicU64::new(0),
             beats: AtomicU64::new(0),
             sent: Arc::new(AtomicU64::new(0)),
@@ -574,13 +672,37 @@ impl Mesh {
     /// a configured seed is still dialled; forgetting is about this
     /// node's table, not about the other node's right to exist.
     ///
+    /// **A peer's word is not enough to bring it back.** Membership is
+    /// each node's own, so the other members may well still remember
+    /// it and gossip it; a node that dialled it on their say-so would
+    /// undo the operator's forget on the next beat. So it is marked
+    /// forgotten, and no rumour of it is taken until it is met again by
+    /// a link of its own.
+    ///
     /// Returns whether there was anything to forget.
     pub fn forget(&self, peer: NodeId) -> bool {
         if let Some(link) = locked(&self.state.links).remove(&peer) {
             link.reader.abort();
             link.writer.abort();
         }
-        locked(&self.state.members).forget(peer)
+        let forgot = locked(&self.state.members).forget(peer);
+        let rumoured = locked(&self.state.rumoured).remove(&peer).is_some();
+        if forgot || rumoured {
+            locked(&self.state.forgotten).insert(peer);
+        }
+        forgot
+    }
+
+    /// Where peers have said members this node has not met are.
+    ///
+    /// For a test, and for an operator asking why a node is dialling an
+    /// address nobody configured.
+    #[must_use]
+    pub fn rumours(&self) -> Vec<(NodeId, String)> {
+        locked(&self.state.rumoured)
+            .iter()
+            .map(|(node, address)| (*node, address.clone()))
+            .collect()
     }
 
     /// Which end of the link to this peer this node is, if there is
@@ -765,24 +887,160 @@ async fn dialling(state: Arc<State>) {
     }
 }
 
-/// Every address worth dialling: the seeds, and the advertised address
-/// of every peer this node has met and has no link to.
+/// Every address worth dialling: the seeds, the advertised address of
+/// every peer this node has met and has no link to, and where peers
+/// have said the members this node has not met are.
 ///
-/// The second half is what the advertised address is *for*. A node
+/// The second part is what the advertised address is *for*. A node
 /// that accepted a link from a peer it was never seeded with has no
 /// other way to reach it again, and the address that link arrived from
-/// is the peer's ephemeral port rather than anything dialable.
+/// is the peer's ephemeral port rather than anything dialable. The third
+/// is section 8.1's "a node learnt through a seed is reached"; see the
+/// module documentation for why it waits for the seeds.
 fn targets(state: &Arc<State>) -> Vec<String> {
     let mut addresses = state.settings.seeds.clone();
     let linked: HashSet<NodeId> = locked(&state.links).keys().copied().collect();
+    let mut met = HashSet::new();
     for member in locked(&state.members).members() {
+        met.insert(member.identity.id());
         if !linked.contains(&member.identity.id()) && !member.advertised.is_empty() {
             addresses.push(member.advertised.clone());
+        }
+    }
+    let seeding = {
+        let dialling = locked(&state.dialling);
+        state
+            .settings
+            .seeds
+            .iter()
+            .any(|seed| dialling.get(seed).is_some_and(|attempt| attempt.running))
+    };
+    if !seeding {
+        let forgotten = locked(&state.forgotten).clone();
+        for (node, address) in locked(&state.rumoured).iter() {
+            // A member's own word wins, and a forgotten node is not
+            // brought back on a peer's: both checked here as well as when
+            // the rumour arrived, because either can change in between.
+            if !met.contains(node) && !linked.contains(node) && !forgotten.contains(node) {
+                addresses.push(address.clone());
+            }
         }
     }
     addresses.sort();
     addresses.dedup();
     addresses
+}
+
+/// What to tell `to` about the members this node is hearing.
+///
+/// **Alive members only.** A rumour is where a peer heard a member
+/// answering, and a member this node has judged dead is one it has not
+/// heard; passing that on would have every node that never met it dial
+/// a corpse for ever. A dead member that comes back dials the nodes it
+/// knows, and they gossip it from there.
+fn gossip_for(state: &State, to: NodeId) -> Message {
+    let members = locked(&state.members)
+        .members()
+        .filter(|member| {
+            member.state == MemberState::Alive
+                && member.identity.id() != to
+                && !member.advertised.is_empty()
+        })
+        .take(MAX_RUMOURS)
+        .map(|member| Rumour {
+            node: member.identity.id().to_bytes(),
+            advertised: member.advertised.clone(),
+        })
+        .collect();
+    Message::Members { members }
+}
+
+/// Section 8.1's gossip, once a beat: every link that has not been
+/// told yet, and on a repair beat one random peer as well.
+///
+/// The new links are what make a join prompt — a node that came in
+/// through one seed learns the rest of the mesh a beat after its first
+/// link, rather than whenever a random choice happens to land on it —
+/// and they cover a member arriving later too, because its own first
+/// link is new to whoever it reached. The random peer is what repairs a
+/// list dropped on a full queue; see [`GOSSIP_EVERY`]. One rather than
+/// all of them, for section 8.2's reason: a random peer reaches
+/// everybody in a few rounds.
+///
+/// The queues are taken out under the link table and the lists made
+/// outside it, because a list reads the member table and the two are
+/// never held at once.
+fn gossip(state: &State, repair: bool) {
+    let (fresh, linked) = {
+        let mut links = locked(&state.links);
+        let linked: Vec<NodeId> = links.keys().copied().collect();
+        let fresh: Vec<(NodeId, crate::link::Outgoing)> = links
+            .iter_mut()
+            .filter(|(_, link)| !link.told)
+            .map(|(peer, link)| {
+                link.told = true;
+                (*peer, link.outgoing.clone())
+            })
+            .collect();
+        (fresh, linked)
+    };
+    let mut told: Vec<(NodeId, crate::link::Outgoing)> = fresh;
+    if let Some(peer) = repair.then(|| crate::replicate::choose(&linked)).flatten() {
+        if !told.iter().any(|(already, _)| *already == peer) {
+            let queue = locked(&state.links)
+                .get(&peer)
+                .map(|link| link.outgoing.clone());
+            told.extend(queue.map(|queue| (peer, queue)));
+        }
+    }
+    for (peer, queue) in told {
+        match queue.send(&gossip_for(state, peer)) {
+            Ok(Sent::Queued) => {}
+            Ok(Sent::Dropped) => {
+                tracing::debug!(%peer, "a peer's queue was full, so its member list was dropped");
+            }
+            Err(why) => tracing::error!(%why, "a member list could not be framed"),
+        }
+    }
+}
+
+/// Take what `from` said about the members it is hearing.
+///
+/// Only a node this one has not met, is not this one, and was not
+/// forgotten, becomes a rumour; see the module documentation for the
+/// three rules. Nothing here dials: [`targets`] reads the rumours on the
+/// next pass, under the backoff every other address has.
+fn learn(state: &State, from: NodeId, members: Vec<Rumour>) {
+    let me = state.identity.id();
+    let met: HashSet<NodeId> = locked(&state.members)
+        .members()
+        .map(|member| member.identity.id())
+        .collect();
+    let forgotten = locked(&state.forgotten).clone();
+    let mut rumoured = locked(&state.rumoured);
+    for rumour in members.into_iter().take(MAX_RUMOURS) {
+        let node = NodeId::from_bytes(rumour.node);
+        if node == me
+            || node == from
+            || rumour.advertised.is_empty()
+            || met.contains(&node)
+            || forgotten.contains(&node)
+        {
+            continue;
+        }
+        if rumoured.len() >= MAX_RUMOURS && !rumoured.contains_key(&node) {
+            continue;
+        }
+        if rumoured.get(&node) != Some(&rumour.advertised) {
+            tracing::debug!(
+                peer = %node,
+                advertised = %rumour.advertised,
+                told_by = %from,
+                "a cluster peer told this node of a member it has not met"
+            );
+            rumoured.insert(node, rumour.advertised);
+        }
+    }
 }
 
 /// Dial `address` if it is due, is not already being dialled, and is
@@ -965,6 +1223,7 @@ async fn beating(state: Arc<State>) {
                 Err(why) => tracing::error!(%why, "a heartbeat could not be framed"),
             }
         }
+        gossip(&state, beat.is_multiple_of(GOSSIP_EVERY));
         let aged = locked(&state.members).age(Instant::now());
         for (identity, verdict) in aged {
             match verdict {
@@ -1073,6 +1332,7 @@ fn install(state: &Arc<State>, stream: BoxStream, peer: handshake::Peer, role: R
         Link {
             epoch,
             role,
+            told: false,
             outgoing: queue,
             reader: reader.abort_handle(),
             writer: writer.abort_handle(),
@@ -1093,6 +1353,11 @@ fn install(state: &Arc<State>, stream: BoxStream, peer: handshake::Peer, role: R
     }
     drop(links);
 
+    // Met by a link of its own: its greeting says where it is from now
+    // on, and a node an operator forgot that came back by itself is a
+    // member again. See the module documentation.
+    locked(&state.rumoured).remove(&id);
+    locked(&state.forgotten).remove(&id);
     let now_alive = locked(&state.members).heard(&peer.identity, &peer.advertised, Instant::now());
     // A peer this node had judged dead is alive again, and its filters
     // are to be routed to again. `Routes` never threw them away, so
@@ -1132,6 +1397,15 @@ async fn reading_from(
                 if let (Some(deliveries), Some(verdict)) = (&state.deliveries, now_alive) {
                     deliveries.member_changed(identity.id(), verdict);
                 }
+                // Section 8.1's gossip is the mesh's own: it is about
+                // where to dial, and nothing above the mesh dials.
+                let message = match message {
+                    Message::Members { members } => {
+                        learn(&state, identity.id(), members);
+                        continue;
+                    }
+                    other => other,
+                };
                 // Counted as a sign of life first and handled second, so
                 // that a handler which refuses a frame has not also made
                 // the peer look dead.
@@ -1742,6 +2016,117 @@ mod tests {
             a.alive() == 1 && b.alive() == 1
         })
         .await;
+    }
+
+    /// A node given one seed ends up linked to every member.
+    ///
+    /// Section 8.1: a node learnt through a seed is reached. Here `b`
+    /// and `c` are each told only where `a` is, so before members were
+    /// gossiped the mesh was two links and never three: `a` knew both,
+    /// and neither knew the other.
+    #[tokio::test]
+    async fn a_node_given_one_seed_is_linked_to_every_member() {
+        let switch = Switch::new();
+        let a = node(&switch, "a", &[], &NodeIdentity::mint("a"), SECRET);
+        let b = node(&switch, "b", &["a"], &NodeIdentity::mint("b"), SECRET);
+        let c = node(&switch, "c", &["a"], &NodeIdentity::mint("c"), SECRET);
+        until("every node sees the other two", || {
+            a.alive() == 2 && b.alive() == 2 && c.alive() == 2
+        })
+        .await;
+        keeps("each node holds exactly two links", 6, || {
+            a.stats().links == 2 && b.stats().links == 2 && c.stats().links == 2
+        })
+        .await;
+        // And `c` met `b` at the address `b` gave in its own greeting.
+        let met = c
+            .members()
+            .into_iter()
+            .find(|member| member.identity.id() == b.identity().id())
+            .expect("c has met b");
+        assert_eq!(met.advertised, "b");
+    }
+
+    /// A rumour of `who` at `address`, as a peer would send it.
+    fn rumour(who: NodeId, address: &str) -> Vec<Rumour> {
+        vec![Rumour {
+            node: who.to_bytes(),
+            advertised: address.to_owned(),
+        }]
+    }
+
+    /// A node an operator forgot is not dialled again on a peer's word,
+    /// and is a member again once it is met by a link of its own.
+    ///
+    /// Membership is each node's own, so the peers that still remember
+    /// a forgotten node go on gossiping it; taking their word would undo
+    /// the operator's forget on the next beat.
+    #[tokio::test]
+    async fn a_forgotten_node_is_not_dialled_on_a_peers_word() {
+        let switch = Switch::new();
+        let a = node(&switch, "a", &[], &NodeIdentity::mint("a"), SECRET);
+        let x = NodeIdentity::mint("x");
+        let teller = NodeIdentity::mint("b").id();
+
+        learn(&a.state, teller, rumour(x.id(), "x"));
+        assert_eq!(a.rumours(), vec![(x.id(), "x".to_owned())]);
+        assert!(targets(&a.state).contains(&"x".to_owned()));
+
+        a.forget(x.id());
+        assert!(a.rumours().is_empty(), "forgetting drops the rumour");
+        learn(&a.state, teller, rumour(x.id(), "x"));
+        assert!(
+            a.rumours().is_empty(),
+            "a peer's word brought a forgotten node back"
+        );
+        assert!(!targets(&a.state).contains(&"x".to_owned()));
+
+        // Forgotten is not banned: dialling in by itself, it is met.
+        let _x = node(&switch, "x", &["a"], &x, SECRET);
+        until("x is met again by a link of its own", || a.alive() == 1).await;
+        assert!(
+            locked(&a.state.forgotten).is_empty(),
+            "a node met again is no longer forgotten"
+        );
+    }
+
+    /// A rumour is where to dial and nothing more: the handshake still
+    /// decides who is there, and a member's own word beats a peer's.
+    #[tokio::test]
+    async fn a_rumour_is_only_where_to_dial() {
+        let switch = Switch::new();
+        let a = node(&switch, "a", &[], &NodeIdentity::mint("a"), SECRET);
+
+        // A node that does not hold the secret, rumoured: dialled, and
+        // never a member.
+        let stranger = NodeIdentity::mint("stranger");
+        let _stranger = node(&switch, "stranger", &[], &stranger, "another-secret");
+        // And an address where somebody other than the rumoured node
+        // answers: whoever answers is who is met.
+        let claimed = NodeIdentity::mint("claimed").id();
+        let real = NodeIdentity::mint("real");
+        let _real = node(&switch, "real", &[], &real, SECRET);
+        let teller = NodeIdentity::mint("teller").id();
+        learn(&a.state, teller, rumour(stranger.id(), "stranger"));
+        learn(&a.state, teller, rumour(claimed, "real"));
+
+        until("the node at the rumoured address is met", || a.alive() == 1).await;
+        keeps("and nobody else ever is", 8, || {
+            let members: Vec<NodeId> = a
+                .members()
+                .into_iter()
+                .map(|member| member.identity.id())
+                .collect();
+            members == vec![real.id()]
+        })
+        .await;
+
+        // A member's own address beats a rumour of it.
+        learn(&a.state, teller, rumour(real.id(), "elsewhere"));
+        assert!(
+            !a.rumours().iter().any(|(node, _)| *node == real.id()),
+            "a rumour overrode what a member said about itself"
+        );
     }
 
     /// A peer whose link is open and silent is declared dead by the

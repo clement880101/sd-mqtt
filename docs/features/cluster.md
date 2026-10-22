@@ -61,9 +61,15 @@ written down, so a node with no `storage.directory` would be a new
 node to its peers after every restart. That configuration is refused
 rather than started.
 
-Seeds are where to look, not who is there. A seed list naming this
-node is harmless — the handshake recognises it and the node stops
-dialling itself — so the same file can go on every node. Two nodes
+Seeds are where to look, not who is there. **One seed is enough**:
+nodes tell each other which members they can hear and the address each
+advertised, so a node that reaches one member is soon linked to every
+live one. That tells a node only where to dial — every link still has
+to prove it holds the secret — and a node you have forgotten through
+`DELETE /api/v1/nodes/{id}` is not dialled again because another node
+still knows it; it is met again only if it connects by itself. A seed
+list naming this node is harmless — the handshake recognises it and the
+node stops dialling itself — so the same file can go on every node. Two nodes
 that dial each other at the same moment settle on **one** link: the
 one dialled by the lower identity, which both ends work out from the
 two identities alone.

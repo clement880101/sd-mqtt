@@ -455,6 +455,22 @@ behind a test's fault-injection gate has a bind address no peer can use.
 Seeds alone are not enough for a full mesh, because a node learnt through a
 seed must publish somewhere to reach it.
 
+**As built, that address travels by gossip, and gossip only says where to
+dial.** Until after 0.8.0 a node dialled its seeds and the peers it had
+met, so the mesh was full only when every node listed every other as a
+seed. (Found by review.) Now each node tells a peer, at the first beat
+after their link comes up and one random peer every ten beats, the members
+it is hearing and the address each gave in its own greeting. What a node
+is told is a rumour: an address dialled under the same backoff as a seed,
+and not while a seed is still being dialled, since a seed is the
+operator's word. It never vouches — every link is still the mutual
+challenge below, so membership is only ever what a handshake proved. It
+never overrides a member's own address. And it never brings back a node
+an operator forgot: other nodes keep their own membership and may still
+gossip it, so a forgotten node is dialled again only once it is met by a
+link of its own. This is not the replicated member list section 8.2
+declines; liveness stays each node's own judgement.
+
 **A node that receives a greeting carrying its own UUID refuses the link and
 says so loudly.** That is a copied data directory or a cloned image, and it
 breaks the uniqueness that conflict resolution depends on, quietly and
