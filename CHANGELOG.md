@@ -50,6 +50,11 @@ the milestone you are moving to.** Everything else is description.
   and what a TLS listener accepts from a client certificate. Updated to
   `webpki-roots` 1.0.10 and `rustls-webpki` 0.103.16. 0.8.0 and earlier
   carry the vulnerable versions.
+- **Two more dependency advisories are fixed.** RUSTSEC-2026-0385
+  (`ctutils` 0.4.3, under argon2's password hashing, compared values in
+  time that depended on them) and RUSTSEC-2026-0386 (tokio 1.53.1's
+  `AsyncFd` constructors were unsound; the broker does not call them).
+  Updated to `ctutils` 0.4.5 and tokio 1.54.1. 0.8.0 carries both.
 
 ## 0.8.0 — 2026-10-18
 
