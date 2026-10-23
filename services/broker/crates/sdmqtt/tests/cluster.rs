@@ -2157,6 +2157,17 @@ async fn a_session_moves_to_the_node_its_client_returns_to() {
         "beta learns that somebody in the cluster wants the filter",
         || nodes[1].publish_reaching(TOPIC, WHILE_AWAY) > 0,
     );
+    // **Queued on alpha before the client returns**, because what is
+    // counted below is a drain. Beta's publish reaching a node is the
+    // forward leaving beta, not arriving: on a loaded runner the client
+    // was claimed while the forward was still on the link, the drain
+    // came back empty, and the message arrived by the late-forward
+    // redirect instead, delivered but not drained. This does not wait
+    // for gamma's copy, which is the race below: alpha's gauge moves
+    // when the message is routed, before its copy is written or sent.
+    until("alpha has queued the message for the absent client", || {
+        nodes[0].counter("sdmqtt_queue_depth") == Some(1)
+    });
 
     // ---- and the client comes back to gamma --------------
     //
