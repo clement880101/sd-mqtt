@@ -49,4 +49,5 @@ v5-ws:test_subscribe_failure     assumption As v5.
 v5-tls:test_flow_control2        flaky      As v5, but through TLS the race between the client's next PUBREL and the DISCONNECT it has not read yet goes either way: observed passing once in three runs, with the same broker that fails it plain.
 v5-ws:test_flow_control2         assumption As v5.
 v5-tls:test_subscribe_options    flaky      As v5.
+v5-tls:test_request_response    flaky      After bclient subscribes, the test waits on aclient's subscribeds, already met, not bclient's, so the request can be published before bclient's SUBSCRIBE is processed and bclient never sees it: test_subscribe_options's race. Seen failing once through TLS, which adds the latency; the plain and WebSocket runs share the race and have not lost it.
 v5-ws:test_subscribe_options     flaky      As v5.
