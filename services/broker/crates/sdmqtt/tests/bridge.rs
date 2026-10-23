@@ -784,15 +784,25 @@ fn the_bridge_reconnects_when_the_remote_comes_back() {
     // Outbound, which needs a live connection.
     let deadline = Instant::now() + PATIENCE;
     let after = loop {
-        near_publisher.publish_and_wait("sensors/after/temp", b"after", Properties::default());
-        if let Some(publish) = far_watcher.delivery_within(SILENCE) {
-            break publish;
-        }
         assert!(
             Instant::now() < deadline,
             "the bridge never reconnected: {}",
             bridged.near.logged()
         );
+        near_publisher.publish_and_wait("sensors/after/temp", b"after", Properties::default());
+        // **A resent "before" is passed over, not failed on.** The far
+        // broker went away right after it took "before", and if its
+        // acknowledgement never reached the bridge the outbox still
+        // holds it and sends it again on the new connection: at least
+        // once, which permits a duplicate and forbids a loss. The new
+        // watcher subscribed after the reconnect and sees that resend
+        // first.
+        if let Some(publish) = far_watcher.delivery_within(SILENCE) {
+            if publish.topic == "from-a/sensors/before/temp" {
+                continue;
+            }
+            break publish;
+        }
     };
     assert_eq!(after.topic, "from-a/sensors/after/temp");
     assert_eq!(&after.payload[..], b"after");
